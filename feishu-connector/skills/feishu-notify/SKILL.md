@@ -7,6 +7,8 @@ description: Use when users ask to send a plain-text Feishu message or when conf
 
 Use the repository's `feishu-connector/scripts/feishu_notify.py` CLI. Do not implement Feishu HTTP requests in this Skill, do not read or print App Secret or access tokens, and do not send messages unless one of the workflows below applies.
 
+The CLI resolves Phase 2 configuration itself using process environment, project JSON, and global JSON. This Skill must not open either JSON file, inspect the legacy `.env`, choose a recipient, or reproduce merge and secret rules. Repository instructions may supply `--project-root` only when they explicitly need to override Git/current-directory discovery; otherwise preserve the existing argv prefixes.
+
 ## argv safety
 
 Every dynamic value, including user text and task-derived fields, must be passed as an independent, literal argv parameter and must not be handed to shell parsing. Use an argv-capable execution tool with shell execution disabled. Never assemble a shell command from dynamic text or use command substitution, variable expansion, interpolated quotes, or any other shell evaluation to supply a value.

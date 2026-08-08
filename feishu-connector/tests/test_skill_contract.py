@@ -75,15 +75,58 @@ class ReadmeContractTests(unittest.TestCase):
             "feishu_notify.py task",
         ):
             self.assertIn(phrase, self.readme)
+        self.assertNotIn("复制为 `.env`", self.readme)
 
     def test_documents_failure_isolation_and_offline_tests(self):
         self.assertIn("不会改变原任务结果", self.readme)
         self.assertIn("不访问真实飞书", self.readme)
 
-    def test_marks_json_configuration_as_phase_two(self):
-        self.assertIn("二期", self.readme)
-        self.assertIn("config.json", self.readme)
-        self.assertIn("一期不读取", self.readme)
+    def test_documents_phase_two_paths_priority_and_diagnostics(self):
+        for phrase in (
+            "~/.config/feishu-connector/config.json",
+            ".config/feishu-connector/config.json",
+            "环境变量 > 项目 JSON > 全局 JSON",
+            "--project-root",
+            "feishu_notify.py config",
+            "(redacted)",
+        ):
+            self.assertIn(phrase, self.readme)
+
+    def test_documents_secret_policy_and_env_migration(self):
+        for phrase in (
+            "项目 JSON 中禁止出现 `appSecret`",
+            "chmod 600",
+            "不再读取",
+            "完成迁移后",
+        ):
+            self.assertIn(phrase, self.readme)
+
+    def test_documents_merged_auto_notification_gate(self):
+        self.assertIn(
+            "合并后的 `notification.autoNotify`",
+            self.readme,
+        )
+        self.assertIn(
+            "`FEISHU_AUTO_NOTIFY=false` 会覆盖较低优先级的 `true`",
+            self.readme,
+        )
+        self.assertNotIn(
+            "当 `FEISHU_AUTO_NOTIFY=false` 或未配置时",
+            self.readme,
+        )
+
+
+class UsageContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.usage = (
+            Path(__file__).resolve().parents[1] / "docs" / "USAGE.md"
+        ).read_text(encoding="utf-8")
+
+    def test_opening_describes_phase_two_scope(self):
+        opening = self.usage.split("## 1.", 1)[0]
+        self.assertIn("二期", opening)
+        self.assertNotIn("一期", opening)
 
 
 if __name__ == "__main__":

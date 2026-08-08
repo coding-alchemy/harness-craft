@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -13,13 +14,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-
-CONFIG_KEYS = (
-    "FEISHU_APP_ID",
-    "FEISHU_APP_SECRET",
-    "FEISHU_RECEIVE_OPEN_ID",
-    "FEISHU_AUTO_NOTIFY",
+from feishu_config import (
+    Config,
+    ConfigError,
+    build_config_paths,
+    config_from_settings,
+    format_source_diagnostics,
+    legacy_migration_message,
+    missing_required_fields,
+    parse_bool,
+    resolve_settings,
 )
+
 
 EXIT_OK = 0
 EXIT_CONFIG = 3
@@ -28,87 +34,6 @@ EXIT_TRANSIENT = 5
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.NullHandler())
-
-
-class ConfigError(Exception):
-    pass
-
-
-@dataclass(frozen=True)
-class Config:
-    app_id: str
-    app_secret: str
-    receive_open_id: str
-    auto_notify: bool
-
-
-def parse_bool(value, key):
-    normalized = value.strip().lower()
-    if normalized == "true":
-        return True
-    if normalized == "false":
-        return False
-    raise ConfigError("%s must be true or false" % key)
-
-
-def load_env_file(path):
-    path = Path(path)
-    try:
-        if not path.exists():
-            return {}
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise ConfigError("unable to read .env configuration") from exc
-    values = {}
-    for line_number, raw_line in enumerate(
-        text.splitlines(), start=1
-    ):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, separator, value = line.partition("=")
-        key = key.strip()
-        if not separator or not key:
-            raise ConfigError("invalid .env assignment at line %d" % line_number)
-        values[key] = value.strip()
-    return values
-
-
-def merged_settings(path, environ):
-    values = load_env_file(path)
-    for key in CONFIG_KEYS:
-        if key in environ:
-            values[key] = environ[key]
-    return values
-
-
-def auto_notify_enabled(path, environ):
-    values = merged_settings(path, environ)
-    return parse_bool(
-        values.get("FEISHU_AUTO_NOTIFY", "false"),
-        "FEISHU_AUTO_NOTIFY",
-    )
-
-
-def load_config(path, environ):
-    values = merged_settings(path, environ)
-    required = (
-        "FEISHU_APP_ID",
-        "FEISHU_APP_SECRET",
-        "FEISHU_RECEIVE_OPEN_ID",
-    )
-    for key in required:
-        if not values.get(key, "").strip():
-            raise ConfigError("missing required configuration: %s" % key)
-    return Config(
-        app_id=values["FEISHU_APP_ID"].strip(),
-        app_secret=values["FEISHU_APP_SECRET"].strip(),
-        receive_open_id=values["FEISHU_RECEIVE_OPEN_ID"].strip(),
-        auto_notify=parse_bool(
-            values.get("FEISHU_AUTO_NOTIFY", "false"),
-            "FEISHU_AUTO_NOTIFY",
-        ),
-    )
 
 
 def redact_identifier(value):
@@ -319,6 +244,11 @@ def non_empty(value):
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Send plain-text Feishu messages")
+    parser.add_argument(
+        "--project-root",
+        type=Path,
+        help="override project root used for .config/feishu-connector/config.json",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     send_parser = subparsers.add_parser("send", help="send explicit plain text")
@@ -334,7 +264,10 @@ def build_parser():
     task_parser.add_argument(
         "--auto",
         action="store_true",
-        help="send only when FEISHU_AUTO_NOTIFY=true",
+        help="send only when merged notification.autoNotify=true",
+    )
+    subparsers.add_parser(
+        "config", help="show effective configuration sources without network access"
     )
     return parser
 
@@ -361,10 +294,6 @@ def render_task_message(source, status, task, summary, repo, branch):
     )
 
 
-def default_env_file():
-    return Path(__file__).resolve().parents[1] / ".env"
-
-
 def _connector_exit_code(error):
     if error.retryable or error.category in ("network", "rate_limit", "server"):
         return EXIT_TRANSIENT
@@ -374,24 +303,44 @@ def _connector_exit_code(error):
 def main(
     argv=None,
     environ=None,
-    env_file=None,
+    config_paths=None,
     client_factory=FeishuClient,
     stdout=None,
     stderr=None,
+    cwd=None,
+    home=None,
+    git_runner=subprocess.run,
 ):
     environ = os.environ if environ is None else environ
-    env_file = default_env_file() if env_file is None else Path(env_file)
     stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
     args = build_parser().parse_args(argv)
-
+    paths = config_paths
     try:
+        if paths is None:
+            paths = build_config_paths(
+                explicit_project_root=args.project_root,
+                cwd=Path.cwd() if cwd is None else cwd,
+                home=Path.home() if home is None else home,
+                git_runner=git_runner,
+            )
+
+        settings = resolve_settings(paths, environ)
+        if args.command == "config":
+            resolution = config_from_settings(settings)
+            print(format_source_diagnostics(resolution), file=stdout)
+            return EXIT_OK
+
         if args.command == "task" and args.auto:
-            if not auto_notify_enabled(env_file, environ):
+            if not settings.values["notification.autoNotify"]:
                 print("Feishu auto notification disabled; nothing sent", file=stdout)
+                if missing_required_fields(settings):
+                    migration = legacy_migration_message(paths.legacy_env_file)
+                    if migration is not None:
+                        print(migration, file=stderr)
                 return EXIT_OK
 
-        config = load_config(env_file, environ)
+        config = config_from_settings(settings).config
         if args.command == "send":
             message = args.message
         else:
@@ -411,6 +360,10 @@ def main(
         return EXIT_OK
     except ConfigError as exc:
         print("Feishu configuration error: %s" % exc, file=stderr)
+        if paths is not None:
+            migration = legacy_migration_message(paths.legacy_env_file)
+            if migration is not None:
+                print(migration, file=stderr)
         return EXIT_CONFIG
     except ConnectorError as exc:
         code_text = " code=%s" % exc.code if exc.code is not None else ""

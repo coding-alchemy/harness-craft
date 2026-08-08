@@ -1,21 +1,26 @@
 import io
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from feishu_notify import ConnectorError, main, render_task_message  # noqa: E402
+from feishu_config import ConfigPaths  # noqa: E402
 
 
 class FakeClient:
     sent = []
+    configs = []
     error = None
 
     def __init__(self, config):
         self.config = config
+        self.configs.append(config)
 
     def send_text(self, message):
         if self.error is not None:
@@ -26,26 +31,40 @@ class FakeClient:
 class CliTests(unittest.TestCase):
     def setUp(self):
         FakeClient.sent = []
+        FakeClient.configs = []
         FakeClient.error = None
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.env_file = Path(directory.name) / ".env"
-        self.env_file.write_text(
-            "FEISHU_APP_ID=cli_test\n"
-            "FEISHU_APP_SECRET=test-secret\n"
-            "FEISHU_RECEIVE_OPEN_ID=ou_test1234\n"
-            "FEISHU_AUTO_NOTIFY=true\n",
+        self.root = Path(directory.name)
+        self.global_file = self.root / "global.json"
+        self.project_file = self.root / "project.json"
+        self.legacy_env_file = self.root / ".env"
+        self.global_file.write_text(
+            json.dumps(
+                {
+                    "app": {
+                        "appId": "cli_test",
+                        "appSecret": "test-secret",
+                    },
+                    "recipient": {"openId": "ou_test1234"},
+                    "notification": {"autoNotify": True},
+                }
+            ),
             encoding="utf-8",
         )
+        self.global_file.chmod(0o600)
+        self.config_paths = ConfigPaths(
+            self.global_file, self.project_file, self.legacy_env_file
+        )
 
-    def invoke(self, argv, environ=None):
+    def invoke(self, argv, environ=None, client_factory=FakeClient):
         stdout = io.StringIO()
         stderr = io.StringIO()
         code = main(
             argv=argv,
             environ={} if environ is None else environ,
-            env_file=self.env_file,
-            client_factory=FakeClient,
+            config_paths=self.config_paths,
+            client_factory=client_factory,
             stdout=stdout,
             stderr=stderr,
         )
@@ -80,7 +99,9 @@ class CliTests(unittest.TestCase):
         )
 
     def test_auto_task_is_noop_when_disabled(self):
-        self.env_file.write_text("FEISHU_AUTO_NOTIFY=false\n", encoding="utf-8")
+        self.global_file.write_text(
+            json.dumps({"notification": {"autoNotify": False}}), encoding="utf-8"
+        )
         code, stdout, stderr = self.invoke(
             [
                 "task", "--auto",
@@ -96,12 +117,69 @@ class CliTests(unittest.TestCase):
         self.assertIn("disabled", stdout)
         self.assertEqual("", stderr)
 
+    def test_auto_environment_false_overrides_json_true_without_client(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("disabled auto task constructed a client")
+
+        code, stdout, stderr = self.invoke(
+            [
+                "task", "--auto",
+                "--status", "success",
+                "--task", "task",
+                "--summary", "summary",
+                "--repo", "repo",
+                "--branch", "branch",
+            ],
+            environ={"FEISHU_AUTO_NOTIFY": "false"},
+            client_factory=ClientMustNotStart,
+        )
+        self.assertEqual(0, code)
+        self.assertIn("disabled", stdout)
+        self.assertEqual("", stderr)
+
+    def test_auto_task_uses_one_configuration_snapshot(self):
+        original_resolve = __import__("feishu_notify").resolve_settings
+
+        def change_after_resolution(paths, environ):
+            settings = original_resolve(paths, environ)
+            self.global_file.write_text(
+                json.dumps(
+                    {
+                        "app": {"appId": "cli_test", "appSecret": "test-secret"},
+                        "recipient": {"openId": "ou_test1234"},
+                        "notification": {"autoNotify": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return settings
+
+        with mock.patch("feishu_notify.resolve_settings", side_effect=change_after_resolution) as resolver:
+            code, _, stderr = self.invoke(
+                [
+                    "task", "--auto",
+                    "--status", "success",
+                    "--task", "task",
+                    "--summary", "summary",
+                    "--repo", "repo",
+                    "--branch", "branch",
+                ]
+            )
+        self.assertEqual(1, resolver.call_count)
+        self.assertEqual(0, code)
+        self.assertTrue(FakeClient.configs[-1].auto_notify)
+        self.assertEqual("", stderr)
+
     def test_explicit_send_ignores_auto_notify_setting(self):
-        self.env_file.write_text(
-            "FEISHU_APP_ID=cli_test\n"
-            "FEISHU_APP_SECRET=test-secret\n"
-            "FEISHU_RECEIVE_OPEN_ID=ou_test1234\n"
-            "FEISHU_AUTO_NOTIFY=false\n",
+        self.global_file.write_text(
+            json.dumps(
+                {
+                    "app": {"appId": "cli_test", "appSecret": "test-secret"},
+                    "recipient": {"openId": "ou_test1234"},
+                    "notification": {"autoNotify": False},
+                }
+            ),
             encoding="utf-8",
         )
         code, _, _ = self.invoke(["send", "--message", "explicit"])
@@ -109,18 +187,181 @@ class CliTests(unittest.TestCase):
         self.assertEqual(["explicit"], FakeClient.sent)
 
     def test_config_error_returns_3_without_leaking_secret(self):
-        self.env_file.write_text("FEISHU_APP_ID=cli_test\n", encoding="utf-8")
+        self.global_file.write_text(
+            json.dumps({"app": {"appId": "cli_test"}}), encoding="utf-8"
+        )
         code, _, stderr = self.invoke(["send", "--message", "hello"])
         self.assertEqual(3, code)
-        self.assertIn("FEISHU_APP_SECRET", stderr)
+        self.assertIn("app.appSecret", stderr)
         self.assertNotIn("ou_test1234", stderr)
 
-    def test_malformed_env_encoding_returns_3_without_leaking_secret(self):
-        self.env_file.write_bytes(b"FEISHU_APP_SECRET=top-secret\n\xff")
+    def test_malformed_json_encoding_returns_3_without_leaking_secret(self):
+        self.global_file.write_bytes(b'{"app":{"appSecret":"top-secret"}}\xff')
         code, _, stderr = self.invoke(["send", "--message", "hello"])
         self.assertEqual(3, code)
         self.assertIn("Feishu configuration error", stderr)
         self.assertNotIn("top-secret", stderr)
+
+    def test_config_command_reports_sources_without_network_or_values(self):
+        self.project_file.write_text(
+            json.dumps(
+                {
+                    "recipient": {"openId": "ou_project_hidden"},
+                    "notification": {"autoNotify": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        class NetworkMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("diagnostics instantiated the client")
+
+        code, stdout, stderr = self.invoke(
+            ["config"],
+            environ={"FEISHU_APP_ID": "cli_environment_hidden"},
+            client_factory=NetworkMustNotStart,
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        self.assertIn("app.appId: environment", stdout)
+        self.assertIn("app.appSecret: global (redacted)", stdout)
+        self.assertIn("recipient.openId: project (redacted)", stdout)
+        self.assertIn("notification.autoNotify: project", stdout)
+        for hidden in (
+            "cli_environment_hidden",
+            "test-secret",
+            "ou_project_hidden",
+        ):
+            self.assertNotIn(hidden, stdout)
+
+    def test_invalid_project_secret_returns_3_before_network(self):
+        self.project_file.write_text(
+            json.dumps({"app": {"appSecret": "forbidden-project-secret"}}),
+            encoding="utf-8",
+        )
+
+        class NetworkMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("client started before configuration validation")
+
+        code, _, stderr = self.invoke(
+            ["send", "--message", "hello"], client_factory=NetworkMustNotStart
+        )
+        self.assertEqual(3, code)
+        self.assertIn("must not contain app.appSecret", stderr)
+        self.assertNotIn("forbidden-project-secret", stderr)
+
+    def test_unresolvable_config_path_returns_3_before_network(self):
+        self.config_paths = ConfigPaths(
+            self.root / "global.json", self.project_file, self.legacy_env_file
+        )
+
+        class NetworkMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("client started before path validation")
+
+        with mock.patch("feishu_config.Path.resolve", side_effect=RuntimeError("loop")):
+            code, _, stderr = self.invoke(
+                ["send", "--message", "hello"], client_factory=NetworkMustNotStart
+            )
+        self.assertEqual(3, code)
+        self.assertTrue(stderr.isascii())
+
+    def test_git_decode_error_returns_3_before_network(self):
+        class NetworkMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("client started before Git validation")
+
+        def git_runner(argv, **kwargs):
+            raise UnicodeDecodeError("utf-8", b"\\xff", 0, 1, "invalid")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        code = main(
+            argv=["send", "--message", "hello"],
+            environ={},
+            client_factory=NetworkMustNotStart,
+            stdout=stdout,
+            stderr=stderr,
+            cwd=self.root,
+            home=self.root,
+            git_runner=git_runner,
+        )
+        self.assertEqual(3, code)
+        self.assertTrue(stderr.getvalue().isascii())
+
+    def test_opencode_source_remains_supported_by_same_task_command(self):
+        code, _, stderr = self.invoke(
+            [
+                "task",
+                "--status", "success",
+                "--task", "task",
+                "--summary", "summary",
+                "--repo", "repo",
+                "--branch", "branch",
+                "--source", "OpenCode",
+            ]
+        )
+        self.assertEqual(0, code)
+        self.assertTrue(FakeClient.sent[-1].startswith("[OpenCode] SUCCESS\n"))
+        self.assertEqual("", stderr)
+
+    def test_project_root_option_selects_project_json(self):
+        project_root = self.root / "selected-project"
+        config_file = project_root / ".config" / "feishu-connector" / "config.json"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            json.dumps({"recipient": {"openId": "ou_selected1234"}}),
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        code = main(
+            argv=["--project-root", str(project_root), "send", "--message", "hello"],
+            environ={
+                "FEISHU_APP_ID": "cli_environment",
+                "FEISHU_APP_SECRET": "environment-secret",
+            },
+            client_factory=FakeClient,
+            stdout=stdout,
+            stderr=stderr,
+            cwd=self.root,
+            home=self.root / "empty-home",
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("ou_selected1234", FakeClient.configs[-1].receive_open_id)
+        self.assertEqual("", stderr.getvalue())
+
+    def test_legacy_env_yields_migration_guidance_without_being_read(self):
+        self.global_file.unlink()
+        self.legacy_env_file.write_text(
+            "FEISHU_APP_SECRET=must-not-appear\n", encoding="utf-8"
+        )
+        code, _, stderr = self.invoke(["send", "--message", "hello"])
+        self.assertEqual(3, code)
+        self.assertIn("legacy .env was not read", stderr)
+        self.assertNotIn("must-not-appear", stderr)
+
+    def test_auto_disabled_with_incomplete_phase_two_config_is_noop_with_hint(self):
+        self.global_file.write_text(
+            json.dumps({"notification": {"autoNotify": False}}), encoding="utf-8"
+        )
+        self.legacy_env_file.write_text("opaque legacy contents", encoding="utf-8")
+        code, stdout, stderr = self.invoke(
+            [
+                "task", "--auto",
+                "--status", "success",
+                "--task", "task",
+                "--summary", "summary",
+                "--repo", "repo",
+                "--branch", "branch",
+            ]
+        )
+        self.assertEqual(0, code)
+        self.assertIn("disabled", stdout)
+        self.assertIn("legacy .env was not read", stderr)
+        self.assertEqual([], FakeClient.sent)
 
     def test_non_transient_api_error_returns_4_and_code(self):
         FakeClient.error = ConnectorError("api", "Feishu business error", code=230013)

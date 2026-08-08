@@ -1,29 +1,28 @@
 # 飞书连接器快速使用指南
 
-一句话说明：一期仅用企业自建应用机器人向固定 Open ID 发送纯文本私聊；不支持群 Webhook、群聊、富文本或动态接收人。
+一句话说明：二期仍仅用企业自建应用机器人向固定 Open ID 发送纯文本私聊；不支持群 Webhook、群聊、富文本或动态接收人。
 
 ## 1. 开始前
 
 请先完成企业自建应用创建、机器人能力启用、`im:message:send_as_bot` 权限申请，并将目标用户加入机器人的可用范围。飞书端的详细准备步骤见 [README](../README.md)。
 
-## 2. 配置
+## 2. 配置与诊断
 
-从示例复制本地配置文件：
+配置按叶子字段合并，优先级为 **环境变量 > 项目 JSON > 全局 JSON**。全局文件位于 `~/.config/feishu-connector/config.json`，可以包含 `app.appId`、`app.appSecret`、`recipient.openId` 和 `notification.autoNotify`；含 Secret 时在 POSIX 上执行：
 
 ```bash
-cp feishu-connector/.env.example feishu-connector/.env
+chmod 600 ~/.config/feishu-connector/config.json
 ```
 
-在 `.env` 中填写以下四项：
+项目文件位于 `<项目根目录>/.config/feishu-connector/config.json`，允许提交并可覆盖 `app.appId`、`recipient.openId` 和 `notification.autoNotify`。项目 JSON 禁止出现 `appSecret`。环境变量 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_RECEIVE_OPEN_ID` 和 `FEISHU_AUTO_NOTIFY` 分别覆盖对应叶子字段。
 
-```dotenv
-FEISHU_APP_ID=
-FEISHU_APP_SECRET=
-FEISHU_RECEIVE_OPEN_ID=
-FEISHU_AUTO_NOTIFY=false
+项目根目录依次取 `--project-root`、当前 Git 仓库顶层目录、当前工作目录。检查有效来源且不联网：
+
+```bash
+python3 feishu-connector/scripts/feishu_notify.py config
 ```
 
-进程环境变量会逐字段覆盖 `.env` 中的同名值。`.env` 不提交；Secret、Token、Authorization 和完整 Open ID 都不得进入命令行或日志。
+二期不再读取 `feishu-connector/.env`。把 Secret 移到全局 JSON 或进程环境变量，把项目差异移到项目 JSON；确认 `config` 诊断正确后再删除旧 `.env`。检测和提示迁移时，CLI 不读取旧文件内容。
 
 ## 3. 发送一条手动消息
 
@@ -57,7 +56,7 @@ python3 feishu-connector/scripts/feishu_notify.py task --auto \
   --branch "feishu"
 ```
 
-仅当 `FEISHU_AUTO_NOTIFY=true` 时发送。关闭或未配置时，命令会以成功的 no-op 结束；此门控仍会读取并解析 `.env` 获取 `FEISHU_AUTO_NOTIFY`，但不要求或验证完整凭据，也不请求网络。通知失败时 CLI 返回相应非零退出码；若 Codex/自动化调用方把通知作为捕获的次要结果处理，原任务结果可保持隔离。
+仅当合并后的 `notification.autoNotify` 为 `true` 时发送。关闭或未配置时，命令会以成功的 no-op 结束；门控会校验全局 JSON、项目 JSON 和相关环境变量，但不要求完整发送凭据，也不请求网络。通知失败时 CLI 返回相应非零退出码；Codex 或自动化调用方必须把通知作为捕获的次要结果处理，保持原任务结果隔离。
 
 ## 6. Codex 与 Shell-only 调用
 
