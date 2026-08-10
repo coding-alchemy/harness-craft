@@ -7,22 +7,24 @@
 ## 范围
 
 - 新建 `feishu-connector/docs/USAGE.md`。
-- 只描述 Phase 1 已实现能力：固定 Open ID 的纯文本私聊、`send`、`task`、`task --auto`、Codex Skill 以及 Shell-only 安全适配器。
+- 描述当前已实现能力：固定 Open ID 的纯文本私聊、多级 JSON 配置、`send`、`task`、`task --auto`、配置诊断、Codex Skill 以及 Shell-only 安全适配器。
+- 简要指向用户级安装流程；安装路径、覆盖规则和安全边界以 [`2026-08-08-feishu-connector-installer-design.md`](2026-08-08-feishu-connector-installer-design.md) 为准，不在使用指南设计中重复。
 - 以现有 `feishu-connector/README.md` 为详细参考来源，避免重复飞书后台配置和完整验收细节。
 
 ## 结构
 
 1. 适用范围与开始前条件
-2. 本地 `.env` 配置及环境变量覆盖规则
-3. 手动发送的最短命令
-4. 手动任务通知与自动通知开关
-5. Codex Skill 与 Shell-only stdin 适配器的安全调用方式
-6. 常见退出码、脱敏原则和完整测试命令
-7. 指向 README 的详细配置、排错与真实端到端验收链接
+2. 用户级安装入口、PATH 提示和安装器设计链接
+3. 全局 JSON、项目 JSON、环境变量优先级及配置诊断
+4. 手动发送的最短命令
+5. 手动任务通知与自动通知开关
+6. Codex Skill 与 Shell-only stdin 适配器的安全调用方式
+7. 常见退出码、脱敏原则和完整测试命令
+8. 指向 README 的详细配置、排错与真实端到端验收链接
 
 ## 内容原则
 
-- 每个命令都以仓库根目录为工作目录，并使用明显的示例值。
+- 安装后的稳定命令可以从任意项目目录执行；源码直接运行命令以仓库根目录为工作目录。所有示例使用明显的假值。
 - 不展示真实 App Secret、Token、Authorization 或完整 Open ID。
 - 不将用户文本拼接进 Shell 命令；Shell-only 环境仅通过适配器的独立标准输入通道传值。
 - 说明默认测试离线运行；真实飞书发送仅由用户在提供测试凭据后手动执行。

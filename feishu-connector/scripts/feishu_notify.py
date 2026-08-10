@@ -10,6 +10,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -121,12 +122,14 @@ class FeishuClient:
         sleep=time.sleep,
         timeout=10.0,
         max_retries=2,
+        uuid_factory=uuid.uuid4,
     ):
         self.config = config
         self.transport = transport
         self.sleep = sleep
         self.timeout = timeout
         self.max_retries = max_retries
+        self.uuid_factory = uuid_factory
 
     def _classify_response(self, response):
         code = response.payload.get("code")
@@ -223,20 +226,28 @@ class FeishuClient:
             ensure_ascii=False,
             separators=(",", ":"),
         )
+        payload = {
+            "receive_id": self.config.receive_open_id,
+            "msg_type": "text",
+            "content": content,
+            "uuid": str(self.uuid_factory()),
+        }
         return self._attempt(
             lambda: self._post(
                 self.MESSAGE_URL,
                 {"Authorization": "Bearer %s" % token},
-                {
-                    "receive_id": self.config.receive_open_id,
-                    "msg_type": "text",
-                    "content": content,
-                },
+                payload,
             )
         )
 
 
 def non_empty(value):
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise argparse.ArgumentTypeError(
+            "value must contain valid Unicode scalar text"
+        ) from exc
     if not value.strip():
         raise argparse.ArgumentTypeError("value must not be empty")
     return value
@@ -300,7 +311,7 @@ def _connector_exit_code(error):
     return EXIT_REMOTE
 
 
-def main(
+def _run_main(
     argv=None,
     environ=None,
     config_paths=None,
@@ -373,6 +384,44 @@ def main(
             file=stderr,
         )
         return _connector_exit_code(exc)
+
+
+def main(
+    argv=None,
+    environ=None,
+    config_paths=None,
+    client_factory=FeishuClient,
+    stdout=None,
+    stderr=None,
+    cwd=None,
+    home=None,
+    git_runner=subprocess.run,
+):
+    stderr = sys.stderr if stderr is None else stderr
+    handler = logging.StreamHandler(stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    previous_level = LOGGER.level
+    previous_propagate = LOGGER.propagate
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.WARNING)
+    LOGGER.propagate = False
+    try:
+        return _run_main(
+            argv=argv,
+            environ=environ,
+            config_paths=config_paths,
+            client_factory=client_factory,
+            stdout=stdout,
+            stderr=stderr,
+            cwd=cwd,
+            home=home,
+            git_runner=git_runner,
+        )
+    finally:
+        LOGGER.removeHandler(handler)
+        LOGGER.setLevel(previous_level)
+        LOGGER.propagate = previous_propagate
+        handler.close()
 
 
 if __name__ == "__main__":

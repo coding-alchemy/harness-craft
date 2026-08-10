@@ -501,7 +501,58 @@ notification.autoNotify: project
 8. 二期实现不读取一期 `.env`，并提供清晰迁移文档。
 9. 增加 OpenCode 适配层时，飞书核心 CLI 无需修改。
 
-## 15. 官方参考
+## 15. 可靠性与输入加固
+
+### 15.1 消息重试幂等
+
+每次 `FeishuClient.send_text()` 逻辑调用必须生成一个新的 UUID，并把它放入飞书消息请求体。一次逻辑发送内的所有消息重试必须复用同一个 UUID；两次独立逻辑发送必须使用不同 UUID。
+
+Token 请求保持第 9.2 节的重试规则。消息请求仍对临时网络错误、HTTP 429、飞书限流业务码和 HTTP 5xx 最多额外重试两次。稳定 UUID 用于处理“飞书已经接受消息，但客户端没有收到响应”的不确定失败，避免同一逻辑通知产生重复私聊。
+
+### 15.2 CLI 重试诊断
+
+连接器作为库导入时保持安静的默认日志行为。CLI `main()` 执行期间必须把重试日志写到当前 CLI 的 `stderr`，执行结束后移除本次安装的日志 handler，避免测试或进程内多次调用累积输出。
+
+每次重试至少记录错误类别和尝试次数，例如 `network` 与 `attempt 1/3`。日志不得包含请求头、完整请求体、Authorization、Secret、Token 或完整 Open ID。
+
+### 15.3 非法 Unicode 输入
+
+`send` 消息以及 `task` 的 `task`、`summary`、`repo` 和 `branch` 字段必须是有效 Unicode scalar 文本。固定枚举字段 `status` 和 `source` 继续由 argparse 的 choices 校验。
+
+自由文本参数必须在读取配置和发起任何网络请求前验证能否编码为 UTF-8。验证失败时使用 argparse 输入错误契约返回退出码 `2`，错误信息只说明对应字段包含无效 Unicode，不得回显输入值，也不得打印 traceback。
+
+该规则同时适用于直接 CLI 调用和 Shell-only 适配器；适配器仍须在创建子进程失败时把 `UnicodeError` 归类为输入错误。
+
+### 15.4 加固测试
+
+- 消息请求第一次发生不确定网络失败、第二次成功时，两次请求必须携带相同 UUID。
+- 两次独立发送必须携带不同 UUID。
+- 使用真实 `FeishuClient` 和假传输触发重试时，CLI stderr 必须包含脱敏后的类别和尝试次数。
+- 在 POSIX 上通过字节 argv 启动真实 CLI，验证非法 Unicode 的 `send` 和任务字段在联网前以退出码 `2` 结束且没有 traceback。
+- 既有配置合并、项目 Secret 禁止、退出码、自动通知门控和 OpenCode 来源兼容测试必须继续通过。
+
+### 15.5 兼容性与验收标准
+
+本节加固不得改变以下契约：
+
+- 环境变量 > 项目 JSON > 全局 JSON 的按字段合并。
+- 项目 JSON 禁止 `appSecret`。
+- `send`、`task`、`task --auto`、`config` 和 `--source OpenCode` 的现有参数接口。
+- 退出码 `0`、`2`、`3`、`4`、`5` 的既有含义。
+- 自动通知失败不改变原任务结果。
+- Python 3 标准库实现，无常驻服务。
+
+以下条件全部满足后，本轮可靠性加固才算完成：
+
+1. 消息阶段的透明重试不会产生重复私聊。
+2. 正常 CLI 执行可以观察到脱敏的重试类别和次数。
+3. 非法 Unicode 自由文本在联网前稳定返回退出码 `2`。
+4. 全部离线单元测试、`compileall`、CLI 帮助烟雾测试和 `git diff --check` 通过。
+5. 仓库和测试输出不包含真实凭据、Token 或 Open ID。
+
+用户级安装行为单独定义在 [`2026-08-08-feishu-connector-installer-design.md`](2026-08-08-feishu-connector-installer-design.md)，不在本节重复。
+
+## 16. 官方参考
 
 - [飞书：发送消息](https://open.feishu.cn/document/server-docs/im-v1/message/create)
 - [飞书：自定义机器人使用指南](https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot)

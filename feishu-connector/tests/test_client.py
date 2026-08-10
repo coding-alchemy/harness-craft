@@ -303,6 +303,54 @@ class ClientTests(unittest.TestCase):
         client.send_text("hello")
         self.assertEqual([1.0], delays)
 
+    def test_message_retry_reuses_one_idempotency_uuid(self):
+        transport = FakeTransport(
+            [
+                JsonResponse(200, {"code": 0, "tenant_access_token": "token-value"}),
+                NetworkFailure("response lost after possible delivery"),
+                JsonResponse(200, {"code": 0, "msg": "success"}),
+            ]
+        )
+        client = FeishuClient(
+            self.config(),
+            transport=transport,
+            sleep=lambda _: None,
+            uuid_factory=lambda: "logical-send-uuid",
+        )
+
+        client.send_text("hello")
+
+        message_calls = [call for call in transport.calls if "/messages?" in call[0]]
+        self.assertEqual(2, len(message_calls))
+        self.assertEqual("logical-send-uuid", message_calls[0][2]["uuid"])
+        self.assertEqual("logical-send-uuid", message_calls[1][2]["uuid"])
+
+    def test_separate_logical_sends_use_different_uuids(self):
+        identifiers = iter(("first-send-uuid", "second-send-uuid"))
+        transport = FakeTransport(
+            [
+                JsonResponse(200, {"code": 0, "tenant_access_token": "token-one"}),
+                JsonResponse(200, {"code": 0, "msg": "success"}),
+                JsonResponse(200, {"code": 0, "tenant_access_token": "token-two"}),
+                JsonResponse(200, {"code": 0, "msg": "success"}),
+            ]
+        )
+        client = FeishuClient(
+            self.config(),
+            transport=transport,
+            sleep=lambda _: None,
+            uuid_factory=lambda: next(identifiers),
+        )
+
+        client.send_text("first")
+        client.send_text("second")
+
+        message_calls = [call for call in transport.calls if "/messages?" in call[0]]
+        self.assertEqual(
+            ["first-send-uuid", "second-send-uuid"],
+            [call[2]["uuid"] for call in message_calls],
+        )
+
     def test_retry_records_error_category_and_attempt_count(self):
         transport = FakeTransport(
             [

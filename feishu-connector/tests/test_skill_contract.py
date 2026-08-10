@@ -15,8 +15,9 @@ class SkillContractTests(unittest.TestCase):
     def test_has_expected_frontmatter_name(self):
         self.assertIn("name: feishu-notify", self.skill)
 
-    def test_explicit_send_uses_send_subcommand(self):
-        self.assertIn("feishu_notify.py send --message", self.skill)
+    def test_explicit_send_uses_installed_send_command(self):
+        self.assertIn("feishu-notify send --message", self.skill)
+        self.assertNotIn("feishu-connector/scripts/", self.skill)
 
     def test_requires_literal_argv_for_dynamic_values_without_shell_evaluation(self):
         self.assertIn("independent, literal argv parameter", self.skill)
@@ -29,18 +30,18 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("## Shell-only execution fallback", self.skill)
         fallback = self.skill.split("## Shell-only execution fallback", 1)[1]
         for required in (
-            "feishu_notify_adapter.py",
+            "feishu-notify-adapter",
             "separate stdin/input-data channel",
-            "feishu_notify.py send --message",
-            "feishu_notify.py task --auto",
+            "feishu-notify send --message",
+            "feishu-notify task --auto",
             "cannot provide separate stdin data",
         ):
             self.assertIn(required, fallback)
         self.assertNotIn("temporary JSON file", fallback)
         self.assertNotIn("python3 -c", fallback)
 
-    def test_automatic_send_uses_task_auto_gate(self):
-        self.assertIn("feishu_notify.py task --auto", self.skill)
+    def test_automatic_send_uses_installed_task_auto_gate(self):
+        self.assertIn("feishu-notify task --auto", self.skill)
 
     def test_requires_all_five_task_fields(self):
         for argument in ("--status", "--task", "--summary", "--repo", "--branch"):

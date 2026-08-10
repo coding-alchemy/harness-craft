@@ -1,5 +1,8 @@
 import io
 import json
+import logging
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,7 +12,15 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from feishu_notify import ConnectorError, main, render_task_message  # noqa: E402
+from feishu_notify import (  # noqa: E402
+    ConnectorError,
+    FeishuClient,
+    JsonResponse,
+    LOGGER,
+    NetworkFailure,
+    main,
+    render_task_message,
+)
 from feishu_config import ConfigPaths  # noqa: E402
 
 
@@ -70,12 +81,57 @@ class CliTests(unittest.TestCase):
         )
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def run_cli_with_bytes(self, arguments):
+        command = [
+            os.fsencode(sys.executable),
+            os.fsencode(str(SCRIPTS / "feishu_notify.py")),
+        ] + arguments
+        environment = {
+            "HOME": str(self.root),
+            "PATH": os.environ.get("PATH", ""),
+        }
+        return subprocess.run(
+            command,
+            cwd=self.root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
     def test_send_sends_exact_plain_text(self):
         code, stdout, stderr = self.invoke(["send", "--message", "hello 飞书"])
         self.assertEqual(0, code)
         self.assertEqual(["hello 飞书"], FakeClient.sent)
         self.assertIn("sent", stdout)
         self.assertEqual("", stderr)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX byte argv semantics required")
+    def test_direct_cli_rejects_non_utf8_send_message_before_configuration(self):
+        result = self.run_cli_with_bytes(
+            [b"send", b"--message", b"invalid-\xff-text"]
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertIn(b"valid Unicode", result.stderr)
+        self.assertNotIn(b"configuration error", result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX byte argv semantics required")
+    def test_direct_cli_rejects_non_utf8_task_field_before_configuration(self):
+        result = self.run_cli_with_bytes(
+            [
+                b"task",
+                b"--status", b"success",
+                b"--task", b"task",
+                b"--summary", b"invalid-\xff-summary",
+                b"--repo", b"repo",
+                b"--branch", b"branch",
+            ]
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertIn(b"valid Unicode", result.stderr)
+        self.assertNotIn(b"configuration error", result.stderr)
+        self.assertNotIn(b"Traceback", result.stderr)
 
     def test_task_renders_fixed_five_field_template(self):
         code, _, _ = self.invoke(
@@ -380,6 +436,116 @@ class CliTests(unittest.TestCase):
         code, _, stderr = self.invoke(["send", "--message", "hello"])
         self.assertEqual(5, code)
         self.assertIn("network", stderr)
+
+    def test_cli_writes_redacted_retry_diagnostics_to_its_stderr(self):
+        original_handlers = tuple(LOGGER.handlers)
+        outcomes = iter(
+            (
+                NetworkFailure("temporary test-secret ou_test1234"),
+                JsonResponse(200, {"code": 0, "tenant_access_token": "token-value"}),
+                JsonResponse(200, {"code": 0, "msg": "success"}),
+            )
+        )
+
+        def transport(url, headers, payload, timeout):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        def client_factory(config):
+            return FeishuClient(config, transport=transport, sleep=lambda _: None)
+
+        code, _, stderr = self.invoke(
+            ["send", "--message", "hello"],
+            client_factory=client_factory,
+        )
+
+        self.assertEqual(0, code)
+        self.assertIn("Feishu retry [network] attempt 1/3", stderr)
+        self.assertNotIn("test-secret", stderr)
+        self.assertNotIn("ou_test1234", stderr)
+        self.assertNotIn("token-value", stderr)
+        self.assertEqual(original_handlers, tuple(LOGGER.handlers))
+
+    def test_cli_retry_diagnostics_ignore_root_error_level(self):
+        root = logging.getLogger()
+        old_level = root.level
+        root.setLevel(logging.ERROR)
+        self.addCleanup(root.setLevel, old_level)
+        outcomes = iter(
+            (
+                NetworkFailure("temporary"),
+                JsonResponse(200, {"code": 0, "tenant_access_token": "token"}),
+                JsonResponse(200, {"code": 0}),
+            )
+        )
+
+        def transport(url, headers, payload, timeout):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        code, _, stderr = self.invoke(
+            ["send", "--message", "hello"],
+            client_factory=lambda config: FeishuClient(
+                config, transport=transport, sleep=lambda _: None
+            ),
+        )
+        self.assertEqual(0, code)
+        self.assertIn("Feishu retry [network] attempt 1/3", stderr)
+
+    def test_cli_retry_diagnostics_do_not_propagate_to_root_handler(self):
+        root = logging.getLogger()
+        old_level = root.level
+        root_stream = io.StringIO()
+        root_handler = logging.StreamHandler(root_stream)
+        root.setLevel(logging.WARNING)
+        root.addHandler(root_handler)
+        self.addCleanup(root.removeHandler, root_handler)
+        self.addCleanup(root.setLevel, old_level)
+        outcomes = iter(
+            (
+                NetworkFailure("temporary"),
+                JsonResponse(200, {"code": 0, "tenant_access_token": "token"}),
+                JsonResponse(200, {"code": 0}),
+            )
+        )
+
+        def transport(url, headers, payload, timeout):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        code, _, stderr = self.invoke(
+            ["send", "--message", "hello"],
+            client_factory=lambda config: FeishuClient(
+                config, transport=transport, sleep=lambda _: None
+            ),
+        )
+        self.assertEqual(0, code)
+        self.assertIn("Feishu retry [network] attempt 1/3", stderr)
+        self.assertEqual("", root_stream.getvalue())
+
+    def test_cli_restores_logger_state_after_exception(self):
+        original_level = LOGGER.level
+        original_propagate = LOGGER.propagate
+        LOGGER.setLevel(logging.ERROR)
+        LOGGER.propagate = True
+        self.addCleanup(setattr, LOGGER, "level", original_level)
+        self.addCleanup(setattr, LOGGER, "propagate", original_propagate)
+
+        def client_factory(config):
+            self.assertEqual(logging.WARNING, LOGGER.level)
+            self.assertFalse(LOGGER.propagate)
+            raise RuntimeError("test failure")
+
+        with self.assertRaisesRegex(RuntimeError, "test failure"):
+            self.invoke(["send", "--message", "hello"], client_factory=client_factory)
+        self.assertEqual(logging.ERROR, LOGGER.level)
+        self.assertTrue(LOGGER.propagate)
 
     def test_render_rejects_empty_task_fields(self):
         with self.assertRaisesRegex(ValueError, "summary"):

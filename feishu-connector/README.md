@@ -14,6 +14,24 @@
 
 用户可以在飞书客户端停止接收机器人消息；连接器会将此类错误报告为不可重试的业务错误。请只使用测试应用和测试用户完成验收。
 
+## 用户级安装
+
+第一版安装器支持 macOS/Linux，只依赖 Python 3 标准库。在仓库根目录运行：
+
+```bash
+python3 feishu-connector/install.py
+```
+
+安装器把运行文件复制到 `~/.local/share/feishu-connector`，把 `feishu-notify` 和 `feishu-notify-adapter` 放到 `~/.local/bin`，并把 Skill 安装到 `${CODEX_HOME:-~/.codex}/skills/feishu-notify`。如果 `~/.local/bin` 不在 `PATH`，安装器会输出设置提示，但不会修改 Shell 配置。
+
+重复安装相同内容且权限正确时是安全的。内容或权限不同时，安装器默认拒绝覆盖；确认要更新受管文件或修复权限后运行：
+
+```bash
+python3 feishu-connector/install.py --force
+```
+
+安装器不会创建或修改飞书配置、`.env`、Secret、Token 或 Open ID。安装后可以从任意项目目录运行 `feishu-notify`；下文的 `python3 feishu-connector/scripts/feishu_notify.py` 命令保留为源码仓库内的直接运行方式。
+
 ## 配置
 
 连接器按叶子字段合并三层配置，优先级固定为：**环境变量 > 项目 JSON > 全局 JSON**。高优先级没有出现的字段继续继承低优先级值；显式 `null`、未知字段、错误类型和空字符串都会在联网前报配置错误。
@@ -118,7 +136,7 @@ python3 feishu-connector/scripts/feishu_notify.py task --auto \
 
 ## Codex Skill
 
-让 Codex 读取 `feishu-connector/skills/feishu-notify/SKILL.md`，以便在用户明确要求时调用 `send`。若要使任务结束时默认执行自动通知，项目指令必须明确启用这一自动任务通知约定；它不是 Codex 平台级的全局 Hook。
+安装后让 Codex 读取 `${CODEX_HOME:-~/.codex}/skills/feishu-notify/SKILL.md`，以便在用户明确要求时调用稳定命令 `feishu-notify`。只有在源码仓库内直接运行时，才使用 `feishu-connector/skills/feishu-notify/SKILL.md` 和 `python3 feishu-connector/scripts/...` 路径。若要使任务结束时默认执行自动通知，项目指令必须明确启用这一自动任务通知约定；它不是 Codex 平台级的全局 Hook。
 
 通知失败时，Skill 只追加一条脱敏警告，**不会改变原任务结果**，也不覆盖原有失败原因。显式发送不依赖自动通知开关。
 
@@ -150,4 +168,8 @@ python3 -m unittest discover -s feishu-connector/tests -p 'test_*.py' -v
 
 退出码 `3` 表示配置错误，例如缺少 App ID、App Secret 或 Open ID，或 `FEISHU_AUTO_NOTIFY` 不是 `true`/`false`。退出码 `4` 表示不可重试的远程错误，包括鉴权/权限不足、用户不在可用范围、无效 Open ID 或用户拒收机器人消息。
 
-退出码 `5` 表示临时性失败，例如网络中断、限流、服务端错误。连接器会在首次失败后最多额外重试两次，因此单个请求阶段最多尝试三次。排错时不要打印 Secret、Token、Authorization 或完整 Open ID；只记录脱敏后的错误类别和飞书错误码（如有）。
+退出码 `5` 表示临时性失败，例如网络中断、限流、服务端错误。连接器会在首次失败后最多额外重试两次，因此单个请求阶段最多尝试三次。消息请求在一次逻辑发送的所有重试中复用同一个幂等 UUID，避免响应丢失造成重复私聊。
+
+CLI 会把每次重试的脱敏错误类别和尝试次数写到 stderr。排错时不要打印 Secret、Token、Authorization、完整 Open ID、请求头或完整请求体。
+
+无法编码为 UTF-8 的消息或任务字段属于参数错误，CLI 会在读取配置和联网前以退出码 `2` 拒绝。
