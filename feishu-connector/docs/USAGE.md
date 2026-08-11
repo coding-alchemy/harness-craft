@@ -7,6 +7,9 @@
 python3 feishu-connector/install_skill.py
 python3 feishu-connector/install_skill.py --force
 ```
+
+首次配置前，请先阅读[飞书应用参数获取指南](FEISHU_APP_SETUP.md)，取得 App ID、App Secret 和目标用户 Open ID。
+
 ## 最小配置
 
 全局 `~/.config/feishu-connector/config.json`：
