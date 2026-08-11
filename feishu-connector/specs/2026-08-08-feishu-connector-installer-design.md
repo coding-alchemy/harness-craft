@@ -1,95 +1,46 @@
-# 飞书连接器用户级安装器设计
+# 飞书连接器 Skill 安装器设计
 
 ## 目标
 
-为飞书连接器提供一个仅依赖 Python 3 标准库的 macOS/Linux 用户级安装器，使 CLI、Shell-only 适配器和 Codex Skill 可以从任意项目稳定调用，不再依赖源码仓库位置或当前工作目录。
+安装器仅将自包含的 `feishu-notify` Skill 安装到用户的 Codex Skill 目录，使已安装入口不依赖源码仓库位置或当前工作目录。消息、配置与错误行为以 [当前契约](feishu-connector.md) 为准。
 
-连接器的消息发送、配置、可靠性和安全行为以 [`feishu-connector.md`](feishu-connector.md) 为准，本设计只定义安装与更新行为。
+## 范围与位置
 
-## 范围
+运行 `python3 feishu-connector/install_skill.py`；更新冲突的受管文件时运行 `python3 feishu-connector/install_skill.py --force`。源目录为 `feishu-connector/skills/feishu-notify`，目标目录为 `${CODEX_HOME:-~/.codex}/skills/feishu-notify`。
 
-- 新增 `feishu-connector/install.py`。
-- 安装连接器运行文件、两个稳定命令入口和 Codex Skill。
-- 支持幂等重复安装和显式 `--force` 更新。
-- 安装后检查文件、权限、入口和 Skill。
-- 在 README 和快速使用指南中说明安装、更新、PATH 与源码直接运行方式。
+安装器不支持 Windows，不安装 launcher 或通用 package，不修改 Shell 配置，不创建卸载器，也不创建、读取或修改飞书配置、Secret、Token 或 Open ID。
 
-第一版不支持 Windows，不安装第三方依赖，不实现卸载器，不自动修改 Shell 配置，不创建或修改飞书配置，也不读取或迁移 Secret。
+## 固定 manifest
 
-## 安装位置
+安装器只管理以下六个文件及其目标权限：
 
-默认用户级路径固定为：
+| 相对路径 | 权限 |
+| --- | --- |
+| `SKILL.md` | `0644` |
+| `scripts/feishu_notify.py` | `0755` |
+| `scripts/feishu_connector/__init__.py` | `0644` |
+| `scripts/feishu_connector/client.py` | `0644` |
+| `scripts/feishu_connector/config.py` | `0644` |
+| `scripts/feishu_connector/cli.py` | `0644` |
 
-- 运行文件：`~/.local/share/feishu-connector/scripts/`
-- CLI 入口：`~/.local/bin/feishu-notify`
-- 适配器入口：`~/.local/bin/feishu-notify-adapter`
-- Codex Skill：`${CODEX_HOME:-~/.codex}/skills/feishu-notify/SKILL.md`
+每个源文件必须是普通文件。安装器创建缺失目录，并以同目录临时文件写入、设置权限、原子替换和最终校验完成发布。
 
-`CODEX_HOME` 只影响 Skill 目标目录；连接器运行文件与命令入口仍使用上述 `~/.local` 路径。
+## 更新、`--force` 与未知文件
 
-## 文件发布与更新
+内容和权限均与 manifest 相同的受管文件视为已安装，重复运行成功且不改动它。受管文件缺失时会创建；现有受管文件的内容或权限不一致时，默认失败且保留原文件。只有 `--force` 才替换这些冲突的受管文件。
 
-安装器维护一组明确的受管文件，并以原子替换发布每个目标文件：
-
-- 目标不存在时创建。
-- 目标内容与权限均和待安装文件相同时视为成功，重复安装不产生额外变化。
-- 目标内容相同但权限不同时，默认拒绝原地修改；只有显式传入 `--force` 时才用新 inode 替换目标，避免修改硬链接别名。
-- 目标内容不同时默认拒绝覆盖并返回非零退出码。
-- 只有显式传入 `--force` 时才替换内容不同的受管文件。
-
-安装器不得删除目标目录、遍历删除旧文件、覆盖受管列表以外的文件或修改飞书配置目录。临时文件必须创建在目标文件所在目录，写入成功并设置权限后再原子发布；目标原先缺失且未传 `--force` 时使用操作系统的原子 no-clobber rename。失败后不得通过存在身份竞态的 pathname unlink 清理；应把仍打开的 staging inode 收紧为 `0600`，保留并报告经过身份验证的恢复路径，同时不破坏原目标。
-
-## 稳定命令入口
-
-两个 `~/.local/bin` 入口使用安装后脚本的绝对路径：
-
-- `feishu-notify` 调用已安装的 `feishu_notify.py`，原样转发所有 argv。
-- `feishu-notify-adapter` 调用已安装的 `feishu_notify_adapter.py`，保留 stdin、stdout、stderr 和退出码。
-
-入口不得对消息或任务字段做 Shell 求值。参数转发必须保持每个调用参数的边界，适配器标准输入必须原样传递。
-
-Codex Skill 改为调用 `feishu-notify` 和 `feishu-notify-adapter`，不再引用 `feishu-connector/scripts/...` 相对路径。安装完成后若 `~/.local/bin` 不在 `PATH`，安装器输出明确提示，但不修改 `.zshrc`、`.bashrc` 或其他 Shell 配置。
+目标 Skill 目录中不在 manifest 内的文件不是安装器管理对象，始终保留。安装器不会递归删除目标目录、清理未知文件或自动删除旧版 `~/.local` 布局；如旧版文件不再需要，由用户确认后一次性手动清理。
 
 ## 安全边界
 
-安装器不得读取或写入以下内容：
+威胁模型是普通单用户本地使用：安装器避免日常误覆盖与部分写入，但不承诺抵御同一用户下恶意进程在安装窗口内篡改目录、硬链接或临时文件。该边界不要求目录描述符链、inode 身份验证、`ctypes` 调用或失败恢复路径。
 
-- `~/.config/feishu-connector/config.json`
-- 项目 `.config/feishu-connector/config.json`
-- 遗留 `feishu-connector/.env` 的内容
-- App Secret、Tenant Access Token 或 Open ID
-
-安装器只报告受管文件路径和安装结果，不输出配置值。安装失败不得删除或截断原有安装文件。
-
-## 文档要求
-
-README 和 `docs/USAGE.md` 必须说明：
-
-- 用户级安装命令与 `--force` 更新命令。
-- `~/.local/bin` 的 PATH 要求。
-- 安装后的稳定命令与源码仓库内 `python3 feishu-connector/scripts/...` 调用方式之间的区别。
-- 安装器不会创建配置，使用者仍需按主规格配置全局 JSON、项目 JSON 或环境变量。
-
-## 测试策略
-
-安装器行为使用测试驱动开发，测试只写入临时 HOME 和临时 CODEX_HOME：
-
-- 验证运行文件、入口和 Skill 的安装位置、内容与权限。
-- 从与源码仓库无关的工作目录运行安装后 `feishu-notify --help`。
-- 以无效 stdin 调用安装后的适配器入口，确认返回输入错误码 `2`。
-- 验证相同内容可重复安装。
-- 验证内容冲突默认失败且不改变原文件。
-- 验证 `--force` 原子更新受管文件。
-- 验证安装过程不创建或修改飞书配置文件。
-- 验证安装后的 Skill 只引用稳定命令入口。
-- 验证消息、引号、换行和类 Shell 文本经过命令入口后仍保持独立 argv 或 stdin 数据，不被求值。
+安装结果只报告受管 Skill 文件与错误；不会输出配置值或秘密。失败不得截断或删除原有受管文件。
 
 ## 验收标准
 
-1. 全新用户目录中运行安装器后，两个稳定命令入口和 Codex Skill 均存在且可用。
-2. 安装结果不依赖源码仓库继续存在，也不依赖任务当前工作目录。
-3. 重复安装相同版本成功且不产生内容变化。
-4. 不带 `--force` 时不会覆盖内容不同的目标文件。
-5. `--force` 只替换明确的受管文件。
-6. 安装过程不读取、创建、修改或输出飞书配置与 Secret。
-7. 安装器及安装后的运行文件只依赖 Python 3 标准库。
+1. 在全新 `CODEX_HOME` 中安装后，六个 manifest 文件存在、内容一致且权限正确。
+2. 已安装入口 `${CODEX_HOME:-~/.codex}/skills/feishu-notify/scripts/feishu_notify.py` 可在源码仓库移除后运行。
+3. 相同版本可重复安装；冲突默认失败；`--force` 仅替换 manifest 中的冲突文件。
+4. 未知文件、飞书配置与旧版用户目录文件均不被安装器删除或修改。
+5. 安装器与安装后的 Skill 只依赖 Python 标准库。

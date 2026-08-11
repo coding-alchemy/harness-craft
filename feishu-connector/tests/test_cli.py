@@ -9,19 +9,20 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS))
+CONNECTOR_ROOT = Path(__file__).resolve().parents[1]
+SKILL_SCRIPTS = CONNECTOR_ROOT / "skills" / "feishu-notify" / "scripts"
+sys.path.insert(0, str(SKILL_SCRIPTS))
 
-from feishu_notify import (  # noqa: E402
+from feishu_connector import cli  # noqa: E402
+from feishu_connector.client import (  # noqa: E402
     ConnectorError,
     FeishuClient,
     JsonResponse,
     LOGGER,
     NetworkFailure,
-    main,
-    render_task_message,
 )
-from feishu_config import ConfigPaths  # noqa: E402
+from feishu_connector.cli import main, render_task_message  # noqa: E402
+from feishu_connector.config import ConfigPaths  # noqa: E402
 
 
 class FakeClient:
@@ -49,7 +50,6 @@ class CliTests(unittest.TestCase):
         self.root = Path(directory.name)
         self.global_file = self.root / "global.json"
         self.project_file = self.root / "project.json"
-        self.legacy_env_file = self.root / ".env"
         self.global_file.write_text(
             json.dumps(
                 {
@@ -65,10 +65,11 @@ class CliTests(unittest.TestCase):
         )
         self.global_file.chmod(0o600)
         self.config_paths = ConfigPaths(
-            self.global_file, self.project_file, self.legacy_env_file
+            global_file=self.global_file,
+            project_file=self.project_file,
         )
 
-    def invoke(self, argv, environ=None, client_factory=FakeClient):
+    def invoke(self, argv, environ=None, client_factory=FakeClient, stdin=None):
         stdout = io.StringIO()
         stderr = io.StringIO()
         code = main(
@@ -76,6 +77,7 @@ class CliTests(unittest.TestCase):
             environ={} if environ is None else environ,
             config_paths=self.config_paths,
             client_factory=client_factory,
+            stdin=stdin,
             stdout=stdout,
             stderr=stderr,
         )
@@ -84,7 +86,7 @@ class CliTests(unittest.TestCase):
     def run_cli_with_bytes(self, arguments):
         command = [
             os.fsencode(sys.executable),
-            os.fsencode(str(SCRIPTS / "feishu_notify.py")),
+            os.fsencode(str(SKILL_SCRIPTS / "feishu_notify.py")),
         ] + arguments
         environment = {
             "HOME": str(self.root),
@@ -195,7 +197,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual("", stderr)
 
     def test_auto_task_uses_one_configuration_snapshot(self):
-        original_resolve = __import__("feishu_notify").resolve_settings
+        original_resolve = cli.resolve_settings
 
         def change_after_resolution(paths, environ):
             settings = original_resolve(paths, environ)
@@ -211,7 +213,10 @@ class CliTests(unittest.TestCase):
             )
             return settings
 
-        with mock.patch("feishu_notify.resolve_settings", side_effect=change_after_resolution) as resolver:
+        with mock.patch(
+            "feishu_connector.cli.resolve_settings",
+            side_effect=change_after_resolution,
+        ) as resolver:
             code, _, stderr = self.invoke(
                 [
                     "task", "--auto",
@@ -310,14 +315,17 @@ class CliTests(unittest.TestCase):
 
     def test_unresolvable_config_path_returns_3_before_network(self):
         self.config_paths = ConfigPaths(
-            self.root / "global.json", self.project_file, self.legacy_env_file
+            global_file=self.root / "global.json",
+            project_file=self.project_file,
         )
 
         class NetworkMustNotStart:
             def __init__(self, config):
                 raise AssertionError("client started before path validation")
 
-        with mock.patch("feishu_config.Path.resolve", side_effect=RuntimeError("loop")):
+        with mock.patch(
+            "feishu_connector.config.Path.resolve", side_effect=RuntimeError("loop")
+        ):
             code, _, stderr = self.invoke(
                 ["send", "--message", "hello"], client_factory=NetworkMustNotStart
             )
@@ -389,35 +397,55 @@ class CliTests(unittest.TestCase):
         self.assertEqual("ou_selected1234", FakeClient.configs[-1].receive_open_id)
         self.assertEqual("", stderr.getvalue())
 
-    def test_legacy_env_yields_migration_guidance_without_being_read(self):
-        self.global_file.unlink()
-        self.legacy_env_file.write_text(
-            "FEISHU_APP_SECRET=must-not-appear\n", encoding="utf-8"
+    def test_stdin_preserves_explicit_project_root(self):
+        selected_project = self.root / "selected-project"
+        selected_config = (
+            selected_project / ".config" / "feishu-connector" / "config.json"
         )
-        code, _, stderr = self.invoke(["send", "--message", "hello"])
-        self.assertEqual(3, code)
-        self.assertIn("legacy .env was not read", stderr)
-        self.assertNotIn("must-not-appear", stderr)
-
-    def test_auto_disabled_with_incomplete_phase_two_config_is_noop_with_hint(self):
-        self.global_file.write_text(
-            json.dumps({"notification": {"autoNotify": False}}), encoding="utf-8"
+        selected_config.parent.mkdir(parents=True)
+        selected_config.write_text(
+            json.dumps({"recipient": {"openId": "ou_selected1234"}}),
+            encoding="utf-8",
         )
-        self.legacy_env_file.write_text("opaque legacy contents", encoding="utf-8")
-        code, stdout, stderr = self.invoke(
-            [
-                "task", "--auto",
-                "--status", "success",
-                "--task", "task",
-                "--summary", "summary",
-                "--repo", "repo",
-                "--branch", "branch",
-            ]
+        wrong_project = self.root / "wrong-project"
+        wrong_config = (
+            wrong_project / ".config" / "feishu-connector" / "config.json"
+        )
+        wrong_config.parent.mkdir(parents=True)
+        wrong_config.write_text(
+            json.dumps({"app": {"appSecret": "must-not-be-read"}}),
+            encoding="utf-8",
+        )
+        global_config = self.root / ".config" / "feishu-connector" / "config.json"
+        global_config.parent.mkdir(parents=True)
+        global_config.write_text(
+            json.dumps(
+                {
+                    "app": {
+                        "appId": "cli_test",
+                        "appSecret": "test-secret",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        global_config.chmod(0o600)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        code = main(
+            argv=["--project-root", str(selected_project), "stdin"],
+            environ={},
+            client_factory=FakeClient,
+            stdin=io.StringIO('{"flow":"send","message":"hello"}'),
+            stdout=stdout,
+            stderr=stderr,
+            cwd=wrong_project,
+            home=self.root,
         )
         self.assertEqual(0, code)
-        self.assertIn("disabled", stdout)
-        self.assertIn("legacy .env was not read", stderr)
-        self.assertEqual([], FakeClient.sent)
+        self.assertEqual("ou_selected1234", FakeClient.configs[-1].receive_open_id)
+        self.assertEqual(["hello"], FakeClient.sent)
+        self.assertEqual("", stderr.getvalue())
 
     def test_non_transient_api_error_returns_4_and_code(self):
         FakeClient.error = ConnectorError("api", "Feishu business error", code=230013)
@@ -550,6 +578,60 @@ class CliTests(unittest.TestCase):
     def test_render_rejects_empty_task_fields(self):
         with self.assertRaisesRegex(ValueError, "summary"):
             render_task_message("Codex", "success", "task", "", "repo", "branch")
+
+    def test_stdin_send_uses_same_send_flow(self):
+        code, _, stderr = self.invoke(
+            ["stdin"],
+            stdin=io.StringIO('{"flow":"send","message":"hello"}'),
+        )
+        self.assertEqual(0, code)
+        self.assertEqual(["hello"], FakeClient.sent)
+        self.assertEqual("", stderr)
+
+    def test_stdin_task_auto_uses_same_gate(self):
+        payload = {
+            "flow": "task-auto",
+            "status": "success",
+            "task": "task",
+            "summary": "summary",
+            "repo": "repo",
+            "branch": "branch",
+        }
+        code, stdout, stderr = self.invoke(
+            ["stdin"],
+            environ={"FEISHU_AUTO_NOTIFY": "false"},
+            stdin=io.StringIO(json.dumps(payload)),
+        )
+        self.assertEqual(0, code)
+        self.assertEqual([], FakeClient.sent)
+        self.assertIn("disabled", stdout)
+        self.assertEqual("", stderr)
+
+    def test_invalid_stdin_returns_exit_2_without_client(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("invalid stdin constructed a client")
+
+        code, _, stderr = self.invoke(
+            ["stdin"],
+            stdin=io.StringIO('{"flow":"send","message":null}'),
+            client_factory=ClientMustNotStart,
+        )
+        self.assertEqual(2, code)
+        self.assertIn("Invalid stdin input", stderr)
+
+    def test_parser_invalid_stdin_returns_fixed_diagnostic_without_client(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("invalid stdin constructed a client")
+
+        code, _, stderr = self.invoke(
+            ["stdin"],
+            stdin=io.StringIO('{"flow":"send","message":" "}'),
+            client_factory=ClientMustNotStart,
+        )
+        self.assertEqual(2, code)
+        self.assertEqual("Invalid stdin input\n", stderr)
 
 
 if __name__ == "__main__":

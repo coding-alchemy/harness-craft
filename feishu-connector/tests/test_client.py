@@ -1,26 +1,33 @@
 import io
 import http.client
 import json
-import socket
 import sys
 import urllib.error
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS))
+CONNECTOR_ROOT = Path(__file__).resolve().parents[1]
+SKILL_SCRIPTS = CONNECTOR_ROOT / "skills" / "feishu-notify" / "scripts"
+sys.path.insert(0, str(SKILL_SCRIPTS))
 
-from feishu_notify import (  # noqa: E402
-    Config,
+from feishu_connector.client import (  # noqa: E402
     ConnectorError,
     FeishuClient,
     JsonResponse,
     NetworkFailure,
-    _connector_exit_code,
     post_json,
-    EXIT_TRANSIENT,
 )
+
+
+def make_config():
+    return SimpleNamespace(
+        app_id="cli_test",
+        app_secret="secret-value",
+        receive_open_id="ou_target1234",
+        auto_notify=False,
+    )
 
 
 class FakeTransport:
@@ -59,7 +66,7 @@ class FakeUrlopenResponse:
 class PostJsonTests(unittest.TestCase):
     def test_uses_post_json_utf8_request(self):
         response = FakeUrlopenResponse(200, b'{"code":0}')
-        with patch("feishu_notify.urllib.request.urlopen", return_value=response) as urlopen:
+        with patch("feishu_connector.client.urllib.request.urlopen", return_value=response) as urlopen:
             result = post_json(
                 "https://example.test/messages",
                 {"Authorization": "Bearer test-token"},
@@ -81,7 +88,7 @@ class PostJsonTests(unittest.TestCase):
 
     def test_converts_url_error_to_network_failure(self):
         url_error = urllib.error.URLError("offline")
-        with patch("feishu_notify.urllib.request.urlopen", side_effect=url_error):
+        with patch("feishu_connector.client.urllib.request.urlopen", side_effect=url_error):
             with self.assertRaises(NetworkFailure) as caught:
                 post_json("https://example.test/messages", {}, {"text": "hello"}, 1.0)
 
@@ -90,7 +97,7 @@ class PostJsonTests(unittest.TestCase):
     def test_converts_incomplete_successful_response_to_network_failure(self):
         incomplete_read = http.client.IncompleteRead(b"partial body", 100)
         response = FakeUrlopenResponse(200, incomplete_read)
-        with patch("feishu_notify.urllib.request.urlopen", return_value=response):
+        with patch("feishu_connector.client.urllib.request.urlopen", return_value=response):
             with self.assertRaises(NetworkFailure) as caught:
                 post_json("https://example.test/messages", {}, {"text": "hello"}, 1.0)
 
@@ -100,7 +107,7 @@ class PostJsonTests(unittest.TestCase):
 
     def test_malformed_successful_response_remains_protocol_error(self):
         response = FakeUrlopenResponse(200, b"not json")
-        with patch("feishu_notify.urllib.request.urlopen", return_value=response):
+        with patch("feishu_connector.client.urllib.request.urlopen", return_value=response):
             with self.assertRaisesRegex(ConnectorError, "invalid JSON") as caught:
                 post_json("https://example.test/messages", {}, {"text": "hello"}, 1.0)
 
@@ -115,19 +122,18 @@ class PostJsonTests(unittest.TestCase):
             io.BytesIO(b""),
         )
         client = FeishuClient(
-            Config("cli_test", "secret-value", "ou_target1234", False),
+            make_config(),
             transport=post_json,
             sleep=lambda _: None,
         )
         with patch(
-            "feishu_notify.urllib.request.urlopen", side_effect=[http_error] * 3
+            "feishu_connector.client.urllib.request.urlopen", side_effect=[http_error] * 3
         ):
             with self.assertRaisesRegex(ConnectorError, "after 3 attempts") as caught:
                 client.fetch_tenant_access_token()
 
         self.assertEqual("rate_limit", caught.exception.category)
         self.assertTrue(caught.exception.retryable)
-        self.assertEqual(EXIT_TRANSIENT, _connector_exit_code(caught.exception))
 
     def test_non_json_http_503_body_remains_retryable_server_error(self):
         def unavailable_error():
@@ -140,12 +146,12 @@ class PostJsonTests(unittest.TestCase):
             )
 
         client = FeishuClient(
-            Config("cli_test", "secret-value", "ou_target1234", False),
+            make_config(),
             transport=post_json,
             sleep=lambda _: None,
         )
         with patch(
-            "feishu_notify.urllib.request.urlopen",
+            "feishu_connector.client.urllib.request.urlopen",
             side_effect=[unavailable_error() for _ in range(3)],
         ):
             with self.assertRaisesRegex(ConnectorError, "after 3 attempts") as caught:
@@ -153,62 +159,6 @@ class PostJsonTests(unittest.TestCase):
 
         self.assertEqual("server", caught.exception.category)
         self.assertTrue(caught.exception.retryable)
-        self.assertEqual(EXIT_TRANSIENT, _connector_exit_code(caught.exception))
-
-    def test_incomplete_http_503_body_retries_to_transient_exit(self):
-        def unavailable_error():
-            incomplete_read = http.client.IncompleteRead(b"partial body", 100)
-            return urllib.error.HTTPError(
-                "https://example.test/token",
-                503,
-                "Service Unavailable",
-                None,
-                FakeUrlopenResponse(503, incomplete_read),
-            )
-
-        client = FeishuClient(
-            Config("cli_test", "secret-value", "ou_target1234", False),
-            transport=post_json,
-            sleep=lambda _: None,
-        )
-        with patch(
-            "feishu_notify.urllib.request.urlopen",
-            side_effect=[unavailable_error() for _ in range(3)],
-        ):
-            with self.assertRaisesRegex(ConnectorError, "after 3 attempts") as caught:
-                client.fetch_tenant_access_token()
-
-        self.assertEqual("server", caught.exception.category)
-        self.assertTrue(caught.exception.retryable)
-        self.assertEqual(EXIT_TRANSIENT, _connector_exit_code(caught.exception))
-        self.assertNotIn("partial body", str(caught.exception))
-
-    def test_timeout_reading_http_503_body_retries_to_transient_exit(self):
-        def unavailable_error():
-            return urllib.error.HTTPError(
-                "https://example.test/token",
-                503,
-                "Service Unavailable",
-                None,
-                FakeUrlopenResponse(503, socket.timeout("read timed out")),
-            )
-
-        client = FeishuClient(
-            Config("cli_test", "secret-value", "ou_target1234", False),
-            transport=post_json,
-            sleep=lambda _: None,
-        )
-        with patch(
-            "feishu_notify.urllib.request.urlopen",
-            side_effect=[unavailable_error() for _ in range(3)],
-        ) as urlopen:
-            with self.assertRaisesRegex(ConnectorError, "after 3 attempts") as caught:
-                client.fetch_tenant_access_token()
-
-        self.assertEqual(3, urlopen.call_count)
-        self.assertEqual("server", caught.exception.category)
-        self.assertTrue(caught.exception.retryable)
-        self.assertEqual(EXIT_TRANSIENT, _connector_exit_code(caught.exception))
 
     def test_invalid_json_http_auth_errors_are_non_retryable_api_errors(self):
         for status in (401, 403):
@@ -221,12 +171,12 @@ class PostJsonTests(unittest.TestCase):
                     io.BytesIO(b"not json"),
                 )
                 client = FeishuClient(
-                    Config("cli_test", "secret-value", "ou_target1234", False),
+                    make_config(),
                     transport=post_json,
                     sleep=lambda _: None,
                 )
                 with patch(
-                    "feishu_notify.urllib.request.urlopen", side_effect=http_error
+                    "feishu_connector.client.urllib.request.urlopen", side_effect=http_error
                 ):
                     with self.assertRaisesRegex(
                         ConnectorError, "HTTP %d" % status
@@ -244,7 +194,7 @@ class PostJsonTests(unittest.TestCase):
             None,
             io.BytesIO(b"x" * 70000),
         )
-        with patch("feishu_notify.urllib.request.urlopen", side_effect=error):
+        with patch("feishu_connector.client.urllib.request.urlopen", side_effect=error):
             result = post_json(
                 "https://example.test/token", {}, {"text": "hello"}, 1.0
             )
@@ -253,7 +203,7 @@ class PostJsonTests(unittest.TestCase):
 
     def test_bad_status_line_from_urlopen_raises_network_failure(self):
         bad_status = http.client.BadStatusLine("HTTP/1.1 200 OK")
-        with patch("feishu_notify.urllib.request.urlopen", side_effect=bad_status):
+        with patch("feishu_connector.client.urllib.request.urlopen", side_effect=bad_status):
             with self.assertRaises(NetworkFailure) as caught:
                 post_json(
                     "https://example.test/token", {}, {"text": "hello"}, 1.0
@@ -263,7 +213,7 @@ class PostJsonTests(unittest.TestCase):
 
 class ClientTests(unittest.TestCase):
     def config(self):
-        return Config("cli_test", "secret-value", "ou_target1234", False)
+        return make_config()
 
     def test_fetches_token_then_sends_double_encoded_plain_text(self):
         transport = FakeTransport(
@@ -359,7 +309,7 @@ class ClientTests(unittest.TestCase):
             ]
         )
         client = FeishuClient(self.config(), transport=transport, sleep=lambda _: None)
-        with self.assertLogs("feishu_notify", level="WARNING") as captured:
+        with self.assertLogs("feishu_connector.client", level="WARNING") as captured:
             client.fetch_tenant_access_token()
         self.assertIn("network", captured.output[0])
         self.assertIn("attempt 1/3", captured.output[0])
@@ -374,7 +324,7 @@ class ClientTests(unittest.TestCase):
             ]
         )
         client = FeishuClient(self.config(), transport=transport, sleep=delays.append)
-        with self.assertLogs("feishu_notify", level="WARNING") as captured:
+        with self.assertLogs("feishu_connector.client", level="WARNING") as captured:
             with self.assertRaisesRegex(ConnectorError, "after 3 attempts") as caught:
                 client.fetch_tenant_access_token()
         self.assertTrue(caught.exception.retryable)

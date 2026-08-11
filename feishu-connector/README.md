@@ -2,174 +2,120 @@
 
 ## 能力边界
 
-连接器通过飞书**企业自建应用**的机器人，向一个固定 Open ID 发送纯文本私聊。它不使用群机器人 Webhook，不接收消息，不支持群聊、富文本、多用户或动态接收人。
+本连接器是一个自包含的 Codex Skill：它通过飞书企业自建应用机器人，向一个已配置的 Open ID 发送纯文本私聊。它支持用户明确发送消息，以及由仓库指令启用的任务结束自动通知。
+
+它不接收消息，不支持群 Webhook、群聊、富文本、多接收人、动态接收人、常驻服务或通用 Python 包安装。通知失败只是附属告警，绝不改变原任务的成功、失败或失败原因。
 
 ## 飞书端准备
 
 1. 在飞书开发者后台创建企业自建应用。
-2. 为应用开启**机器人能力**，并发布包含此能力的应用版本。
-3. 申请最小发送权限 `im:message:send_as_bot`。
-4. 将固定目标用户加入应用机器人的**可用范围**。
-5. 发布后，记录 App ID、App Secret，以及该应用下目标用户的 Open ID。
+2. 开启机器人能力，并发布包含该能力的应用版本。
+3. 申请最小权限 `im:message:send_as_bot`。
+4. 将固定目标用户加入机器人的可用范围。
+5. 记录 App ID、App Secret 和该用户在此应用下的 Open ID。
 
-用户可以在飞书客户端停止接收机器人消息；连接器会将此类错误报告为不可重试的业务错误。请只使用测试应用和测试用户完成验收。
+用户可在飞书客户端停止接收机器人消息；这种情况会被报告为不可重试的远程错误。真实验收只应使用测试应用和测试用户。
 
-## 用户级安装
+## 安装与更新
 
-第一版安装器支持 macOS/Linux，只依赖 Python 3 标准库。在仓库根目录运行：
-
-```bash
-python3 feishu-connector/install.py
-```
-
-安装器把运行文件复制到 `~/.local/share/feishu-connector`，把 `feishu-notify` 和 `feishu-notify-adapter` 放到 `~/.local/bin`，并把 Skill 安装到 `${CODEX_HOME:-~/.codex}/skills/feishu-notify`。如果 `~/.local/bin` 不在 `PATH`，安装器会输出设置提示，但不会修改 Shell 配置。
-
-重复安装相同内容且权限正确时是安全的。内容或权限不同时，安装器默认拒绝覆盖；确认要更新受管文件或修复权限后运行：
+在仓库根目录运行：
 
 ```bash
-python3 feishu-connector/install.py --force
+python3 feishu-connector/install_skill.py
+python3 feishu-connector/install_skill.py --force
 ```
 
-安装器不会创建或修改飞书配置、`.env`、Secret、Token 或 Open ID。安装后可以从任意项目目录运行 `feishu-notify`；下文的 `python3 feishu-connector/scripts/feishu_notify.py` 命令保留为源码仓库内的直接运行方式。
+安装器将 Skill 的六个受管文件复制到 `${CODEX_HOME:-~/.codex}/skills/feishu-notify`。内容和权限相同的重复安装成功且不改动文件；受管文件冲突时默认拒绝，`--force` 才会替换受管文件。它不创建飞书配置、凭据、Token 或 Open ID，也不安装 launcher 或通用 package；目标目录中的未知文件会保留。
+
+安装器采用普通单用户威胁模型，防止日常误覆盖，但不承诺防御同一用户的恶意并发篡改。旧版若曾安装到 `~/.local/share/feishu-connector` 或 `~/.local/bin/feishu-notify*`，确认不再需要后请自行一次性手动清理；安装器不会删除这些旧文件。
 
 ## 配置
 
-连接器按叶子字段合并三层配置，优先级固定为：**环境变量 > 项目 JSON > 全局 JSON**。高优先级没有出现的字段继续继承低优先级值；显式 `null`、未知字段、错误类型和空字符串都会在联网前报配置错误。
+配置按叶子字段合并，优先级为：**环境变量 > 项目 JSON > 全局 JSON**。高优先级未出现的字段继续继承低优先级值；`null`、未知字段、错误类型和空字符串都在联网前作为配置错误拒绝。
 
-全局兜底路径是 `~/.config/feishu-connector/config.json`：
-
-```json
-{
-  "app": {
-    "appId": "cli_example",
-    "appSecret": "example-secret"
-  },
-  "recipient": {
-    "openId": "ou_example"
-  },
-  "notification": {
-    "autoNotify": false
-  }
-}
-```
-
-在 POSIX 系统上，只要全局 JSON 含 `appSecret`，就必须执行 `chmod 600 ~/.config/feishu-connector/config.json`，不得授予 group 或 other 读写权限。
-
-项目覆盖路径是 `<项目根目录>/.config/feishu-connector/config.json`，允许提交 Git：
+全局文件是 `~/.config/feishu-connector/config.json`：
 
 ```json
 {
-  "recipient": {
-    "openId": "ou_project_example"
-  },
-  "notification": {
-    "autoNotify": true
-  }
+  "app": {"appId": "cli_example", "appSecret": "example-secret"},
+  "recipient": {"openId": "ou_example"},
+  "notification": {"autoNotify": false}
 }
 ```
 
-项目 JSON 中禁止出现 `appSecret`，即使为空或假值也会被拒绝。Secret 只能来自全局 JSON 或 `FEISHU_APP_SECRET`；Open ID 可以按仓库访问控制提交，但日志和诊断仍会脱敏。四个兼容环境变量是 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_RECEIVE_OPEN_ID` 和 `FEISHU_AUTO_NOTIFY`。
-
-项目根目录依次取 CLI `--project-root`、当前 Git 仓库顶层目录、当前工作目录。需要显式指定时，把选项放在子命令前：
+全局 JSON 含 `appSecret` 时，在 POSIX 系统上必须仅由当前用户读写，例如：
 
 ```bash
-python3 feishu-connector/scripts/feishu_notify.py \
-  --project-root /path/to/project send --message "测试消息"
+chmod 600 ~/.config/feishu-connector/config.json
 ```
 
-## 配置诊断
+项目文件为 `<项目根目录>/.config/feishu-connector/config.json`，可提交 Git，但不得出现 `appSecret`：
 
-以下命令只显示每个有效字段的来源，不显示配置值，也不发起网络请求：
-
-```bash
-python3 feishu-connector/scripts/feishu_notify.py config
+```json
+{
+  "recipient": {"openId": "ou_project_example"},
+  "notification": {"autoNotify": true}
+}
 ```
 
-示例输出：
+兼容环境变量是 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_RECEIVE_OPEN_ID` 与 `FEISHU_AUTO_NOTIFY`（后者只接受 `true` 或 `false`）。项目根目录依次取 `--project-root`、当前 Git 仓库顶层目录和当前工作目录。`appSecret` 只可来自全局 JSON 或 `FEISHU_APP_SECRET`；诊断和日志都会脱敏 Secret 与 Open ID。
+
+历史说明：一期仓库内 `.env` 已废弃；当前版本既不读取也不检测它，也不会输出迁移提示。请将 Secret 放在全局 JSON 或进程环境变量中。
+
+## Skill 入口与调用
+
+路径约定（展示用途，不是可直接执行的 Shell 命令）：
 
 ```text
-app.appId: project
-app.appSecret: global (redacted)
-recipient.openId: environment (redacted)
-notification.autoNotify: project
+${CODEX_HOME:-~/.codex}/skills/feishu-notify/scripts/feishu_notify.py
 ```
 
-## 从一期 `.env` 迁移
-
-二期不再读取 `feishu-connector/.env`。把 App Secret 移至全局 JSON 或进程环境变量，把可提交的项目差异移至项目 JSON；原 `.env` 即使保留也不会生效。CLI 只在二期配置不完整或无效时检查旧文件是否存在并打印迁移提示，不读取或输出旧文件内容。验证新配置并完成迁移后删除旧文件；`.gitignore` 继续保护迁移期间遗留的真实 `.env`。
-
-## 手动发送
-
-用户明确需要发送时，在仓库根目录执行：
+支持 argv 的执行器先声明已安装入口，并将每个动态值作为独立 argv；不得拼接 Shell 字符串。四个子命令如下：
 
 ```bash
-python3 feishu-connector/scripts/feishu_notify.py send --message "测试消息"
+ENTRY="${CODEX_HOME:-$HOME/.codex}/skills/feishu-notify/scripts/feishu_notify.py"
+python3 "$ENTRY" send --message "测试消息"
+python3 "$ENTRY" task --status success --task "修复登录问题" --summary "测试通过" --repo "harness-craft" --branch "feishu"
+python3 "$ENTRY" task --auto --status success --task "修复登录问题" --summary "测试通过" --repo "harness-craft" --branch "feishu"
+python3 "$ENTRY" config
 ```
 
-`send` 会将消息原样作为纯文本发给固定 Open ID，且显式发送不受 `FEISHU_AUTO_NOTIFY` 开关影响。
+`send` 始终发送用户指定的纯文本。`task` 固定渲染状态、任务、摘要、仓库和分支，`--status` 只能是 `success` 或 `failure`，可选 `--source` 为 `Codex`（默认）或 `OpenCode`。`config` 不联网，只显示有效字段的来源，不显示值。
 
-## 任务通知
+如果执行工具只接受 Shell 命令字符串但提供独立 stdin 通道，先声明上述 `ENTRY`，再使用固定命令 `python3 "$ENTRY" stdin`。以下 JSON 必须通过独立 stdin 通道传入，动态内容不得进入命令字符串：
 
-任务通知需要五个字段：`--status`、`--task`、`--summary`、`--repo` 和 `--branch`。`--status` 只能为 `success|failure`；消息总是使用固定纯文本格式，包含状态、任务名称、简短摘要、仓库和分支。可选参数 `--source`（默认 `Codex`，可设为 `OpenCode`）为未来 OpenCode 复用预留。
-
-```bash
-python3 feishu-connector/scripts/feishu_notify.py task \
-  --status success \
-  --task "修复登录问题" \
-  --summary "修复 Token 刷新并通过测试" \
-  --repo "harness-craft" \
-  --branch "feishu"
+```json
+{"flow":"send","message":"用户指定的原文"}
 ```
 
-自动通知应使用安全开关：
-
-```bash
-python3 feishu-connector/scripts/feishu_notify.py task --auto \
-  --status success \
-  --task "修复登录问题" \
-  --summary "修复 Token 刷新并通过测试" \
-  --repo "harness-craft" \
-  --branch "feishu"
+```json
+{"flow":"task-auto","status":"success","task":"简短任务名","summary":"简短摘要","repo":"仓库名","branch":"分支名"}
 ```
 
-`task --auto` 是否发送由合并后的 `notification.autoNotify` 决定，优先级为 **环境变量 > 项目 JSON > 全局 JSON**：只有合并结果为 `true` 才发送；关闭或未配置时是成功但不发送的 no-op。`FEISHU_AUTO_NOTIFY=false` 会覆盖较低优先级的 `true`，因此不能被项目或全局 JSON 绕过；不传 `--auto` 的 `task` 仍会发送。
+没有独立 stdin 通道时，不使用此回退路径，应改用支持 argv 的执行器。
 
-## Codex Skill
+## 自动通知门控
 
-安装后让 Codex 读取 `${CODEX_HOME:-~/.codex}/skills/feishu-notify/SKILL.md`，以便在用户明确要求时调用稳定命令 `feishu-notify`。只有在源码仓库内直接运行时，才使用 `feishu-connector/skills/feishu-notify/SKILL.md` 和 `python3 feishu-connector/scripts/...` 路径。若要使任务结束时默认执行自动通知，项目指令必须明确启用这一自动任务通知约定；它不是 Codex 平台级的全局 Hook。
+只有任务使用 `task --auto` 且合并后的 `notification.autoNotify` 为 `true` 时才会发送。关闭或未配置时，该命令以退出码 `0` 成功结束且不联网；显式 `send` 和未带 `--auto` 的 `task` 不受此开关影响。要在任务结束时使用自动通知，仓库指令必须明确启用该 Skill 工作流；它不是 Codex 的全局 Hook。
 
-通知失败时，Skill 只追加一条脱敏警告，**不会改变原任务结果**，也不覆盖原有失败原因。显式发送不依赖自动通知开关。
+## 重试、幂等与排错
 
-## 测试
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 已发送，或自动通知关闭时的 no-op |
+| `2` | CLI 参数或 stdin JSON 无效 |
+| `3` | 配置错误 |
+| `4` | 不可重试的飞书/API 错误 |
+| `5` | 网络、限流或服务端等可重试错误耗尽重试 |
 
-运行默认离线测试：
+Token 和消息请求在网络错误、HTTP 429、飞书限流或 HTTP 5xx 时，首次失败后最多额外重试两次。单次逻辑消息发送的所有重试复用同一个 UUID，避免响应丢失造成重复私聊。stderr 只输出脱敏的错误类别和尝试次数；不要输出 Secret、Token、Authorization、完整 Open ID、请求头或完整请求体。
+
+## 测试与真实验收
+
+运行离线测试：
 
 ```bash
 python3 -m unittest discover -s feishu-connector/tests -p 'test_*.py' -v
 ```
 
-测试默认通过 Mock 运行，**不访问真实飞书**，也不读取真实凭据。
-
-## 手动端到端验收
-
-只使用测试应用和测试用户，并在操作者明确授权真实发送后执行：
-
-1. 创建权限为 `0600` 的全局 JSON，并创建只覆盖 `recipient.openId` 的项目 JSON。
-2. 运行 `config`，确认四个字段来源正确且 Secret/Open ID 不出现在输出中。
-3. 临时在项目 JSON 加入空的 `appSecret`，确认 CLI 以退出码 `3` 在联网前拒绝；随后删除该字段。
-4. 运行 `send`，确认测试用户收到纯文本私聊。
-5. 运行 `task`，确认状态、任务、摘要、仓库和分支正确展示。
-6. 分别验证自动开关：关闭时任务结束不发送，开启时只发送一次。
-7. 临时使用无效 Open ID，确认错误脱敏且通知失败不改变原任务结果。
-
-## 排错
-
-退出码 `2` 表示适配器输入无效（例如 JSON 解析失败、字段缺失或 payload 包含不可表示的字符），或 CLI 参数错误（如缺少 `--message`、空值、非法 `--status`）。适配器在 Shell-only 安全场景下使用，它从 STDIN 读取 JSON 并调用 CLI。
-
-退出码 `3` 表示配置错误，例如缺少 App ID、App Secret 或 Open ID，或 `FEISHU_AUTO_NOTIFY` 不是 `true`/`false`。退出码 `4` 表示不可重试的远程错误，包括鉴权/权限不足、用户不在可用范围、无效 Open ID 或用户拒收机器人消息。
-
-退出码 `5` 表示临时性失败，例如网络中断、限流、服务端错误。连接器会在首次失败后最多额外重试两次，因此单个请求阶段最多尝试三次。消息请求在一次逻辑发送的所有重试中复用同一个幂等 UUID，避免响应丢失造成重复私聊。
-
-CLI 会把每次重试的脱敏错误类别和尝试次数写到 stderr。排错时不要打印 Secret、Token、Authorization、完整 Open ID、请求头或完整请求体。
-
-无法编码为 UTF-8 的消息或任务字段属于参数错误，CLI 会在读取配置和联网前以退出码 `2` 拒绝。
+测试使用 Mock，不访问真实飞书或真实凭据。真实发送须由操作者配置测试凭据并明确执行；建议先运行 `config` 确认来源与脱敏，再用测试用户运行一次 `send` 和一次 `task`。

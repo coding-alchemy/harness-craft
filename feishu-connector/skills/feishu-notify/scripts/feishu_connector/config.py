@@ -46,7 +46,6 @@ REDACTED_DIAGNOSTIC_FIELDS = {"app.appSecret", "recipient.openId"}
 class ConfigPaths:
     global_file: Path
     project_file: Path
-    legacy_env_file: Path
 
 
 @dataclass(frozen=True)
@@ -222,29 +221,17 @@ def build_config_paths(
     cwd=None,
     home=None,
     git_runner=subprocess.run,
-    connector_root=None,
 ):
     cwd = Path.cwd() if cwd is None else Path(cwd)
     home = _resolve_path(Path.home() if home is None else home)
-    connector_root = (
-        Path(__file__).resolve().parents[1]
-        if connector_root is None
-        else Path(connector_root)
-    )
     project_root = resolve_project_root(
         explicit_project_root, cwd, git_runner=git_runner
     )
     global_file = home / ".config" / "feishu-connector" / "config.json"
-    project_file = (
-        project_root / ".config" / "feishu-connector" / "config.json"
-    )
+    project_file = project_root / ".config" / "feishu-connector" / "config.json"
     if _same_existing_directory(home, project_root):
         project_file = global_file
-    return ConfigPaths(
-        global_file=global_file,
-        project_file=project_file,
-        legacy_env_file=connector_root / ".env",
-    )
+    return ConfigPaths(global_file=global_file, project_file=project_file)
 
 
 def _environment_value(environment_name, dotted, value):
@@ -297,14 +284,6 @@ def config_from_settings(settings):
     return ResolvedConfig(config=config, sources=settings.sources)
 
 
-def load_config(paths, environ):
-    return config_from_settings(resolve_settings(paths, environ))
-
-
-def auto_notify_enabled(paths, environ):
-    return bool(resolve_settings(paths, environ).values["notification.autoNotify"])
-
-
 def format_source_diagnostics(resolution):
     lines = []
     for dotted in DIAGNOSTIC_FIELDS:
@@ -312,19 +291,3 @@ def format_source_diagnostics(resolution):
         suffix = " (redacted)" if dotted in REDACTED_DIAGNOSTIC_FIELDS else ""
         lines.append("%s: %s%s" % (dotted, source, suffix))
     return "\n".join(lines)
-
-
-def legacy_migration_message(legacy_env_file):
-    try:
-        exists = Path(legacy_env_file).is_file()
-    except OSError:
-        exists = False
-    if not exists:
-        return None
-    return (
-        "Legacy feishu-connector/.env detected but Phase 2 configuration is "
-        "incomplete or invalid. Move appSecret to the global JSON or process "
-        "environment, move project overrides to "
-        ".config/feishu-connector/config.json, and remove the old file after "
-        "migration. The legacy .env was not read."
-    )

@@ -1,61 +1,32 @@
 ---
 name: feishu-notify
-description: Use when users ask to send a plain-text Feishu message or when configured task-completion notification applies.
+description: 当用户明确要求发送飞书纯文本消息，或仓库指令要求在任务完成时自动发送飞书通知时使用。
 ---
 
-# Feishu Notify
+# 飞书通知
 
-Use the installed `feishu-notify` CLI. Do not implement Feishu HTTP requests in this Skill, do not read or print App Secret or access tokens, and do not send messages unless one of the workflows below applies.
+仅在用户明确要求发送消息，或仓库指令启用自动任务通知时使用本 Skill。入口相对当前 `SKILL.md`：`scripts/feishu_notify.py`。
 
-The CLI resolves Phase 2 configuration itself using process environment, project JSON, and global JSON. This Skill must not open either JSON file, inspect the legacy `.env`, choose a recipient, or reproduce merge and secret rules. Repository instructions may supply `--project-root` only when they explicitly need to override Git/current-directory discovery; otherwise preserve the existing argv prefixes.
+## 调用契约
 
-## argv safety
+使用支持 argv 的执行器时，直接调用入口；将每个动态值作为独立 argv 传递，不得拼接 Shell 字符串、插值或交给 Shell 解析。
 
-Every dynamic value, including user text and task-derived fields, must be passed as an independent, literal argv parameter and must not be handed to shell parsing. Use an argv-capable execution tool with shell execution disabled. Never assemble a shell command from dynamic text or use command substitution, variable expansion, interpolated quotes, or any other shell evaluation to supply a value.
+发送用户指定原文时，调用 `python3 scripts/feishu_notify.py send --message`，并将原文作为独立 argv。只发送用户指定的原文，不附加完整日志、Diff、内部推理或其他上下文。
 
-## Shell-only execution fallback
+自动任务通知时，调用 `python3 scripts/feishu_notify.py task --auto`，并将 `--status`、`--task`、`--summary`、`--repo`、`--branch` 及其值分别作为独立 argv。只发送简短任务摘要；每个最终任务结果最多执行一次自动通知，通知失败不得改变原任务结果。
 
-If the available command facility accepts only a shell command string, use this fallback only when it also provides a separate stdin/input-data channel. Do not put any message or task value in the shell string. Send one of these JSON objects as the separate input data:
+## 仅 Shell 的回退
 
-```json
-{"flow": "send", "message": "the exact user-designated text"}
-```
+只有执行工具提供独立 stdin 通道时，才使用固定命令 `python3 scripts/feishu_notify.py stdin`。不得把动态值放入命令字符串；仅通过 stdin 传入以下白名单 JSON 之一：
 
 ```json
-{"flow": "task-auto", "status": "success", "task": "short task name", "summary": "short outcome", "repo": "repository name", "branch": "branch name"}
+{"flow": "send", "message": "用户指定的原文"}
 ```
 
-Invoke this static shell string, with no dynamic values in it:
-
-```sh
-feishu-notify-adapter
+```json
+{"flow": "task-auto", "status": "success", "task": "简短任务名", "summary": "简短结果", "repo": "仓库名", "branch": "分支名"}
 ```
 
-The adapter reads exactly one JSON object from standard input, maps `send` to the same `feishu-notify send --message` contract and `task-auto` to the same `feishu-notify task --auto` contract, invokes the CLI with an argv list and shell execution disabled, and propagates the CLI result and exit code exactly. It is only an adapter: do not add HTTP calls, token or secret reading/printing, or other connector logic.
+没有独立 stdin 通道时，不得使用 Shell 回退；改用支持 argv 的执行器。
 
-If the tool cannot provide separate stdin data, this fallback is prohibited; use an argv-capable tool instead. For automatic notification, capture the result as a secondary notification outcome: a notification failure may add one redacted warning but must not change the original task result.
-
-## Explicit message workflow
-
-When the user explicitly asks to send text to Feishu:
-
-1. Use exactly the text the user designated for sending. Do not attach source code, logs, Diff, or other context unless the user explicitly included it.
-2. Invoke the fixed argv prefix `feishu-notify send --message`, followed by the exact user-designated text as one independent, literal argv parameter. This notation is an argv sequence, not a shell command.
-
-3. Report whether the CLI succeeded. If it failed, report the CLI's redacted warning without exposing configuration values.
-
-This workflow does not depend on `FEISHU_AUTO_NOTIFY`.
-
-## Automatic task-completion workflow
-
-Use this workflow only when repository instructions enable it and the current task is about to return its final result. Run it at most once per final task result.
-
-1. Derive:
-   - `status`: `success` only when the original task succeeded; otherwise `failure`.
-   - `task`: a short name based on the user's request.
-   - `summary`: one short outcome summary. Never send the 完整最终回复、完整日志、Diff、内部推理, secrets, tokens, or unrelated context.
-   - `repo`: the current Git repository directory name, or the current directory name outside Git.
-   - `branch`: `git branch --show-current`; use `detached` if it is empty.
-2. Invoke the CLI's safe configuration gate with the fixed argv prefix `feishu-notify task --auto`, then pass each option and its value as separate literal argv parameters: `--status` with `success` or `failure`, followed by `--task`, `--summary`, `--repo`, and `--branch` with their respective derived values. This notation is an argv sequence, not a shell command.
-3. If the command reports that automatic notification is disabled, do not send anything and do not mention an error.
-4. If sending fails, append one short redacted warning to the original final response. 通知失败不得改变原任务结果，也不得覆盖原失败原因或 trigger another work cycle.
+不得读取配置文件、选择接收人或实现 HTTP 请求；这些职责均由入口脚本处理。
