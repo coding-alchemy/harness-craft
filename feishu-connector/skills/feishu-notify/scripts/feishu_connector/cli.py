@@ -24,6 +24,14 @@ EXIT_CONFIG = 3
 EXIT_REMOTE = 4
 EXIT_TRANSIENT = 5
 
+TASK_STATUS = {
+    "success": ("任务完成", "green"),
+    "failure": ("任务失败", "red"),
+    "confirm": ("待确认", "orange"),
+}
+
+LINE_BREAKS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+
 
 def redact_identifier(value):
     if not value:
@@ -46,8 +54,41 @@ def non_empty(value):
     return value
 
 
+def _validate_task_text(name, value, single_line=False):
+    if not isinstance(value, str):
+        raise ValueError("%s must be text" % name)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            "%s must contain valid Unicode scalar text" % name
+        ) from exc
+    if not value.strip() or "\x00" in value:
+        raise ValueError("%s must not be empty or contain NUL" % name)
+    if single_line and any(char in LINE_BREAKS for char in value):
+        raise ValueError("%s must be a single line" % name)
+    return value
+
+
+def _task_argument(name, value, single_line=False):
+    try:
+        return _validate_task_text(name, value, single_line=single_line)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def single_line_non_empty(value):
+    return _task_argument("value", value, single_line=True)
+
+
+def task_content(value):
+    return _task_argument("content", value)
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(description="Send plain-text Feishu messages")
+    parser = argparse.ArgumentParser(
+        description="Send plain-text Feishu messages and task cards"
+    )
     parser.add_argument(
         "--project-root",
         type=Path,
@@ -59,12 +100,16 @@ def build_parser():
     send_parser.add_argument("--message", required=True, type=non_empty)
 
     task_parser = subparsers.add_parser("task", help="send a task notification")
-    task_parser.add_argument("--status", required=True, choices=("success", "failure"))
-    task_parser.add_argument("--task", required=True, type=non_empty)
-    task_parser.add_argument("--summary", required=True, type=non_empty)
-    task_parser.add_argument("--repo", required=True, type=non_empty)
-    task_parser.add_argument("--branch", required=True, type=non_empty)
-    task_parser.add_argument("--source", choices=("Codex", "OpenCode"), default="Codex")
+    task_parser.add_argument(
+        "--status", required=True, choices=tuple(TASK_STATUS)
+    )
+    task_parser.add_argument(
+        "--project", required=True, type=single_line_non_empty
+    )
+    task_parser.add_argument(
+        "--conversation", required=True, type=single_line_non_empty
+    )
+    task_parser.add_argument("--content", required=True, type=task_content)
     task_parser.add_argument(
         "--auto",
         action="store_true",
@@ -77,26 +122,29 @@ def build_parser():
     return parser
 
 
-def render_task_message(source, status, task, summary, repo, branch):
-    fields = {
-        "source": source,
-        "status": status,
-        "task": task,
-        "summary": summary,
-        "repo": repo,
-        "branch": branch,
-    }
-    for name, value in fields.items():
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError("%s must not be empty" % name)
-    return (
-        "[%s] %s\n"
-        "任务：%s\n"
-        "摘要：%s\n"
-        "仓库：%s\n"
-        "分支：%s"
-        % (source, status.upper(), task, summary, repo, branch)
+def render_task_card(status, project, conversation, content):
+    try:
+        label, color = TASK_STATUS[status]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("status must be success, failure, or confirm") from exc
+    project = _validate_task_text("project", project, single_line=True)
+    conversation = _validate_task_text(
+        "conversation", conversation, single_line=True
     )
+    content = _validate_task_text("content", content)
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": color,
+            "title": {
+                "tag": "plain_text",
+                "content": "%s-%s-%s" % (project, conversation, label),
+            },
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+        ],
+    }
 
 
 def _connector_exit_code(error):
@@ -113,20 +161,19 @@ def _stdin_argv(payload):
         if isinstance(message, str) and "\x00" not in message:
             return ["send", "--message", message]
         return None
-    task_keys = {"flow", "status", "task", "summary", "repo", "branch"}
+    task_keys = {"flow", "status", "project", "conversation", "content"}
     if set(payload) != task_keys or payload.get("flow") != "task-auto":
         return None
-    fields = ("status", "task", "summary", "repo", "branch")
+    fields = ("status", "project", "conversation", "content")
     if not all(isinstance(payload.get(field), str) for field in fields):
         return None
     return [
         "task",
         "--auto",
         "--status", payload["status"],
-        "--task", payload["task"],
-        "--summary", payload["summary"],
-        "--repo", payload["repo"],
-        "--branch", payload["branch"],
+        "--project", payload["project"],
+        "--conversation", payload["conversation"],
+        "--content", payload["content"],
     ]
 
 
@@ -167,17 +214,15 @@ def _run_main(
 
         config = config_from_settings(settings).config
         if args.command == "send":
-            message = args.message
+            client_factory(config).send_text(args.message)
         else:
-            message = render_task_message(
-                args.source,
+            card = render_task_card(
                 args.status,
-                args.task,
-                args.summary,
-                args.repo,
-                args.branch,
+                args.project,
+                args.conversation,
+                args.content,
             )
-        client_factory(config).send_text(message)
+            client_factory(config).send_card(card)
         print(
             "Feishu message sent to %s" % redact_identifier(config.receive_open_id),
             file=stdout,

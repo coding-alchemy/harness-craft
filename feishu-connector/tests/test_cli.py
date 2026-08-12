@@ -21,12 +21,13 @@ from feishu_connector.client import (  # noqa: E402
     LOGGER,
     NetworkFailure,
 )
-from feishu_connector.cli import main, render_task_message  # noqa: E402
+from feishu_connector.cli import main, render_task_card  # noqa: E402
 from feishu_connector.config import ConfigPaths  # noqa: E402
 
 
 class FakeClient:
-    sent = []
+    sent_text = []
+    sent_cards = []
     configs = []
     error = None
 
@@ -37,12 +38,18 @@ class FakeClient:
     def send_text(self, message):
         if self.error is not None:
             raise self.error
-        self.sent.append(message)
+        self.sent_text.append(message)
+
+    def send_card(self, card):
+        if self.error is not None:
+            raise self.error
+        self.sent_cards.append(card)
 
 
 class CliTests(unittest.TestCase):
     def setUp(self):
-        FakeClient.sent = []
+        FakeClient.sent_text = []
+        FakeClient.sent_cards = []
         FakeClient.configs = []
         FakeClient.error = None
         directory = tempfile.TemporaryDirectory()
@@ -104,7 +111,8 @@ class CliTests(unittest.TestCase):
     def test_send_sends_exact_plain_text(self):
         code, stdout, stderr = self.invoke(["send", "--message", "hello 飞书"])
         self.assertEqual(0, code)
-        self.assertEqual(["hello 飞书"], FakeClient.sent)
+        self.assertEqual(["hello 飞书"], FakeClient.sent_text)
+        self.assertEqual([], FakeClient.sent_cards)
         self.assertIn("sent", stdout)
         self.assertEqual("", stderr)
 
@@ -118,43 +126,164 @@ class CliTests(unittest.TestCase):
         self.assertNotIn(b"configuration error", result.stderr)
         self.assertNotIn(b"Traceback", result.stderr)
 
-    @unittest.skipUnless(os.name == "posix", "POSIX byte argv semantics required")
-    def test_direct_cli_rejects_non_utf8_task_field_before_configuration(self):
-        result = self.run_cli_with_bytes(
-            [
-                b"task",
-                b"--status", b"success",
-                b"--task", b"task",
-                b"--summary", b"invalid-\xff-summary",
-                b"--repo", b"repo",
-                b"--branch", b"branch",
-            ]
+    def test_render_task_card_uses_exact_title_color_and_markdown(self):
+        self.assertEqual(
+            {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "template": "green",
+                    "title": {
+                        "tag": "plain_text",
+                        "content": "HETU-个股-二期-架构师-任务完成",
+                    },
+                },
+                "elements": [
+                    {
+                        "tag": "div",
+                        "text": {
+                            "tag": "lark_md",
+                            "content": "**结果**\n\n- 评审通过",
+                        },
+                    }
+                ],
+            },
+            render_task_card(
+                "success", "HETU", "个股-二期-架构师", "**结果**\n\n- 评审通过"
+            ),
         )
-        self.assertEqual(2, result.returncode)
-        self.assertIn(b"valid Unicode", result.stderr)
-        self.assertNotIn(b"configuration error", result.stderr)
-        self.assertNotIn(b"Traceback", result.stderr)
 
-    def test_task_renders_fixed_five_field_template(self):
-        code, _, _ = self.invoke(
+    def test_render_task_card_maps_all_statuses(self):
+        for status, label, color in (
+            ("success", "任务完成", "green"),
+            ("failure", "任务失败", "red"),
+            ("confirm", "待确认", "orange"),
+        ):
+            with self.subTest(status=status):
+                card = render_task_card(status, "项目", "对话", "正文")
+                self.assertEqual(
+                    "项目-对话-" + label, card["header"]["title"]["content"]
+                )
+                self.assertEqual(color, card["header"]["template"])
+
+    def test_render_task_card_rejects_invalid_status(self):
+        for status in ("cancel", "SUCCESS", "", None):
+            with self.subTest(status=status):
+                with self.assertRaisesRegex(ValueError, "status"):
+                    render_task_card(status, "项目", "对话", "正文")
+
+    def test_render_task_card_validates_title_fields_and_content(self):
+        line_breaks = (
+            "\n",
+            "\r",
+            "\v",
+            "\f",
+            "\x1c",
+            "\x1d",
+            "\x1e",
+            "\x85",
+            "\u2028",
+            "\u2029",
+        )
+        for field in ("project", "conversation"):
+            for value in ("", "   ", "a\x00b", "\ud800") + tuple(
+                "a%sb" % char for char in line_breaks
+            ):
+                with self.subTest(field=field, value=repr(value)):
+                    arguments = {
+                        "status": "success",
+                        "project": "项目",
+                        "conversation": "对话",
+                        "content": "正文",
+                    }
+                    arguments[field] = value
+                    with self.assertRaisesRegex(ValueError, field):
+                        render_task_card(**arguments)
+        for value in ("", "   ", "a\x00b", "\ud800"):
+            with self.subTest(content=repr(value)):
+                with self.assertRaisesRegex(ValueError, "content"):
+                    render_task_card("success", "项目", "对话", value)
+        multiline = "第一行\n第二行\u2028第三行"
+        card = render_task_card("success", "项目", "对话", multiline)
+        self.assertEqual(multiline, card["elements"][0]["text"]["content"])
+
+    def test_task_sends_card_and_explicit_send_stays_plain_text(self):
+        code, _, stderr = self.invoke(
             [
                 "task",
-                "--status", "success",
-                "--task", "修复登录问题",
-                "--summary", "测试已通过",
-                "--repo", "harness-craft",
-                "--branch", "feishu",
+                "--status",
+                "success",
+                "--project",
+                "HETU",
+                "--conversation",
+                "个股",
+                "--content",
+                "- 完成",
             ]
         )
         self.assertEqual(0, code)
-        self.assertEqual(
-            "[Codex] SUCCESS\n"
-            "任务：修复登录问题\n"
-            "摘要：测试已通过\n"
-            "仓库：harness-craft\n"
-            "分支：feishu",
-            FakeClient.sent[0],
+        self.assertEqual(1, len(FakeClient.sent_cards))
+        self.assertEqual([], FakeClient.sent_text)
+        self.assertEqual("", stderr)
+
+        code, _, stderr = self.invoke(["send", "--message", "hello 飞书"])
+        self.assertEqual(0, code)
+        self.assertEqual(["hello 飞书"], FakeClient.sent_text)
+        self.assertEqual(1, len(FakeClient.sent_cards))
+        self.assertEqual("", stderr)
+
+    def test_explicit_send_keeps_existing_nul_behavior(self):
+        code, _, stderr = self.invoke(["send", "--message", "a\x00b"])
+        self.assertEqual(0, code)
+        self.assertEqual(["a\x00b"], FakeClient.sent_text)
+        self.assertEqual("", stderr)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX byte argv semantics required")
+    def test_old_task_parameters_have_no_compatibility_layer(self):
+        result = self.run_cli_with_bytes(
+            [
+                b"task",
+                b"--status",
+                b"success",
+                b"--task",
+                b"old",
+                b"--summary",
+                b"old",
+                b"--repo",
+                b"repo",
+                b"--branch",
+                b"branch",
+                b"--source",
+                b"Codex",
+            ]
         )
+        self.assertEqual(2, result.returncode)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX byte argv semantics required")
+    def test_direct_cli_rejects_non_utf8_new_task_fields_before_configuration(self):
+        for invalid_field in ("project", "conversation", "content"):
+            values = {
+                "project": b"project",
+                "conversation": b"conversation",
+                "content": b"content",
+            }
+            values[invalid_field] = b"invalid-\xff"
+            with self.subTest(field=invalid_field):
+                result = self.run_cli_with_bytes(
+                    [
+                        b"task",
+                        b"--status",
+                        b"success",
+                        b"--project",
+                        values["project"],
+                        b"--conversation",
+                        values["conversation"],
+                        b"--content",
+                        values["content"],
+                    ]
+                )
+                self.assertEqual(2, result.returncode)
+                self.assertIn(b"valid Unicode", result.stderr)
+                self.assertNotIn(b"configuration error", result.stderr)
 
     def test_auto_task_is_noop_when_disabled(self):
         self.global_file.write_text(
@@ -164,14 +293,14 @@ class CliTests(unittest.TestCase):
             [
                 "task", "--auto",
                 "--status", "success",
-                "--task", "task",
-                "--summary", "summary",
-                "--repo", "repo",
-                "--branch", "branch",
+                "--project", "project",
+                "--conversation", "conversation",
+                "--content", "content",
             ]
         )
         self.assertEqual(0, code)
-        self.assertEqual([], FakeClient.sent)
+        self.assertEqual([], FakeClient.sent_text)
+        self.assertEqual([], FakeClient.sent_cards)
         self.assertIn("disabled", stdout)
         self.assertEqual("", stderr)
 
@@ -184,10 +313,9 @@ class CliTests(unittest.TestCase):
             [
                 "task", "--auto",
                 "--status", "success",
-                "--task", "task",
-                "--summary", "summary",
-                "--repo", "repo",
-                "--branch", "branch",
+                "--project", "project",
+                "--conversation", "conversation",
+                "--content", "content",
             ],
             environ={"FEISHU_AUTO_NOTIFY": "false"},
             client_factory=ClientMustNotStart,
@@ -221,10 +349,9 @@ class CliTests(unittest.TestCase):
                 [
                     "task", "--auto",
                     "--status", "success",
-                    "--task", "task",
-                    "--summary", "summary",
-                    "--repo", "repo",
-                    "--branch", "branch",
+                    "--project", "project",
+                    "--conversation", "conversation",
+                    "--content", "content",
                 ]
             )
         self.assertEqual(1, resolver.call_count)
@@ -245,7 +372,7 @@ class CliTests(unittest.TestCase):
         )
         code, _, _ = self.invoke(["send", "--message", "explicit"])
         self.assertEqual(0, code)
-        self.assertEqual(["explicit"], FakeClient.sent)
+        self.assertEqual(["explicit"], FakeClient.sent_text)
 
     def test_config_error_returns_3_without_leaking_secret(self):
         self.global_file.write_text(
@@ -355,22 +482,6 @@ class CliTests(unittest.TestCase):
         self.assertEqual(3, code)
         self.assertTrue(stderr.getvalue().isascii())
 
-    def test_opencode_source_remains_supported_by_same_task_command(self):
-        code, _, stderr = self.invoke(
-            [
-                "task",
-                "--status", "success",
-                "--task", "task",
-                "--summary", "summary",
-                "--repo", "repo",
-                "--branch", "branch",
-                "--source", "OpenCode",
-            ]
-        )
-        self.assertEqual(0, code)
-        self.assertTrue(FakeClient.sent[-1].startswith("[OpenCode] SUCCESS\n"))
-        self.assertEqual("", stderr)
-
     def test_project_root_option_selects_project_json(self):
         project_root = self.root / "selected-project"
         config_file = project_root / ".config" / "feishu-connector" / "config.json"
@@ -444,7 +555,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(0, code)
         self.assertEqual("ou_selected1234", FakeClient.configs[-1].receive_open_id)
-        self.assertEqual(["hello"], FakeClient.sent)
+        self.assertEqual(["hello"], FakeClient.sent_text)
         self.assertEqual("", stderr.getvalue())
 
     def test_non_transient_api_error_returns_4_and_code(self):
@@ -575,35 +686,109 @@ class CliTests(unittest.TestCase):
         self.assertEqual(logging.ERROR, LOGGER.level)
         self.assertTrue(LOGGER.propagate)
 
-    def test_render_rejects_empty_task_fields(self):
-        with self.assertRaisesRegex(ValueError, "summary"):
-            render_task_message("Codex", "success", "task", "", "repo", "branch")
-
     def test_stdin_send_uses_same_send_flow(self):
         code, _, stderr = self.invoke(
             ["stdin"],
             stdin=io.StringIO('{"flow":"send","message":"hello"}'),
         )
         self.assertEqual(0, code)
-        self.assertEqual(["hello"], FakeClient.sent)
+        self.assertEqual(["hello"], FakeClient.sent_text)
         self.assertEqual("", stderr)
 
-    def test_stdin_task_auto_uses_same_gate(self):
+    def test_stdin_task_auto_sends_same_card(self):
+        literal_content = "请选择 A 或 B；不要执行 $(touch /tmp/feishu-shell-marker)"
+        payload = {
+            "flow": "task-auto",
+            "status": "confirm",
+            "project": "HETU",
+            "conversation": "架构师",
+            "content": literal_content,
+        }
+        code, _, stderr = self.invoke(
+            ["stdin"], stdin=io.StringIO(json.dumps(payload))
+        )
+        self.assertEqual(0, code)
+        self.assertEqual(
+            "HETU-架构师-待确认",
+            FakeClient.sent_cards[0]["header"]["title"]["content"],
+        )
+        self.assertEqual(
+            literal_content,
+            FakeClient.sent_cards[0]["elements"][0]["text"]["content"],
+        )
+        self.assertEqual("", stderr)
+
+    def test_stdin_task_rejects_non_whitelisted_or_invalid_payloads(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("invalid stdin constructed a client")
+
+        for payload in (
+            {
+                "flow": "task-auto",
+                "status": "success",
+                "task": "old",
+                "summary": "old",
+                "repo": "r",
+                "branch": "b",
+            },
+            {
+                "flow": "task-auto",
+                "status": "success",
+                "project": "p",
+                "conversation": "c",
+                "content": "x",
+                "source": "Codex",
+            },
+            {
+                "flow": "task-auto",
+                "status": "success",
+                "project": "p",
+                "conversation": "c",
+            },
+            {
+                "flow": "task-auto",
+                "status": "cancel",
+                "project": "p",
+                "conversation": "c",
+                "content": "x",
+            },
+            {
+                "flow": "task-auto",
+                "status": "success",
+                "project": "p",
+                "conversation": "c",
+                "content": None,
+            },
+        ):
+            with self.subTest(payload=payload):
+                code, _, stderr = self.invoke(
+                    ["stdin"],
+                    client_factory=ClientMustNotStart,
+                    stdin=io.StringIO(json.dumps(payload)),
+                )
+                self.assertEqual(2, code)
+                self.assertEqual("Invalid stdin input\n", stderr)
+
+    def test_stdin_task_auto_disabled_does_not_construct_client(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("disabled auto task constructed a client")
+
         payload = {
             "flow": "task-auto",
             "status": "success",
-            "task": "task",
-            "summary": "summary",
-            "repo": "repo",
-            "branch": "branch",
+            "project": "p",
+            "conversation": "c",
+            "content": "x",
         }
         code, stdout, stderr = self.invoke(
             ["stdin"],
             environ={"FEISHU_AUTO_NOTIFY": "false"},
+            client_factory=ClientMustNotStart,
             stdin=io.StringIO(json.dumps(payload)),
         )
         self.assertEqual(0, code)
-        self.assertEqual([], FakeClient.sent)
         self.assertIn("disabled", stdout)
         self.assertEqual("", stderr)
 
