@@ -275,8 +275,60 @@ class ClientTests(unittest.TestCase):
         self.assertEqual("logical-send-uuid", message_calls[0][2]["uuid"])
         self.assertEqual("logical-send-uuid", message_calls[1][2]["uuid"])
 
-    def test_separate_logical_sends_use_different_uuids(self):
-        identifiers = iter(("first-send-uuid", "second-send-uuid"))
+    def test_fetches_token_then_sends_double_encoded_interactive_card(self):
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {"template": "green", "title": {"tag": "plain_text", "content": "项目-对话-任务完成"}},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "- 完成"}}],
+        }
+        transport = FakeTransport([
+            JsonResponse(200, {"code": 0, "tenant_access_token": "token-value"}),
+            JsonResponse(200, {"code": 0, "msg": "success"}),
+        ])
+        FeishuClient(self.config(), transport=transport, sleep=lambda _: None).send_card(card)
+        message_call = transport.calls[1]
+        self.assertEqual("interactive", message_call[2]["msg_type"])
+        self.assertEqual(card, json.loads(message_call[2]["content"]))
+        self.assertEqual("ou_target1234", message_call[2]["receive_id"])
+
+    def test_card_retry_reuses_one_idempotency_uuid(self):
+        transport = FakeTransport([
+            JsonResponse(200, {"code": 0, "tenant_access_token": "token-value"}),
+            NetworkFailure("response lost"),
+            JsonResponse(200, {"code": 0}),
+        ])
+        client = FeishuClient(self.config(), transport=transport, sleep=lambda _: None,
+                              uuid_factory=lambda: "card-send-uuid")
+        client.send_card({
+            "config": {"wide_screen_mode": True},
+            "header": {"template": "green", "title": {"tag": "plain_text", "content": "项目-对话-任务完成"}},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "- 完成"}}],
+        })
+        calls = [call for call in transport.calls if "/messages?" in call[0]]
+        self.assertEqual(["card-send-uuid", "card-send-uuid"], [call[2]["uuid"] for call in calls])
+
+    def test_card_remote_size_error_is_not_retried_split_or_truncated(self):
+        content = "长正文" * 10000
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {"template": "red", "title": {"tag": "plain_text", "content": "项目-对话-任务失败"}},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": content}}],
+        }
+        transport = FakeTransport([
+            JsonResponse(200, {"code": 0, "tenant_access_token": "token-value"}),
+            JsonResponse(400, {"code": 230001, "msg": "content too large"}),
+        ])
+        client = FeishuClient(self.config(), transport=transport, sleep=lambda _: None)
+        with self.assertRaises(ConnectorError) as caught:
+            client.send_card(card)
+        message_calls = [call for call in transport.calls if "/messages?" in call[0]]
+        self.assertEqual(1, len(message_calls))
+        self.assertEqual(card, json.loads(message_calls[0][2]["content"]))
+        self.assertEqual(230001, caught.exception.code)
+        self.assertFalse(caught.exception.retryable)
+
+    def test_separate_text_and_card_sends_use_different_uuids(self):
+        identifiers = iter(("text-send-uuid", "card-send-uuid"))
         transport = FakeTransport(
             [
                 JsonResponse(200, {"code": 0, "tenant_access_token": "token-one"}),
@@ -293,11 +345,15 @@ class ClientTests(unittest.TestCase):
         )
 
         client.send_text("first")
-        client.send_text("second")
+        client.send_card({
+            "config": {"wide_screen_mode": True},
+            "header": {"template": "orange", "title": {"tag": "plain_text", "content": "项目-对话-待确认"}},
+            "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "请选择"}}],
+        })
 
         message_calls = [call for call in transport.calls if "/messages?" in call[0]]
         self.assertEqual(
-            ["first-send-uuid", "second-send-uuid"],
+            ["text-send-uuid", "card-send-uuid"],
             [call[2]["uuid"] for call in message_calls],
         )
 

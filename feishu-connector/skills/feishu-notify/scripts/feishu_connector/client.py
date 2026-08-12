@@ -187,17 +187,16 @@ class FeishuClient:
             )
         return token
 
-    def send_text(self, message):
+    def _send_message(self, msg_type, content):
         token = self.fetch_tenant_access_token()
-        content = json.dumps(
-            {"text": message},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
         payload = {
             "receive_id": self.config.receive_open_id,
-            "msg_type": "text",
-            "content": content,
+            "msg_type": msg_type,
+            "content": json.dumps(
+                content,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
             "uuid": str(self.uuid_factory()),
         }
         return self._attempt(
@@ -207,3 +206,9 @@ class FeishuClient:
                 payload,
             )
         )
+
+    def send_text(self, message):
+        return self._send_message("text", {"text": message})
+
+    def send_card(self, card):
+        return self._send_message("interactive", card)
