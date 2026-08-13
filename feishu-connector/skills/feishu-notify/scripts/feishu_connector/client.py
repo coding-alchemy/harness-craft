@@ -2,6 +2,7 @@ import http.client
 import json
 import logging
 import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -21,7 +22,9 @@ class JsonResponse:
 
 
 class NetworkFailure(Exception):
-    pass
+    def __init__(self, message, category="network.unreachable"):
+        super().__init__(message)
+        self.category = category
 
 
 class ConnectorError(Exception):
@@ -40,6 +43,20 @@ def _decode_response(raw):
     if not isinstance(decoded, dict):
         raise ConnectorError("protocol", "Feishu returned a non-object JSON response")
     return decoded
+
+
+def _network_category(error):
+    while isinstance(error, urllib.error.URLError):
+        error = error.reason
+    if isinstance(error, socket.gaierror):
+        return "network.dns"
+    if isinstance(error, (socket.timeout, TimeoutError)):
+        return "network.timeout"
+    if isinstance(error, ssl.SSLError):
+        return "network.tls"
+    if isinstance(error, ConnectionError):
+        return "network.connection"
+    return "network.unreachable"
 
 
 def post_json(url, headers, payload, timeout):
@@ -72,7 +89,10 @@ def post_json(url, headers, payload, timeout):
         OSError,
         http.client.HTTPException,
     ) as exc:
-        raise NetworkFailure("Feishu request failed") from exc
+        raise NetworkFailure(
+            "Feishu request failed",
+            category=_network_category(exc),
+        ) from exc
 
 
 class FeishuClient:
@@ -139,7 +159,7 @@ class FeishuClient:
                 return operation()
             except NetworkFailure as exc:
                 error = ConnectorError(
-                    "network",
+                    exc.category,
                     "Feishu network request failed",
                     retryable=True,
                 )

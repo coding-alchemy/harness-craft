@@ -21,7 +21,7 @@ from feishu_connector.client import (  # noqa: E402
     LOGGER,
     NetworkFailure,
 )
-from feishu_connector.cli import main, render_task_card  # noqa: E402
+from feishu_connector.cli import main, render_rich_card, render_task_card  # noqa: E402
 from feishu_connector.config import ConfigPaths  # noqa: E402
 
 
@@ -152,6 +152,53 @@ class CliTests(unittest.TestCase):
             ),
         )
 
+    def test_render_rich_card_uses_exact_title_color_and_markdown(self):
+        self.assertEqual(
+            {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "template": "blue",
+                    "title": {"tag": "plain_text", "content": "更新"},
+                },
+                "elements": [
+                    {
+                        "tag": "div",
+                        "text": {"tag": "lark_md", "content": "**正文**\n\n- 内容"},
+                    }
+                ],
+            },
+            render_rich_card("更新", "**正文**\n\n- 内容"),
+        )
+
+    def test_render_rich_card_validates_title_and_content(self):
+        line_breaks = (
+            "\n",
+            "\r",
+            "\v",
+            "\f",
+            "\x1c",
+            "\x1d",
+            "\x1e",
+            "\x85",
+            "\u2028",
+            "\u2029",
+        )
+        for value in ("", "   ", "a\x00b", "\ud800") + tuple(
+            "a%sb" % char for char in line_breaks
+        ):
+            with self.subTest(title=repr(value)):
+                with self.assertRaisesRegex(ValueError, "title"):
+                    render_rich_card(value, "正文")
+        for value in ("", "   ", "a\x00b", "\ud800"):
+            with self.subTest(content=repr(value)):
+                with self.assertRaisesRegex(ValueError, "content"):
+                    render_rich_card("标题", value)
+        multiline = "第一行\n第二行\u2028第三行"
+        self.assertEqual(
+            multiline,
+            render_rich_card("标题", multiline)["elements"][0]["text"]["content"],
+        )
+
     def test_render_task_card_maps_all_statuses(self):
         for status, label, color in (
             ("success", "任务完成", "green"),
@@ -231,6 +278,44 @@ class CliTests(unittest.TestCase):
         self.assertEqual(1, len(FakeClient.sent_cards))
         self.assertEqual("", stderr)
 
+    def test_rich_sends_card_and_explicit_task_ignores_auto_notify_setting(self):
+        self.global_file.write_text(
+            json.dumps(
+                {
+                    "app": {"appId": "cli_test", "appSecret": "test-secret"},
+                    "recipient": {"openId": "ou_test1234"},
+                    "notification": {"autoNotify": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+        code, _, stderr = self.invoke(
+            ["rich", "--title", "标题", "--content", "**内容**"]
+        )
+        self.assertEqual(0, code)
+        self.assertEqual([], FakeClient.sent_text)
+        self.assertEqual(
+            [render_rich_card("标题", "**内容**")], FakeClient.sent_cards
+        )
+        self.assertEqual("", stderr)
+
+        code, _, stderr = self.invoke(
+            [
+                "task",
+                "--status",
+                "success",
+                "--project",
+                "项目",
+                "--conversation",
+                "对话",
+                "--content",
+                "正文",
+            ]
+        )
+        self.assertEqual(0, code)
+        self.assertEqual(2, len(FakeClient.sent_cards))
+        self.assertEqual("", stderr)
+
     def test_explicit_send_keeps_existing_nul_behavior(self):
         code, _, stderr = self.invoke(["send", "--message", "a\x00b"])
         self.assertEqual(0, code)
@@ -301,7 +386,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertEqual([], FakeClient.sent_text)
         self.assertEqual([], FakeClient.sent_cards)
-        self.assertIn("disabled", stdout)
+        self.assertEqual(
+            "Feishu notification skipped: autoNotify=false\n", stdout
+        )
         self.assertEqual("", stderr)
 
     def test_auto_environment_false_overrides_json_true_without_client(self):
@@ -321,7 +408,9 @@ class CliTests(unittest.TestCase):
             client_factory=ClientMustNotStart,
         )
         self.assertEqual(0, code)
-        self.assertIn("disabled", stdout)
+        self.assertEqual(
+            "Feishu notification skipped: autoNotify=false\n", stdout
+        )
         self.assertEqual("", stderr)
 
     def test_auto_task_uses_one_configuration_snapshot(self):
@@ -576,6 +665,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual(5, code)
         self.assertIn("network", stderr)
 
+    def test_network_timeout_returns_5_with_safe_category(self):
+        secret = "test-secret-ou_test1234"
+        FakeClient.error = ConnectorError(
+            "network.timeout",
+            "Feishu network request failed",
+        )
+
+        code, _, stderr = self.invoke(["send", "--message", "hello"])
+
+        self.assertEqual(5, code)
+        self.assertIn("[network.timeout]", stderr)
+        self.assertNotIn(secret, stderr)
+
     def test_cli_writes_redacted_retry_diagnostics_to_its_stderr(self):
         original_handlers = tuple(LOGGER.handlers)
         outcomes = iter(
@@ -601,7 +703,7 @@ class CliTests(unittest.TestCase):
         )
 
         self.assertEqual(0, code)
-        self.assertIn("Feishu retry [network] attempt 1/3", stderr)
+        self.assertIn("Feishu retry [network.unreachable] attempt 1/3", stderr)
         self.assertNotIn("test-secret", stderr)
         self.assertNotIn("ou_test1234", stderr)
         self.assertNotIn("token-value", stderr)
@@ -633,7 +735,7 @@ class CliTests(unittest.TestCase):
             ),
         )
         self.assertEqual(0, code)
-        self.assertIn("Feishu retry [network] attempt 1/3", stderr)
+        self.assertIn("Feishu retry [network.unreachable] attempt 1/3", stderr)
 
     def test_cli_retry_diagnostics_do_not_propagate_to_root_handler(self):
         root = logging.getLogger()
@@ -665,7 +767,7 @@ class CliTests(unittest.TestCase):
             ),
         )
         self.assertEqual(0, code)
-        self.assertIn("Feishu retry [network] attempt 1/3", stderr)
+        self.assertIn("Feishu retry [network.unreachable] attempt 1/3", stderr)
         self.assertEqual("", root_stream.getvalue())
 
     def test_cli_restores_logger_state_after_exception(self):
@@ -693,6 +795,47 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(0, code)
         self.assertEqual(["hello"], FakeClient.sent_text)
+        self.assertEqual("", stderr)
+
+    def test_stdin_rich_sends_same_card_as_argv(self):
+        title = "标题"
+        content = "**正文**\n\n- 内容"
+        code, _, stderr = self.invoke(
+            ["stdin"],
+            stdin=io.StringIO(
+                json.dumps({"flow": "rich", "title": title, "content": content})
+            ),
+        )
+        self.assertEqual(0, code)
+        self.assertEqual([render_rich_card(title, content)], FakeClient.sent_cards)
+        self.assertEqual("", stderr)
+
+    def test_stdin_task_sends_same_card_as_argv_when_auto_disabled(self):
+        self.global_file.write_text(
+            json.dumps(
+                {
+                    "app": {"appId": "cli_test", "appSecret": "test-secret"},
+                    "recipient": {"openId": "ou_test1234"},
+                    "notification": {"autoNotify": False},
+                }
+            ),
+            encoding="utf-8",
+        )
+        payload = {
+            "flow": "task",
+            "status": "success",
+            "project": "项目",
+            "conversation": "对话",
+            "content": "正文",
+        }
+        code, _, stderr = self.invoke(
+            ["stdin"], stdin=io.StringIO(json.dumps(payload))
+        )
+        self.assertEqual(0, code)
+        self.assertEqual(
+            [render_task_card("success", "项目", "对话", "正文")],
+            FakeClient.sent_cards,
+        )
         self.assertEqual("", stderr)
 
     def test_stdin_task_auto_sends_same_card(self):
@@ -760,12 +903,63 @@ class CliTests(unittest.TestCase):
                 "conversation": "c",
                 "content": None,
             },
+            {"flow": "rich", "title": "title", "content": "content", "extra": "x"},
+            {"flow": "rich", "title": 1, "content": "content"},
+            {"flow": "rich", "title": "title\x00", "content": "content"},
+            {
+                "flow": "task",
+                "status": "cancel",
+                "project": "p",
+                "conversation": "c",
+                "content": "x",
+            },
+            {
+                "flow": "task",
+                "status": "success",
+                "project": "p\x00",
+                "conversation": "c",
+                "content": "x",
+            },
+            {
+                "flow": "task-auto",
+                "status": "success",
+                "project": "p",
+                "conversation": "c",
+                "content": "x\x00",
+            },
+            {"flow": ["task"], "status": "success", "project": "p", "conversation": "c", "content": "x"},
         ):
             with self.subTest(payload=payload):
                 code, _, stderr = self.invoke(
                     ["stdin"],
                     client_factory=ClientMustNotStart,
                     stdin=io.StringIO(json.dumps(payload)),
+                )
+                self.assertEqual(2, code)
+                self.assertEqual("Invalid stdin input\n", stderr)
+
+    def test_stdin_rejects_duplicate_json_keys_without_constructing_client(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("duplicate stdin key constructed a client")
+
+        duplicate_payloads = (
+            (
+                '{"flow":"task-auto","status":"success",'
+                '"project":"p","conversation":"c","content":"x",'
+                '"flow":"task"}'
+            ),
+            (
+                '{"flow":"rich","title":"safe","content":"x",'
+                '"title":"overridden"}'
+            ),
+        )
+        for payload in duplicate_payloads:
+            with self.subTest(payload=payload):
+                code, _, stderr = self.invoke(
+                    ["stdin"],
+                    client_factory=ClientMustNotStart,
+                    stdin=io.StringIO(payload),
                 )
                 self.assertEqual(2, code)
                 self.assertEqual("Invalid stdin input\n", stderr)
@@ -789,7 +983,9 @@ class CliTests(unittest.TestCase):
             stdin=io.StringIO(json.dumps(payload)),
         )
         self.assertEqual(0, code)
-        self.assertIn("disabled", stdout)
+        self.assertEqual(
+            "Feishu notification skipped: autoNotify=false\n", stdout
+        )
         self.assertEqual("", stderr)
 
     def test_invalid_stdin_returns_exit_2_without_client(self):

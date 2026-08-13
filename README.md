@@ -6,7 +6,7 @@ Harness Craft 是一个 Harness 工具箱，用于沉淀可复用的 Agent Skill
 
 ### [feishu-connector](./feishu-connector/README.md)
 
-飞书消息连接器，可通过企业自建应用机器人发送纯文本消息和任务状态卡片。它支持分层配置、按需自动通知、失败重试和敏感信息脱敏，适合将 Agent 的任务完成、失败或待确认状态同步到飞书。
+飞书消息连接器，可通过企业自建应用机器人发送纯文本、富文本和任务状态卡片。它支持分层配置、显式外发授权、按需自动通知、失败重试和敏感信息脱敏，适合将 Agent 的任务完成、失败或待确认状态同步到飞书。
 
 ### [analyzing-projects](./analyzing-projects/README.md)
 

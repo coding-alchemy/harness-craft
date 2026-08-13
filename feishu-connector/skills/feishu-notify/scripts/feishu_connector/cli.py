@@ -85,9 +85,18 @@ def task_content(value):
     return _task_argument("content", value)
 
 
+def _stdin_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate stdin JSON key")
+        result[key] = value
+    return result
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Send plain-text Feishu messages and task cards"
+        description="Send plain-text, rich-text, and task-card Feishu messages"
     )
     parser.add_argument(
         "--project-root",
@@ -115,6 +124,13 @@ def build_parser():
         action="store_true",
         help="send only when merged notification.autoNotify=true",
     )
+    rich_parser = subparsers.add_parser("rich", help="send an explicit rich message")
+    rich_parser.add_argument(
+        "--title", required=True, type=lambda value: _task_argument(
+            "title", value, single_line=True
+        )
+    )
+    rich_parser.add_argument("--content", required=True, type=task_content)
     subparsers.add_parser(
         "config", help="show effective configuration sources without network access"
     )
@@ -147,8 +163,28 @@ def render_task_card(status, project, conversation, content):
     }
 
 
+def render_rich_card(title, content):
+    title = _validate_task_text("title", title, single_line=True)
+    content = _validate_task_text("content", content)
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "elements": [
+            {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+        ],
+    }
+
+
 def _connector_exit_code(error):
-    if error.retryable or error.category in ("network", "rate_limit", "server"):
+    if (
+        error.retryable
+        or error.category == "network"
+        or error.category.startswith("network.")
+        or error.category in ("rate_limit", "server")
+    ):
         return EXIT_TRANSIENT
     return EXIT_REMOTE
 
@@ -156,20 +192,29 @@ def _connector_exit_code(error):
 def _stdin_argv(payload):
     if not isinstance(payload, dict):
         return None
-    if set(payload) == {"flow", "message"} and payload.get("flow") == "send":
-        message = payload.get("message")
-        if isinstance(message, str) and "\x00" not in message:
-            return ["send", "--message", message]
+    flows = {
+        "send": ("message",),
+        "rich": ("title", "content"),
+        "task": ("status", "project", "conversation", "content"),
+        "task-auto": ("status", "project", "conversation", "content"),
+    }
+    flow = payload.get("flow")
+    fields = flows.get(flow)
+    if fields is None or set(payload) != {"flow", *fields}:
         return None
-    task_keys = {"flow", "status", "project", "conversation", "content"}
-    if set(payload) != task_keys or payload.get("flow") != "task-auto":
+    if not all(
+        isinstance(payload[field], str) and "\x00" not in payload[field]
+        for field in fields
+    ):
         return None
-    fields = ("status", "project", "conversation", "content")
-    if not all(isinstance(payload.get(field), str) for field in fields):
-        return None
-    return [
-        "task",
-        "--auto",
+    if flow == "send":
+        return ["send", "--message", payload["message"]]
+    if flow == "rich":
+        return ["rich", "--title", payload["title"], "--content", payload["content"]]
+    argv = ["task"]
+    if flow == "task-auto":
+        argv.append("--auto")
+    return argv + [
         "--status", payload["status"],
         "--project", payload["project"],
         "--conversation", payload["conversation"],
@@ -209,13 +254,17 @@ def _run_main(
 
         if args.command == "task" and args.auto:
             if not settings.values["notification.autoNotify"]:
-                print("Feishu auto notification disabled; nothing sent", file=stdout)
+                print("Feishu notification skipped: autoNotify=false", file=stdout)
                 return EXIT_OK
 
         config = config_from_settings(settings).config
         if args.command == "send":
             client_factory(config).send_text(args.message)
-        else:
+        elif args.command == "rich":
+            client_factory(config).send_card(
+                render_rich_card(args.title, args.content)
+            )
+        elif args.command == "task":
             card = render_task_card(
                 args.status,
                 args.project,
@@ -268,7 +317,9 @@ def main(
         if args.command == "stdin":
             project_root = args.project_root
             try:
-                stdin_argv = _stdin_argv(json.load(stdin))
+                stdin_argv = _stdin_argv(
+                    json.load(stdin, object_pairs_hook=_stdin_json_object)
+                )
             except (json.JSONDecodeError, OSError, TypeError, ValueError):
                 stdin_argv = None
             if stdin_argv is None:
