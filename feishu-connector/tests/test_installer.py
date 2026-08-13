@@ -158,6 +158,8 @@ class SkillInstallerTests(unittest.TestCase):
 
         self.assertEqual(0, help_result.returncode, help_result.stderr)
         self.assertIn("usage:", help_result.stdout)
+        self.assertIn("rich", help_result.stdout)
+        self.assertIn("rich-text", help_result.stdout)
 
     def test_install_does_not_create_configuration(self):
         result = self.run_installer()

@@ -1,6 +1,8 @@
 import io
 import http.client
 import json
+import socket
+import ssl
 import sys
 import urllib.error
 import unittest
@@ -86,13 +88,46 @@ class PostJsonTests(unittest.TestCase):
         self.assertEqual("Bearer test-token", request.get_header("Authorization"))
         self.assertEqual(3.5, urlopen.call_args.kwargs["timeout"])
 
-    def test_converts_url_error_to_network_failure(self):
-        url_error = urllib.error.URLError("offline")
-        with patch("feishu_connector.client.urllib.request.urlopen", side_effect=url_error):
-            with self.assertRaises(NetworkFailure) as caught:
-                post_json("https://example.test/messages", {}, {"text": "hello"}, 1.0)
+    def test_classifies_network_failures_without_exposing_causes(self):
+        secret = "token-secret-ou_complete_open_id"
+        cases = (
+            (
+                urllib.error.URLError(socket.gaierror(-2, secret)),
+                "network.dns",
+            ),
+            (
+                urllib.error.URLError(socket.timeout(secret)),
+                "network.timeout",
+            ),
+            (
+                urllib.error.URLError(ssl.SSLError(secret)),
+                "network.tls",
+            ),
+            (
+                urllib.error.URLError(ConnectionRefusedError(secret)),
+                "network.connection",
+            ),
+            (http.client.BadStatusLine(secret), "network.unreachable"),
+        )
 
-        self.assertIs(caught.exception.__cause__, url_error)
+        for error, category in cases:
+            with self.subTest(category=category):
+                with patch(
+                    "feishu_connector.client.urllib.request.urlopen",
+                    side_effect=error,
+                ):
+                    with self.assertRaises(NetworkFailure) as caught:
+                        post_json(
+                            "https://token-secret@example.test/messages",
+                            {"Authorization": "Bearer " + secret},
+                            {"text": "hello"},
+                            1.0,
+                        )
+
+                self.assertEqual("Feishu request failed", str(caught.exception))
+                self.assertEqual(category, caught.exception.category)
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertIs(caught.exception.__cause__, error)
 
     def test_converts_incomplete_successful_response_to_network_failure(self):
         incomplete_read = http.client.IncompleteRead(b"partial body", 100)
@@ -369,6 +404,28 @@ class ClientTests(unittest.TestCase):
             client.fetch_tenant_access_token()
         self.assertIn("network", captured.output[0])
         self.assertIn("attempt 1/3", captured.output[0])
+
+    def test_exhausted_network_retries_preserve_safe_category(self):
+        secret = "token-secret-ou_complete_open_id"
+        transport = FakeTransport(
+            [
+                NetworkFailure(secret, category="network.timeout"),
+                NetworkFailure(secret, category="network.timeout"),
+                NetworkFailure(secret, category="network.timeout"),
+            ]
+        )
+        client = FeishuClient(self.config(), transport=transport, sleep=lambda _: None)
+
+        with self.assertRaises(ConnectorError) as caught:
+            client.fetch_tenant_access_token()
+
+        self.assertEqual("network.timeout", caught.exception.category)
+        self.assertEqual(
+            "Feishu network request failed after 3 attempts",
+            str(caught.exception),
+        )
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertEqual(3, len(transport.calls))
 
     def test_retries_http_429_and_5xx_at_most_twice(self):
         delays = []
