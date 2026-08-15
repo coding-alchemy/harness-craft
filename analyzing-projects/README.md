@@ -4,7 +4,19 @@
 
 ## 当前版本
 
-**V1.0**
+**V1.1**
+
+### V1.1 更新内容
+
+- 将项目级架构发现与函数级实现追踪整合为一条完整工作流：先建立全仓能力地图，再逐一深入所有主要流程。
+- 新增独立的 `references/implementation-tracing.md`，集中承载源码深度追踪的强制规范，并要求每个主要流程完整执行。
+- 为每个主要流程强制提供四层输出：端到端执行栈、关键符号总表、函数级源码深度分析和跨节点系统行为总结。
+- 引入 P0/P1/P2 分级和 P0 深度闭包；每个 P0 语义步骤必须附连续实际源码与紧邻解释，重要项目自有下游必须递归使用同一完整模板。
+- 完善同步、异步、动态分派和跨语言调用链追踪，并将项目自有 CPU/GPU/native 实现下钻至 binding、operator、launcher、kernel 或经过证据确认的所有权边界。
+- 强化证据、真实性和完成门：明确 `SOURCE`、`TEST`、`CALL-CHAIN`、`UNVERIFIED`，禁止用调用栈、符号表或字段摘要替代源码深度分析。
+- 收紧适用范围：完整源码级项目架构与实现文档适用；单个 bug、函数、调用链、代码审查或实现计划不适用。
+
+### 当前能力
 
 当前版本主要提供以下功能：
 
@@ -16,7 +28,7 @@
 
 本 Skill 采用开放的目录结构：一个包含 YAML 元数据和执行指令的 `SKILL.md`，以及可选的 `scripts/`、`references/` 和 `assets/`。它不依赖某个特定 agent 的私有命令或配置，可用于支持这种 Skill 结构的 Codex、Claude Code、OpenCode、Kiro 等工具。
 
-[`skills/analyzing-projects/SKILL.md`](./skills/analyzing-projects/SKILL.md) 是 agent 实际加载和执行的唯一权威规则。本 README 只说明如何分发、安装和使用，不复述执行逻辑。
+[`skills/analyzing-projects/SKILL.md`](./skills/analyzing-projects/SKILL.md) 是 agent 实际加载和执行的唯一权威入口。分析每一个已识别的主要流程时，都必须完整读取并执行 [`references/implementation-tracing.md`](./skills/analyzing-projects/references/implementation-tracing.md)。本 README 只说明分发、安装和使用，不复述执行逻辑。
 
 ## 适用范围
 
@@ -30,7 +42,9 @@
 analyzing-projects/
 └── skills/
     └── analyzing-projects/
-        └── SKILL.md
+        ├── SKILL.md
+        └── references/
+            └── implementation-tracing.md
 ```
 
 以后如果增加 `scripts/`、`references/` 或 `assets/`，它们也应放在 `skills/analyzing-projects/` 中，并随整个目录一起安装。
@@ -50,10 +64,12 @@ cp -R analyzing-projects/skills/analyzing-projects/. "${SKILLS_ROOT:?}/analyzing
 ```text
 <SKILLS_ROOT>/
 └── analyzing-projects/
-    └── SKILL.md
+    ├── SKILL.md
+    └── references/
+        └── implementation-tracing.md
 ```
 
-不要只复制 `SKILL.md`；这样可以确保未来新增的脚本、参考资料和资源不会遗漏。安装或更新后，启动新会话或按所用 agent 的方式重新加载 Skills。
+不要只复制 `SKILL.md`；必须复制整个 `analyzing-projects` Skill 目录，确保 `references/implementation-tracing.md` 等资料随包安装，未来新增的脚本、参考资料和资源也不会遗漏。安装或更新后，启动新会话或按所用 agent 的方式重新加载 Skills。
 
 ## 平台说明
 
