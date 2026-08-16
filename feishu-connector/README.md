@@ -2,13 +2,14 @@
 
 ## 当前版本
 
-**V1.1**
+**V1.2**
 
 当前版本主要提供以下功能：
 
 - 通过飞书企业自建应用机器人向已配置用户发送纯文本和通用富文本消息；标题、分段、列表、链接或代码等格式化信息优先使用富文本。
 - 发送任务完成、任务失败和待确认三种状态的 interactive Markdown 消息卡片，并明确区分显式任务通知与由仓库规则控制的自动通知。
 - 用户明确要求发送飞书消息即授权向已配置的固定接收人进行一次显式外发；未指定正文时仅发送任务结果和必要的简短验证信息。
+- 用户明确要求真实发送时，Agent 在首个 `send`、`rich` 或实际发送的 `task` 调用上直接申请受控的沙箱外联网权限；不得先在网络隔离沙箱试发；`config` 等离线诊断仍可在沙箱内执行。
 - 支持安全的独立 argv 调用，以及 `send`、`rich`、`task`、`task-auto` 四种 stdin 输入流程。
 - 支持环境变量、项目配置和全局配置的分层合并与严格校验。
 - 支持由仓库指令控制的自动通知，在关闭时安全跳过联网请求，并明确报告已发送或已跳过状态。
@@ -47,6 +48,12 @@ python3 feishu-connector/install_skill.py --force
 项目文件为 `<项目根目录>/.config/feishu-connector/config.json`，可设置接收人和 `notification.autoNotify`，但不得包含 `appSecret`。`--project-root` 是全局选项；项目配置选择依次为显式路径、Git 项目根目录、当前工作目录。环境变量为 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_RECEIVE_OPEN_ID` 与 `FEISHU_AUTO_NOTIFY`（只接受 `true` 或 `false`）。全局文件含 Secret 时，在 POSIX 系统执行 `chmod 600 ~/.config/feishu-connector/config.json`。`null`、未知字段、错误类型、空字符串在联网前拒绝；诊断和日志脱敏 Secret 与 Open ID。
 
 ## Skill 入口与调用
+
+### Agent 执行权限
+
+`send`、`rich` 和实际发送的 `task` 都需要访问飞书网络。用户明确要求发送时，在首个真实发送子命令（`send`、`rich` 或实际发送的 `task`）调用上直接请求沙箱外联网权限。使用 Codex 执行器时，在该调用上设置 `sandbox_permissions=require_escalated`；执行器支持限制网络目标时，仅允许 `open.feishu.cn:443`。
+
+不得先在网络隔离沙箱中使用发送子命令试发或探测连通性；`config` 等明确不联网的诊断不计入真实发送调用，可以在沙箱内执行。如果联网权限被拒绝或执行器不支持权限升级，停止调用并报告消息未发送，不得退回网络隔离沙箱试发或改用其他渠道绕过审批。
 
 ```bash
 ENTRY="${CODEX_HOME:-$HOME/.codex}/skills/feishu-notify/scripts/feishu_notify.py"
