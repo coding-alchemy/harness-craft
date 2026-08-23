@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -88,6 +89,37 @@ class CliTests(unittest.TestCase):
             stdout=stdout,
             stderr=stderr,
         )
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def invoke_prepare(
+        self,
+        payload,
+        project_root=None,
+        cwd=None,
+        git_runner=subprocess.run,
+        client_factory=FakeClient,
+    ):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        argv = []
+        if project_root is not None:
+            argv.extend(["--project-root", str(project_root)])
+        argv.append("prepare-shell")
+        stdin_text = payload if isinstance(payload, str) else json.dumps(payload)
+        entry = SKILL_SCRIPTS / "feishu_notify.py"
+        with mock.patch.object(cli.sys, "argv", [str(entry)]):
+            code = main(
+                argv=argv,
+                environ={},
+                config_paths=self.config_paths,
+                client_factory=client_factory,
+                stdin=io.StringIO(stdin_text),
+                stdout=stdout,
+                stderr=stderr,
+                cwd=self.root if cwd is None else cwd,
+                home=self.root,
+                git_runner=git_runner,
+            )
         return code, stdout.getvalue(), stderr.getvalue()
 
     def run_cli_with_bytes(self, arguments):
@@ -1013,6 +1045,312 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(2, code)
         self.assertEqual("Invalid stdin input\n", stderr)
+
+    def test_stdin_rejects_bare_leading_dash_value_without_constructing_client(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("leading-dash stdin message constructed a client")
+
+        code, stdout, stderr = self.invoke(
+            ["stdin"],
+            stdin=io.StringIO('{"flow":"send","message":"-dash"}'),
+            client_factory=ClientMustNotStart,
+        )
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("Invalid stdin input\n", stderr)
+
+    def test_prepare_shell_builds_basic_send_command_without_sending(self):
+        code, stdout, stderr = self.invoke_prepare(
+            {"flow": "send", "message": "hello 飞书"},
+            project_root=self.root,
+        )
+
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        self.assertEqual([], FakeClient.sent_text)
+        self.assertEqual([], FakeClient.sent_cards)
+        command_argv = shlex.split(stdout.removesuffix("\n"))
+        self.assertEqual(str(Path(sys.executable).resolve()), command_argv[0])
+        self.assertEqual(
+            str((SKILL_SCRIPTS / "feishu_notify.py").resolve()),
+            command_argv[1],
+        )
+        self.assertEqual(
+            "--project-root=%s" % self.root.resolve(), command_argv[2]
+        )
+        self.assertEqual(["send", "--message=hello 飞书"], command_argv[3:])
+
+    def test_prepare_shell_round_trips_all_flows_and_shell_metacharacters(self):
+        dangerous = "-'\" $(touch /tmp/no) `id` \\\n中文 😀\n```sh\necho no\n```"
+        cases = (
+            ({"flow": "send", "message": dangerous}, "send"),
+            ({"flow": "rich", "title": "标题 ' \"", "content": dangerous}, "rich"),
+            ({
+                "flow": "task",
+                "status": "success",
+                "project": "-HETU",
+                "conversation": "评审 `id`",
+                "content": dangerous,
+            }, "task"),
+            ({
+                "flow": "task-auto",
+                "status": "confirm",
+                "project": "HETU",
+                "conversation": "阶段 5",
+                "content": dangerous,
+            }, "task"),
+        )
+        parser = cli.build_parser()
+        for payload, expected_command in cases:
+            with self.subTest(flow=payload["flow"]):
+                code, stdout, stderr = self.invoke_prepare(
+                    payload, project_root=self.root
+                )
+                self.assertEqual(0, code)
+                self.assertEqual("", stderr)
+                command = stdout[:-1]
+                command_argv = shlex.split(command)
+                parsed = parser.parse_args(command_argv[3:])
+                self.assertEqual(expected_command, parsed.command)
+                for name in ("message", "title", "status", "project", "conversation", "content"):
+                    if name in payload:
+                        self.assertEqual(payload[name], getattr(parsed, name))
+                self.assertEqual(payload["flow"] == "task-auto", getattr(parsed, "auto", False))
+                self.assertNotIn("stdin", command_argv)
+                self.assertNotIn("prepare-shell", command_argv)
+                self.assertEqual(
+                    len(command_argv),
+                    3 + len(cli._shell_send_argv(cli._stdin_argv(payload))),
+                )
+
+    def test_prepare_shell_rejects_invalid_json_without_client(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("invalid prepare-shell constructed a client")
+
+        invalid_payloads = (
+            '{"flow":"send","message":"first","message":"second"}',
+            {"flow": "send", "message": "hello", "extra": "forbidden"},
+            {"flow": "task", "status": "unknown", "project": "p", "conversation": "c", "content": "x"},
+            {"flow": "send", "message": "   "},
+            {"flow": "rich", "title": "line one\nline two", "content": "x"},
+            {"flow": "send", "message": "\ud800"},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=repr(payload)):
+                code, stdout, stderr = self.invoke_prepare(
+                    payload,
+                    project_root=self.root,
+                    client_factory=ClientMustNotStart,
+                )
+                self.assertEqual(2, code)
+                self.assertEqual("", stdout)
+                self.assertEqual("Invalid stdin input\n", stderr)
+
+    def test_prepare_shell_rejects_deep_json_without_client_or_config(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("deep JSON constructed a client")
+
+        deep_json = "[" * 10_000 + "0" + "]" * 10_000
+        with mock.patch.object(
+            cli,
+            "resolve_settings",
+            side_effect=AssertionError("deep JSON read configuration"),
+        ):
+            try:
+                code, stdout, stderr = self.invoke_prepare(
+                    deep_json,
+                    project_root=self.root,
+                    client_factory=ClientMustNotStart,
+                )
+            except RecursionError as exc:
+                self.fail("deep JSON escaped the fixed CLI error contract: %s" % exc)
+
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("Invalid stdin input\n", stderr)
+
+    def test_prepare_shell_uses_project_root_precedence_and_survives_cwd_change(self):
+        git_root = self.root / "git-root"
+        git_root.mkdir()
+
+        def git_success(argv, **kwargs):
+            self.assertEqual(["git", "-C", str(self.root.resolve()), "rev-parse", "--show-toplevel"], argv)
+            return subprocess.CompletedProcess(argv, 0, str(git_root) + "\n", "")
+
+        code, stdout, stderr = self.invoke_prepare(
+            {"flow": "send", "message": "root"}, git_runner=git_success
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("", stderr)
+        prepared = shlex.split(stdout[:-1])
+        self.assertEqual("--project-root=%s" % git_root.resolve(), prepared[2])
+
+        other_cwd = self.root / "other"
+        other_cwd.mkdir()
+        reparsed = cli.build_parser().parse_args(prepared[2:])
+        self.assertEqual(git_root.resolve(), reparsed.project_root)
+        self.assertNotEqual(other_cwd.resolve(), reparsed.project_root)
+
+        def git_not_repo(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 128, "", "not a repository")
+
+        code, stdout, stderr = self.invoke_prepare(
+            {"flow": "send", "message": "cwd"}, git_runner=git_not_repo
+        )
+        self.assertEqual(0, code)
+        self.assertEqual("--project-root=%s" % self.root.resolve(), shlex.split(stdout[:-1])[2])
+        self.assertEqual("", stderr)
+
+    def test_prepare_shell_fails_closed_on_platform_and_path_errors(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("failed prepare-shell constructed a client")
+
+        with mock.patch.object(cli.os, "name", "nt"):
+            code, stdout, stderr = self.invoke_prepare(
+                {"flow": "send", "message": "no send"},
+                client_factory=ClientMustNotStart,
+            )
+        self.assertEqual((2, "", "POSIX shell is required\n"), (code, stdout, stderr))
+
+        missing = self.root / "missing-entry.py"
+        with mock.patch.object(cli.sys, "argv", [str(missing)]):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            code = main(
+                argv=["--project-root", str(self.root), "prepare-shell"],
+                stdin=io.StringIO('{"flow":"send","message":"no send"}'),
+                stdout=stdout,
+                stderr=stderr,
+                client_factory=ClientMustNotStart,
+                cwd=self.root,
+            )
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout.getvalue())
+        self.assertEqual("Unable to prepare shell command\n", stderr.getvalue())
+
+        code, stdout, stderr = self.invoke_prepare(
+            {"flow": "send", "message": "no send"},
+            project_root=self.root / "missing-project",
+            client_factory=ClientMustNotStart,
+        )
+        self.assertEqual((2, "", "Unable to prepare shell command\n"), (code, stdout, stderr))
+
+        with mock.patch.object(cli.sys, "executable", str(self.root / "missing-python")):
+            code, stdout, stderr = self.invoke_prepare(
+                {"flow": "send", "message": "no send"},
+                project_root=self.root,
+                client_factory=ClientMustNotStart,
+            )
+        self.assertEqual((2, "", "Unable to prepare shell command\n"), (code, stdout, stderr))
+
+    def test_prepare_shell_rejects_surrogate_project_root_without_client_or_config(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("surrogate project root constructed a client")
+
+        with mock.patch.object(
+            cli,
+            "resolve_project_root",
+            return_value=Path("/prepared/\udcff-root"),
+        ), mock.patch.object(
+            cli,
+            "resolve_settings",
+            side_effect=AssertionError("surrogate project root read configuration"),
+        ):
+            try:
+                code, stdout, stderr = self.invoke_prepare(
+                    {"flow": "send", "message": "offline"},
+                    project_root=self.root,
+                    client_factory=ClientMustNotStart,
+                )
+            except UnicodeEncodeError as exc:
+                self.fail(
+                    "surrogate project root escaped the preparation error contract: %s"
+                    % exc
+                )
+
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("Unable to prepare shell command\n", stderr)
+
+    def test_prepare_shell_does_not_resolve_config_or_construct_client(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("prepare-shell constructed a client")
+
+        with mock.patch.object(
+            cli,
+            "resolve_settings",
+            side_effect=AssertionError("prepare-shell read configuration"),
+        ):
+            code, stdout, stderr = self.invoke_prepare(
+                {"flow": "send", "message": "offline"},
+                project_root=self.root,
+                client_factory=ClientMustNotStart,
+            )
+        self.assertEqual(0, code)
+        self.assertTrue(stdout.endswith("\n"))
+        self.assertEqual("", stderr)
+
+    def test_prepare_shell_enforces_exact_complete_command_byte_limit(self):
+        executable = str(Path(sys.executable).resolve())
+        entry = str((SKILL_SCRIPTS / "feishu_notify.py").resolve())
+        project_root = str(self.root.resolve())
+        fixed = shlex.join(
+            [
+                executable,
+                entry,
+                "--project-root=%s" % project_root,
+                "send",
+                "--message=",
+            ]
+        )
+        exact_message = "x" * (
+            98_304 - len(fixed.encode("utf-8"))
+        )
+
+        for delta, expected_code in ((-1, 0), (0, 0), (1, 2)):
+            with self.subTest(delta=delta):
+                message = exact_message + ("x" if delta == 1 else "")
+                if delta == -1:
+                    message = exact_message[:-1]
+                code, stdout, stderr = self.invoke_prepare(
+                    {"flow": "send", "message": message},
+                    project_root=self.root,
+                )
+                if expected_code == 0:
+                    self.assertEqual(0, code)
+                    self.assertEqual("", stderr)
+                    self.assertEqual(98_304 + delta, len(stdout[:-1].encode("utf-8")))
+                else:
+                    self.assertEqual(2, code)
+                    self.assertEqual("", stdout)
+                    self.assertEqual(
+                        "Prepared command exceeds 96 KiB limit\n", stderr
+                    )
+
+    def test_prepare_shell_counts_unicode_and_quote_expansion(self):
+        payloads = (
+            {"flow": "send", "message": "中😀" * 200},
+            {"flow": "send", "message": "'" * 200},
+        )
+        for payload in payloads:
+            with self.subTest(message=payload["message"][:4]):
+                code, stdout, stderr = self.invoke_prepare(
+                    payload, project_root=self.root
+                )
+                self.assertEqual(0, code)
+                self.assertEqual("", stderr)
+                command = stdout[:-1]
+                self.assertEqual(
+                    len(command.encode("utf-8")),
+                    len(shlex.join(shlex.split(command)).encode("utf-8")),
+                )
+                self.assertEqual(payload["message"], shlex.split(command)[-1].split("=", 1)[1])
 
 
 if __name__ == "__main__":

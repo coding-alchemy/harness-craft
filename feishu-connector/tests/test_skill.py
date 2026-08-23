@@ -93,6 +93,51 @@ class SkillContractTests(unittest.TestCase):
                 section.index(offline_diagnostics), section.index(codex_first_send)
             )
 
+    def test_codex_uses_approval_visible_prepare_then_exact_send_command(self):
+        text = self.skill
+        codex = text.split("### Codex 审批可见调用", 1)[1].split(
+            "### 非 Codex stdin 兼容入口", 1
+        )[0]
+        required = (
+            "`prepare-shell`",
+            "网络隔离沙箱",
+            "只移除 stdout 最后的一个换行",
+            "其余命令原样",
+            "`sandbox_permissions=require_escalated`",
+            "审批拒绝",
+            "不重试",
+            "不回退 stdin、文件或环境变量",
+            "`Feishu message sent`",
+        )
+        for phrase in required:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, codex)
+        self.assertLess(codex.index("`prepare-shell`"), codex.index("只移除"))
+        self.assertLess(codex.index("只移除"), codex.index("require_escalated"))
+        self.assertNotIn("python3 scripts/feishu_notify.py stdin", codex)
+
+    def test_skill_preserves_non_codex_stdin_and_disclosure_limits(self):
+        text = self.skill
+        compatibility = text.split("### 非 Codex stdin 兼容入口", 1)[1]
+        for phrase in (
+            "不存在审批前 payload 可见性要求",
+            "`stdin`",
+            "四种白名单",
+            "不得用于 Codex 的真实发送",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, compatibility)
+        for phrase in (
+            "完整正文会出现在 Codex 工具调用、审批记录和可能的会话记录中",
+            "凭据",
+            "Token",
+            "完整日志",
+            "Diff",
+            "内部推理",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, text)
+
     def test_documents_card_task_contract_and_safety_rules(self):
         for required in (
             "--project", "--conversation", "--content", '"project"',
@@ -110,7 +155,6 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("任务结果或待确认节点", frontmatter)
         for document in (
             Path(__file__).resolve().parents[1] / "README.md",
-            Path(__file__).resolve().parents[1] / "docs" / "USAGE.md",
             Path(__file__).resolve().parents[1] / "specs" / "feishu-connector.md",
         ):
             with self.subTest(document=document):
@@ -118,6 +162,13 @@ class SkillContractTests(unittest.TestCase):
                     "Codex 与 OpenCode 共用相同的 argv/stdin 显式接口",
                     document.read_text(encoding="utf-8"),
                 )
+        usage = (
+            Path(__file__).resolve().parents[1] / "docs" / "USAGE.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "直接 argv 与非 Codex stdin 兼容，Codex Shell 发送使用审批可见命令",
+            usage,
+        )
 
     def test_frontmatter_describes_all_notification_triggers(self):
         frontmatter = self.skill.split("---", 2)[1]
@@ -187,7 +238,7 @@ class SkillContractTests(unittest.TestCase):
                 with self.subTest(document=document, required=required):
                     self.assertIn(required, text)
 
-    def test_readme_v12_summary_states_agent_first_send_permission_contract(self):
+    def test_readme_v13_summary_states_agent_first_send_permission_contract(self):
         root = Path(__file__).resolve().parents[1]
         readme = (root / "README.md").read_text(encoding="utf-8")
         current_version = readme.split("## 当前版本", 1)[1].split(
@@ -199,7 +250,7 @@ class SkillContractTests(unittest.TestCase):
             "`config` 等离线诊断仍可在沙箱内执行。"
         )
 
-        self.assertIn("**V1.2**", current_version)
+        self.assertIn("**V1.3**", current_version)
         self.assertIn(expected_summary, current_version)
 
     def test_readme_agent_permission_section_matches_skill_contract(self):
@@ -230,6 +281,55 @@ class SkillContractTests(unittest.TestCase):
         self.assertLess(section.index(first_send), section.index("不得先"))
         self.assertLess(section.index("不得先"), section.index("`config`"))
         self.assertLess(section.index("`config`"), section.index(denied))
+
+    def test_product_docs_state_posix_and_96_kib_at_codex_call_site(self):
+        root = Path(__file__).resolve().parents[1]
+        documents = (
+            root / "README.md",
+            root / "docs" / "USAGE.md",
+        )
+        required = (
+            "POSIX 操作系统",
+            "POSIX Shell",
+            "macOS/Linux",
+            "96 KiB",
+            "98,304 字节",
+            "UTF-8",
+            "路径、选项和引用开销",
+            "PowerShell",
+            "`cmd.exe`",
+            "不发送、不截断、不拆分、不回退",
+        )
+        for path in documents:
+            text = path.read_text(encoding="utf-8")
+            codex = text.split("Codex 审批可见调用", 1)[1].split("非 Codex", 1)[0]
+            for phrase in required:
+                with self.subTest(document=path.name, phrase=phrase):
+                    self.assertIn(phrase, codex)
+
+    def test_current_contract_and_changelog_define_prepare_shell_v13(self):
+        root = Path(__file__).resolve().parents[1]
+        contract = (root / "specs" / "feishu-connector.md").read_text(encoding="utf-8")
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "CLI 子命令为 `send`、`rich`、`task`、`config`、`stdin` 与 "
+            "`prepare-shell`。",
+            contract,
+        )
+        for phrase in (
+            "`prepare-shell`",
+            "stdout",
+            "98,304 字节",
+            "--project-root=<绝对路径>",
+            "退出码 `2`",
+            "不读取飞书配置",
+        ):
+            self.assertIn(phrase, contract)
+        self.assertIn("## V1.3 — 2026-08-23", changelog)
+        self.assertLess(
+            changelog.index("## V1.3 — 2026-08-23"),
+            changelog.index("## V1.2 — 2026-08-16"),
+        )
 
     def test_changelog_v12_contract_and_history_are_preserved(self):
         root = Path(__file__).resolve().parents[1]

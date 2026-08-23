@@ -54,9 +54,21 @@ python3 scripts/feishu_notify.py task --auto --status confirm --project "HETU" -
 
 自动通知仅用于仓库指令明确启用的任务结果或待确认节点；手动取消不调用连接器，每个节点最多执行一次。失败正文只能提供用户可见原因，不能包含内部推理、完整日志或敏感上下文；通知失败不得改变原任务结果。stdout 出现 `Feishu message sent` 才表示 `sent`（已发送）；`Feishu notification skipped: autoNotify=false` 表示 `skipped`（未发送）。
 
-## 仅 Shell 的回退
+## Shell 执行器调用
 
-只有执行工具提供独立 stdin 通道时，才使用固定命令 `python3 scripts/feishu_notify.py stdin`。动态值绝不进入 Shell 命令字符串；stdin 仅接受以下四种白名单 JSON：
+### Codex 审批可见调用
+
+Codex 使用 POSIX Shell 执行器时，先在任务工作区、网络隔离沙箱内调用 `python3 scripts/feishu_notify.py prepare-shell`；若需要覆盖项目根，在子命令前传入 `--project-root /absolute/project/path`。通过独立 stdin 写入与下文相同的四种白名单 JSON。`prepare-shell` 不读飞书配置、不构造客户端、不联网，也不发送消息。
+
+准备成功后，只移除 stdout 最后的一个换行，将其余命令原样作为新的执行调用，不得重建、补充或重新引用。真实命令设置 `sandbox_permissions=require_escalated`，审批理由只说明连接器向已配置固定接收人发送本次可见正文。正文或其他动态字段变化时必须重新准备并触发新的审批。
+
+命令无法提交、审批拒绝或联网权限被拒绝时，立即报告未发送；不重试、不重建命令，也不回退 stdin、文件或环境变量传参。审批通过后沿用现有发送、自动 no-op、进程内重试和结果判断；只有 stdout 出现 `Feishu message sent` 才报告已发送。
+
+完整正文会出现在 Codex 工具调用、审批记录和可能的会话记录中。继续禁止附加凭据、Token、配置值、完整日志、Diff、内部推理或其他未要求上下文。
+
+### 非 Codex stdin 兼容入口
+
+在不存在审批前 payload 可见性要求的非 Codex 环境中，执行工具有独立 `stdin` 通道时可继续调用 `python3 scripts/feishu_notify.py stdin`。该入口保持 `send`、`rich`、`task`、`task-auto` 四种白名单和现有行为，但不得用于 Codex 的真实发送。
 
 ```json
 {"flow": "send", "message": "用户指定的原文"}
@@ -73,8 +85,6 @@ python3 scripts/feishu_notify.py task --auto --status confirm --project "HETU" -
 ```json
 {"flow": "task-auto", "status": "confirm", "project": "HETU", "conversation": "个股-二期-架构师", "content": "请选择 A 或 B"}
 ```
-
-没有独立 stdin 通道时，不得使用 Shell 回退；改用支持 argv 的执行器。不得读取配置文件、选择接收人或实现 HTTP 请求；这些职责均由入口脚本处理。
 
 ## 联网结果与重复风险
 

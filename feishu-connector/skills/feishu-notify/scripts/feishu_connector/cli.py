@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -15,8 +16,13 @@ from .config import (
     config_from_settings,
     format_source_diagnostics,
     missing_required_fields,
+    resolve_project_root,
     resolve_settings,
 )
+
+
+class PrepareError(Exception):
+    pass
 
 
 EXIT_OK = 0
@@ -31,6 +37,19 @@ TASK_STATUS = {
 }
 
 LINE_BREAKS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+
+VALUE_OPTIONS = frozenset(
+    {
+        "--message",
+        "--title",
+        "--status",
+        "--project",
+        "--conversation",
+        "--content",
+    }
+)
+
+MAX_PREPARED_COMMAND_BYTES = 96 * 1024
 
 
 def redact_identifier(value):
@@ -135,6 +154,10 @@ def build_parser():
         "config", help="show effective configuration sources without network access"
     )
     subparsers.add_parser("stdin", help="read a safe notification request from stdin")
+    subparsers.add_parser(
+        "prepare-shell",
+        help="prepare an approval-visible POSIX shell send command",
+    )
     return parser
 
 
@@ -222,6 +245,83 @@ def _stdin_argv(payload):
     ]
 
 
+def _read_stdin_args(stdin, parser, shell=False):
+    try:
+        request_argv = _stdin_argv(
+            json.load(stdin, object_pairs_hook=_stdin_json_object)
+        )
+    except (json.JSONDecodeError, OSError, TypeError, ValueError, RecursionError):
+        return None
+    if request_argv is None:
+        return None
+    parse_argv = _shell_send_argv(request_argv) if shell else request_argv
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            request_args = parser.parse_args(parse_argv)
+    except SystemExit:
+        return None
+    return request_args, request_argv
+
+
+def _resolved_file(value):
+    try:
+        path = Path(value).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise PrepareError("Unable to prepare shell command") from exc
+    if not path.is_file():
+        raise PrepareError("Unable to prepare shell command")
+    return path
+
+
+def _shell_send_argv(argv):
+    normalized = []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item in VALUE_OPTIONS:
+            normalized.append("%s=%s" % (item, argv[index + 1]))
+            index += 2
+        else:
+            normalized.append(item)
+            index += 1
+    return normalized
+
+
+def _prepare_shell_command(
+    request_argv,
+    explicit_project_root,
+    cwd,
+    git_runner,
+):
+    if os.name != "posix":
+        raise PrepareError("POSIX shell is required")
+    interpreter = _resolved_file(sys.executable)
+    launcher = _resolved_file(sys.argv[0])
+    try:
+        project_root = resolve_project_root(
+            explicit_project_root,
+            cwd,
+            git_runner=git_runner,
+        )
+    except (ConfigError, OSError, RuntimeError, ValueError) as exc:
+        raise PrepareError("Unable to prepare shell command") from exc
+    command = shlex.join(
+        [
+            str(interpreter),
+            str(launcher),
+            "--project-root=%s" % project_root,
+            *_shell_send_argv(request_argv),
+        ]
+    )
+    try:
+        command_bytes = command.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise PrepareError("Unable to prepare shell command") from exc
+    if len(command_bytes) > MAX_PREPARED_COMMAND_BYTES:
+        raise PrepareError("Prepared command exceeds 96 KiB limit")
+    return command
+
+
 def _run_main(
     args,
     environ=None,
@@ -303,6 +403,7 @@ def main(
     git_runner=subprocess.run,
 ):
     stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
     handler = logging.StreamHandler(stderr)
     handler.setFormatter(logging.Formatter("%(message)s"))
@@ -314,24 +415,30 @@ def main(
     try:
         parser = build_parser()
         args = parser.parse_args(argv)
-        if args.command == "stdin":
-            project_root = args.project_root
-            try:
-                stdin_argv = _stdin_argv(
-                    json.load(stdin, object_pairs_hook=_stdin_json_object)
-                )
-            except (json.JSONDecodeError, OSError, TypeError, ValueError):
-                stdin_argv = None
-            if stdin_argv is None:
+        if args.command in ("stdin", "prepare-shell"):
+            source_command = args.command
+            explicit_project_root = args.project_root
+            parsed = _read_stdin_args(
+                stdin, parser, shell=source_command == "prepare-shell"
+            )
+            if parsed is None:
                 print("Invalid stdin input", file=stderr)
                 return 2
-            try:
-                with contextlib.redirect_stderr(io.StringIO()):
-                    args = parser.parse_args(stdin_argv)
-            except SystemExit:
-                print("Invalid stdin input", file=stderr)
-                return 2
-            args.project_root = project_root
+            args, request_argv = parsed
+            args.project_root = explicit_project_root
+            if source_command == "prepare-shell":
+                try:
+                    command = _prepare_shell_command(
+                        request_argv,
+                        explicit_project_root,
+                        Path.cwd() if cwd is None else cwd,
+                        git_runner,
+                    )
+                except PrepareError as exc:
+                    print(str(exc), file=stderr)
+                    return 2
+                print(command, file=stdout)
+                return EXIT_OK
         return _run_main(
             args,
             environ=environ,

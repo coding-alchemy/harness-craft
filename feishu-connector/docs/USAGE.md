@@ -1,6 +1,6 @@
 # 飞书连接器快速开始
 
-本连接器向一个已配置 Open ID 发送消息：显式 `send` 为纯文本，`rich` 为通用 Markdown 卡片，`task` 为自包含 interactive Markdown 任务卡片。Codex 与 OpenCode 共用相同的 argv/stdin 显式接口。运行时仅需 Python 3.9+。
+本连接器向一个已配置 Open ID 发送消息：显式 `send` 为纯文本，`rich` 为通用 Markdown 卡片，`task` 为自包含 interactive Markdown 任务卡片。直接 argv 与非 Codex stdin 兼容，Codex Shell 发送使用审批可见命令。运行时仅需 Python 3.9+。
 
 ## 安装和最小配置
 
@@ -55,6 +55,16 @@ python3 "$ENTRY" task --auto --status confirm --project "HETU" --conversation "�
 ```
 
 无独立 stdin 时改用 argv。argv 与网络权限独立，stdin 只是传参，stdin 不提供网络能力。
+
+### Codex 审批可见调用
+
+Codex 先在网络隔离沙箱中把现有四种白名单 JSON 写入 `prepare-shell` 的 stdin，取得完整命令；只移除 stdout 最后的一个换行，再把其余命令原样作为设置 `sandbox_permissions=require_escalated` 的真实发送调用。真实审批命令因此包含消息类型和全部动态字段，不再使用审批后才写入正文的 `stdin` 发送路径。
+
+该路径要求 POSIX 操作系统和 POSIX Shell，已在 macOS/Linux 验证；PowerShell 与 `cmd.exe` 不受支持。生成的完整命令按 UTF-8 计上限为 96 KiB（98,304 字节），包含解释器和入口路径、选项和引用开销，以及项目根与动态字段，不是正文字数限制。超限、平台不支持、准备失败、命令无法提交或审批拒绝时均不发送、不截断、不拆分、不回退 stdin、文件或环境变量。
+
+### 非 Codex stdin 兼容入口
+
+不存在审批前 payload 可见性要求的非 Codex 环境仍可使用现有 `stdin` 四种白名单；该兼容入口不得用于 Codex 的真实发送。
 
 ## 自动通知与验证
 
