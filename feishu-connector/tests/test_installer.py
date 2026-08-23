@@ -1,4 +1,6 @@
+import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -160,6 +162,34 @@ class SkillInstallerTests(unittest.TestCase):
         self.assertIn("usage:", help_result.stdout)
         self.assertIn("rich", help_result.stdout)
         self.assertIn("rich-text", help_result.stdout)
+
+    def test_installed_prepare_shell_works_without_source_repository(self):
+        source_copy = self.root / "temporary-source" / "feishu-connector"
+        shutil.copytree(CONNECTOR_ROOT, source_copy)
+        result = self.run_installer(installer=source_copy / "install_skill.py")
+        self.assertEqual(0, result.returncode, result.stderr)
+        isolated_skill = self.root / "isolated" / "feishu-notify"
+        shutil.copytree(self.target, isolated_skill)
+        shutil.rmtree(source_copy.parent)
+
+        entry = isolated_skill / "scripts" / "feishu_notify.py"
+        prepare_result = subprocess.run(
+            [sys.executable, str(entry), "--project-root", str(self.project), "prepare-shell"],
+            cwd=self.project,
+            env=self.environ,
+            input=json.dumps({"flow": "send", "message": "installed 飞书"}),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(0, prepare_result.returncode, prepare_result.stderr)
+        prepared = shlex.split(prepare_result.stdout[:-1])
+        self.assertEqual(str(Path(sys.executable).resolve()), prepared[0])
+        self.assertEqual(str(entry.resolve()), prepared[1])
+        self.assertEqual("--project-root=%s" % self.project.resolve(), prepared[2])
+        self.assertEqual(["send", "--message=installed 飞书"], prepared[3:])
+        self.assertFalse(source_copy.exists())
 
     def test_install_does_not_create_configuration(self):
         result = self.run_installer()

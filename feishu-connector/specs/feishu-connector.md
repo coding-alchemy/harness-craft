@@ -18,7 +18,7 @@ python3 "$ENTRY" task --status success --project "HETU" --conversation "个股-�
 python3 "$ENTRY" task --auto --status confirm --project "HETU" --conversation "个股-二期-架构师" --content "请选择 A 或 B"
 ```
 
-CLI 子命令为 `send`、`rich`、`task`、`config` 与 `stdin`。动态值必须是独立 argv，禁止动态 Shell 拼接。`rich --title` 和 `--content` 固定生成蓝色标题的 `interactive` 卡片，标题为 `plain_text`，且仅有一个 `lark_md` 正文；不得传入任意消息类型、卡片 JSON 或后台模板。显式 `task` 不添加 `--auto`，`task --auto` 只供仓库规则驱动的自动通知。`task` 只接受 `--status success|failure|confirm`、非空 `--project`、非空 `--conversation`、非空 `--content` 和可选 `--auto`。
+CLI 子命令为 `send`、`rich`、`task`、`config`、`stdin` 与 `prepare-shell`。动态值必须是独立 argv，禁止动态 Shell 拼接。`rich --title` 和 `--content` 固定生成蓝色标题的 `interactive` 卡片，标题为 `plain_text`，且仅有一个 `lark_md` 正文；不得传入任意消息类型、卡片 JSON 或后台模板。显式 `task` 不添加 `--auto`，`task --auto` 只供仓库规则驱动的自动通知。`task` 只接受 `--status success|failure|confirm`、非空 `--project`、非空 `--conversation`、非空 `--content` 和可选 `--auto`。
 
 项目名和对话框名须为非空、单行、有效 Unicode，拒绝换行与 NUL。正文须非空且有效 Unicode，允许 Markdown 换行，原样传递、不解析、不重组、不截断、不拆分，即使超过飞书限制。不得传入任意消息类型、卡片 JSON 或后台模板。
 
@@ -41,6 +41,10 @@ CLI 子命令为 `send`、`rich`、`task`、`config` 与 `stdin`。动态值必�
 ```
 
 没有独立 stdin 时必须使用 argv 执行器。argv 与网络权限独立，stdin 只是传参，stdin 不提供网络能力。
+
+离线子命令 `prepare-shell` 从 stdin 接受上述四种精确字段白名单，成功时 stdout 仅输出由 `shlex.join()` 生成的完整 POSIX Shell 命令及最后一个换行，退出码为 `0`。命令包含当前解释器、当前入口、`--project-root=<绝对路径>` 和规范化后的 `send|rich|task` argv；它不读取飞书配置、不构造客户端、不联网、不发送消息。
+
+完整命令按 UTF-8 计不得超过 96 KiB（98,304 字节），不计 stdout 的最后换行。无效输入、非 POSIX、路径准备失败和超限均以退出码 `2` 失败，stdout 为空；超限错误为 `Prepared command exceeds 96 KiB limit`。失败时不截断、不拆分，也不回退 stdin、文件或环境变量。
 
 ## 任务卡片格式
 
