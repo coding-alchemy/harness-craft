@@ -32,6 +32,8 @@ python3 "$ENTRY" task --auto --status confirm --project "HETU" --conversation "�
 
 任务消息卡片固定是自包含 `interactive`，只含 `config.wide_screen_mode`、`header.template`、`header.title`（`plain_text`）和一个正文 `div`（`lark_md`）；不得提供任意消息类型、卡片 JSON 或后台模板。标题为 `<项目名>-<对话框名>-<状态中文>`：`success` → “任务完成”/`green`，`failure` → “任务失败”/`red`，`confirm` → “待确认”/`orange`。
 
+用户要求结果通知但未指定正文时，使用显式 `task` 发送任务标识、状态和执行结果：成功包含核心结果及相关验证或产物位置，失败包含具体的非敏感原因及安全下一步，待确认包含需要决定的事项及选项或影响。密码、API key、访问 Token、Cookie、私钥、验证码、凭据和个人信息的具体值在首次发送前替换为短脱敏标记；普通项目、提交和测试信息保留。仅在工具明确发送进程尚未创建、拒绝指向隐私或目的地信任、允许更安全替代且本通知未重写过时，才可生成一次仍有信息量的脱敏替代正文；网络错误或投递状态不明不跨进程重试。
+
 ```json
 {"config":{"wide_screen_mode":true},"header":{"template":"orange","title":{"tag":"plain_text","content":"HETU-个股-二期-架构师-待确认"}},"elements":[{"tag":"div","text":{"tag":"lark_md","content":"请选择 A 或 B"}}]}
 ```
@@ -60,7 +62,7 @@ python3 "$ENTRY" task --auto --status confirm --project "HETU" --conversation "�
 
 Codex 先在网络隔离沙箱中把现有四种白名单 JSON 写入 `prepare-shell` 的 stdin，取得完整命令；只移除 stdout 最后的一个换行，再把其余命令原样作为设置 `sandbox_permissions=require_escalated` 的真实发送调用。真实审批命令因此包含消息类型和全部动态字段，不再使用审批后才写入正文的 `stdin` 发送路径。
 
-该路径要求 POSIX 操作系统和 POSIX Shell，已在 macOS/Linux 验证；PowerShell 与 `cmd.exe` 不受支持。生成的完整命令按 UTF-8 计上限为 96 KiB（98,304 字节），包含解释器和入口路径、选项和引用开销，以及项目根与动态字段，不是正文字数限制。超限、平台不支持、准备失败、命令无法提交或审批拒绝时均不发送、不截断、不拆分、不回退 stdin、文件或环境变量。
+该路径要求 POSIX 操作系统和 POSIX Shell，已在 macOS/Linux 验证；PowerShell 与 `cmd.exe` 不受支持。生成的完整命令按 UTF-8 计上限为 96 KiB（98,304 字节），包含解释器和入口路径、选项和引用开销，以及项目根与动态字段，不是正文字数限制。超限、平台不支持、准备失败、命令无法提交或审批拒绝时均不发送、不截断、不拆分、不回退 stdin、文件或环境变量；仅满足上述一次隐私脱敏重写条件时，才可重新准备并重新申请审批。
 
 ### 非 Codex stdin 兼容入口
 

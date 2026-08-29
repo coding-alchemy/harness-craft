@@ -1352,6 +1352,46 @@ class CliTests(unittest.TestCase):
                 )
                 self.assertEqual(payload["message"], shlex.split(command)[-1].split("=", 1)[1])
 
+    def test_stdin_notify_is_unknown_without_configuration_or_client(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("unknown notify constructed a client")
+
+        with mock.patch.object(
+            cli,
+            "resolve_settings",
+            side_effect=AssertionError("unknown notify read configuration"),
+        ):
+            code, stdout, stderr = self.invoke(
+                ["stdin"],
+                client_factory=ClientMustNotStart,
+                stdin=io.StringIO(
+                    json.dumps({"flow": "notify", "status": "success"})
+                ),
+            )
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("Invalid stdin input\n", stderr)
+
+    def test_prepare_shell_notify_is_unknown_without_configuration_or_client(self):
+        class ClientMustNotStart:
+            def __init__(self, config):
+                raise AssertionError("prepare-shell unknown notify constructed a client")
+
+        with mock.patch.object(
+            cli,
+            "resolve_settings",
+            side_effect=AssertionError("prepare-shell unknown notify read configuration"),
+        ):
+            code, stdout, stderr = self.invoke_prepare(
+                {"flow": "notify", "status": "confirm"},
+                project_root=self.root,
+                client_factory=ClientMustNotStart,
+            )
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout)
+        self.assertEqual("Invalid stdin input\n", stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
