@@ -12,10 +12,11 @@ class SkillContractTests(unittest.TestCase):
     def test_uses_bundled_entry_script(self):
         self.assertIn("scripts/feishu_notify.py", self.skill)
 
-    def test_documents_fixed_stdin_fallback(self):
+    def test_documents_four_stdin_flows(self):
         self.assertIn("stdin", self.skill)
         self.assertIn('"flow": "send"', self.skill)
         self.assertIn('"flow": "task-auto"', self.skill)
+        self.assertNotIn('"flow": "notify"', self.skill)
 
     def test_prohibits_shell_interpolation_and_sensitive_context(self):
         self.assertIn("不得", self.skill)
@@ -30,8 +31,7 @@ class SkillContractTests(unittest.TestCase):
             "即构成本次联网与外发授权",
             "无需再次向用户确认",
             "已配置的固定接收人",
-            "用户指定的正文",
-            "任务结果和必要的简短验证信息",
+            "用户指定正文",
             "不自动延续到后续消息",
             "平台安全审批",
             "Diff",
@@ -40,6 +40,25 @@ class SkillContractTests(unittest.TestCase):
         ):
             with self.subTest(required=required):
                 self.assertIn(required, self.skill)
+
+    def test_bodiless_notifications_use_informative_task_with_single_redaction_retry(self):
+        for required in (
+            "未指定正文时，生成简短且自包含的任务结果通知",
+            "任务标识、核心结果",
+            "未完成的具体原因",
+            "需要用户决定的事项",
+            "密码、API key、访问 Token、Cookie、私钥、验证码",
+            "身份证件号、电话号码、私人邮箱、家庭地址",
+            "首次发送前",
+            "发送进程尚未创建",
+            "更安全的替代内容",
+            "最多重写一次",
+            "投递状态不明",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.skill)
+        self.assertNotIn("`notify`", self.skill)
+        self.assertNotIn("请回到 Codex", self.skill)
 
     def test_real_send_requests_network_escalation_on_first_call(self):
         section = self.skill.split("### 执行权限", 1)[1].split(
@@ -55,10 +74,7 @@ class SkillContractTests(unittest.TestCase):
         offline_diagnostics = (
             "`config` 等明确不联网的诊断不计入真实发送调用，可以在沙箱内执行"
         )
-        denied = (
-            "如果联网权限被拒绝或执行器不支持权限升级，停止调用并明确报告消息未发送；"
-            "不得退回网络隔离沙箱试发，也不得改用其他渠道绕过审批"
-        )
+        denied = "遵循「外发授权」的单次隐私脱敏重写条件"
         codex_first_send = (
             "使用 Codex 执行器时，在上述首个真实发送子命令调用上设置 "
             "`sandbox_permissions=require_escalated`"
@@ -105,7 +121,7 @@ class SkillContractTests(unittest.TestCase):
             "其余命令原样",
             "`sandbox_permissions=require_escalated`",
             "审批拒绝",
-            "不重试",
+            "单次隐私脱敏重写",
             "不回退 stdin、文件或环境变量",
             "`Feishu message sent`",
         )
@@ -222,6 +238,7 @@ class SkillContractTests(unittest.TestCase):
                 "rich --title",
                 '"flow":"rich"',
                 '"flow":"task"',
+                "任务标识、状态和执行结果",
                 "autoNotify=false",
                 "network.dns",
                 "network.timeout",
@@ -238,19 +255,25 @@ class SkillContractTests(unittest.TestCase):
                 with self.subTest(document=document, required=required):
                     self.assertIn(required, text)
 
-    def test_readme_v13_summary_states_agent_first_send_permission_contract(self):
+    def test_readme_v14_summary_states_task_and_permission_contract(self):
         root = Path(__file__).resolve().parents[1]
         readme = (root / "README.md").read_text(encoding="utf-8")
         current_version = readme.split("## 当前版本", 1)[1].split(
             "## 能力边界", 1
         )[0]
+        task_summary = (
+            "- 用户明确要求发送飞书消息即授权向已配置的固定接收人进行一次显式外发；"
+            "未指定正文时使用现有 `task` 发送任务、状态和执行结果；首次发送前脱敏，"
+            "仅在发送进程创建前的隐私拒绝允许更安全替代时最多重写一次。"
+        )
         expected_summary = (
             "- 用户明确要求真实发送时，Agent 在首个 `send`、`rich` 或实际发送的 "
             "`task` 调用上直接申请受控的沙箱外联网权限；不得先在网络隔离沙箱试发；"
             "`config` 等离线诊断仍可在沙箱内执行。"
         )
 
-        self.assertIn("**V1.3**", current_version)
+        self.assertIn("**V1.4**", current_version)
+        self.assertIn(task_summary, current_version)
         self.assertIn(expected_summary, current_version)
 
     def test_readme_agent_permission_section_matches_skill_contract(self):
@@ -264,8 +287,8 @@ class SkillContractTests(unittest.TestCase):
             "`task`）调用上直接请求沙箱外联网权限"
         )
         denied = (
-            "如果联网权限被拒绝或执行器不支持权限升级，停止调用并报告消息未发送，"
-            "不得退回网络隔离沙箱试发或改用其他渠道绕过审批"
+            "联网权限或审批拒绝时，仅满足上述一次隐私脱敏重写条件才重新准备；"
+            "否则报告消息未发送，不得退回网络隔离沙箱试发或改用其他渠道绕过审批"
         )
         for required in (
             "`send`、`rich` 和实际发送的 `task` 都需要访问飞书网络",
@@ -382,3 +405,23 @@ class SkillContractTests(unittest.TestCase):
 - 提供不访问真实飞书或凭据的离线测试。
 - 提供可重复执行且支持冲突保护的 Skill 安装器。"""
         self.assertEqual(expected_historical, historical)
+
+    def test_changelog_v14_records_task_default_and_single_redaction_retry(self):
+        root = Path(__file__).resolve().parents[1]
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## V1.4 — 2026-08-29", changelog)
+        self.assertLess(
+            changelog.index("## V1.4 — 2026-08-29"),
+            changelog.index("## V1.3 — 2026-08-23"),
+        )
+        v14 = changelog.split("## V1.4 — 2026-08-29", 1)[1].split(
+            "## V1.3 — 2026-08-23", 1
+        )[0]
+        for required in (
+            "删除未发布的 `notify` flow",
+            "复用现有 `task`",
+            "任务、状态和执行结果",
+            "最多重写一次",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, v14)

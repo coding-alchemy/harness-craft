@@ -6,6 +6,12 @@
 
 使用者创建并发布企业自建应用、开启机器人能力、申请最小权限 `im:message:send_as_bot`，并将固定测试用户加入可用范围。用户拒收机器人消息、无效 Open ID、权限不足和鉴权失败均为不可重试远程错误。
 
+## 默认结果通知与隐私
+
+用户明确要求结果通知但未指定正文时，Agent 使用现有显式 `task` 发送任务标识、状态和执行结果。成功正文包含核心结果及相关时的验证或产物位置；失败正文包含未完成的具体非敏感原因及安全下一步；待确认正文包含需要用户决定的事项及选项或影响。项目、模块、分支、提交号、测试数量和仓库相对路径是普通任务信息，默认保留。
+
+首次发送前只替换密码、API key、访问 Token、Cookie、私钥、验证码、App Secret、凭据及身份证件号、电话号码、私人邮箱、家庭地址等个人信息的具体值，使用说明类别的短标记；不以动态性或工作区来源为由删除普通结果。仅当工具明确发送进程尚未创建、拒绝指向正文隐私、秘密或目的地信任、允许提交更安全替代且本通知未重写过时，才可重新准备一次仍保留任务和安全结论的脱敏正文。再次拒绝、配置或远程错误、网络错误及投递状态不明均停止，不跨进程重试或更换渠道。
+
 ## CLI 与 stdin 合同
 
 源码入口是 `feishu-connector/skills/feishu-notify/scripts/feishu_notify.py`，安装后入口是 `${CODEX_HOME:-~/.codex}/skills/feishu-notify/scripts/feishu_notify.py`：
@@ -42,7 +48,7 @@ CLI 子命令为 `send`、`rich`、`task`、`config`、`stdin` 与 `prepare-shel
 
 没有独立 stdin 时必须使用 argv 执行器。argv 与网络权限独立，stdin 只是传参，stdin 不提供网络能力。
 
-离线子命令 `prepare-shell` 从 stdin 接受上述四种精确字段白名单，成功时 stdout 仅输出由 `shlex.join()` 生成的完整 POSIX Shell 命令及最后一个换行，退出码为 `0`。命令包含当前解释器、当前入口、`--project-root=<绝对路径>` 和规范化后的 `send|rich|task` argv；它不读取飞书配置、不构造客户端、不联网、不发送消息。
+离线子命令 `prepare-shell` 从 stdin 接受上述四种精确字段白名单，成功时 stdout 仅输出由 `shlex.join()` 生成的完整 POSIX Shell 命令及最后一个换行，退出码为 `0`。命令包含当前解释器、当前入口、`--project-root=<绝对路径>` 和规范化后的 `send|rich|task` argv；它不读取飞书配置、不构造客户端、不联网、不发送消息。未知 flow、附加或缺失字段、非字符串、NUL 和重复键均以退出码 `2` 失败关闭，不读取配置、不构造客户端、不联网。
 
 完整命令按 UTF-8 计不得超过 96 KiB（98,304 字节），不计 stdout 的最后换行。无效输入、非 POSIX、路径准备失败和超限均以退出码 `2` 失败，stdout 为空；超限错误为 `Prepared command exceeds 96 KiB limit`。失败时不截断、不拆分，也不回退 stdin、文件或环境变量。
 
