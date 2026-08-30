@@ -61,7 +61,7 @@
 
 需求文档和设计文档按归属范围就近存放，使用 Markdown 格式：
 
-- 只属于单个模块的文档放在 `<module>/specs/`；例如 `hpc-doc-translator` 的规格放在 `hpc-doc-translator/specs/`。
+- 只属于单个模块的文档放在 `<module>/specs/`。
 - 同时约束两个或以上模块，或约束仓库整体的文档放在项目根目录 `specs/`。
 
 规格文档不得写入 `docs/`、`docs/superpowers/` 或其他工具默认目录。

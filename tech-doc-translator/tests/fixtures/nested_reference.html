@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head><title>Nested Reference Manual</title></head>
+<body>
+<article id="nested-reference">
+  <h1>2. Nested Reference Manual</h1>
+  <p>Calls use cudaMalloc and threadIdx.x.</p>
+
+  <h2>2.1. Deep Heading Trail</h2>
+  <h3>2.1.1. Section</h3>
+  <h4>2.1.1.1. Subsection</h4>
+  <h5>2.1.1.1.1. Deep</h5>
+  <p>Deep text.</p>
+  <h6>2.1.1.1.1.1. Deeper</h6>
+  <p>Deeper text.</p>
+
+  <h2>2.2. Nested Elements</h2>
+  <ul>
+    <li>list item with figure
+      <figure>
+        <img src="images/thread_hierarchy.png" alt="List figure">
+        <figcaption>Fig 1. List caption</figcaption>
+      </figure>
+      <pre><code>__global__ void listKernel() {}</code></pre>
+    </li>
+  </ul>
+
+  <dl>
+    <dt>Term</dt>
+    <dd>definition with figure
+      <figure>
+        <img src="images/thread_hierarchy.png" alt="Definition figure">
+        <figcaption>Fig 2. Definition caption</figcaption>
+      </figure>
+      <pre><code>__global__ void defKernel() {}</code></pre>
+    </dd>
+  </dl>
+
+  <blockquote>
+    <p>quoted text</p>
+    <figure>
+      <img src="images/thread_hierarchy.png" alt="Blockquote figure">
+      <figcaption>Fig 3. Blockquote caption</figcaption>
+    </figure>
+    <pre><code>__global__ void bqKernel() {}</code></pre>
+  </blockquote>
+</article>
+</body>
+</html>

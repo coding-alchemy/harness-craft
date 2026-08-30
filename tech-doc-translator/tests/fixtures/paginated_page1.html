@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Programming Model</title></head>
+<body>
+<main class="document">
+<article>
+<section id="programming-model">
+<h1>1. Programming Model</h1>
+<p>The CUDA programming model organizes parallel computation around a hierarchy of threads.</p>
+<h2>1.1. Kernels</h2>
+<p>CUDA C++ extends C++ by allowing the programmer to define <em>kernel</em> functions.</p>
+<pre><code>// kernel launch with triple chevrons
+#include &lt;cuda_runtime.h&gt;
+
+__global__ void vecAdd(const float* A, const float* B, float* C, int n) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i &lt; n) {
+        C[i] = A[i] + B[i];
+    }
+}
+
+int main() {
+    int N = 1 &lt;&lt; 20;
+    vecAdd&lt;&lt;&lt;(N + 255) / 256, 256&gt;&gt;&gt;(d_A, d_B, d_C, N);
+    if (N &gt; 0 &amp;&amp; N &lt; 1024) return 0;
+    return 0;
+}
+</code></pre>
+<ul>
+<li>Kernels are launched by the host.</li>
+<li>Threads are grouped into thread blocks.</li>
+</ul>
+<img src="images/grid_blocks.png" alt="Grid of thread blocks"/>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>Kernel launches are asynchronous with respect to the host.</p>
+</div>
+</section>
+</article>
+</main>
+</body>
+</html>
