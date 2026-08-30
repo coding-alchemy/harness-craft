@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head><title>Sample HPC Guide</title></head>
+<body>
+<article id="single-page-guide">
+  <h1>1. Compute Kernel Basics</h1>
+  <p>A <em>kernel</em> is a function that runs on the
+     <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/">GPU</a>.
+     Its launch syntax is <code>kernel<<<blocks, threads>>>(args)</code>.</p>
+  <div class="admonition note">
+    <p class="admonition-title">Note</p>
+    <p>Always check return codes in host code.</p>
+  </div>
+  <h2>1.1. Thread Hierarchy</h2>
+  <p>Threads are grouped into <span class="math">N</span> blocks.
+     A footnote example<a class="footnote-reference" href="#id1"><sup>[1]</sup></a>.</p>
+  <ul>
+    <li>thread: one execution unit</li>
+    <li>block: a group of threads</li>
+  </ul>
+  <pre><code>__global__ void kernel(int* a) {
+    int idx = threadIdx.x;
+    a[idx] = idx;
+}</code></pre>
+  <h3>1.1.1. Memory Model</h3>
+  <table>
+    <tr><th>Memory</th><th>Scope</th></tr>
+    <tr><td>Shared</td><td>Block</td></tr>
+    <tr><td>Global</td><td>Grid</td></tr>
+  </table>
+  <img src="images/thread_hierarchy.png" alt="Thread hierarchy diagram">
+  <dl>
+    <dt>[1]</dt><dd>Footnote text about grids.</dd>
+  </dl>
+</article>
+</body>
+</html>

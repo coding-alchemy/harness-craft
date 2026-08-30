@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>cublasSgemm</title>
+</head>
+<body>
+  <article>
+    <h1>cublasSgemm</h1>
+    <p>Performs matrix multiplication.</p>
+
+    <h2>Parameters</h2>
+    <dl>
+      <dt>handle</dt>
+      <dd>cuBLAS handle.</dd>
+      <dt>transa</dt>
+      <dd>Operation op(A).</dd>
+    </dl>
+
+    <h2>Examples</h2>
+    <div class="sphinx-tabs docutils container">
+      <div aria-label="Tabbed" class="closeable" role="tablist">
+        <button aria-controls="panel-cpp" aria-selected="true" class="sphinx-tabs-tab" id="tab-cpp" name="cpp" role="tab" tabindex="0">C++</button>
+        <button aria-controls="panel-py" aria-selected="false" class="sphinx-tabs-tab" id="tab-py" name="py" role="tab" tabindex="-1">Python</button>
+      </div>
+      <div aria-labelledby="tab-cpp" class="sphinx-tabs-panel" id="panel-cpp" name="cpp" role="tabpanel" tabindex="0">
+        <div class="highlight-cpp notranslate">
+          <div class="highlight"><pre><code>float alpha = 1.0f;
+int lda = m;</code></pre></div>
+        </div>
+      </div>
+      <div aria-labelledby="tab-py" class="sphinx-tabs-panel" id="panel-py" name="py" role="tabpanel" tabindex="0">
+        <div class="highlight-python notranslate">
+          <div class="highlight"><pre><code>alpha = 1.0
+lda = m</code></pre></div>
+        </div>
+      </div>
+    </div>
+
+    <figure>
+      <img src="images/diagram.png" alt="diagram">
+    </figure>
+  </article>
+</body>
+</html>

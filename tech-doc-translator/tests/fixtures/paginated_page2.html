@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Programming Interface</title></head>
+<body>
+<main class="document">
+<article>
+<section id="programming-interface">
+<h1>2. Programming Interface</h1>
+<p>The CUDA programming interface supports compilation, memory management, and execution control.</p>
+<h2>2.1. Compilation</h2>
+<p>Source files containing CUDA C++ kernels are compiled with <code>nvcc</code>.</p>
+<pre><code>#include &lt;iostream&gt;
+#include &lt;cuda_runtime.h&gt;
+
+template&lt;typename T&gt;
+__global__ void scale(T* out, const T* in, T factor, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx &lt; n) {
+        out[idx] = in[idx] * factor;
+    }
+}
+
+// compare operators preserved
+bool check(int a, int b) {
+    return a &lt; b &amp;&amp; b &gt; a;
+}
+</code></pre>
+<table>
+<thead><tr><th>Option</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><code>-arch=sm_90</code></td><td>Target SM 9.0 architecture.</td></tr>
+<tr><td><code>--use_fast_math</code></td><td>Use faster but less precise intrinsics.</td></tr>
+</tbody>
+</table>
+<img src="images/compilation_flow.png" alt="Compilation flow"/>
+</section>
+</article>
+</main>
+</body>
+</html>
