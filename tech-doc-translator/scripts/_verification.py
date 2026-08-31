@@ -86,9 +86,20 @@ def link_targets(text):
 
 
 def invalid_math_delimiters(text):
-    """返回嵌套在 Markdown 定界符中的 LaTeX 定界符。"""
+    """逐次返回嵌套在 Markdown 定界符中的 LaTeX 定界符模式。"""
     patterns = (r'\$\\\(', r'\\\)\$', r'\$\$\s*\\\[', r'\\\]\s*\$\$')
-    return [pattern for pattern in patterns if re.search(pattern, text)]
+    return [pattern for pattern in patterns
+            for _ in re.finditer(pattern, text)]
+
+
+def invalid_math_expressions(text):
+    """返回使用嵌套 Markdown/LaTeX 定界符的完整公式原文。"""
+    patterns = (
+        r'\$\\\([^$\n]*?\\\)\$',
+        r'\$\$\s*\\\[[\s\S]*?\\\]\s*\$\$',
+    )
+    return [match.group(0) for pattern in patterns
+            for match in re.finditer(pattern, text)]
 
 
 def missing_images(text, base_dir, allow_cwd=False):

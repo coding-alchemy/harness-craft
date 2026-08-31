@@ -15,6 +15,7 @@ from collections import Counter
 from _verification import (
     heading_lines,
     invalid_math_delimiters,
+    invalid_math_expressions,
     link_targets,
     literal_fence_count,
     missing_images,
@@ -34,7 +35,7 @@ def extract_headings(doc):
     """返回 (h1s, subs) 其中 subs 按文档顺序包含所有 H2-H6。"""
     h1s = []
     subs = []
-    for level, raw_text in heading_lines(doc):
+    for level, raw_text in heading_lines(doc, ignore_fences=True):
         text = normalize(strip_chinese_suffix(raw_text))
         if level == 1:
             h1s.append(text)
@@ -103,9 +104,19 @@ def main():
         print('代码围栏不成对: %d 个反引号边界 FAIL' % fence_count)
 
     # 7) 公式定界符与链接目标
-    if invalid_math_delimiters(doc):
+    doc_math_issues = Counter(invalid_math_delimiters(doc))
+    src_math_issues = Counter(invalid_math_delimiters(src)) if src else Counter()
+    doc_math_expressions = Counter(invalid_math_expressions(doc))
+    src_math_expressions = Counter(invalid_math_expressions(src)) if src else Counter()
+    introduced_math_markers = doc_math_issues - src_math_issues
+    changed_math_expressions = doc_math_expressions - src_math_expressions
+    if introduced_math_markers or changed_math_expressions:
         fail += 1
-        print('公式定界符嵌套: Markdown 与 LaTeX 定界符不得叠加 FAIL')
+        print('公式定界符嵌套: 译文新增或改变 %d 个表达式 / %d 个边界 FAIL' %
+              (sum(changed_math_expressions.values()),
+               sum(introduced_math_markers.values())))
+    elif doc_math_issues:
+        print('公式定界符嵌套: 与源文逐项一致，保留为回源定性告警 WARN')
     if src:
         missing_links = Counter(link_targets(src)) - Counter(link_targets(doc))
         if missing_links:

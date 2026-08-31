@@ -20,6 +20,70 @@ python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
   "1.1. Thread Hierarchy" \
   "1.1.1. Memory Model"
 
+echo "==> 回归：围栏内 # 注释不得计入 Markdown 标题"
+python3 - "$TMP/sample_translated.md" "$TMP/sample_fenced_comment.md" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding='utf-8').read()
+text += '\n```python\n# 这是代码注释，不是 H1\nprint("ok")\n```\n'
+open(sys.argv[2], 'w', encoding='utf-8').write(text)
+PY
+python3 "$VERIFY" "$TMP/sample_fenced_comment.md" "$TMP/sample_source.md" \
+  "1. Compute Kernel Basics" \
+  "1.1. Thread Hierarchy" \
+  "1.1.1. Memory Model"
+
+echo "==> 回归：源译双方保留的历史嵌套数学定界符只告警"
+python3 - "$TMP/sample_source.md" "$TMP/sample_translated.md" \
+  "$TMP/legacy_math_source.md" "$TMP/legacy_math_translated.md" <<'PY'
+import sys
+
+source = open(sys.argv[1], encoding='utf-8').read()
+translated = open(sys.argv[2], encoding='utf-8').read()
+legacy = r'$\(N\)$'
+open(sys.argv[3], 'w', encoding='utf-8').write(source + '\n' + legacy + '\n')
+open(sys.argv[4], 'w', encoding='utf-8').write(translated + '\n' + legacy + '\n')
+PY
+python3 "$VERIFY" "$TMP/legacy_math_translated.md" "$TMP/legacy_math_source.md" \
+  "1. Compute Kernel Basics" \
+  "1.1. Thread Hierarchy" \
+  "1.1.1. Memory Model"
+
+echo "==> 失败回归：译文新增嵌套数学定界符必须判 FAIL"
+python3 - "$TMP/legacy_math_translated.md" "$TMP/legacy_math_extra.md" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding='utf-8').read()
+open(sys.argv[2], 'w', encoding='utf-8').write(text + '\n' + r'$\(M\)$' + '\n')
+PY
+if python3 "$VERIFY" "$TMP/legacy_math_extra.md" "$TMP/legacy_math_source.md" \
+  "1. Compute Kernel Basics" \
+  "1.1. Thread Hierarchy" \
+  "1.1.1. Memory Model"; then
+  echo "错误：译文新增的嵌套数学定界符未被检测到"
+  exit 1
+else
+  echo "新增嵌套数学定界符已正确报 FAIL"
+fi
+
+echo "==> 失败回归：同数量但内容改变的历史嵌套公式必须判 FAIL"
+python3 - "$TMP/legacy_math_translated.md" "$TMP/legacy_math_changed.md" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding='utf-8').read()
+text = text.replace(r'$\(N\)$', r'$\(M\)$')
+open(sys.argv[2], 'w', encoding='utf-8').write(text)
+PY
+if python3 "$VERIFY" "$TMP/legacy_math_changed.md" "$TMP/legacy_math_source.md" \
+  "1. Compute Kernel Basics" \
+  "1.1. Thread Hierarchy" \
+  "1.1.1. Memory Model"; then
+  echo "错误：内容改变的历史嵌套公式未被检测到"
+  exit 1
+else
+  echo "内容改变的历史嵌套公式已正确报 FAIL"
+fi
+
 echo "==> 失败回归：链接目标丢失和嵌套公式定界符必须判 FAIL"
 python3 - "$TMP/sample_translated.md" "$TMP/sample_bad_inline.md" <<'PY'
 import sys
