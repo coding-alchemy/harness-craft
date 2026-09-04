@@ -1,0 +1,23 @@
+{
+  "platform": "bilibili",
+  "original_url": "https://www.bilibili.com/video/BV1sample00",
+  "canonical_url": "https://www.bilibili.com/video/BV1sample00",
+  "content_type": "video",
+  "title": "固定样本：示例视频标题",
+  "author": "示例UP主",
+  "published_at": "2026-08-01",
+  "duration": 6,
+  "subtitle_tracks": [
+    {
+      "language": "zh-CN",
+      "kind": "manual",
+      "cues": [
+        {"start": 0.0, "end": 2.5, "text": "第一句固定样本字幕。"},
+        {"start": 3.0, "end": 6.0, "text": "第二句固定样本字幕。"}
+      ]
+    }
+  ],
+  "media_items": [],
+  "image_items": [],
+  "summary": null
+}

@@ -1,0 +1,17 @@
+{
+  "platform": "xiaohongshu",
+  "original_url": "https://www.xiaohongshu.com/explore/64sample000000000000sample0",
+  "canonical_url": "https://www.xiaohongshu.com/explore/64sample000000000000sample0",
+  "content_type": "image_gallery",
+  "title": "固定样本：图文笔记标题",
+  "author": "示例博主",
+  "published_at": "2026-08-03",
+  "duration": null,
+  "subtitle_tracks": [],
+  "media_items": [],
+  "image_items": [
+    {"index": 1, "url": "https://example.com/1.jpg", "ocr_text": "第一张图片的文字"},
+    {"index": 2, "url": "https://example.com/2.jpg", "ocr_text": ""}
+  ],
+  "summary": "平台生成的补充摘要文本"
+}
