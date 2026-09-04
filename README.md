@@ -15,3 +15,7 @@ Harness Craft 是一个 Harness 工具箱，用于沉淀可复用的 Agent Skill
 ### [tech-doc-translator](./tech-doc-translator/README.md)
 
 面向理工科英文技术文档的结构化翻译 Skill 与脚本集，覆盖单页 HTML、分页代码文档、数学/深层嵌套参考手册、多页面 API/DSL 文档以及工作包编排、术语合并与中断恢复，并已使用 12 套 NVIDIA 官方文档完成扩展验证，并构建了NVIDIA文档翻译的术语库。
+
+### [online-media-reader](./online-media-reader/README.md)
+
+在线媒体文字读取 Skill：从抖音、B站和小红书的公开单条链接自适应取得可靠字幕、语音转写或图片 OCR，生成标明来源的 Markdown，默认清理媒体与匿名 Cookie。

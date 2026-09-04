@@ -1,0 +1,18 @@
+# 条件依赖：按实际使用的处理分支安装
+# 媒体下载（所有需要媒体的分支）
+yt-dlp
+# B站 API 对 Python TLS 指纹返回 412，需要系统 curl 作为备用 HTTP 通道
+# curl 为 macOS/Linux 系统自带命令，通常无需单独安装
+
+# 语音转写分支
+faster-whisper
+
+# 图片 OCR 分支（简体中文模型随包下载）
+# 注意：paddleocr 3.7 与 paddlepaddle 3.0 不兼容（PIR 断言错误），
+# 已验证 paddleocr 3.2.0 + paddlepaddle 3.0.0 可用
+paddleocr==3.2.0
+paddlepaddle==3.0.0
+
+# 抖音匿名会话 / 小红书渲染（需要浏览器时）
+playwright
+# 安装后需执行: playwright install chromium

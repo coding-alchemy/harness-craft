@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">在线媒体文字读取模块架构</title>
+  <desc id="desc">三个平台适配器汇入 ContentManifest，再分流到字幕、ASR 与 OCR，最终输出 Markdown。</desc>
+  <defs>
+    <linearGradient id="manifestGradient" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2F80ED"/>
+      <stop offset="1" stop-color="#1659B7"/>
+    </linearGradient>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#2F80ED" flood-opacity="0.2"/>
+    </filter>
+    <marker id="arrowInk" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#102A43"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#9B51E0"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#27AE60"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#F2994A"/>
+    </marker>
+    <marker id="arrowIndigo" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#6C5CE7"/>
+    </marker>
+    <style>
+      .cn { font-family: MiSans, "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .en { font-family: Liter, Inter, Arial, sans-serif; }
+      .title { font-size: 38px; font-weight: 700; fill: #102A43; }
+      .subtitle { font-size: 16px; fill: #627D98; }
+      .kicker { font-size: 12px; font-weight: 700; letter-spacing: 1.7px; }
+      .node-title { font-size: 17px; font-weight: 700; fill: #102A43; }
+      .node-body { font-size: 12px; fill: #627D98; }
+      .tiny { font-size: 11px; fill: #627D98; }
+    </style>
+  </defs>
+
+  <rect width="1440" height="900" fill="#F5F7FA"/>
+  <rect width="24" height="900" fill="#2F80ED"/>
+  <line x1="60" y1="119" x2="1380" y2="119" stroke="#D9E2EC" stroke-width="2"/>
+  <circle cx="741" cy="413" r="155" fill="#2F80ED" opacity="0.08"/>
+  <rect x="905" y="152" width="310" height="530" rx="28" fill="#102A43" opacity="0.045"/>
+
+  <text x="60" y="72" class="cn title">在线媒体文字读取模块</text>
+  <text x="60" y="104" class="cn subtitle">公开单条链接 → 平台差异收敛 → 自适应选择文字来源 → 可核对 Markdown</text>
+  <text x="1380" y="62" text-anchor="end" class="en kicker" fill="#2F80ED">ONLINE MEDIA READER</text>
+
+  <text x="60" y="176" class="en kicker" fill="#627D98">01 / INPUT</text>
+  <text x="462" y="176" class="en kicker" fill="#9B51E0">02 / ADAPTERS</text>
+  <text x="938" y="176" class="en kicker" fill="#627D98">03 / ADAPTIVE PIPELINE</text>
+  <text x="1380" y="176" text-anchor="end" class="en kicker" fill="#F2994A">04 / OUTPUT</text>
+
+  <path d="M205 396 H275" fill="none" stroke="#102A43" stroke-width="5" marker-end="url(#arrowInk)"/>
+  <path d="M435 385 H460 V275 H480" fill="none" stroke="#9B51E0" stroke-width="3" marker-end="url(#arrowPurple)"/>
+  <path d="M435 391 H480" fill="none" stroke="#9B51E0" stroke-width="3" marker-end="url(#arrowPurple)"/>
+  <path d="M435 401 H460 V527 H480" fill="none" stroke="#9B51E0" stroke-width="3" marker-end="url(#arrowPurple)"/>
+  <path d="M610 275 H669 V371 H697" fill="none" stroke="#9B51E0" stroke-width="3.5" marker-end="url(#arrowPurple)"/>
+  <path d="M610 391 H697" fill="none" stroke="#9B51E0" stroke-width="3.5" marker-end="url(#arrowPurple)"/>
+  <path d="M610 527 H669 V430 H697" fill="none" stroke="#9B51E0" stroke-width="3.5" marker-end="url(#arrowPurple)"/>
+  <path d="M852 358 H898 V248 H952" fill="none" stroke="#27AE60" stroke-width="5" marker-end="url(#arrowGreen)"/>
+  <path d="M870 402 H952" fill="none" stroke="#F2994A" stroke-width="5" marker-end="url(#arrowOrange)"/>
+  <path d="M852 430 H898 V560 H952" fill="none" stroke="#6C5CE7" stroke-width="5" marker-end="url(#arrowIndigo)"/>
+  <path d="M1192 248 H1234 V383 H1272" fill="none" stroke="#27AE60" stroke-width="3.5" marker-end="url(#arrowGreen)"/>
+  <path d="M1192 401 H1272" fill="none" stroke="#F2994A" stroke-width="3.5" marker-end="url(#arrowOrange)"/>
+  <path d="M1192 560 H1234 V420 H1272" fill="none" stroke="#6C5CE7" stroke-width="3.5" marker-end="url(#arrowIndigo)"/>
+
+  <rect x="62" y="350" width="143" height="92" rx="18" fill="#102A43"/>
+  <text x="133.5" y="386" text-anchor="middle" class="cn" font-size="17" font-weight="700" fill="#FFFFFF">公开 URL</text>
+  <text x="133.5" y="416" text-anchor="middle" class="cn" font-size="12" fill="#BCCCDC">抖音 · B站 · 小红书</text>
+
+  <rect x="275" y="316" width="160" height="154" rx="16" fill="#FFFFFF" stroke="#102A43" stroke-width="2"/>
+  <text x="355" y="346" text-anchor="middle" class="cn node-title">Agent Skill</text>
+  <text x="355" y="366" text-anchor="middle" class="en tiny">SKILL.md</text>
+  <line x1="301" y1="384" x2="409" y2="384" stroke="#D9E2EC"/>
+  <text x="355" y="410" text-anchor="middle" class="cn node-title">CLI 编排</text>
+  <text x="355" y="432" text-anchor="middle" class="en tiny">scripts/read.py</text>
+  <text x="355" y="451" text-anchor="middle" class="en tiny">scripts/review.py</text>
+
+  <g>
+    <rect x="480" y="222" width="130" height="106" rx="18" fill="#F4ECFB" stroke="#9B51E0" stroke-width="2"/>
+    <text x="545" y="257" text-anchor="middle" class="cn node-title">抖音</text>
+    <text x="545" y="280" text-anchor="middle" class="cn node-body">SSR / 字幕</text>
+    <text x="545" y="299" text-anchor="middle" class="cn node-body">合成媒体</text>
+  </g>
+  <g>
+    <rect x="480" y="348" width="130" height="86" rx="18" fill="#F4ECFB" stroke="#9B51E0" stroke-width="2"/>
+    <text x="545" y="379" text-anchor="middle" class="cn node-title">B站</text>
+    <text x="545" y="401" text-anchor="middle" class="cn node-body">API / 当前分 P</text>
+    <text x="545" y="420" text-anchor="middle" class="cn node-body">DASH</text>
+  </g>
+  <g>
+    <rect x="480" y="474" width="130" height="106" rx="18" fill="#F4ECFB" stroke="#9B51E0" stroke-width="2"/>
+    <text x="545" y="509" text-anchor="middle" class="cn node-title">小红书</text>
+    <text x="545" y="532" text-anchor="middle" class="cn node-body">SSR / 渲染</text>
+    <text x="545" y="551" text-anchor="middle" class="cn node-body">视频 / 图片集</text>
+  </g>
+
+  <path d="M482 662 V632 H602 V610" fill="none" stroke="#EB5757" stroke-width="1.5" stroke-dasharray="6 6"/>
+  <rect x="405" y="662" width="258" height="64" rx="16" fill="#FFF5F5" stroke="#EB5757" stroke-width="1.5" stroke-dasharray="6 6"/>
+  <text x="534" y="688" text-anchor="middle" class="cn" font-size="13" font-weight="700" fill="#EB5757">平台访问支撑 · 按需匿名会话</text>
+  <text x="534" y="708" text-anchor="middle" class="en" font-size="9.5" fill="#627D98">platform_http.py · browser_session.py · Playwright</text>
+
+  <circle cx="741" cy="413" r="129" fill="url(#manifestGradient)" stroke="#FFFFFF" stroke-width="3" filter="url(#softShadow)"/>
+  <text x="741" y="345" text-anchor="middle" class="en kicker" fill="#D9EAFD">UNIFIED BOUNDARY</text>
+  <text x="741" y="391" text-anchor="middle" class="en" font-size="23" font-weight="700" fill="#FFFFFF">ContentManifest</text>
+  <text x="741" y="423" text-anchor="middle" class="cn" font-size="12" fill="#EAF2FB">元数据 · 字幕轨 · 图片项</text>
+  <text x="741" y="443" text-anchor="middle" class="en" font-size="12" fill="#EAF2FB">MediaSources · ReviewState</text>
+  <text x="741" y="463" text-anchor="middle" class="cn" font-size="12" fill="#EAF2FB">摘要 · 处理路径</text>
+  <text x="741" y="490" text-anchor="middle" class="en" font-size="11" fill="#BBD7F4">scripts/omr/model.py</text>
+
+  <g>
+    <rect x="952" y="194" width="240" height="108" rx="18" fill="#EAF7EF" stroke="#27AE60" stroke-width="2"/>
+    <text x="972" y="227" class="cn" font-size="18" font-weight="700" fill="#1B7F46">可靠字幕直达</text>
+    <text x="972" y="253" class="cn node-body">选择 + 质量评估</text>
+    <text x="972" y="277" class="en tiny">subtitles.py · 默认不下载</text>
+  </g>
+  <g>
+    <rect x="952" y="347" width="240" height="124" rx="18" fill="#FFF3E4" stroke="#F2994A" stroke-width="2"/>
+    <text x="972" y="380" class="cn" font-size="18" font-weight="700" fill="#B86712">下载 + ASR</text>
+    <text x="972" y="406" class="cn node-body">字幕缺失 / 不可靠 / 原音核验</text>
+    <text x="972" y="426" class="en" font-size="10" fill="#627D98">media.py · yt-dlp · ffmpeg · faster-whisper</text>
+    <text x="972" y="442" class="cn" font-size="10" fill="#627D98">证据帧 ≤3/cue · review.py</text>
+    <text x="972" y="458" class="cn" font-size="10" fill="#627D98">纠正原子提交 · 失败可重试</text>
+  </g>
+  <g>
+    <rect x="952" y="506" width="240" height="108" rx="18" fill="#F0EEFD" stroke="#6C5CE7" stroke-width="2"/>
+    <text x="972" y="539" class="cn" font-size="18" font-weight="700" fill="#4F46C8">逐图 OCR</text>
+    <text x="972" y="565" class="cn node-body">小红书图片集 · 保留页面顺序</text>
+    <text x="972" y="585" class="en" font-size="10" fill="#627D98">ocr.py / ocr_runner.py · PaddleOCR</text>
+    <text x="972" y="601" class="cn" font-size="10" fill="#627D98">只提取文字，不描述画面</text>
+  </g>
+  <text x="952" y="655" class="cn node-body">pipeline.py 依据内容类型、字幕质量与显式参数选路</text>
+
+  <rect x="1272" y="326" width="108" height="188" rx="18" fill="#102A43"/>
+  <text x="1326" y="372" text-anchor="middle" class="cn" font-size="17" font-weight="700" fill="#FFFFFF">可核对</text>
+  <text x="1326" y="397" text-anchor="middle" class="en" font-size="17" font-weight="700" fill="#FFFFFF">Markdown</text>
+  <text x="1326" y="433" text-anchor="middle" class="en" font-size="11" fill="#BCCCDC">render.py</text>
+  <text x="1326" y="455" text-anchor="middle" class="cn" font-size="11" fill="#BCCCDC">同源双输出</text>
+  <text x="1326" y="477" text-anchor="middle" class="cn" font-size="11" fill="#BCCCDC">连续字幕 + 时间戳</text>
+  <text x="1326" y="499" text-anchor="middle" class="cn" font-size="11" fill="#BCCCDC">来源标签 / 逐图小节</text>
+
+  <rect x="60" y="760" width="1320" height="98" rx="18" fill="#FFF5F5" stroke="#EB5757" stroke-width="1.5" stroke-dasharray="8 6"/>
+  <text x="82" y="791" class="cn" font-size="14" font-weight="700" fill="#EB5757">执行目录、模型与失败关闭边界</text>
+  <text x="82" y="818" class="cn node-body">成功清理 work · 失败保留诊断材料</text>
+  <text x="82" y="840" class="cn node-body">review/ 留存 · 失败回 pending 可重试</text>
+  <text x="460" y="830" class="cn node-body">.media/tools · Whisper / PaddleOCR 模型</text>
+  <text x="840" y="830" class="cn node-body">Cookie 0600 · 所有退出路径兜底删除</text>
+  <text x="1354" y="812" text-anchor="end" class="cn" font-size="12" font-weight="700" fill="#EB5757">--keep-media 原子发布</text>
+  <text x="1354" y="834" text-anchor="end" class="cn tiny">失败不留半文件 / Cookie</text>
+
+  <text x="62" y="886" class="cn" font-size="11" fill="#627D98">实线箭头 = 主数据流　·　虚线 = 按需支撑 / 安全边界　·　所有节点映射当前真实源码</text>
+  <text x="1380" y="886" text-anchor="end" class="en" font-size="10" fill="#627D98">SOURCE: specs/2026-09-01-online-media-reader-design.md · 2026-09-04</text>
+</svg>

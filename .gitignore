@@ -4,3 +4,4 @@ feishu-connector/.env
 __pycache__/
 *.py[cod]
 .omo/
+.media/

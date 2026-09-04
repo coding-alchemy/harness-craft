@@ -1,0 +1,41 @@
+version: v2
+title: 在线媒体文字读取模块架构
+size: [1440, 900]
+theme:
+  colors:
+    background: "#F5F7FA"
+    ink: "#102A43"
+    muted: "#627D98"
+    grid: "#D9E2EC"
+    blue: "#2F80ED"
+    purple: "#9B51E0"
+    green: "#27AE60"
+    orange: "#F2994A"
+    indigo: "#6C5CE7"
+    red: "#EB5757"
+    white: "#FFFFFF"
+  textStyles:
+    title:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 38
+      bold: true
+      color: "$ink"
+    subtitle:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 16
+      color: "$muted"
+    nodeTitle:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 18
+      bold: true
+      color: "$ink"
+    nodeBody:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 13
+      color: "$muted"
+    code:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 12
+      color: "$muted"
+pages:
+  - pages/1_architecture.page

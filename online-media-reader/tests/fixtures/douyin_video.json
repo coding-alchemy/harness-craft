@@ -1,0 +1,23 @@
+{
+  "platform": "douyin",
+  "original_url": "https://www.douyin.com/video/7000000000000000000",
+  "canonical_url": "https://www.douyin.com/video/7000000000000000000",
+  "content_type": "video",
+  "title": "固定样本：抖音示例标题",
+  "author": "示例作者",
+  "published_at": "2026-08-02",
+  "duration": 30,
+  "subtitle_tracks": [
+    {
+      "language": "zh-CN",
+      "kind": "auto",
+      "cues": [
+        {"start": 0.0, "end": 15.0, "text": "抖音固定样本字幕上半。"},
+        {"start": 15.0, "end": 30.0, "text": "抖音固定样本字幕下半。"}
+      ]
+    }
+  ],
+  "media_items": [],
+  "image_items": [],
+  "summary": null
+}

@@ -1,0 +1,581 @@
+pageType: architecture
+background:
+  type: solid
+  color: "$background"
+notes: 单页架构图；内容基线来自 ../specs/2026-09-01-online-media-reader-design.md。
+elements:
+  - elementId: accent-band
+    elementType: shape
+    bounds: [0, 0, 24, 900]
+    shapeName: rect
+    fill: {type: solid, color: "$blue"}
+
+  - elementId: top-rule
+    elementType: shape
+    bounds: [60, 118, 1320, 2]
+    shapeName: rect
+    fill: {type: solid, color: "$grid"}
+
+  - elementId: manifest-halo
+    elementType: shape
+    bounds: [586, 258, 310, 310]
+    shapeName: ellipse
+    opacity: 0.1
+    fill: {type: solid, color: "$blue"}
+
+  - elementId: processing-field
+    elementType: shape
+    bounds: [905, 152, 310, 530]
+    shapeName: roundRect
+    adjustments: [12000]
+    opacity: 0.06
+    fill: {type: solid, color: "$ink"}
+
+  - elementId: lifecycle-field
+    elementType: shape
+    bounds: [60, 760, 1320, 98]
+    shapeName: roundRect
+    adjustments: [12000]
+    fill: {type: solid, color: "#FFF5F5"}
+    border: {style: dash, width: 1.5, color: "$red"}
+
+  - elementId: line-url-cli
+    elementType: line
+    bounds: [205, 395, 70, 2]
+    viewBox: [70, 2]
+    points: "0,1 70,1"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 4, color: "$ink"}
+
+  - elementId: line-cli-douyin
+    elementType: line
+    bounds: [435, 240, 45, 145]
+    viewBox: [45, 145]
+    points: "0,145 25,145 25,0 45,0"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 2.5, color: "$purple"}
+
+  - elementId: line-cli-bili
+    elementType: line
+    bounds: [435, 390, 45, 2]
+    viewBox: [45, 2]
+    points: "0,1 45,1"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 2.5, color: "$purple"}
+
+  - elementId: line-cli-xhs
+    elementType: line
+    bounds: [435, 400, 45, 145]
+    viewBox: [45, 145]
+    points: "0,0 25,0 25,145 45,145"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 2.5, color: "$purple"}
+
+  - elementId: line-douyin-manifest
+    elementType: line
+    bounds: [610, 275, 102, 96]
+    viewBox: [102, 96]
+    points: "0,0 59,0 59,96 102,96"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 3, color: "$purple"}
+
+  - elementId: line-bili-manifest
+    elementType: line
+    bounds: [610, 389, 87, 2]
+    viewBox: [87, 2]
+    points: "0,1 87,1"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 3, color: "$purple"}
+
+  - elementId: line-xhs-manifest
+    elementType: line
+    bounds: [610, 410, 102, 100]
+    viewBox: [102, 100]
+    points: "0,100 59,100 59,0 102,0"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 3, color: "$purple"}
+
+  - elementId: line-manifest-subtitles
+    elementType: line
+    bounds: [852, 248, 100, 110]
+    viewBox: [100, 110]
+    points: "0,110 46,110 46,0 100,0"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 4, color: "$green"}
+
+  - elementId: line-manifest-asr
+    elementType: line
+    bounds: [852, 401, 100, 2]
+    viewBox: [100, 2]
+    points: "0,1 100,1"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 4, color: "$orange"}
+
+  - elementId: line-manifest-ocr
+    elementType: line
+    bounds: [852, 430, 100, 130]
+    viewBox: [100, 130]
+    points: "0,0 46,0 46,130 100,130"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 4, color: "$indigo"}
+
+  - elementId: line-subtitles-output
+    elementType: line
+    bounds: [1192, 248, 80, 135]
+    viewBox: [80, 135]
+    points: "0,0 42,0 42,135 80,135"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 3, color: "$green"}
+
+  - elementId: line-asr-output
+    elementType: line
+    bounds: [1192, 401, 80, 2]
+    viewBox: [80, 2]
+    points: "0,1 80,1"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 3, color: "$orange"}
+
+  - elementId: line-ocr-output
+    elementType: line
+    bounds: [1192, 420, 80, 140]
+    viewBox: [80, 140]
+    points: "0,140 42,140 42,0 80,0"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: solid, width: 3, color: "$indigo"}
+
+  - elementId: line-browser-support
+    elementType: line
+    bounds: [482, 610, 120, 52]
+    viewBox: [120, 52]
+    points: "0,52 0,22 120,22 120,0"
+    curve: sharp
+    arrow: [null, stealth]
+    border: {style: dash, width: 1.5, color: "$red"}
+
+  - elementId: title
+    elementType: text
+    bounds: [60, 34, 850, 48]
+    content:
+      style: "$title"
+      wrap: false
+      align: [left, middle]
+      text: 在线媒体文字读取模块
+
+  - elementId: english-kicker
+    elementType: text
+    bounds: [1020, 42, 360, 28]
+    content:
+      fontFamily: Liter
+      fontSize: 15
+      letterSpacing: 2
+      color: "$blue"
+      bold: true
+      wrap: false
+      align: [right, middle]
+      text: ONLINE MEDIA READER
+
+  - elementId: subtitle
+    elementType: text
+    bounds: [62, 84, 850, 26]
+    content:
+      style: "$subtitle"
+      wrap: false
+      text: 公开单条链接 → 平台差异收敛 → 自适应选择文字来源 → 可核对 Markdown
+
+  - elementId: input-label
+    elementType: text
+    bounds: [60, 155, 160, 24]
+    content:
+      fontFamily: Liter
+      fontSize: 12
+      color: "$muted"
+      bold: true
+      letterSpacing: 1.5
+      text: 01 / INPUT
+
+  - elementId: url-shape
+    elementType: shape
+    bounds: [62, 350, 143, 92]
+    shapeName: roundRect
+    adjustments: [14000]
+    fill: {type: solid, color: "$ink"}
+
+  - elementId: url-text
+    elementType: text
+    bounds: [78, 365, 112, 62]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 16
+      color: "$white"
+      bold: true
+      align: [center, middle]
+      text: |
+        <p>公开 URL</p>
+        <p><span style="font-size:12px;color:#BCCCDC">抖音 · B站 · 小红书</span></p>
+
+  - elementId: cli-shape
+    elementType: shape
+    bounds: [275, 316, 160, 154]
+    shapeName: roundRect
+    adjustments: [10000]
+    fill: {type: solid, color: "$white"}
+    border: {style: solid, width: 2, color: "$ink"}
+
+  - elementId: cli-text
+    elementType: text
+    bounds: [291, 326, 128, 134]
+    content:
+      align: [center, middle]
+      text: |
+        <p><strong>Agent Skill</strong></p>
+        <p><span style="font-size:12px;color:#627D98">SKILL.md</span></p>
+        <p style="margin-top:8px"><strong>CLI 编排</strong></p>
+        <p><span style="font-size:12px;color:#627D98">scripts/read.py</span></p>
+        <p><span style="font-size:12px;color:#627D98">scripts/review.py</span></p>
+
+  - elementId: adapter-label
+    elementType: text
+    bounds: [462, 155, 170, 24]
+    content:
+      fontFamily: Liter
+      fontSize: 12
+      color: "$purple"
+      bold: true
+      letterSpacing: 1.5
+      text: 02 / ADAPTERS
+
+  - elementId: douyin-shape
+    elementType: shape
+    bounds: [480, 222, 130, 106]
+    shapeName: roundRect
+    adjustments: [14000]
+    fill: {type: solid, color: "#F4ECFB"}
+    border: {style: solid, width: 2, color: "$purple"}
+
+  - elementId: douyin-text
+    elementType: text
+    bounds: [492, 236, 106, 78]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 15
+      bold: true
+      align: [center, middle]
+      text: |
+        <p>抖音</p>
+        <p><span style="font-size:11px;color:#627D98">SSR / 字幕</span></p>
+        <p><span style="font-size:11px;color:#627D98">合成媒体</span></p>
+
+  - elementId: bili-shape
+    elementType: shape
+    bounds: [480, 348, 130, 86]
+    shapeName: roundRect
+    adjustments: [14000]
+    fill: {type: solid, color: "#F4ECFB"}
+    border: {style: solid, width: 2, color: "$purple"}
+
+  - elementId: bili-text
+    elementType: text
+    bounds: [492, 360, 106, 62]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 15
+      bold: true
+      align: [center, middle]
+      text: |
+        <p>B站</p>
+        <p><span style="font-size:11px;color:#627D98">API / 当前分 P</span></p>
+        <p><span style="font-size:11px;color:#627D98">DASH</span></p>
+
+  - elementId: xhs-shape
+    elementType: shape
+    bounds: [480, 474, 130, 106]
+    shapeName: roundRect
+    adjustments: [14000]
+    fill: {type: solid, color: "#F4ECFB"}
+    border: {style: solid, width: 2, color: "$purple"}
+
+  - elementId: xhs-text
+    elementType: text
+    bounds: [492, 488, 106, 78]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 15
+      bold: true
+      align: [center, middle]
+      text: |
+        <p>小红书</p>
+        <p><span style="font-size:11px;color:#627D98">SSR / 渲染</span></p>
+        <p><span style="font-size:11px;color:#627D98">视频 / 图片集</span></p>
+
+  - elementId: browser-shape
+    elementType: shape
+    bounds: [405, 662, 258, 64]
+    shapeName: roundRect
+    adjustments: [14000]
+    fill: {type: solid, color: "#FFF5F5"}
+    border: {style: dash, width: 1.5, color: "$red"}
+
+  - elementId: browser-text
+    elementType: text
+    bounds: [421, 672, 226, 44]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 13
+      color: "$red"
+      bold: true
+      align: [center, middle]
+      text: |
+        <p>平台访问支撑 · 按需匿名会话</p>
+        <p><span style="font-size:10px;color:#627D98">platform_http.py · browser_session.py · Playwright</span></p>
+
+  - elementId: manifest-shape
+    elementType: shape
+    bounds: [612, 284, 258, 258]
+    shapeName: ellipse
+    fill:
+      type: gradient
+      gradientType: linear
+      angle: 90
+      stops:
+        - {position: 0, color: "#2F80ED"}
+        - {position: 1, color: "#1659B7"}
+    border: {style: solid, width: 3, color: "$white"}
+    shadow: {blur: 18, color: "#2F80ED33", offset: [0, 8]}
+
+  - elementId: manifest-kicker
+    elementType: text
+    bounds: [654, 326, 174, 22]
+    content:
+      fontFamily: Liter
+      fontSize: 11
+      color: "#D9EAFD"
+      bold: true
+      letterSpacing: 1.8
+      align: [center, middle]
+      text: UNIFIED BOUNDARY
+
+  - elementId: manifest-title
+    elementType: text
+    bounds: [638, 356, 206, 54]
+    content:
+      fontFamily: Liter
+      fontSize: 22
+      color: "$white"
+      bold: true
+      align: [center, middle]
+      text: ContentManifest
+
+  - elementId: manifest-body
+    elementType: text
+    bounds: [652, 414, 178, 90]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 12
+      color: "#EAF2FB"
+      lineHeight: 1.35
+      align: [center, top]
+      text: |
+        <p>元数据 · 字幕轨 · 图片项</p>
+        <p>MediaSources · ReviewState</p>
+        <p>摘要 · 处理路径</p>
+        <p style="margin-top:4px"><span style="font-size:11px;color:#BBD7F4">scripts/omr/model.py</span></p>
+
+  - elementId: process-label
+    elementType: text
+    bounds: [938, 155, 230, 24]
+    content:
+      fontFamily: Liter
+      fontSize: 12
+      color: "$muted"
+      bold: true
+      letterSpacing: 1.5
+      text: 03 / ADAPTIVE PIPELINE
+
+  - elementId: subtitle-shape
+    elementType: shape
+    bounds: [952, 194, 240, 108]
+    shapeName: roundRect
+    adjustments: [12000]
+    fill: {type: solid, color: "#EAF7EF"}
+    border: {style: solid, width: 2, color: "$green"}
+
+  - elementId: subtitle-text
+    elementType: text
+    bounds: [970, 210, 204, 78]
+    content:
+      align: [left, middle]
+      text: |
+        <p><strong><span style="color:#1B7F46">可靠字幕直达</span></strong></p>
+        <p><span style="font-size:12px;color:#627D98">选择 + 质量评估</span></p>
+        <p><span style="font-size:11px;color:#627D98">subtitles.py · 默认不下载</span></p>
+
+  - elementId: asr-shape
+    elementType: shape
+    bounds: [952, 347, 240, 124]
+    shapeName: roundRect
+    adjustments: [12000]
+    fill: {type: solid, color: "#FFF3E4"}
+    border: {style: solid, width: 2, color: "$orange"}
+
+  - elementId: asr-text
+    elementType: text
+    bounds: [970, 356, 204, 106]
+    content:
+      align: [left, middle]
+      text: |
+        <p><strong><span style="color:#B86712">下载 + ASR</span></strong></p>
+        <p><span style="font-size:12px;color:#627D98">字幕缺失 / 不可靠 / 原音核验</span></p>
+        <p><span style="font-size:10px;color:#627D98">media.py · yt-dlp · ffmpeg · faster-whisper</span></p>
+        <p><span style="font-size:10px;color:#627D98">证据帧 ≤3/cue · review.py</span></p>
+        <p><span style="font-size:10px;color:#627D98">纠正原子提交 · 失败可重试</span></p>
+
+  - elementId: ocr-shape
+    elementType: shape
+    bounds: [952, 506, 240, 108]
+    shapeName: roundRect
+    adjustments: [12000]
+    fill: {type: solid, color: "#F0EEFD"}
+    border: {style: solid, width: 2, color: "$indigo"}
+
+  - elementId: ocr-text
+    elementType: text
+    bounds: [970, 522, 204, 78]
+    content:
+      align: [left, middle]
+      text: |
+        <p><strong><span style="color:#4F46C8">逐图 OCR</span></strong></p>
+        <p><span style="font-size:12px;color:#627D98">小红书图片集 · 保留页面顺序</span></p>
+        <p><span style="font-size:10px;color:#627D98">ocr.py / ocr_runner.py · PaddleOCR</span></p>
+        <p><span style="font-size:10px;color:#627D98">只提取文字，不描述画面</span></p>
+
+  - elementId: pipeline-caption
+    elementType: text
+    bounds: [942, 636, 260, 42]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 12
+      color: "$muted"
+      align: [left, top]
+      text: pipeline.py 依据内容类型、字幕质量与显式参数选路
+
+  - elementId: output-label
+    elementType: text
+    bounds: [1248, 155, 132, 24]
+    content:
+      fontFamily: Liter
+      fontSize: 12
+      color: "$orange"
+      bold: true
+      letterSpacing: 1.5
+      align: [right, middle]
+      text: 04 / OUTPUT
+
+  - elementId: output-shape
+    elementType: shape
+    bounds: [1272, 326, 108, 188]
+    shapeName: roundRect
+    adjustments: [12000]
+    fill: {type: solid, color: "$ink"}
+    shadow: {blur: 12, color: "#102A4333", offset: [0, 6]}
+
+  - elementId: output-text
+    elementType: text
+    bounds: [1285, 344, 82, 152]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 16
+      color: "$white"
+      bold: true
+      lineHeight: 1.25
+      align: [center, middle]
+      text: |
+        <p>可核对</p>
+        <p>Markdown</p>
+        <p style="margin-top:10px"><span style="font-size:11px;color:#BCCCDC">render.py</span></p>
+        <p><span style="font-size:11px;color:#BCCCDC">同源双输出</span></p>
+        <p><span style="font-size:11px;color:#BCCCDC">连续字幕 + 时间戳</span></p>
+        <p><span style="font-size:11px;color:#BCCCDC">来源标签 / 逐图小节</span></p>
+
+  - elementId: lifecycle-title
+    elementType: text
+    bounds: [82, 776, 260, 26]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 14
+      color: "$red"
+      bold: true
+      text: 执行目录、模型与失败关闭边界
+
+  - elementId: lifecycle-temp
+    elementType: text
+    bounds: [82, 806, 340, 48]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 12
+      color: "$muted"
+      text: |
+        <p>成功清理 work · 失败保留诊断材料</p>
+        <p>review/ 留存 · 失败回 pending 可重试</p>
+
+  - elementId: lifecycle-cookie
+    elementType: text
+    bounds: [460, 812, 330, 28]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 12
+      color: "$muted"
+      text: ".media/tools · Whisper / PaddleOCR 模型"
+
+  - elementId: lifecycle-cleanup
+    elementType: text
+    bounds: [840, 812, 300, 28]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 12
+      color: "$muted"
+      text: Cookie 0600 · 所有退出路径兜底删除
+
+  - elementId: lifecycle-keep
+    elementType: text
+    bounds: [1140, 802, 214, 44]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 12
+      color: "$red"
+      bold: true
+      align: [right, middle]
+      text: |
+        <p>--keep-media 原子发布</p>
+        <p><span style="font-size:11px;color:#627D98">失败不留半文件 / Cookie</span></p>
+
+  - elementId: legend-main
+    elementType: text
+    bounds: [62, 870, 600, 18]
+    content:
+      fontFamily: {latin: Liter, ea: MiSans}
+      fontSize: 11
+      color: "$muted"
+      text: 实线箭头 = 主数据流　·　虚线 = 按需支撑 / 安全边界　·　所有节点映射当前真实源码
+
+  - elementId: source-note
+    elementType: text
+    bounds: [850, 870, 530, 18]
+    content:
+      fontFamily: Liter
+      fontSize: 10
+      color: "$muted"
+      align: [right, middle]
+      text: "SOURCE: specs/2026-09-01-online-media-reader-design.md · 2026-09-04"
