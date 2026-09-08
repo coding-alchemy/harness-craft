@@ -194,7 +194,7 @@ def test_http_response_body_read_obeys_absolute_deadline(monkeypatch):
         platform_http.fetch_text("https://example.com", timeout=30)
 
 
-def test_bilibili_probe_downloads_only_best_subtitle(monkeypatch, tmp_path):
+def test_bilibili_probe_downloads_only_best_subtitle(monkeypatch, work_root):
     monkeypatch.setattr(bilibili, "_get_json", lambda url, timeout=30: bilibili_view())
     requested = []
 
@@ -236,7 +236,7 @@ def test_bilibili_probe_downloads_only_best_subtitle(monkeypatch, tmp_path):
     monkeypatch.setattr(bilibili, "fetch_text", fake_fetch_text)
 
     manifest = bilibili.fetch(
-        "https://www.bilibili.com/video/BV1sample000", tmp_path, probe_only=True
+        "https://www.bilibili.com/video/BV1sample000", work_root, probe_only=True
     )
 
     assert manifest.subtitle_probe.status == "usable"
@@ -248,7 +248,7 @@ def test_bilibili_probe_downloads_only_best_subtitle(monkeypatch, tmp_path):
 
 
 def test_bilibili_uses_selected_page_duration_for_subtitle_quality(
-    monkeypatch, tmp_path
+    monkeypatch, work_root
 ):
     view = bilibili_view()
     view["data"]["duration"] = 100
@@ -285,7 +285,7 @@ def test_bilibili_uses_selected_page_duration_for_subtitle_quality(
 
     manifest = bilibili.fetch(
         "https://www.bilibili.com/video/BV1sample000?p=2",
-        tmp_path,
+        work_root,
         probe_only=True,
     )
 
@@ -293,7 +293,7 @@ def test_bilibili_uses_selected_page_duration_for_subtitle_quality(
     assert manifest.subtitle_probe.status == "usable"
 
 
-def test_douyin_probe_downloads_only_best_subtitle(monkeypatch, tmp_path):
+def test_douyin_probe_downloads_only_best_subtitle(monkeypatch, work_root):
     item = {
         "aweme_id": "7000000000000000003",
         "desc": "探测样本",
@@ -333,7 +333,7 @@ def test_douyin_probe_downloads_only_best_subtitle(monkeypatch, tmp_path):
     monkeypatch.setattr(douyin, "make_opener", lambda: Opener())
 
     manifest = douyin.fetch(
-        "https://www.douyin.com/video/7000000000000000003", tmp_path, probe_only=True
+        "https://www.douyin.com/video/7000000000000000003", work_root, probe_only=True
     )
 
     assert manifest.subtitle_probe.status == "usable"
@@ -342,7 +342,7 @@ def test_douyin_probe_downloads_only_best_subtitle(monkeypatch, tmp_path):
 
 
 def test_douyin_probe_uses_browser_path_and_shared_remaining_budget(
-    monkeypatch, tmp_path
+    monkeypatch, work_root
 ):
     item = {
         "aweme_id": "7000000000000000003",
@@ -409,7 +409,7 @@ def test_douyin_probe_uses_browser_path_and_shared_remaining_budget(
 
     manifest = douyin.fetch(
         "https://www.douyin.com/video/7000000000000000003",
-        tmp_path,
+        work_root,
         probe_only=True,
     )
 
@@ -419,7 +419,7 @@ def test_douyin_probe_uses_browser_path_and_shared_remaining_budget(
     assert ("open", manifest.canonical_url, 20) in used
     assert ("open", "https://subs/manual", 15) in used
 
-    normal_workdir = tmp_path / "normal"
+    normal_workdir = work_root / "normal"
     normal_workdir.mkdir()
     normal = douyin.fetch(
         "https://www.douyin.com/video/7000000000000000003",
@@ -429,7 +429,7 @@ def test_douyin_probe_uses_browser_path_and_shared_remaining_budget(
     assert normal.subtitle_probe.status == manifest.subtitle_probe.status == "usable"
 
 
-def test_douyin_probe_browser_failure_returns_asr_decision(monkeypatch, tmp_path):
+def test_douyin_probe_browser_failure_returns_asr_decision(monkeypatch, work_root):
     from omr.model import OMRError
 
     monkeypatch.setattr(douyin, "_direct_html", lambda _url, timeout=30: "")
@@ -443,7 +443,7 @@ def test_douyin_probe_browser_failure_returns_asr_decision(monkeypatch, tmp_path
 
     manifest = douyin.fetch(
         "https://www.douyin.com/video/7000000000000000003",
-        tmp_path,
+        work_root,
         probe_only=True,
     )
 
@@ -452,7 +452,7 @@ def test_douyin_probe_browser_failure_returns_asr_decision(monkeypatch, tmp_path
 
     normal = douyin.fetch(
         "https://www.douyin.com/video/7000000000000000003",
-        tmp_path,
+        work_root,
         probe_only=False,
     )
     assert normal.subtitle_probe.status == "inaccessible"
@@ -460,7 +460,7 @@ def test_douyin_probe_browser_failure_returns_asr_decision(monkeypatch, tmp_path
 
 
 def test_anonymous_browser_launch_and_navigation_share_timeout(
-    monkeypatch, tmp_path
+    monkeypatch, work_root
 ):
     from omr import browser_session
 
@@ -509,7 +509,7 @@ def test_anonymous_browser_launch_and_navigation_share_timeout(
 
 
 def test_anonymous_browser_driver_is_bounded_by_parent_timeout(
-    monkeypatch, tmp_path
+    monkeypatch, work_root
 ):
     from omr import browser_session
     from omr.model import OMRError
@@ -522,12 +522,12 @@ def test_anonymous_browser_driver_is_bounded_by_parent_timeout(
 
     with pytest.raises(OMRError, match="共享字幕探测预算"):
         browser_session.anonymous_cookie_jar(
-            "https://www.douyin.com/", tmp_path, timeout_ms=30000
+            "https://www.douyin.com/", work_root, timeout_ms=30000
         )
 
 
 def test_anonymous_browser_runner_returns_private_cookie_file(
-    monkeypatch, tmp_path
+    monkeypatch, work_root
 ):
     from omr import browser_session
 
@@ -551,14 +551,14 @@ def test_anonymous_browser_runner_returns_private_cookie_file(
     monkeypatch.setattr(browser_session.subprocess, "run", success)
 
     cookie = browser_session.anonymous_cookie_jar(
-        "https://www.douyin.com/", tmp_path, timeout_ms=30000
+        "https://www.douyin.com/", work_root, timeout_ms=30000
     )
 
     assert "ttwid\tvalue" in cookie.read_text(encoding="utf-8")
     assert cookie.stat().st_mode & 0o777 == 0o600
 
 
-def test_bilibili_null_caption_text_returns_invalid_probe(monkeypatch, tmp_path):
+def test_bilibili_null_caption_text_returns_invalid_probe(monkeypatch, work_root):
     monkeypatch.setattr(bilibili, "_get_json", lambda url, timeout=30: bilibili_view())
 
     def fake_fetch_text(url, ua=None, referer=None, timeout=30):
@@ -587,7 +587,7 @@ def test_bilibili_null_caption_text_returns_invalid_probe(monkeypatch, tmp_path)
 
     manifest = bilibili.fetch(
         "https://www.bilibili.com/video/BV1sample000",
-        tmp_path,
+        work_root,
         probe_only=True,
     )
 
@@ -611,7 +611,7 @@ def test_bilibili_null_caption_text_returns_invalid_probe(monkeypatch, tmp_path)
             {"start": 0, "end": 1, "text": "ASR 正文"}
         ],
     )
-    pipeline.process(manifest, tmp_path, tmp_path / "artifacts")
+    pipeline.process(manifest, work_root, work_root / "artifacts")
 
     from omr.render import render_markdown
 
@@ -620,7 +620,7 @@ def test_bilibili_null_caption_text_returns_invalid_probe(monkeypatch, tmp_path)
     assert "] None" not in markdown
 
 
-def test_bilibili_non_object_caption_cue_is_ignored(monkeypatch, tmp_path):
+def test_bilibili_non_object_caption_cue_is_ignored(monkeypatch, work_root):
     monkeypatch.setattr(
         bilibili, "_get_json", lambda url, timeout=30: bilibili_view()
     )
@@ -656,7 +656,7 @@ def test_bilibili_non_object_caption_cue_is_ignored(monkeypatch, tmp_path):
 
     manifest = bilibili.fetch(
         "https://www.bilibili.com/video/BV1sample000",
-        tmp_path,
+        work_root,
         probe_only=True,
     )
 
@@ -690,7 +690,7 @@ def test_render_state_is_bounded_by_parent_timeout(monkeypatch):
         )
 
 
-def test_bilibili_short_link_expansion_shares_probe_budget(monkeypatch, tmp_path):
+def test_bilibili_short_link_expansion_shares_probe_budget(monkeypatch, work_root):
     budget = SubtitleProbeBudget(30, clock=lambda: 100.0)
     remaining = iter([20.0, 10.0])
     monkeypatch.setattr(budget, "remaining", lambda: next(remaining))
@@ -713,7 +713,7 @@ def test_bilibili_short_link_expansion_shares_probe_budget(monkeypatch, tmp_path
         lambda *_args, **_kwargs: ([], bilibili.SubtitleProbe(status="absent")),
     )
 
-    bilibili.fetch("https://b23.tv/abcDEF0", tmp_path, probe_only=True)
+    bilibili.fetch("https://b23.tv/abcDEF0", work_root, probe_only=True)
 
     assert used == {"short": 20.0, "view": 10.0}
 
@@ -756,7 +756,7 @@ def test_bilibili_media_sources_keep_best_and_bounded_review_video(monkeypatch):
     assert sources.review_video == "https://cdn/480p.m4s"
 
 
-def test_bilibili_subtitle_failure_falls_back_to_asr(monkeypatch, tmp_path):
+def test_bilibili_subtitle_failure_falls_back_to_asr(monkeypatch, work_root):
     monkeypatch.setattr(bilibili, "_get_json", lambda url, timeout=30: bilibili_view())
     attempts = []
 
@@ -767,7 +767,7 @@ def test_bilibili_subtitle_failure_falls_back_to_asr(monkeypatch, tmp_path):
     monkeypatch.setattr(bilibili, "fetch_text", unavailable)
     monkeypatch.setattr(bilibili, "_resolve_media_sources", lambda *args: MediaSources())
     manifest = bilibili.fetch(
-        "https://www.bilibili.com/video/BV1sample000", tmp_path
+        "https://www.bilibili.com/video/BV1sample000", work_root
     )
     assert len(attempts) == 2
     assert manifest.subtitle_probe.status == "inaccessible"
@@ -786,14 +786,14 @@ def test_bilibili_subtitle_failure_falls_back_to_asr(monkeypatch, tmp_path):
         lambda audio, model, **kwargs: [{"start": 0, "end": 5, "text": "ASR 正文"}],
     )
 
-    pipeline.process(manifest, tmp_path, tmp_path / "artifacts")
+    pipeline.process(manifest, work_root, work_root / "artifacts")
 
     assert manifest.processing_path == "语音转写（ASR）"
     assert manifest.subtitle_tracks[0].cues[0].text == "ASR 正文"
 
 
-def test_probe_only_outputs_json_without_media_or_asr(tmp_path):
-    fixture = tmp_path / "subtitle.json"
+def test_probe_only_outputs_json_without_media_or_asr(work_root):
+    fixture = work_root / "subtitle.json"
     fixture.write_text(
         json.dumps(
             {
@@ -815,7 +815,7 @@ def test_probe_only_outputs_json_without_media_or_asr(tmp_path):
         ),
         encoding="utf-8",
     )
-    calllog = tmp_path / "calls.log"
+    calllog = work_root / "calls.log"
     env = dict(os.environ)
     env["OMR_FIXTURE"] = str(fixture)
     env["OMR_CALLLOG"] = str(calllog)
@@ -830,7 +830,7 @@ def test_probe_only_outputs_json_without_media_or_asr(tmp_path):
         capture_output=True,
         text=True,
         env=env,
-        cwd=tmp_path,
+        cwd=work_root,
     )
 
     assert result.returncode == 0, result.stderr
@@ -841,7 +841,7 @@ def test_probe_only_outputs_json_without_media_or_asr(tmp_path):
         "elapsed_ms": 0,
     }
     assert not calllog.exists()
-    assert list(tmp_path.glob("*.md")) == []
+    assert list(work_root.glob("*.md")) == []
 
     data = json.loads(fixture.read_text(encoding="utf-8"))
     data["subtitle_tracks"] = []
@@ -856,10 +856,10 @@ def test_probe_only_outputs_json_without_media_or_asr(tmp_path):
         capture_output=True,
         text=True,
         env=env,
-        cwd=tmp_path,
+        cwd=work_root,
     )
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["decision"] == "use_asr"
     assert json.loads(result.stdout)["status"] == "absent"
-    assert not (tmp_path / ".media").exists()
+    assert not (work_root / ".media").exists()

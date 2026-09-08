@@ -25,9 +25,11 @@ def detect_platform(url):
     if official_host(host, "douyin.com"):
         path = urlparse(url).path
         has_video = bool(re.search(r"/video/\d+", path))
-        # modal_id 是弹窗视频 ID，出现在任意个人页形态（/user/self、/user/profile/...）
+        # /note/<id> 是图文详情页形态；modal_id 是弹窗内容 ID，
+        # 出现在任意个人页形态（/user/self、/user/profile/...）
+        has_note = bool(re.search(r"/note/\d+", path))
         has_modal = "modal_id" in parse_qs(urlparse(url).query)
-        if has_video or has_modal:
+        if has_video or has_note or has_modal:
             return "douyin"
         raise UnsupportedURLError(url)
 

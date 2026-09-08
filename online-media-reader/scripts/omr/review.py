@@ -276,7 +276,7 @@ def apply(workspace, corrections_path):
         else:
             reason = ZERO_CORRECTIONS_REASON
         manifest.review = ReviewState.reviewed(review_path, reason)
-        rendered = render_markdown(manifest)
+        rendered = render_markdown(manifest, evidence_link=workspace.evidence_link())
     write_json_atomic(corrections_file, normalized)
     if rendered is not None:
         workspace.deliver(rendered)

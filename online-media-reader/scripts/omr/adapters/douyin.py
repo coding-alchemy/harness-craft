@@ -36,7 +36,7 @@ _ROUTER_PATTERN = r"window\._ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>"
 
 
 def normalize_url(url, budget=None):
-    """返回 (video_id, canonical_url)。支持 /video/<id> 与个人页 modal_id。"""
+    """返回 (video_id, canonical_url)。支持 /video/<id>、/note/<id> 与个人页 modal_id。"""
     parsed = urlparse(url)
     if parsed.hostname == "v.douyin.com":
         head = request(url)
@@ -51,7 +51,7 @@ def normalize_url(url, budget=None):
         or official_host(host, "iesdouyin.com")
     ):
         raise OMRError(f"抖音链接展开结果不是官方域名：{url}", exit_code=4)
-    m = re.search(r"/video/(\d+)", parsed.path)
+    m = re.search(r"/(?:video|note)/(\d+)", parsed.path)
     vid = m.group(1) if m else ""
     if not vid:
         modal = (parse_qs(parsed.query).get("modal_id") or [""])[0]
@@ -59,7 +59,8 @@ def normalize_url(url, budget=None):
             vid = modal
     if not vid:
         raise OMRError(f"无法从抖音链接解析视频 ID：{url}", exit_code=4)
-    return vid, f"https://www.douyin.com/video/{vid}"
+    kind = "note" if "/note/" in parsed.path else "video"
+    return vid, f"https://www.douyin.com/{kind}/{vid}"
 
 
 def parse_router_data(html):
@@ -130,6 +131,13 @@ def fetch(url, workdir, probe_only=False):
 
     desc = (item.get("desc") or "").strip().splitlines()
     summary = item.get("ai_global_summary") or item.get("video_text") or ""
+    if item.get("images"):
+        return _gallery_manifest(url, canonical, item, cookie_file)
+    if item.get("aweme_type") == 2:
+        # 已知图文但未返回任何图片：明确失败，不静默转入视频路径。
+        raise OMRError(
+            "抖音图文条目未返回任何图片，无法按图文处理。", exit_code=4
+        )
     duration_ms = (item.get("video") or {}).get("duration")
     duration = duration_ms / 1000 if duration_ms is not None else None
     tracks, subtitle_probe = _load_caption_tracks(
@@ -151,6 +159,37 @@ def fetch(url, workdir, probe_only=False):
         summary=summary or None,
         cookie_file=str(cookie_file) if cookie_file else None,
         media_sources=_media_sources(item),
+    )
+
+
+def _gallery_manifest(url, canonical, item, cookie_file):
+    """把真实图文条目映射为 image_gallery 清单；缺地址等失败关闭。
+
+    同一图的多个地址（url_list/download_url_list）是候选，不是多张图；
+    按页面原始顺序生成 ImageItem，不调用字幕与媒体提取。
+    """
+    from ..model import ImageItem
+
+    image_items = []
+    for i, img in enumerate(item.get("images") or [], start=1):
+        urls = img.get("url_list") or img.get("download_url_list") or []
+        if not urls:
+            raise OMRError(
+                f"抖音图文第 {i} 张图片缺少可用下载地址。", exit_code=4
+            )
+        image_items.append(ImageItem(index=i, url=urls[0]))
+    desc = (item.get("desc") or "").strip().splitlines()
+    return ContentManifest(
+        platform="douyin",
+        original_url=url,
+        canonical_url=canonical,
+        content_type="image_gallery",
+        title=desc[0] if desc else f"抖音图文 {item.get('aweme_id', '')}",
+        author=(item.get("author") or {}).get("nickname", ""),
+        published_at=datetime.date.fromtimestamp(item["create_time"]).isoformat()
+        if item.get("create_time") else "",
+        image_items=image_items,
+        cookie_file=str(cookie_file) if cookie_file else None,
     )
 
 

@@ -149,9 +149,12 @@ def main(argv=None):
             verify_audio=args.verify_audio,
             whisper_model=args.whisper_model,
         )
+        stage = "evidence"
+        workspace.set_stage(stage, manifest)
+        workspace.publish_evidence(manifest, workspace.work_dir)
         stage = "rendering"
         workspace.set_stage(stage, manifest)
-        markdown = render_markdown(manifest)
+        markdown = render_markdown(manifest, evidence_link=workspace.evidence_link())
         stage = "delivering"
         workspace.set_stage(stage, manifest)
         workspace.deliver(markdown)

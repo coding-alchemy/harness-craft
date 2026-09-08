@@ -6,6 +6,8 @@
 
 import json
 import os
+import stat
+import textwrap
 import subprocess
 import sys
 from pathlib import Path
@@ -14,13 +16,33 @@ MODULE_DIR = Path(__file__).resolve().parent.parent
 ENTRY = MODULE_DIR / "scripts" / "read.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
+from test_video_pipeline import write_fixture  # noqa: E402
+
 
 def run_entry(url, output, extra_args=None, fixture=None):
     env = dict(os.environ)
     if fixture is None:
         env.pop("OMR_FIXTURE", None)
+    elif Path(fixture).is_file():
+        env["OMR_FIXTURE"] = str(fixture)
     else:
         env["OMR_FIXTURE"] = str(FIXTURES / fixture)
+    # 图文样本的 ocr_text 留空时走真实 OCR 分支；用假 OCR 保持离线与确定性。
+    bindir = output.parent / ".fakes"
+    bindir.mkdir(exist_ok=True)
+    fake_ocr = bindir / "fake-ocr"
+    fake_ocr.write_text(
+        textwrap.dedent(
+            """\
+            #!/bin/sh
+            text=$(cat "$1")
+            printf '{"text": "%s"}' "$text"
+            """
+        ),
+        encoding="utf-8",
+    )
+    fake_ocr.chmod(fake_ocr.stat().st_mode | stat.S_IEXEC)
+    env["OMR_OCR_BIN"] = str(fake_ocr)
     return subprocess.run(
         [sys.executable, str(ENTRY), url, "--output", str(output)]
         + (extra_args or []),
@@ -31,38 +53,52 @@ def run_entry(url, output, extra_args=None, fixture=None):
     )
 
 
-def test_supported_urls_route_to_platform(tmp_path):
+def _dynamic_gallery_fixture(work_root, name):
+    """真实形态的图文样本：图片 file:// 可下载、ocr_text 留空交给假 OCR。"""
+    img1 = work_root / f"{name}-1.txt"
+    img1.write_text("第一张图片的文字", encoding="utf-8")
+    img2 = work_root / f"{name}-2.txt"
+    img2.write_text("\n", encoding="utf-8")
+    base = json.loads((FIXTURES / "xiaohongshu_note.json").read_text(encoding="utf-8"))
+    base["image_items"] = [
+        {"index": 1, "url": img1.as_uri(), "ocr_text": None},
+        {"index": 2, "url": img2.as_uri(), "ocr_text": None},
+    ]
+    return write_fixture(work_root, f"{name}.json", base)
+
+
+def test_supported_urls_route_to_platform(work_root):
     cases = [
         ("https://www.bilibili.com/video/BV1sample00", "bilibili_subtitle.json", "bilibili"),
         ("https://b23.tv/abcDEF0", "bilibili_subtitle.json", "bilibili"),
         ("https://www.douyin.com/video/7000000000000000000", "douyin_video.json", "douyin"),
         ("https://v.douyin.com/AbCdEf0/", "douyin_video.json", "douyin"),
-        ("https://www.xiaohongshu.com/explore/64sample000000000000sample0", "xiaohongshu_note.json", "xiaohongshu"),
+        ("https://www.xiaohongshu.com/explore/64sample000000000000sample0", _dynamic_gallery_fixture(work_root, "route-gal"), "xiaohongshu"),
         ("https://www.douyin.com/user/profile/abc?modal_id=7000000000000000000", "douyin_video.json", "douyin"),
     ]
     for url, fixture, platform in cases:
-        out = tmp_path / "out.md"
+        out = work_root / "out.md"
         result = run_entry(url, out, fixture=fixture)
         assert result.returncode == 0, result.stderr
         text = out.read_text(encoding="utf-8")
         assert platform in text
 
 
-def test_unsupported_url_fails_without_markdown(tmp_path):
-    out = tmp_path / "out.md"
+def test_unsupported_url_fails_without_markdown(work_root):
+    out = work_root / "out.md"
     result = run_entry("https://example.com/watch?v=abc", out)
     assert result.returncode != 0
     assert not out.exists()
     assert "不支持" in result.stderr or "不支持" in result.stdout
 
 
-def test_spoofed_platform_domains_are_rejected(tmp_path):
+def test_spoofed_platform_domains_are_rejected(work_root):
     for url in (
         "https://evil-douyin.com/video/7000000000000000000",
         "https://evilbilibili.com/video/BV1sample00",
         "https://notxiaohongshu.com/explore/64abcdef",
     ):
-        out = tmp_path / "out.md"
+        out = work_root / "out.md"
         result = run_entry(url, out)
 
         assert result.returncode == 2
@@ -70,7 +106,7 @@ def test_spoofed_platform_domains_are_rejected(tmp_path):
         assert not out.exists()
 
 
-def test_cli_argument_errors_use_structured_failure_json(tmp_path):
+def test_cli_argument_errors_use_structured_failure_json(work_root):
     env = dict(os.environ)
     env.pop("OMR_FIXTURE", None)
     cases = [
@@ -84,7 +120,7 @@ def test_cli_argument_errors_use_structured_failure_json(tmp_path):
             capture_output=True,
             text=True,
             env=env,
-            cwd=tmp_path,
+            cwd=work_root,
         )
 
         assert result.returncode == 2
@@ -97,8 +133,8 @@ def test_cli_argument_errors_use_structured_failure_json(tmp_path):
         }
 
 
-def test_manifest_renders_required_markdown_sections(tmp_path):
-    out = tmp_path / "out.md"
+def test_manifest_renders_required_markdown_sections(work_root):
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.bilibili.com/video/BV1sample00", out, fixture="bilibili_subtitle.json"
     )
@@ -116,8 +152,8 @@ def test_manifest_renders_required_markdown_sections(tmp_path):
     assert "00:00:00" in text  # 字幕时间戳
 
 
-def test_douyin_marks_processing_path(tmp_path):
-    out = tmp_path / "out.md"
+def test_douyin_marks_processing_path(work_root):
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.douyin.com/video/7000000000000000000", out, fixture="douyin_video.json"
     )
@@ -126,12 +162,12 @@ def test_douyin_marks_processing_path(tmp_path):
     assert "处理路径：自动字幕" in text
 
 
-def test_xiaohongshu_renders_ordered_ocr_and_empty_marker(tmp_path):
-    out = tmp_path / "out.md"
+def test_xiaohongshu_renders_ordered_ocr_and_empty_marker(work_root):
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.xiaohongshu.com/explore/64sample000000000000sample0",
         out,
-        fixture="xiaohongshu_note.json",
+        fixture=_dynamic_gallery_fixture(work_root, "render-gal"),
     )
     assert result.returncode == 0, result.stderr
     text = out.read_text(encoding="utf-8")
@@ -142,31 +178,31 @@ def test_xiaohongshu_renders_ordered_ocr_and_empty_marker(tmp_path):
     assert "平台生成的补充摘要文本" in text
 
 
-def test_reliable_subtitle_renders_continuous_and_timed_transcripts(tmp_path):
-    out = tmp_path / "out.md"
+def test_reliable_subtitle_renders_continuous_and_timed_transcripts(work_root):
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.bilibili.com/video/BV1sample00", out, fixture="bilibili_subtitle.json"
     )
     assert result.returncode == 0, result.stderr
     text = out.read_text(encoding="utf-8")
-    assert "## 完整连续字幕\n\n第一句固定样本字幕。第二句固定样本字幕。\n\n" in text
+    assert "## 原始字幕\n\n第一句固定样本字幕。第二句固定样本字幕。\n\n" in text
     assert "- [00:00:03 → 00:00:06] 第二句固定样本字幕。" in text
-    assert text.index("## 完整连续字幕") < text.index("## 人工字幕")
+    assert text.index("## 原始字幕") < text.index("## 人工字幕")
 
 
-def test_xiaohongshu_gallery_omits_continuous_transcript(tmp_path):
-    out = tmp_path / "out.md"
+def test_xiaohongshu_gallery_omits_continuous_transcript(work_root):
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.xiaohongshu.com/explore/64sample000000000000sample0",
         out,
-        fixture="xiaohongshu_note.json",
+        fixture=_dynamic_gallery_fixture(work_root, "omit-gal"),
     )
     assert result.returncode == 0, result.stderr
-    assert "完整连续字幕" not in out.read_text(encoding="utf-8")
+    assert "原始字幕" not in out.read_text(encoding="utf-8")
 
 
-def test_work_dir_cleaned_on_success(tmp_path):
-    out = tmp_path / "out.md"
+def test_work_dir_cleaned_on_success(work_root):
+    out = work_root / "out.md"
     ok = run_entry(
         "https://www.bilibili.com/video/BV1sample00", out, fixture="bilibili_subtitle.json"
     )
