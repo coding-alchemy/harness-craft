@@ -12,7 +12,7 @@ import pytest
 
 from test_video_pipeline import ASR_FIXTURE, make_fakes, write_fixture
 
-MODULE_DIR = Path(__file__).resolve().parent.parent
+MODULE_DIR = Path(__file__).resolve().parent.parent / "skills" / "online-media-reader"
 ENTRY = MODULE_DIR / "scripts" / "read.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

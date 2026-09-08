@@ -1,13 +1,34 @@
 # 在线媒体文字读取（online-media-reader）
 
-本模块提供一个 Agent Skill（[SKILL.md](./SKILL.md)）及两个执行入口：主读取 [scripts/read.py](./scripts/read.py) 与 ASR 画面复核 [scripts/review.py](./scripts/review.py)。它从抖音、B站和小红书的公开单条链接自适应取得文字内容，输出标明来源的 Markdown。
+本模块提供一个可安装的 Agent Skill，唯一 Skill 源目录为 [skills/online-media-reader/](./skills/online-media-reader/)：入口 [SKILL.md](./skills/online-media-reader/SKILL.md)、主读取 [scripts/read.py](./skills/online-media-reader/scripts/read.py)、ASR 画面复核 [scripts/review.py](./skills/online-media-reader/scripts/review.py) 与条件依赖声明 [requirements.txt](./skills/online-media-reader/requirements.txt) 都在该目录内，随 Skill 整体安装。README、规格、架构图、测试和安装器留在模块根目录，不属于安装包。它从抖音、B站和小红书的公开单条链接自适应取得文字内容，输出标明来源的 Markdown。
+
+## 安装
+
+```bash
+# Codex：安装/更新到 ${CODEX_HOME:-~/.codex}/skills/online-media-reader
+python3 online-media-reader/install_skill.py
+# 受管文件冲突时默认拒绝；确认替换后使用：
+python3 online-media-reader/install_skill.py --force
+```
+
+安装器只依赖 Python 标准库，把 Skill 源目录的全部发布文件复制到 `${CODEX_HOME:-~/.codex}/skills/online-media-reader`；相同内容与权限的重复安装成功且不重写文件，目标中的未知文件保留，不创建依赖、模型、浏览器、配置或凭据。其他兼容 Agent Skills 的工具可直接把整个 `skills/online-media-reader/` 复制到目标 Skill 根目录（不要只复制 `SKILL.md`）。
+
+安装后从安装目录内的 [requirements.txt](./skills/online-media-reader/requirements.txt) 按实际使用的处理分支显式安装依赖，例如：
+
+```bash
+pip install -r "${CODEX_HOME:-$HOME/.codex}/skills/online-media-reader/requirements.txt"
+```
+
+条件依赖清单见下文"条件依赖"。
 
 ## 使用
 
+`<SKILL目录>` 指已安装或已复制的 `online-media-reader` Skill 目录（源码内即 `online-media-reader/skills/online-media-reader`）：
+
 ```bash
-python3 scripts/read.py <URL> [--output 结果.md] [--keep-media] [--verify-audio] [--whisper-model small]
-python3 scripts/read.py <URL> --probe-only
-python3 scripts/review.py <run_dir> --corrections <corrections.json>
+python3 <SKILL目录>/scripts/read.py <URL> [--output 结果.md] [--keep-media] [--verify-audio] [--whisper-model small]
+python3 <SKILL目录>/scripts/read.py <URL> --probe-only
+python3 <SKILL目录>/scripts/review.py <run_dir> --corrections <corrections.json>
 ```
 
 处理路径自适应：脚本在 30 秒总预算内只验证最高优先级的平台字幕（人工 > 自动，中文优先），可靠时直接采用；字幕缺失、不可访问、无效或超时则下载媒体并用 faster-whisper 转写。中文转写会使用标题和作者作为短提示。`--probe-only` 只输出机器可读的字幕可用性决策，不下载媒体或运行 ASR；`--verify-audio` 可在字幕可靠时附加 ASR 核验。小红书与抖音图文按页面原始顺序逐图 PaddleOCR（抖音支持 `/note/<id>` 详情、官方短链与 `modal_id` 入口，图文不进入视频下载或 ASR）；平台 AI 摘要只作为补充，不替代正文。
@@ -41,7 +62,7 @@ stdout JSON 的 `result_path` 指向唯一正文，`run_dir` 指向本次运行�
 
 ## 条件依赖
 
-脚本不自动安装依赖。按实际使用的处理分支配置（[requirements.txt](./requirements.txt)）：
+脚本不自动安装依赖。按实际使用的处理分支配置（[requirements.txt](./skills/online-media-reader/requirements.txt)）：
 
 - 字幕直读：无额外依赖；
 - 媒体下载：已有可用直连时无需额外下载器，否则使用 `yt-dlp`；抖音匿名会话另需 Playwright 浏览器能力；
@@ -57,4 +78,4 @@ python3 -m pytest tests/ -q
 # 也可在仓库根目录运行：python3 -m pytest online-media-reader/tests -q
 ```
 
-全部测试使用固定样本与假外部命令（临时 PATH 与 `OMR_WHISPER_BIN` / `OMR_OCR_BIN`），不访问真实网络。规格与执行计划见 [specs/](./specs/)。
+全部测试使用固定样本与假外部命令（临时 PATH 与 `OMR_WHISPER_BIN` / `OMR_OCR_BIN`），不访问真实网络；其中 `tests/test_online_media_reader_installer.py` 覆盖安装器合同与脱离源码启动验收（共享合同实现见仓库根 [tests/installer_contract.py](../tests/installer_contract.py)）。规格与执行计划见 [specs/](./specs/)。

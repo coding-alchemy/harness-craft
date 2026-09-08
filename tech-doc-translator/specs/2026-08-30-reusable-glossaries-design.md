@@ -11,6 +11,9 @@
 | 需求依据 | [可复用术语库需求](./2026-08-30-reusable-glossaries-requirements.md) |
 | 上游规格 | [技术文档翻译模块 Practice-first 规格](./2026-08-29-tech-doc-translator-practice-first-design.md) |
 
+> 路径说明：2026-09-08 起本模块的 Skill 运行时收拢到 `tech-doc-translator/skills/tech-doc-translator/`；正文中的模块根相对路径（如 `scripts/`、`rules/`、`glossaries/`）为迁移前布局记录，行为约定不变。
+
+
 ## 1. 设计目标
 
 在不引入数据库、服务或新的翻译平台前提下，增加一层可移植的共享术语库。首个资产是从 `HPC_Trans` 的 12 份权威项目术语表整理出的 NVIDIA 术语库；项目 `术语表.md` 继续拥有最高的术语文件优先级。

@@ -14,7 +14,7 @@ import textwrap
 import types
 from pathlib import Path
 
-MODULE_DIR = Path(__file__).resolve().parent.parent
+MODULE_DIR = Path(__file__).resolve().parent.parent / "skills" / "online-media-reader"
 ENTRY = MODULE_DIR / "scripts" / "read.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 

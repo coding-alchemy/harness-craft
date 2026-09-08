@@ -14,12 +14,12 @@ import tempfile
 import textwrap
 from pathlib import Path
 
-MODULE_DIR = Path(__file__).resolve().parent.parent
+MODULE_DIR = Path(__file__).resolve().parent.parent / "skills" / "online-media-reader"
 ENTRY = MODULE_DIR / "scripts" / "read.py"
 REVIEW_ENTRY = MODULE_DIR / "scripts" / "review.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
-sys.path.insert(0, str(MODULE_DIR / "tests"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_video_pipeline import ASR_FIXTURE, make_fakes, run_entry, write_fixture  # noqa: E402
 from test_xiaohongshu import gallery_fixture  # noqa: E402

@@ -3,10 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 FIXTURE_SITE="tests/fixtures/multipage_site"
-DISCOVER="scripts/discover_pages.py"
-PARSE="scripts/parse_api_html.py"
-MERGE="scripts/merge_api.py"
-VERIFY="scripts/verify_api_translation.py"
+DISCOVER="skills/tech-doc-translator/scripts/discover_pages.py"
+PARSE="skills/tech-doc-translator/scripts/parse_api_html.py"
+MERGE="skills/tech-doc-translator/scripts/merge_api.py"
+VERIFY="skills/tech-doc-translator/scripts/verify_api_translation.py"
 FIXTURE_IMAGE="tests/fixtures/valid_1x1.png"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

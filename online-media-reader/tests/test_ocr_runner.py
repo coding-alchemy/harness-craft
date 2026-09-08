@@ -13,7 +13,7 @@ import sys
 import textwrap
 from pathlib import Path
 
-MODULE_DIR = Path(__file__).resolve().parent.parent
+MODULE_DIR = Path(__file__).resolve().parent.parent / "skills" / "online-media-reader"
 RUNNER = MODULE_DIR / "scripts" / "omr" / "ocr_runner.py"
 
 sys.path.insert(0, str(MODULE_DIR / "scripts"))

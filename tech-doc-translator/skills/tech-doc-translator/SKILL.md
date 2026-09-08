@@ -22,7 +22,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 
 ## 依赖
 
-脚本依赖 `beautifulsoup4`，按 `requirements.txt` 安装：`pip install -r ../../requirements.txt`。
+`<SKILL目录>` 指本 `SKILL.md` 所在目录；本文的脚本、翻译约定、共享词库和依赖声明都通过 `<SKILL目录>` 内路径定位，不依赖仓库层级。脚本依赖 `beautifulsoup4`，按 `requirements.txt` 安装：`pip install -r <SKILL目录>/requirements.txt`。
 
 ## 执行顺序
 
@@ -31,11 +31,11 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
    - 用 `curl -sL` 或等价工具保存本地只读 HTML 快照到项目 `source/`；解析脚本只读本地快照。
    - 多页面站点先下载入口，再按新发现的范围内链接补齐本地页面，反复运行页面发现直到清单不再增长，并与独立官方 TOC/导航对账。
 2. **建立项目口径**
-   - 用户或项目约定可显式选择一个或多个 `../../glossaries/<library-id>.md`；未选择时不启用共享术语库。多个库的声明顺序就是共享层优先级。
-   - 已选择共享库时，运行 `../../scripts/select_glossary.py --source <源Markdown> --library <库1> [--library <库2> ...] [--project <项目术语表>] --output <工作区外的子集.md>`，把子集作为工作包术语上下文。
+   - 用户或项目约定可显式选择一个或多个 `<SKILL目录>/references/glossaries/<library-id>.md`；未选择时不启用共享术语库。多个库的声明顺序就是共享层优先级。
+   - 已选择共享库时，运行 `<SKILL目录>/scripts/select_glossary.py --source <源Markdown> --library <库1> [--library <库2> ...] [--project <项目术语表>] --output <工作区外的子集.md>`，把子集作为工作包术语上下文。
    - 项目 `术语表.md` 覆盖共享库的同键同语境口径。选择器报告同词多语境时，使用 `--context '英文原词=语境'` 明确选择，或先裁决项目术语；不得依靠周边文字猜测。
    - 读取项目 `术语表.md`；没有则创建最小 Markdown 表（英文原词、中文译法/保留、处理方式、首现位置）。
-   - 读取 `../../rules/translation_conventions.md`。
+   - 读取 `<SKILL目录>/references/translation_conventions.md`。
 3. **选择源家族并解析**
    - 见下方“源家族判断”；解析后检查输出是否含 `[TAGNAME]` 占位符，有则决定适配脚本或标记待处理。
    - 分派翻译前，用原始 HTML/PDF 独立统计标题、图片、代码块、块级公式和脚注等关键结构，并与解析产物逐项对账；新源家族先用代表页校准解析器，未解释的缺失或顺序变化必须停止。
@@ -55,28 +55,28 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
    - 对需要合并的产物，只做围栏感知的拼接或结构调整，禁止不感知围栏的全局空白压缩；按最终交付路径重新运行全量校验。
 7. **术语合并与交付**
    - 主 Agent 逐条裁决候选术语后集中写入 `术语表.md` 与最终文件；未经裁决的候选不得自动入库。
-   - 已通过项目验收且拟回流共享库的术语，使用 `../../scripts/consolidate_glossaries.py --baseline <共享库> --draft <工作区外草稿> --report <工作区外报告> <项目术语表>` 核算。只将经人工批准的无冲突候选写入共享库；候选不能静默覆盖已有默认值。
+   - 已通过项目验收且拟回流共享库的术语，使用 `<SKILL目录>/scripts/consolidate_glossaries.py --baseline <共享库> --draft <工作区外草稿> --report <工作区外报告> <项目术语表>` 核算。只将经人工批准的无冲突候选写入共享库；候选不能静默覆盖已有默认值。
    - 主 Agent 集中把图片下载到交付目录的 `images/` 并运行 `file`；多页面 API 合并器会把本地快照中的页面相对图片集中复制到最终产物旁的 `images/`，同名不同内容时停止。
    - 验收必须针对用户指定的实际交付路径；临时目录只承载回归过程，不能替代实际产物证据。
    - 交付说明：源版本、产物、术语变化、验证结论、模型/token/墙钟时间（可获得时；不可获得时标注未知）。验证结论分别标明“硬不变量通过”“源文全量对账完成”和“语义复核完成”；未闭合页面发现或未与独立官方 TOC 对账的多页面文档不得标为后两者已完成。
 
 ## 源家族判断（首版）
 
-脚本与规则位于模块根目录下 `scripts/`、`rules/`；从本 Skill 出发的相对路径为 `../../scripts/...`、`../../rules/...`。
+脚本位于 `<SKILL目录>/scripts/`，翻译约定与共享词库位于 `<SKILL目录>/references/`。
 
 | 源特征 | 工具 |
 |---|---|
-| 单页 HTML，含 `<article>` / `<main>` / `<body>` 与常规章节 | `../../scripts/parse_single_page_html.py <html> [section_id] <out.md>` |
-| 分页、代码密集型 HTML（多页/多节，需围栏拼接） | `../../scripts/parse_paginated_html.py page1.html page2.html ...` → `splice_fences.py` → `merge_sections.py` |
-| 数学密集或深层嵌套参考手册 | `../../scripts/parse_reference_html.py <html> <out.md>` |
-| 多页面 API/DSL 文档 | `../../scripts/discover_pages.py <site/index.html>` → `parse_api_html.py` → `merge_api.py`；页面清单必须与**独立的官方 TOC/导航快照**逐项对账，manifest 交付顺序按官方 TOC 重排（`discover_pages` 的字典序输出只用于集合发现，不作为交付顺序） |
+| 单页 HTML，含 `<article>` / `<main>` / `<body>` 与常规章节 | `<SKILL目录>/scripts/parse_single_page_html.py <html> [section_id] <out.md>` |
+| 分页、代码密集型 HTML（多页/多节，需围栏拼接） | `<SKILL目录>/scripts/parse_paginated_html.py page1.html page2.html ...` → `splice_fences.py` → `merge_sections.py` |
+| 数学密集或深层嵌套参考手册 | `<SKILL目录>/scripts/parse_reference_html.py <html> <out.md>` |
+| 多页面 API/DSL 文档 | `<SKILL目录>/scripts/discover_pages.py <site/index.html>` → `parse_api_html.py` → `merge_api.py`；页面清单必须与**独立的官方 TOC/导航快照**逐项对账，manifest 交付顺序按官方 TOC 重排（`discover_pages` 的字典序输出只用于集合发现，不作为交付顺序） |
 | 扫描版 PDF | 仅当用户明确要求且使用宿主 OCR 工具 |
 
 工作包编排：
-- 拆分：`../../scripts/split_work_packages.py <source.md> <wps_dir> <trans_dir>`
-- 合并译文：`../../scripts/merge_work_packages.py <out.md> <wp_*.md>...`
-- 合并术语：`../../scripts/merge_glossary.py <术语表.md> <out.md> <conflicts.md> [--approve 批准词表.txt] [--pending 待定.md] <candidates*.md>`；只有列入批准词表的候选才写入，其余进入待定文件
-- 恢复：`../../scripts/recover_work_packages.py <source.md> <wps_dir> [trans_dir]`；校验失败、计数不符或无法独立验证的工作包一律判为需重做，不降级复用
+- 拆分：`<SKILL目录>/scripts/split_work_packages.py <source.md> <wps_dir> <trans_dir>`
+- 合并译文：`<SKILL目录>/scripts/merge_work_packages.py <out.md> <wp_*.md>...`
+- 合并术语：`<SKILL目录>/scripts/merge_glossary.py <术语表.md> <out.md> <conflicts.md> [--approve 批准词表.txt] [--pending 待定.md] <candidates*.md>`；只有列入批准词表的候选才写入，其余进入待定文件
+- 恢复：`<SKILL目录>/scripts/recover_work_packages.py <source.md> <wps_dir> [trans_dir]`；校验失败、计数不符或无法独立验证的工作包一律判为需重做，不降级复用
 
 ### 工作包任务模板
 

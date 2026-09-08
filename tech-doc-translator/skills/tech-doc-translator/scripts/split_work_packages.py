@@ -18,15 +18,18 @@ strategy:
     每个文件头部写入上下文块（YAML frontmatter），包含：
       - source_file / target_file / source_order
       - content_blocks: headings, paragraphs, list_items, code_fences
-      - rules_path（指向 tech-doc-translator/rules/translation_conventions.md）
+      - rules_path（指向翻译约定的绝对路径，按脚本自身位置解析，
+        无论从源码仓库还是已安装 Skill 调用都可读）
       - section_id / fragment_index / source_order（同一小节拆分片段时）
 """
 import sys
 import os
 import re
 import math
+from pathlib import Path
 
-_RULES_PATH = "tech-doc-translator/rules/translation_conventions.md"
+_SKILL_DIR = Path(__file__).resolve().parent.parent
+_RULES_PATH = str(_SKILL_DIR / "references" / "translation_conventions.md")
 
 
 def _parse_sections(doc):

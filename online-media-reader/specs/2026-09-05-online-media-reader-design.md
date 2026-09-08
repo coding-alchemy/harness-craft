@@ -12,6 +12,9 @@
 | 对应需求 | [报告优化需求](./2026-09-05-online-media-reader-requirements.md) V0.1 |
 | 既有基线 | [在线媒体文字读取 Skill 设计](./2026-09-01-online-media-reader-design.md) V0.6（已批准，原文保留） |
 
+> 路径说明：2026-09-08 起本模块的 Skill 运行时收拢到 `online-media-reader/skills/online-media-reader/`；正文中的模块根相对路径（如 `scripts/`、`agents/`、`SKILL.md`）为迁移前布局记录，行为约定不变。
+
+
 ## 1. 本次目标与文档边界
 
 本次实现需求中的三项优化：将“完整连续字幕”改名为“原始字幕”并增加有排版和标点的“完整字幕”；根据原始字幕形成详细完整、适合阅读的“完整版内容”；提炼“一句话概括”，按用户指定顺序组织报告。
