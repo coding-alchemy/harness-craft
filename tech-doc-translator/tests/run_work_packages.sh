@@ -2,7 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-ROOT=".."
+ROOT="../skills/tech-doc-translator"
 SPLIT="$ROOT/scripts/split_work_packages.py"
 MERGE_WP="$ROOT/scripts/merge_work_packages.py"
 MERGE_GLOSSARY="$ROOT/scripts/merge_glossary.py"
@@ -46,7 +46,7 @@ EOF
 echo "==> 失败回归：粗体和表格分隔行不得误计为列表项"
 python3 - <<'PY'
 import sys
-sys.path.insert(0, '../scripts')
+sys.path.insert(0, '../skills/tech-doc-translator/scripts')
 import recover_work_packages as recover
 import split_work_packages as split
 
@@ -64,6 +64,13 @@ ls "$TMP/wps"
 echo "==> 检查 frontmatter target_file 指向独立译文目录"
 grep -q "target_file: $TMP/trans/wp_001.md" "$TMP/wps/wp_001.md" \
   || { echo "target_file 未指向独立译文目录"; exit 1; }
+
+echo "==> 检查 frontmatter rules_path 从任意 cwd 都可解析"
+RULES_PATH=$(sed -n 's/^rules_path: //p' "$TMP/wps/wp_001.md" | head -1)
+if [ -z "$RULES_PATH" ] || [ ! -f "$RULES_PATH" ]; then
+    echo "rules_path 无法解析为已存在的翻译约定文件: $RULES_PATH"
+    exit 1
+fi
 
 # 辅助函数：保留原 frontmatter，将 body_file 写入独立译文目标
 write_translation() {

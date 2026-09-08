@@ -2,8 +2,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-PARSE="../scripts/parse_reference_html.py"
-VERIFY="../scripts/verify_reference_translation.py"
+PARSE="../skills/tech-doc-translator/scripts/parse_reference_html.py"
+VERIFY="../skills/tech-doc-translator/scripts/verify_reference_translation.py"
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT

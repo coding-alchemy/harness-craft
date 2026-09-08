@@ -3,10 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PARSE="../scripts/parse_paginated_html.py"
-SPLICE="../scripts/splice_fences.py"
-MERGE="../scripts/merge_sections.py"
-VERIFY="../scripts/verify_paginated_translation.py"
+PARSE="../skills/tech-doc-translator/scripts/parse_paginated_html.py"
+SPLICE="../skills/tech-doc-translator/scripts/splice_fences.py"
+MERGE="../skills/tech-doc-translator/scripts/merge_sections.py"
+VERIFY="../skills/tech-doc-translator/scripts/verify_paginated_translation.py"
 
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT

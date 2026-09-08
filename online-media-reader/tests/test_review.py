@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-MODULE_DIR = Path(__file__).resolve().parent.parent
+MODULE_DIR = Path(__file__).resolve().parent.parent / "skills" / "online-media-reader"
 ENTRY = MODULE_DIR / "scripts" / "read.py"
 REVIEW_ENTRY = MODULE_DIR / "scripts" / "review.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"

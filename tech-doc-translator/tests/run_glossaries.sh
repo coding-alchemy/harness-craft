@@ -2,8 +2,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-SCRIPT="scripts/consolidate_glossaries.py"
-SELECT="scripts/select_glossary.py"
+SCRIPT="skills/tech-doc-translator/scripts/consolidate_glossaries.py"
+SELECT="skills/tech-doc-translator/scripts/select_glossary.py"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -169,7 +169,7 @@ cat > "$TMP/leading-dimension-project.md" <<'EOF'
 | leading dimension | leading dimension | 保留英文 | 3.3.1 |
 EOF
 python3 "$SELECT" --source "$TMP/leading-dimension-source.md" \
-  --library glossaries/nvidia.md --project "$TMP/leading-dimension-project.md" \
+  --library skills/tech-doc-translator/references/glossaries/nvidia.md --project "$TMP/leading-dimension-project.md" \
   --output "$TMP/leading-dimension-subset.md"
 grep -q '| leading dimension | leading dimension | 英文 |' "$TMP/leading-dimension-subset.md"
 grep -q '项目覆盖:.*leading-dimension-project.md.*leading dimension.*nvidia.md' \

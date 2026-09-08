@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-MODULE_DIR = Path(__file__).resolve().parent.parent
+MODULE_DIR = Path(__file__).resolve().parent.parent / "skills" / "online-media-reader"
 SCRIPTS = MODULE_DIR / "scripts"
 ENTRY = SCRIPTS / "read.py"
 
