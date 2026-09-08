@@ -80,14 +80,14 @@ INCOMPLETE_FIXTURE = {
 }
 
 
-def write_fixture(tmp_path, name, data):
-    path = tmp_path / name
+def write_fixture(work_root, name, data):
+    path = work_root / name
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     return str(path)
 
 
-def make_fakes(tmp_path):
-    bindir = tmp_path / "bin"
+def make_fakes(work_root):
+    bindir = work_root / "bin"
     bindir.mkdir(exist_ok=True)
     for name, body in [
         ("yt-dlp", FAKE_YTDLP),
@@ -101,7 +101,7 @@ def make_fakes(tmp_path):
     return bindir
 
 
-def run_entry(url, output, tmp_path, fixture=None, extra_args=None, fakes=True, calllog=None):
+def run_entry(url, output, work_root, fixture=None, extra_args=None, fakes=True, calllog=None):
     env = dict(os.environ)
     env.pop("OMR_FIXTURE", None)
     env.pop("OMR_WHISPER_BIN", None)
@@ -109,90 +109,90 @@ def run_entry(url, output, tmp_path, fixture=None, extra_args=None, fakes=True, 
     if fixture is not None:
         env["OMR_FIXTURE"] = fixture
     if fakes:
-        bindir = make_fakes(tmp_path)
+        bindir = make_fakes(work_root)
         env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
         env["OMR_WHISPER_BIN"] = str(bindir / "fake-whisper")
         env["OMR_OCR_BIN"] = str(bindir / "fake-ocr")
-        log = calllog or (tmp_path / "calls.log")
+        log = calllog or (work_root / "calls.log")
         env["OMR_CALLLOG"] = str(log)
     return subprocess.run(
         [sys.executable, str(ENTRY), url, "--output", str(output)] + (extra_args or []),
         capture_output=True,
         text=True,
         env=env,
-        cwd=tmp_path,
+        cwd=work_root,
     )
 
 
-def calls(tmp_path):
-    log = tmp_path / "calls.log"
+def calls(work_root):
+    log = work_root / "calls.log"
     if not log.exists():
         return []
     return [line for line in log.read_text().splitlines() if line.strip()]
 
 
-def test_reliable_subtitle_used_without_download(tmp_path):
-    out = tmp_path / "out.md"
+def test_reliable_subtitle_used_without_download(work_root):
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.bilibili.com/video/BV1sample00",
         out,
-        tmp_path,
+        work_root,
         fixture=str(FIXTURES / "bilibili_subtitle.json"),
     )
     assert result.returncode == 0, result.stderr
     text = out.read_text(encoding="utf-8")
     assert "人工字幕" in text
     assert "处理路径：人工字幕" in text
-    assert calls(tmp_path) == []
-    assert list(tmp_path.glob("*.mp4")) == list(tmp_path.glob("*.m4a")) == []
+    assert calls(work_root) == []
+    assert list(work_root.glob("*.mp4")) == list(work_root.glob("*.m4a")) == []
 
 
-def test_missing_subtitle_triggers_asr(tmp_path):
-    fixture = write_fixture(tmp_path, "no_subs.json", ASR_FIXTURE)
-    out = tmp_path / "out.md"
-    result = run_entry("https://www.bilibili.com/video/BV1noSubs0", out, tmp_path, fixture=fixture)
+def test_missing_subtitle_triggers_asr(work_root):
+    fixture = write_fixture(work_root, "no_subs.json", ASR_FIXTURE)
+    out = work_root / "out.md"
+    result = run_entry("https://www.bilibili.com/video/BV1noSubs0", out, work_root, fixture=fixture)
     assert result.returncode == 0, result.stderr
     text = out.read_text(encoding="utf-8")
     assert "语音转写（ASR）" in text
     assert "处理路径：语音转写（ASR）" in text
     assert "转写第一句。" in text
     assert "00:00:04" in text
-    invoked = calls(tmp_path)
+    invoked = calls(work_root)
     assert any(c.startswith("yt-dlp") for c in invoked)
     assert any(c.startswith("whisper") for c in invoked)
     # 无 --keep-media：不残留媒体
-    assert list(tmp_path.glob("*.mp4")) == []
+    assert list(work_root.glob("*.mp4")) == []
 
 
-def test_asr_renders_continuous_and_timed_transcripts(tmp_path):
-    fixture = write_fixture(tmp_path, "no_subs_cont.json", ASR_FIXTURE)
-    out = tmp_path / "out.md"
-    result = run_entry("https://www.bilibili.com/video/BV1noSubs0", out, tmp_path, fixture=fixture)
+def test_asr_renders_continuous_and_timed_transcripts(work_root):
+    fixture = write_fixture(work_root, "no_subs_cont.json", ASR_FIXTURE)
+    out = work_root / "out.md"
+    result = run_entry("https://www.bilibili.com/video/BV1noSubs0", out, work_root, fixture=fixture)
     assert result.returncode == 0, result.stderr
     text = out.read_text(encoding="utf-8")
-    assert "## 完整连续字幕\n\n转写第一句。转写第二句。\n\n" in text
+    assert "## 原始字幕\n\n转写第一句。转写第二句。\n\n" in text
     assert "- [00:00:04 → 00:00:09] 转写第二句。" in text
 
 
-def test_verify_audio_renders_single_continuous_transcript_from_first_track(tmp_path):
-    out = tmp_path / "out.md"
+def test_verify_audio_renders_single_continuous_transcript_from_first_track(work_root):
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.bilibili.com/video/BV1sample00",
         out,
-        tmp_path,
+        work_root,
         fixture=str(FIXTURES / "bilibili_subtitle.json"),
         extra_args=["--verify-audio"],
     )
     assert result.returncode == 0, result.stderr
     text = out.read_text(encoding="utf-8")
-    assert text.count("## 完整连续字幕") == 1
-    assert "## 完整连续字幕\n\n第一句固定样本字幕。第二句固定样本字幕。\n\n" in text
+    assert text.count("## 原始字幕") == 1
+    assert "## 原始字幕\n\n第一句固定样本字幕。第二句固定样本字幕。\n\n" in text
 
 
-def test_incomplete_subtitle_lists_original_and_warns(tmp_path):
-    fixture = write_fixture(tmp_path, "partial.json", INCOMPLETE_FIXTURE)
-    out = tmp_path / "out.md"
-    result = run_entry("https://www.bilibili.com/video/BV1partial0", out, tmp_path, fixture=fixture)
+def test_incomplete_subtitle_lists_original_and_warns(work_root):
+    fixture = write_fixture(work_root, "partial.json", INCOMPLETE_FIXTURE)
+    out = work_root / "out.md"
+    result = run_entry("https://www.bilibili.com/video/BV1partial0", out, work_root, fixture=fixture)
     assert result.returncode == 0, result.stderr
     text = out.read_text(encoding="utf-8")
     assert "处理路径：语音转写（ASR）" in text
@@ -203,12 +203,12 @@ def test_incomplete_subtitle_lists_original_and_warns(tmp_path):
     assert text.index("转写第一句。") < text.index("仅有的少量自动字幕。")
 
 
-def test_keep_media_downloads_without_asr(tmp_path):
-    out = tmp_path / "out.md"
+def test_keep_media_downloads_without_asr(work_root):
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.bilibili.com/video/BV1sample00",
         out,
-        tmp_path,
+        work_root,
         fixture=str(FIXTURES / "bilibili_subtitle.json"),
         extra_args=["--keep-media"],
     )
@@ -216,19 +216,19 @@ def test_keep_media_downloads_without_asr(tmp_path):
     text = out.read_text(encoding="utf-8")
     assert "处理路径：人工字幕" in text
     assert "ASR" not in text
-    invoked = calls(tmp_path)
+    invoked = calls(work_root)
     assert any(c.startswith("yt-dlp") for c in invoked)
     assert not any(c.startswith("whisper") for c in invoked)
     run_dir = Path(json.loads(result.stdout)["run_dir"])
     assert (run_dir / "artifacts" / "source.mp4").is_file()
 
 
-def test_verify_audio_transcribes_reliable_subtitle_without_keeping_media(tmp_path):
-    out = tmp_path / "out.md"
+def test_verify_audio_transcribes_reliable_subtitle_without_keeping_media(work_root):
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.bilibili.com/video/BV1sample00",
         out,
-        tmp_path,
+        work_root,
         fixture=str(FIXTURES / "bilibili_subtitle.json"),
         extra_args=["--verify-audio"],
     )
@@ -237,13 +237,13 @@ def test_verify_audio_transcribes_reliable_subtitle_without_keeping_media(tmp_pa
     assert "处理路径：人工字幕 + 原音核验（ASR）" in text
     assert text.index("第一句固定样本字幕。") < text.index("转写第一句。")
     assert "在线字幕与转写结果可能存在实质差异" in text
-    invoked = calls(tmp_path)
+    invoked = calls(work_root)
     assert any(c.startswith("yt-dlp") for c in invoked)
     assert any(c.startswith("whisper") for c in invoked)
-    assert not [p for p in tmp_path.iterdir() if p.suffix in (".mp4", ".m4a", ".wav")]
+    assert not [p for p in work_root.iterdir() if p.suffix in (".mp4", ".m4a", ".wav")]
 
 
-def test_verify_audio_keeps_reliable_subtitle_when_asr_is_empty(monkeypatch, tmp_path):
+def test_verify_audio_keeps_reliable_subtitle_when_asr_is_empty(monkeypatch, work_root):
     import sys as _sys
 
     _sys.path.insert(0, str(MODULE_DIR / "scripts"))
@@ -271,19 +271,19 @@ def test_verify_audio_keeps_reliable_subtitle_when_asr_is_empty(monkeypatch, tmp
     monkeypatch.setattr(pipeline.media, "extract_audio", lambda a, b: b.write_bytes(b"x"))
     monkeypatch.setattr(pipeline.media, "transcribe_audio", lambda a, m, **kwargs: [])
 
-    pipeline.process(manifest, tmp_path, tmp_path / "artifacts", verify_audio=True)
+    pipeline.process(manifest, work_root, work_root / "artifacts", verify_audio=True)
 
     assert [track.kind for track in manifest.subtitle_tracks] == ["manual"]
     assert manifest.processing_path == "人工字幕（原音核验无结果）"
 
 
-def test_keep_media_saves_media_even_with_unreliable_subtitle(tmp_path):
-    fixture = write_fixture(tmp_path, "partial_keep.json", dict(INCOMPLETE_FIXTURE, cookie_file=None))
-    out = tmp_path / "keep.md"
+def test_keep_media_saves_media_even_with_unreliable_subtitle(work_root):
+    fixture = write_fixture(work_root, "partial_keep.json", dict(INCOMPLETE_FIXTURE, cookie_file=None))
+    out = work_root / "keep.md"
     result = run_entry(
         "https://www.bilibili.com/video/BV1partial0",
         out,
-        tmp_path,
+        work_root,
         fixture=fixture,
         extra_args=["--keep-media"],
     )
@@ -294,14 +294,14 @@ def test_keep_media_saves_media_even_with_unreliable_subtitle(tmp_path):
     assert (run_dir / "artifacts" / "source.mp4").is_file()
 
 
-def test_cookie_file_deleted_after_media_located(monkeypatch, tmp_path):
+def test_cookie_file_deleted_after_media_located(monkeypatch, work_root):
     import sys as _sys
 
     _sys.path.insert(0, str(MODULE_DIR / "scripts"))
     from omr import pipeline
     from omr.model import ContentManifest
 
-    cookie = tmp_path / "cookies.txt"
+    cookie = work_root / "cookies.txt"
     cookie.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
     manifest = ContentManifest(
         platform="douyin",
@@ -326,20 +326,20 @@ def test_cookie_file_deleted_after_media_located(monkeypatch, tmp_path):
     monkeypatch.setattr(
         pipeline.media, "extract_frame", lambda *_args: _args[2].write_bytes(b"frame")
     )
-    pipeline.process(manifest, tmp_path, tmp_path / "artifacts")
+    pipeline.process(manifest, work_root, work_root / "artifacts")
     assert saved["cookies"] == str(cookie), "yt-dlp 应收到匿名 Cookie"
     assert not cookie.exists(), "媒体定位完成后 Cookie 应尽早删除"
     assert manifest.cookie_file is None
 
 
-def test_douyin_media_branch_creates_cookie_on_demand(monkeypatch, tmp_path):
+def test_douyin_media_branch_creates_cookie_on_demand(monkeypatch, work_root):
     import sys as _sys
 
     _sys.path.insert(0, str(MODULE_DIR / "scripts"))
     from omr import pipeline
     from omr.model import ContentManifest
 
-    cookie = tmp_path / "cookies.txt"
+    cookie = work_root / "cookies.txt"
     manifest = ContentManifest(
         platform="douyin",
         original_url="u",
@@ -368,7 +368,7 @@ def test_douyin_media_branch_creates_cookie_on_demand(monkeypatch, tmp_path):
         lambda a, m, **kwargs: [{"start": 0.0, "end": 5.0, "text": "转写句。"}],
     )
 
-    pipeline.process(manifest, tmp_path, tmp_path / "artifacts")
+    pipeline.process(manifest, work_root, work_root / "artifacts")
 
     assert used == {
         "cookie_url": manifest.canonical_url,
@@ -377,7 +377,7 @@ def test_douyin_media_branch_creates_cookie_on_demand(monkeypatch, tmp_path):
     assert not cookie.exists()
 
 
-def test_douyin_direct_media_does_not_require_browser(monkeypatch, tmp_path):
+def test_douyin_direct_media_does_not_require_browser(monkeypatch, work_root):
     import sys as _sys
 
     _sys.path.insert(0, str(MODULE_DIR / "scripts"))
@@ -419,12 +419,12 @@ def test_douyin_direct_media_does_not_require_browser(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: [{"start": 0, "end": 1, "text": "正文"}],
     )
 
-    pipeline.process(manifest, tmp_path, tmp_path / "artifacts")
+    pipeline.process(manifest, work_root, work_root / "artifacts")
 
     assert manifest.processing_path == "语音转写（ASR）"
 
 
-def test_blank_asr_segments_are_treated_as_no_result(monkeypatch, tmp_path):
+def test_blank_asr_segments_are_treated_as_no_result(monkeypatch, work_root):
     import sys as _sys
 
     _sys.path.insert(0, str(MODULE_DIR / "scripts"))
@@ -454,29 +454,29 @@ def test_blank_asr_segments_are_treated_as_no_result(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: [{"start": 0, "end": 1, "text": "   "}],
     )
 
-    pipeline.process(manifest, tmp_path, tmp_path / "artifacts")
+    pipeline.process(manifest, work_root, work_root / "artifacts")
 
     assert manifest.subtitle_tracks == []
     assert manifest.processing_path == "未获得文字（转写无结果）"
     assert manifest.cookie_file is None
 
 
-def test_missing_dependency_fails_only_when_needed(tmp_path):
-    out = tmp_path / "out.md"
+def test_missing_dependency_fails_only_when_needed(work_root):
+    out = work_root / "out.md"
     # 字幕可靠：无下载依赖也应成功
     result = run_entry(
         "https://www.bilibili.com/video/BV1sample00",
         out,
-        tmp_path,
+        work_root,
         fixture=str(FIXTURES / "bilibili_subtitle.json"),
         fakes=False,
     )
     assert result.returncode == 0, result.stderr
     # 需要下载但 PATH 中没有 yt-dlp：明确失败并指出缺失能力
-    fixture = write_fixture(tmp_path, "no_subs2.json", ASR_FIXTURE)
-    empty_bin = tmp_path / "emptybin"
+    fixture = write_fixture(work_root, "no_subs2.json", ASR_FIXTURE)
+    empty_bin = work_root / "emptybin"
     empty_bin.mkdir()
-    out2 = tmp_path / "out2.md"
+    out2 = work_root / "out2.md"
     env_clean = dict(os.environ)
     env_clean["PATH"] = str(empty_bin)
     env_clean["OMR_FIXTURE"] = fixture
@@ -484,32 +484,32 @@ def test_missing_dependency_fails_only_when_needed(tmp_path):
     result = subprocess.run(
         [sys.executable, str(ENTRY), "https://www.bilibili.com/video/BV1noSubs0",
          "--output", str(out2)],
-        capture_output=True, text=True, env=env_clean, cwd=tmp_path,
+        capture_output=True, text=True, env=env_clean, cwd=work_root,
     )
     assert result.returncode == 3
     assert "yt-dlp" in result.stderr
     assert not out2.exists()
 
 
-def test_chinese_asr_receives_language_and_page_context(tmp_path):
-    fixture = write_fixture(tmp_path, "zh-context.json", ASR_FIXTURE)
-    out = tmp_path / "out.md"
+def test_chinese_asr_receives_language_and_page_context(work_root):
+    fixture = write_fixture(work_root, "zh-context.json", ASR_FIXTURE)
+    out = work_root / "out.md"
 
     result = run_entry(
         "https://www.bilibili.com/video/BV1noSubs0",
         out,
-        tmp_path,
+        work_root,
         fixture=fixture,
     )
 
     assert result.returncode == 0, result.stderr
-    whisper = next(c for c in calls(tmp_path) if c.startswith("whisper"))
+    whisper = next(c for c in calls(work_root) if c.startswith("whisper"))
     assert "--language zh" in whisper
     assert "--initial-prompt" in whisper
     assert "固定样本：无字幕视频" in whisper
     assert "示例UP主" in whisper
     assert "--download-root" in whisper
-    assert str(tmp_path / ".media" / "tools" / "faster-whisper") in whisper
+    assert str(work_root / ".media" / "tools" / "faster-whisper") in whisper
 
 
 def test_whisper_dependency_check_does_not_require_downloader(monkeypatch):
@@ -520,7 +520,7 @@ def test_whisper_dependency_check_does_not_require_downloader(monkeypatch):
     media.require_transcribe_deps()
 
 
-def test_whisper_runner_forwards_language_and_prompt(monkeypatch, capsys, tmp_path):
+def test_whisper_runner_forwards_language_and_prompt(monkeypatch, capsys, work_root):
     from omr import whisper_runner
 
     received = {}
@@ -553,7 +553,7 @@ def test_whisper_runner_forwards_language_and_prompt(monkeypatch, capsys, tmp_pa
             "audio.wav",
             "small",
             "--download-root",
-            str(tmp_path / ".media" / "tools" / "faster-whisper"),
+            str(work_root / ".media" / "tools" / "faster-whisper"),
             "--language",
             "zh",
             "--initial-prompt",
@@ -565,7 +565,7 @@ def test_whisper_runner_forwards_language_and_prompt(monkeypatch, capsys, tmp_pa
 
     assert received == {
         "model": "small",
-        "download_root": str(tmp_path / ".media" / "tools" / "faster-whisper"),
+        "download_root": str(work_root / ".media" / "tools" / "faster-whisper"),
         "audio": "audio.wav",
         "language": "zh",
         "initial_prompt": "标题：舆情监测；作者：书醒时刻",

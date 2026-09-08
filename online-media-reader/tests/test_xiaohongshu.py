@@ -40,10 +40,10 @@ VIDEO_FIXTURE = {
 }
 
 
-def gallery_fixture(tmp_path):
-    img1 = tmp_path / "img1.txt"
+def gallery_fixture(work_root):
+    img1 = work_root / "img1.txt"
     img1.write_text("第一张图片 中英文 OCR 文本", encoding="utf-8")
-    img2 = tmp_path / "img2.txt"
+    img2 = work_root / "img2.txt"
     img2.write_text("\n", encoding="utf-8")
     return {
         "platform": "xiaohongshu",
@@ -64,14 +64,14 @@ def gallery_fixture(tmp_path):
     }
 
 
-def test_gallery_ocr_in_order_with_empty_marker(tmp_path):
-    fixture = tmp_path / "gallery.json"
-    fixture.write_text(json.dumps(gallery_fixture(tmp_path), ensure_ascii=False), encoding="utf-8")
-    out = tmp_path / "out.md"
+def test_gallery_ocr_in_order_with_empty_marker(work_root):
+    fixture = work_root / "gallery.json"
+    fixture.write_text(json.dumps(gallery_fixture(work_root), ensure_ascii=False), encoding="utf-8")
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.xiaohongshu.com/explore/65galler000000000000gal0",
         out,
-        tmp_path,
+        work_root,
         fixture=str(fixture),
     )
     assert result.returncode == 0, result.stderr
@@ -85,14 +85,14 @@ def test_gallery_ocr_in_order_with_empty_marker(tmp_path):
     assert "画面" not in text
 
 
-def test_video_uses_shared_asr_without_ocr_dependency(tmp_path):
-    fixture = tmp_path / "video.json"
+def test_video_uses_shared_asr_without_ocr_dependency(work_root):
+    fixture = work_root / "video.json"
     fixture.write_text(json.dumps(VIDEO_FIXTURE, ensure_ascii=False), encoding="utf-8")
-    out = tmp_path / "out.md"
+    out = work_root / "out.md"
     env_result = run_entry(
         "https://www.xiaohongshu.com/explore/65video000000000000vide0",
         out,
-        tmp_path,
+        work_root,
         fixture=str(fixture),
     )
     assert env_result.returncode == 0, env_result.stderr
@@ -100,28 +100,28 @@ def test_video_uses_shared_asr_without_ocr_dependency(tmp_path):
     assert "处理路径：语音转写（ASR）" in text
     assert "转写第一句。" in text
     # 视频分支不需要 OCR：OCR 命令未被调用
-    assert not any(c.startswith("ocr") for c in calls(tmp_path))
+    assert not any(c.startswith("ocr") for c in calls(work_root))
 
 
-def test_missing_paddleocr_fails_image_branch_only(tmp_path):
-    fixture = tmp_path / "gallery.json"
-    fixture.write_text(json.dumps(gallery_fixture(tmp_path), ensure_ascii=False), encoding="utf-8")
-    out = tmp_path / "out.md"
+def test_missing_paddleocr_fails_image_branch_only(work_root):
+    fixture = work_root / "gallery.json"
+    fixture.write_text(json.dumps(gallery_fixture(work_root), ensure_ascii=False), encoding="utf-8")
+    out = work_root / "out.md"
     # 不提供假 OCR（OMR_OCR_BIN 未设置，宿主机也无 paddleocr 时失败并指出能力）
     env = dict(os.environ)
     env["OMR_FIXTURE"] = str(fixture)
     env.pop("OMR_OCR_BIN", None)
     from test_video_pipeline import make_fakes
-    bindir = make_fakes(tmp_path)
+    bindir = make_fakes(work_root)
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["OMR_WHISPER_BIN"] = str(bindir / "fake-whisper")
-    env["OMR_CALLLOG"] = str(tmp_path / "calls.log")
+    env["OMR_CALLLOG"] = str(work_root / "calls.log")
     result = subprocess.run(
         [sys.executable, str(ENTRY),
          "https://www.xiaohongshu.com/explore/65galler000000000000gal0",
          "--output", str(out)],
         capture_output=True, text=True, env=env,
-        cwd=tmp_path,
+        cwd=work_root,
     )
     try:
         import paddleocr  # noqa: F401
@@ -144,7 +144,7 @@ def test_initial_state_fail_closed_on_restrictions():
             raise AssertionError(f"含 {marker} 的页面应失败关闭")
 
 
-def test_ssr_image_list_maps_to_ordered_image_items(monkeypatch, tmp_path):
+def test_ssr_image_list_maps_to_ordered_image_items(monkeypatch, work_root):
     note_id = "65abcdef0123456789abcdef"
     state = {
         "note": {
@@ -185,7 +185,7 @@ def test_ssr_image_list_maps_to_ordered_image_items(monkeypatch, tmp_path):
     )
 
     manifest = xhs_adapter.fetch(
-        f"https://www.xiaohongshu.com/explore/{note_id}", tmp_path
+        f"https://www.xiaohongshu.com/explore/{note_id}", work_root
     )
 
     assert [item.index for item in manifest.image_items] == [1, 2]
@@ -197,7 +197,7 @@ def test_ssr_image_list_maps_to_ordered_image_items(monkeypatch, tmp_path):
 
 
 def test_image_gallery_without_images_is_reported_as_extraction_failure(
-    monkeypatch, tmp_path
+    monkeypatch, work_root
 ):
     note_id = "65abcdef0123456789abcdea"
     state = {
@@ -218,14 +218,14 @@ def test_image_gallery_without_images_is_reported_as_extraction_failure(
 
     with pytest.raises(OMRError, match="未返回图片"):
         xhs_adapter.fetch(
-            f"https://www.xiaohongshu.com/explore/{note_id}", tmp_path
+            f"https://www.xiaohongshu.com/explore/{note_id}", work_root
         )
 
 
-def test_entry_does_not_render_after_restriction(monkeypatch, tmp_path):
+def test_entry_does_not_render_after_restriction(monkeypatch, work_root):
     import read as read_entry
 
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(work_root)
     monkeypatch.delenv("OMR_FIXTURE", raising=False)
     monkeypatch.setattr(
         xhs_adapter,
@@ -238,7 +238,7 @@ def test_entry_does_not_render_after_restriction(monkeypatch, tmp_path):
 
     monkeypatch.setattr(xhs_adapter.browser_session, "render_state", unexpected_render)
 
-    out = tmp_path / "restricted.md"
+    out = work_root / "restricted.md"
     result = read_entry.main(
         [
             "https://www.xiaohongshu.com/explore/65galler000000000000gal0",
@@ -252,7 +252,7 @@ def test_entry_does_not_render_after_restriction(monkeypatch, tmp_path):
 
 
 def test_browser_fallback_fails_closed_when_rendered_page_requires_login(
-    monkeypatch, tmp_path
+    monkeypatch, work_root
 ):
     note_id = "65abcdef0123456789abcded"
     monkeypatch.setattr(
@@ -277,12 +277,12 @@ def test_browser_fallback_fails_closed_when_rendered_page_requires_login(
 
     with pytest.raises(OMRError, match="扫码登录"):
         xhs_adapter.fetch(
-            f"https://www.xiaohongshu.com/explore/{note_id}", tmp_path
+            f"https://www.xiaohongshu.com/explore/{note_id}", work_root
         )
 
 
 def test_probe_only_browser_fallback_uses_remaining_30_second_budget(
-    monkeypatch, tmp_path
+    monkeypatch, work_root
 ):
     note_id = "65abcdef0123456789abcdec"
 
@@ -322,7 +322,7 @@ def test_probe_only_browser_fallback_uses_remaining_30_second_budget(
 
     manifest = xhs_adapter.fetch(
         f"https://www.xiaohongshu.com/explore/{note_id}",
-        tmp_path,
+        work_root,
         probe_only=True,
     )
 
@@ -331,17 +331,17 @@ def test_probe_only_browser_fallback_uses_remaining_30_second_budget(
     assert manifest.subtitle_probe.status == "absent"
 
 
-def test_image_download_failure_is_reported_without_traceback(tmp_path):
-    data = gallery_fixture(tmp_path)
-    data["image_items"][0]["url"] = (tmp_path / "missing.webp").as_uri()
-    fixture = tmp_path / "missing-image.json"
+def test_image_download_failure_is_reported_without_traceback(work_root):
+    data = gallery_fixture(work_root)
+    data["image_items"][0]["url"] = (work_root / "missing.webp").as_uri()
+    fixture = work_root / "missing-image.json"
     fixture.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    out = tmp_path / "out.md"
+    out = work_root / "out.md"
 
     result = run_entry(
         "https://www.xiaohongshu.com/explore/65galler000000000000gal0",
         out,
-        tmp_path,
+        work_root,
         fixture=str(fixture),
     )
 
@@ -351,10 +351,10 @@ def test_image_download_failure_is_reported_without_traceback(tmp_path):
     assert not out.exists()
 
 
-def test_ocr_runner_uses_run_workdir_and_local_model_cache(tmp_path):
-    image = tmp_path / "source.webp"
+def test_ocr_runner_uses_run_workdir_and_local_model_cache(work_root):
+    image = work_root / "source.webp"
     image.write_bytes(b"fake image")
-    fake_modules = tmp_path / "fake-modules"
+    fake_modules = work_root / "fake-modules"
     fake_modules.mkdir()
     (fake_modules / "paddleocr.py").write_text(
         textwrap.dedent(
@@ -385,6 +385,9 @@ def test_ocr_runner_uses_run_workdir_and_local_model_cache(tmp_path):
         textwrap.dedent(
             """
             class FakeImage:
+                width = 10
+                height = 10
+
                 def __enter__(self):
                     return self
 
@@ -403,9 +406,9 @@ def test_ocr_runner_uses_run_workdir_and_local_model_cache(tmp_path):
         ),
         encoding="utf-8",
     )
-    temp_root = tmp_path / "system-temp"
+    temp_root = work_root / "system-temp"
     temp_root.mkdir()
-    runner = tmp_path / "run-ocr"
+    runner = work_root / "run-ocr"
     ocr_runner = SCRIPTS / "omr" / "ocr_runner.py"
     runner.write_text(
         f"#!{sys.executable}\n"
@@ -416,17 +419,17 @@ def test_ocr_runner_uses_run_workdir_and_local_model_cache(tmp_path):
         encoding="utf-8",
     )
     runner.chmod(runner.stat().st_mode | stat.S_IEXEC)
-    data = gallery_fixture(tmp_path)
+    data = gallery_fixture(work_root)
     data["image_items"] = [{"index": 1, "url": image.as_uri()}]
-    fixture = tmp_path / "ocr-cleanup.json"
+    fixture = work_root / "ocr-cleanup.json"
     fixture.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    out = tmp_path / "ocr.md"
+    out = work_root / "ocr.md"
     env = dict(os.environ)
     env["PYTHONPATH"] = str(fake_modules)
     env["TMPDIR"] = str(temp_root)
     env["OMR_FIXTURE"] = str(fixture)
     env["OMR_OCR_BIN"] = str(runner)
-    env["OMR_EXPECTED_ROOT"] = str(tmp_path)
+    env["OMR_EXPECTED_ROOT"] = str(work_root)
 
     result = subprocess.run(
         [
@@ -439,7 +442,7 @@ def test_ocr_runner_uses_run_workdir_and_local_model_cache(tmp_path):
         capture_output=True,
         text=True,
         env=env,
-        cwd=tmp_path,
+        cwd=work_root,
     )
 
     assert result.returncode == 0, result.stderr

@@ -17,15 +17,15 @@ ENTRY = MODULE_DIR / "scripts" / "read.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
-def run_default(tmp_path, url, fixture, extra_args=None, fakes=False, env_changes=None):
+def run_default(work_root, url, fixture, extra_args=None, fakes=False, env_changes=None):
     env = dict(os.environ)
     env["OMR_FIXTURE"] = str(fixture)
     if fakes:
-        bindir = make_fakes(tmp_path)
+        bindir = make_fakes(work_root)
         env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
         env["OMR_WHISPER_BIN"] = str(bindir / "fake-whisper")
         env["OMR_OCR_BIN"] = str(bindir / "fake-ocr")
-        env["OMR_CALLLOG"] = str(tmp_path / "calls.log")
+        env["OMR_CALLLOG"] = str(work_root / "calls.log")
     if env_changes:
         env.update(env_changes)
     return subprocess.run(
@@ -33,13 +33,13 @@ def run_default(tmp_path, url, fixture, extra_args=None, fakes=False, env_change
         capture_output=True,
         text=True,
         env=env,
-        cwd=tmp_path,
+        cwd=work_root,
     )
 
 
-def test_default_run_delivers_content_and_manifest_under_media(tmp_path):
+def test_default_run_delivers_content_and_manifest_under_media(work_root):
     result = run_default(
-        tmp_path,
+        work_root,
         "https://www.bilibili.com/video/BV1sample00",
         FIXTURES / "bilibili_subtitle.json",
     )
@@ -51,7 +51,7 @@ def test_default_run_delivers_content_and_manifest_under_media(tmp_path):
     assert payload["processing_path"] == "人工字幕"
     run_dir = Path(payload["run_dir"])
     result_path = Path(payload["result_path"])
-    assert run_dir.parent == tmp_path / ".media"
+    assert run_dir.parent == work_root / ".media"
     assert re.fullmatch(r"bilibili-BV1sample00-\d{8}T\d{6}[+-]\d{4}(?:-\d+)?", run_dir.name)
     assert result_path == run_dir / "content.md"
     assert result_path.is_file()
@@ -67,16 +67,17 @@ def test_default_run_delivers_content_and_manifest_under_media(tmp_path):
         "status": "success",
         "stage": "complete",
         "processing_path": "人工字幕",
+        "evidence_path": "evidence/index.json",
         "review_status": "not_required",
         "result_path": str(result_path),
         "artifact_paths": [],
     }
 
 
-def test_explicit_output_remains_the_only_body_file(tmp_path):
-    output = tmp_path / "chosen.md"
+def test_explicit_output_remains_the_only_body_file(work_root):
+    output = work_root / "chosen.md"
     result = run_default(
-        tmp_path,
+        work_root,
         "https://www.bilibili.com/video/BV1sample00",
         FIXTURES / "bilibili_subtitle.json",
         extra_args=["--output", str(output)],
@@ -91,16 +92,16 @@ def test_explicit_output_remains_the_only_body_file(tmp_path):
     assert not list(run_dir.rglob("*.md"))
 
 
-def test_failure_keeps_work_and_reports_stage_without_cookie(tmp_path):
-    cookie = tmp_path / "fixture-cookies.txt"
+def test_failure_keeps_work_and_reports_stage_without_cookie(work_root):
+    cookie = work_root / "fixture-cookies.txt"
     cookie.write_text("secret", encoding="utf-8")
     fixture_data = dict(ASR_FIXTURE, cookie_file=str(cookie))
-    fixture = write_fixture(tmp_path, "failure.json", fixture_data)
-    empty_bin = tmp_path / "empty-bin"
+    fixture = write_fixture(work_root, "failure.json", fixture_data)
+    empty_bin = work_root / "empty-bin"
     empty_bin.mkdir()
 
     result = run_default(
-        tmp_path,
+        work_root,
         "https://www.bilibili.com/video/BV1noSubs0",
         fixture,
         env_changes={"PATH": str(empty_bin)},
@@ -124,9 +125,9 @@ def test_failure_keeps_work_and_reports_stage_without_cookie(tmp_path):
     assert manifest["error"] == payload["error"]
 
 
-def test_keep_media_uses_fixed_artifact_name(tmp_path):
+def test_keep_media_uses_fixed_artifact_name(work_root):
     result = run_default(
-        tmp_path,
+        work_root,
         "https://www.bilibili.com/video/BV1sample00",
         FIXTURES / "bilibili_subtitle.json",
         extra_args=["--keep-media"],
@@ -142,7 +143,7 @@ def test_keep_media_uses_fixed_artifact_name(tmp_path):
     assert manifest["artifact_paths"] == [str(media_path)]
 
 
-def test_keep_media_muxes_to_typed_work_file_before_publish(monkeypatch, tmp_path):
+def test_keep_media_muxes_to_typed_work_file_before_publish(monkeypatch, work_root):
     sys.path.insert(0, str(MODULE_DIR / "scripts"))
     from omr import pipeline
     from omr.model import ContentManifest, MediaSources
@@ -159,9 +160,9 @@ def test_keep_media_muxes_to_typed_work_file_before_publish(monkeypatch, tmp_pat
             referer="https://page",
         ),
     )
-    workdir = tmp_path / "work"
+    workdir = work_root / "work"
     workdir.mkdir()
-    artifacts = tmp_path / "artifacts"
+    artifacts = work_root / "artifacts"
 
     monkeypatch.setattr(
         pipeline.media,
@@ -181,11 +182,11 @@ def test_keep_media_muxes_to_typed_work_file_before_publish(monkeypatch, tmp_pat
     assert not (workdir / "source.mp4").exists()
 
 
-def test_keyboard_interrupt_reports_json_and_removes_cookie(monkeypatch, capsys, tmp_path):
+def test_keyboard_interrupt_reports_json_and_removes_cookie(monkeypatch, capsys, work_root):
     sys.path.insert(0, str(MODULE_DIR / "scripts"))
     import read as read_entry
 
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(work_root)
     monkeypatch.delenv("OMR_FIXTURE", raising=False)
 
     def interrupt_fetch(_platform, _url, workdir, probe_only=False):
@@ -209,13 +210,13 @@ def test_keyboard_interrupt_reports_json_and_removes_cookie(monkeypatch, capsys,
     ] == "error"
 
 
-def test_explicit_output_part_is_removed_when_replace_fails(monkeypatch, tmp_path):
+def test_explicit_output_part_is_removed_when_replace_fails(monkeypatch, work_root):
     sys.path.insert(0, str(MODULE_DIR / "scripts"))
     from omr.workspace import RunWorkspace
 
-    output = tmp_path / "chosen.md"
+    output = work_root / "chosen.md"
     workspace = RunWorkspace.create(
-        tmp_path,
+        work_root,
         "bilibili",
         "https://www.bilibili.com/video/BV1replace0",
         output=output,
@@ -237,13 +238,13 @@ def test_explicit_output_part_is_removed_when_replace_fails(monkeypatch, tmp_pat
     assert not part.exists()
 
 
-def test_final_manifest_failure_preserves_work_diagnostics(monkeypatch, tmp_path):
+def test_final_manifest_failure_preserves_work_diagnostics(monkeypatch, work_root):
     sys.path.insert(0, str(MODULE_DIR / "scripts"))
     from omr.model import ContentManifest
     from omr.workspace import RunWorkspace
 
     workspace = RunWorkspace.create(
-        tmp_path,
+        work_root,
         "bilibili",
         "https://www.bilibili.com/video/BV1manifest0",
     )
@@ -271,7 +272,7 @@ def test_final_manifest_failure_preserves_work_diagnostics(monkeypatch, tmp_path
     assert diagnostic.read_text(encoding="utf-8") == "diagnostic"
 
 
-def test_work_cleanup_failure_records_error_manifest(monkeypatch, tmp_path, capsys):
+def test_work_cleanup_failure_records_error_manifest(monkeypatch, work_root, capsys):
     import importlib.util
 
     sys.path.insert(0, str(MODULE_DIR / "scripts"))
@@ -280,7 +281,7 @@ def test_work_cleanup_failure_records_error_manifest(monkeypatch, tmp_path, caps
     from omr.workspace import RunWorkspace
 
     workspace = RunWorkspace.create(
-        tmp_path,
+        work_root,
         "bilibili",
         "https://www.bilibili.com/video/BV1cleanup0",
     )
@@ -321,7 +322,7 @@ def test_work_cleanup_failure_records_error_manifest(monkeypatch, tmp_path, caps
 
 @pytest.mark.parametrize("source", ["muxed", "downloader", "separate"])
 def test_keep_media_failure_never_publishes_partial_artifact(
-    monkeypatch, tmp_path, source
+    monkeypatch, work_root, source
 ):
     sys.path.insert(0, str(MODULE_DIR / "scripts"))
     from omr import pipeline
@@ -346,9 +347,9 @@ def test_keep_media_failure_never_publishes_partial_artifact(
         title="t",
         media_sources=media_sources,
     )
-    workdir = tmp_path / "work"
+    workdir = work_root / "work"
     workdir.mkdir()
-    artifacts = tmp_path / "artifacts"
+    artifacts = work_root / "artifacts"
 
     def failing_download(_url, dest, **_kwargs):
         dest.write_bytes(b"partial")
@@ -376,16 +377,16 @@ def test_keep_media_failure_never_publishes_partial_artifact(
         pipeline._download_keep_copy(manifest, artifacts, workdir)
 
     assert not (artifacts / "source.mp4").exists()
-    assert not list(tmp_path.rglob("*.part"))
+    assert not list(work_root.rglob("*.part"))
     assert manifest.media_items == []
 
 
-def test_media_downloader_removes_yt_dlp_part_on_failure(monkeypatch, tmp_path):
+def test_media_downloader_removes_yt_dlp_part_on_failure(monkeypatch, work_root):
     sys.path.insert(0, str(MODULE_DIR / "scripts"))
     from omr import media
     from omr.model import OMRError
 
-    dest = tmp_path / "source.m4a"
+    dest = work_root / "source.m4a"
     monkeypatch.setattr(media, "require_binary", lambda *_args: None)
 
     def fail(argv, **_kwargs):
@@ -401,16 +402,16 @@ def test_media_downloader_removes_yt_dlp_part_on_failure(monkeypatch, tmp_path):
 
     assert not [
         path
-        for path in tmp_path.iterdir()
+        for path in work_root.iterdir()
         if ".part" in path.name or path.suffix == ".ytdl"
     ]
 
 
-def test_review_download_does_not_force_an_audio_stream(monkeypatch, tmp_path):
+def test_review_download_does_not_force_an_audio_stream(monkeypatch, work_root):
     sys.path.insert(0, str(MODULE_DIR / "scripts"))
     from omr import media
 
-    dest = tmp_path / "review-source.mp4"
+    dest = work_root / "review-source.mp4"
     observed = {}
     monkeypatch.setattr(media, "require_binary", lambda *_args: None)
 

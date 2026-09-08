@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
-"""一次读取的固定目录、运行清单与原子结果交付。"""
+"""一次读取的固定目录、运行清单、持久证据与原子结果交付。"""
 
 import hashlib
 import json
+import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
-from .model import ReviewState, WorkspaceFinalizationError
+from .model import OMRError, ReviewState, WorkspaceFinalizationError
 
 
 def content_id_from_url(platform, url):
@@ -19,7 +21,7 @@ def content_id_from_url(platform, url):
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
     patterns = {
-        "douyin": r"/video/([^/?#]+)",
+        "douyin": r"/(?:video|note)/([^/?#]+)",
         "bilibili": r"/video/([^/?#]+)",
         "xiaohongshu": r"/(?:explore|discovery/item)/([^/?#]+)",
     }
@@ -41,6 +43,23 @@ def _available_path(parent, basename):
         candidate = parent / f"{basename}-{suffix}"
         suffix += 1
     return candidate
+
+
+def _under_system_temp(path):
+    """输出根落在 /tmp、其真实路径或平台系统临时根之下（含符号链接）时为真。"""
+    resolved = Path(path).resolve()
+    roots = {Path("/tmp").resolve(), Path("/private/tmp").resolve()}
+    roots.add(Path(tempfile.gettempdir()).resolve())
+    return any(resolved == root or root in resolved.parents for root in roots)
+
+
+def _require_persistent_output(path, what):
+    if _under_system_temp(path):
+        raise OMRError(
+            f"{what}位于系统临时目录（{Path(path).resolve()}）；"
+            "持久结果与证据禁止写入 /tmp 等会被自动清理的位置，"
+            "请从持久目录运行命令或改用持久磁盘上的输出路径。"
+        )
 
 
 def write_json_atomic(path, payload):
@@ -68,11 +87,13 @@ class RunWorkspace:
     status: str = "running"
     stage: str = "initializing"
     processing_path: str = ""
+    evidence_path: Optional[str] = None
     review: ReviewState = ReviewState()
     error: Optional[str] = None
 
     @classmethod
     def create(cls, cwd, platform, input_url, output=None):
+        _require_persistent_output(Path(cwd) / ".media", "持久输出目录")
         media_root = (Path(cwd) / ".media").resolve()
         media_root.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z")
@@ -85,6 +106,7 @@ class RunWorkspace:
             output_override = (
                 raw_output if raw_output.is_absolute() else Path(cwd) / raw_output
             ).resolve()
+            _require_persistent_output(output_override, "显式输出路径")
         workspace = cls(
             media_root=media_root,
             platform=platform,
@@ -119,6 +141,7 @@ class RunWorkspace:
             status=state.get("status", "running"),
             stage=state.get("stage", ""),
             processing_path=state.get("processing_path", ""),
+            evidence_path=state.get("evidence_path"),
             review=ReviewState.from_dict(state),
             error=state.get("error"),
         )
@@ -149,6 +172,122 @@ class RunWorkspace:
     @property
     def result_path(self):
         return self.output_override or (self.run_dir / "content.md")
+
+    @property
+    def evidence_dir(self):
+        return self.run_dir / "evidence"
+
+    def evidence_link(self):
+        """正文中可用的证据索引链接；未发布证据时为 None。"""
+        if not self.evidence_path:
+            return None
+        if self.output_override is None:
+            return self.evidence_path
+        return os.path.relpath(self.run_dir / self.evidence_path, self.result_path.parent)
+
+    def write_evidence_atomic(self, rel, text):
+        """证据文件 .part 暂存后原子替换；目标被占用或写入失败时报结构化错误。"""
+        target = self.evidence_dir / rel
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise OMRError(f"证据目录创建失败：{exc}") from None
+        if target.exists():
+            raise OMRError(f"证据写入失败：目标已被占用：{target}")
+        part = target.with_name(target.name + ".part")
+        try:
+            part.write_text(text, encoding="utf-8")
+            part.replace(target)
+        except OSError as exc:
+            raise OMRError(f"证据写入失败：{exc}") from None
+        finally:
+            part.unlink(missing_ok=True)
+
+    def copy_evidence_file(self, src, rel):
+        """原始图片等二进制证据同文件系统原子发布；源缺失即报错，不静默跳图。"""
+        src = Path(src)
+        target = self.evidence_dir / rel
+        if not src.is_file():
+            raise OMRError(f"证据发布失败：源材料缺失：{src}")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise OMRError(f"证据目录创建失败：{exc}") from None
+        if target.exists():
+            raise OMRError(f"证据写入失败：目标已被占用：{target}")
+        part = target.with_name(target.name + ".part")
+        try:
+            shutil.copyfile(src, part)
+            part.replace(target)
+        except OSError as exc:
+            raise OMRError(f"证据写入失败：{exc}") from None
+        finally:
+            part.unlink(missing_ok=True)
+
+    def publish_evidence(self, manifest, work_dir):
+        """按白名单快照发布脚本证据，材料齐备后发布索引；失败即结构化报错。
+
+        ASR 原文与证据帧由 review/ 承载，这里只引用不复制；可靠字幕轨发布
+        cue 白名单快照；图文发布逐图原图与 OCR 原始识别结果。
+        """
+        entries = []
+        if manifest.content_type == "image_gallery":
+            snap_images = []
+            for item in manifest.image_items:
+                suffix = Path(urlparse(item.url).path).suffix
+                suffix = suffix if re.fullmatch(r"\.[0-9A-Za-z]{1,8}", suffix) else ".img"
+                rel = f"images/{item.index:03d}{suffix}"
+                self.copy_evidence_file(work_dir / "images" / f"{item.index:03d}{suffix}", rel)
+                entries.append(
+                    {"kind": "ocr", "path": f"evidence/{rel}", "image_index": item.index}
+                )
+                snap_images.append(
+                    {"index": item.index, "url": item.url, "ocr_text": item.ocr_text or ""}
+                )
+            self.write_evidence_atomic(
+                "ocr-snapshot.json",
+                json.dumps({"images": snap_images}, ensure_ascii=False, indent=2) + "\n",
+            )
+        elif manifest.subtitle_tracks and manifest.review.status == "not_required":
+            track = manifest.subtitle_tracks[0]
+            snapshot = {
+                "track": {"language": track.language, "kind": track.kind},
+                "cues": [
+                    {"start": cue.start, "end": cue.end, "text": cue.text}
+                    for cue in track.cues
+                    if isinstance(cue.text, str)
+                ],
+            }
+            self.write_evidence_atomic(
+                "subtitle-cues.json",
+                json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n",
+            )
+            entries.append(
+                {
+                    "kind": "subtitle",
+                    "path": "evidence/subtitle-cues.json",
+                    "note": f"主轨原文（{track.label()}）",
+                }
+            )
+        if manifest.review.path:
+            entries.append(
+                {
+                    "kind": "review",
+                    "path": "review/input.json",
+                    "note": "ASR 原始 cue 与画面证据帧（相对运行目录）",
+                }
+            )
+        index = {
+            "version": 1,
+            "result_path": (
+                str(self.result_path) if self.output_override else "content.md"
+            ),
+            "entries": entries,
+        }
+        self.write_evidence_atomic(
+            "index.json", json.dumps(index, ensure_ascii=False, indent=2) + "\n"
+        )
+        self.evidence_path = "evidence/index.json"
 
     @property
     def manifest_path(self):
@@ -280,6 +419,8 @@ class RunWorkspace:
             "result_path": str(self.result_path),
             "artifact_paths": self.artifact_paths(),
         }
+        if self.evidence_path:
+            payload["evidence_path"] = self.evidence_path
         payload.update(self.review.to_dict())
         if self.error is not None:
             payload["error"] = self.error

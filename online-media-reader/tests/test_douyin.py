@@ -134,8 +134,8 @@ def test_router_data_selects_requested_video_id():
     assert douyin_adapter._extract_item(html, "7000000000000000099") is None
 
 
-def test_cookie_jar_format_and_permissions(tmp_path):
-    jar = tmp_path / "cookies.txt"
+def test_cookie_jar_format_and_permissions(work_root):
+    jar = work_root / "cookies.txt"
     douyin_adapter.browser_session.write_cookie_jar(
         [{"name": "ttwid", "value": "abc123", "domain": ".douyin.com"}], jar
     )
@@ -147,7 +147,7 @@ def test_cookie_jar_format_and_permissions(tmp_path):
 
 
 def test_cookie_file_is_created_private_before_secret_is_written(
-    monkeypatch, tmp_path
+    monkeypatch, work_root
 ):
     browser_session = douyin_adapter.browser_session
     original_open = browser_session.os.open
@@ -161,14 +161,14 @@ def test_cookie_file_is_created_private_before_secret_is_written(
 
     browser_session.write_cookie_jar(
         [{"name": "ttwid", "value": "secret", "domain": ".douyin.com"}],
-        tmp_path / "cookies.txt",
+        work_root / "cookies.txt",
     )
 
     assert created_modes == [0o600]
 
 
-def test_cookie_opener_loads_browser_cookie_jar(tmp_path):
-    jar = tmp_path / "cookies.txt"
+def test_cookie_opener_loads_browser_cookie_jar(work_root):
+    jar = work_root / "cookies.txt"
     douyin_adapter.browser_session.write_cookie_jar(
         [{"name": "ttwid", "value": "abc123", "domain": ".douyin.com"}], jar
     )
@@ -179,7 +179,7 @@ def test_cookie_opener_loads_browser_cookie_jar(tmp_path):
     assert [cookie.name for cookie in processor.cookiejar] == ["ttwid"]
 
 
-def test_fetch_converts_douyin_duration_from_milliseconds(monkeypatch, tmp_path):
+def test_fetch_converts_douyin_duration_from_milliseconds(monkeypatch, work_root):
     router_data = {
         "loaderData": {
             "note_(id)/page": {
@@ -218,7 +218,7 @@ def test_fetch_converts_douyin_duration_from_milliseconds(monkeypatch, tmp_path)
     monkeypatch.setattr(douyin_adapter, "make_opener", lambda: Opener())
 
     manifest = douyin_adapter.fetch(
-        "https://www.douyin.com/video/7000000000000000003", tmp_path
+        "https://www.douyin.com/video/7000000000000000003", work_root
     )
 
     assert manifest.duration == 12.5
@@ -235,14 +235,14 @@ def test_router_data_fail_closed_on_login_and_captcha():
             raise AssertionError(f"含 {marker} 的页面应失败关闭")
 
 
-def test_summary_stays_out_of_subtitles(tmp_path):
-    fixture = tmp_path / "summary.json"
+def test_summary_stays_out_of_subtitles(work_root):
+    fixture = work_root / "summary.json"
     fixture.write_text(json.dumps(SUMMARY_FIXTURE, ensure_ascii=False), encoding="utf-8")
-    out = tmp_path / "out.md"
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.douyin.com/video/7000000000000000002",
         out,
-        tmp_path,
+        work_root,
         fixture=str(fixture),
     )
     assert result.returncode == 0, result.stderr
@@ -255,29 +255,172 @@ def test_summary_stays_out_of_subtitles(tmp_path):
     assert text.index("人工字幕正文内容。") < text.index("AI 生成的章节要点摘要")
 
 
-def test_douyin_no_subtitle_uses_shared_asr(tmp_path):
-    cookie = tmp_path / "cookies.txt"
+def test_douyin_no_subtitle_uses_shared_asr(work_root):
+    cookie = work_root / "cookies.txt"
     cookie.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
-    fixture = tmp_path / "nosub.json"
+    fixture = work_root / "nosub.json"
     fixture.write_text(
         json.dumps(
             dict(NO_SUBTITLE_FIXTURE, cookie_file=str(cookie)), ensure_ascii=False
         ),
         encoding="utf-8",
     )
-    out = tmp_path / "out.md"
+    out = work_root / "out.md"
     result = run_entry(
         "https://www.douyin.com/video/7000000000000000001",
         out,
-        tmp_path,
+        work_root,
         fixture=str(fixture),
     )
     assert result.returncode == 0, result.stderr
     text = out.read_text(encoding="utf-8")
     assert "处理路径：语音转写（ASR）" in text
     assert "转写第一句。" in text
-    invoked = calls(tmp_path)
+    invoked = calls(work_root)
     assert any(c.startswith("yt-dlp") for c in invoked)
     assert not cookie.exists()
     run_dir = Path(json.loads(result.stdout)["run_dir"])
     assert not (run_dir / "work").exists()
+
+
+# ---------------------------------------------------------- gallery-and-durable-evidence ticket 03
+
+GALLERY_NOTE_ID = "7422510759139183906"
+
+
+def _gallery_item(note_id=GALLERY_NOTE_ID, image_count=2, with_images=True):
+    item = {
+        "aweme_id": note_id,
+        "aweme_type": 2,
+        "desc": "固定样本：抖音图文标题\n第二行说明",
+        "author": {"nickname": "示例图文作者"},
+        "create_time": 1750000000,
+        "music": {},
+        "video": {},
+    }
+    if with_images:
+        item["images"] = [
+            {
+                "url_list": [f"https://p3-sign.douyinpic.com/img-{i}-a"],
+                "download_url_list": [f"https://p3-sign.douyinpic.com/img-{i}-dl"],
+            }
+            for i in range(1, image_count + 1)
+        ]
+    return item
+
+
+def _gallery_html(item, note_id=GALLERY_NOTE_ID):
+    data = {
+        "loaderData": {
+            f"note_({note_id})/page": {"videoInfoRes": {"item_list": [item]}}
+        }
+    }
+    return "<script>window._ROUTER_DATA = " + json.dumps(data) + "</script>"
+
+
+def test_note_url_normalizes_keeping_note_form():
+    vid, canonical = douyin_adapter.normalize_url(
+        f"https://www.douyin.com/note/{GALLERY_NOTE_ID}"
+    )
+    assert vid == GALLERY_NOTE_ID
+    assert canonical == f"https://www.douyin.com/note/{GALLERY_NOTE_ID}"
+
+
+def test_short_link_expanding_to_note_keeps_note_form(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def geturl(self):
+            return f"https://www.douyin.com/note/{GALLERY_NOTE_ID}"
+
+    class Opener:
+        def open(self, request, timeout):
+            return Response()
+
+    monkeypatch.setattr(douyin_adapter, "build_opener", lambda: Opener())
+    vid, canonical = douyin_adapter.normalize_url("https://v.douyin.com/AbCdEf0/")
+    assert vid == GALLERY_NOTE_ID
+    assert canonical == f"https://www.douyin.com/note/{GALLERY_NOTE_ID}"
+
+
+def test_workspace_content_id_parses_note_url():
+    sys.path.insert(0, str(SCRIPTS))
+    from omr.workspace import content_id_from_url
+
+    assert (
+        content_id_from_url("douyin", f"https://www.douyin.com/note/{GALLERY_NOTE_ID}")
+        == GALLERY_NOTE_ID
+    )
+
+
+def test_router_accepts_note_detail_and_existing_video_entries():
+    from omr.router import detect_platform
+
+    assert detect_platform(f"https://www.douyin.com/note/{GALLERY_NOTE_ID}") == "douyin"
+    assert detect_platform("https://www.douyin.com/video/7000000000000000001") == "douyin"
+    assert (
+        detect_platform("https://www.douyin.com/user/self?modal_id=7000000000000000001")
+        == "douyin"
+    )
+
+
+def test_gallery_item_routes_to_image_gallery(monkeypatch, work_root):
+    monkeypatch.setattr(
+        douyin_adapter, "_direct_html",
+        lambda canonical, timeout=30: _gallery_html(_gallery_item()),
+    )
+    manifest = douyin_adapter.fetch(
+        f"https://www.douyin.com/note/{GALLERY_NOTE_ID}", work_root
+    )
+
+    assert manifest.content_type == "image_gallery"
+    assert [img.index for img in manifest.image_items] == [1, 2]
+    assert manifest.image_items[0].url == "https://p3-sign.douyinpic.com/img-1-a"
+    assert all(img.ocr_text is None for img in manifest.image_items)
+    assert manifest.subtitle_tracks == []
+    assert manifest.media_sources.audio is None and manifest.media_sources.muxed is None
+    assert manifest.duration is None
+
+
+def test_gallery_via_modal_id_entry_routes_to_image_gallery(monkeypatch, work_root):
+    monkeypatch.setattr(
+        douyin_adapter, "_direct_html",
+        lambda canonical, timeout=30: _gallery_html(_gallery_item()),
+    )
+    manifest = douyin_adapter.fetch(
+        "https://www.douyin.com/user/profile/abc?modal_id=" + GALLERY_NOTE_ID,
+        work_root,
+    )
+    assert manifest.content_type == "image_gallery"
+    assert manifest.image_items[0].url == "https://p3-sign.douyinpic.com/img-1-a"
+
+
+def test_gallery_item_without_images_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        douyin_adapter, "_direct_html",
+        lambda canonical, timeout=30: _gallery_html(_gallery_item(with_images=False)),
+    )
+    try:
+        douyin_adapter.fetch(
+            f"https://www.douyin.com/note/{GALLERY_NOTE_ID}", Path(".")
+        )
+    except OMRError as exc:
+        assert "图文" in str(exc)
+    else:
+        raise AssertionError("已知图文缺图必须明确失败")
+
+
+def test_gallery_download_uses_image_url_not_video(monkeypatch, work_root):
+    """分流后不进入视频媒体提取：media_sources 保持为空（无 playwm/合成流）。"""
+    monkeypatch.setattr(
+        douyin_adapter, "_direct_html",
+        lambda canonical, timeout=30: _gallery_html(_gallery_item()),
+    )
+    manifest = douyin_adapter.fetch(
+        f"https://www.douyin.com/note/{GALLERY_NOTE_ID}", work_root
+    )
+    assert manifest.media_sources == douyin_adapter.MediaSources()

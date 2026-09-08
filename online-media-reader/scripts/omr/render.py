@@ -59,7 +59,7 @@ def _continuous_transcript(track):
     return _join_transcript_pieces(cue_texts)
 
 
-def render_markdown(manifest):
+def render_markdown(manifest, evidence_link=None):
     lines = [f"# {_display_title(manifest.title)}", ""]
     lines += [
         f"- 平台：{manifest.platform}",
@@ -74,6 +74,8 @@ def render_markdown(manifest):
     if manifest.duration:
         lines.append(f"- 时长：{int(manifest.duration)} 秒")
     lines.append(f"- 处理路径：{_default_processing_path(manifest)}")
+    if evidence_link:
+        lines.append(f"- 证据索引：{evidence_link}")
     lines.append("")
 
     probe_labels = {"inaccessible": "不可访问", "invalid": "无效"}
@@ -88,7 +90,7 @@ def render_markdown(manifest):
     if manifest.content_type == "video" and tracks:
         paragraph = _continuous_transcript(tracks[0])
         if paragraph:
-            lines.append("## 完整连续字幕")
+            lines.append("## 原始字幕")
             lines.append("")
             lines.append(paragraph)
             lines.append("")

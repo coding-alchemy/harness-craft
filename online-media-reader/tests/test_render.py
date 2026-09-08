@@ -34,7 +34,7 @@ def test_continuous_transcript_joins_chinese_cues_directly():
 
     text = render_markdown(item)
 
-    assert text.index("## 完整连续字幕") < text.index("## 人工字幕")
+    assert text.index("## 原始字幕") < text.index("## 人工字幕")
     assert "第一句。第二句。" in text
 
 
@@ -78,7 +78,7 @@ def test_continuous_transcript_skips_empty_cues():
     text = render_markdown(item)
 
     assert "正文。" in text
-    assert "## 完整连续字幕\n\n正文。\n\n" in text
+    assert "## 原始字幕\n\n正文。\n\n" in text
 
 
 def test_continuous_transcript_uses_only_first_track():
@@ -90,8 +90,8 @@ def test_continuous_transcript_uses_only_first_track():
 
     text = render_markdown(item)
 
-    assert text.count("## 完整连续字幕") == 1
-    assert "## 完整连续字幕\n\n主轨句子。\n\n" in text
+    assert text.count("## 原始字幕") == 1
+    assert "## 原始字幕\n\n主轨句子。\n\n" in text
 
 
 def test_image_gallery_omits_continuous_transcript():
@@ -101,7 +101,7 @@ def test_image_gallery_omits_continuous_transcript():
 
     text = render_markdown(item)
 
-    assert "完整连续字幕" not in text
+    assert "原始字幕" not in text
     assert "图片文字" in text
 
 
@@ -114,7 +114,7 @@ def test_rerender_after_cue_edit_updates_both_transcripts():
     after = render_markdown(item)
 
     assert "原始转写" not in after
-    assert "## 完整连续字幕\n\n画面纠正文字\n\n" in after
+    assert "## 原始字幕\n\n画面纠正文字\n\n" in after
     assert "- [00:00:00 → 00:00:02] 画面纠正文字" in after
 
 
@@ -122,7 +122,7 @@ def test_video_without_usable_track_text_omits_continuous_section():
     item = manifest("无字幕视频")
     item.subtitle_tracks = [track([cue(0, 1, "   ")])]
 
-    assert "完整连续字幕" not in render_markdown(item)
+    assert "原始字幕" not in render_markdown(item)
 
 
 def test_exact_repeated_title_half_is_rendered_once():

@@ -85,8 +85,8 @@ def fake_frames(record):
     return extract
 
 
-def workspace_layout(tmp_path):
-    run_dir = tmp_path / "run"
+def workspace_layout(work_root):
+    run_dir = work_root / "run"
     workdir = run_dir / "work"
     workdir.mkdir(parents=True)
     artifacts = run_dir / "artifacts"
@@ -105,11 +105,11 @@ def test_media_sources_choose_one_review_url():
     assert MediaSources(video="https://cdn/video").review_url == "https://cdn/video"
 
 
-def test_prepare_writes_input_json_with_relative_frames(monkeypatch, tmp_path):
+def test_prepare_writes_input_json_with_relative_frames(monkeypatch, work_root):
     from omr import review
 
     manifest = asr_manifest()
-    run_dir, workdir, artifacts = workspace_layout(tmp_path)
+    run_dir, workdir, artifacts = workspace_layout(work_root)
     monkeypatch.setattr(
         review.media,
         "download_media",
@@ -139,7 +139,7 @@ def test_prepare_writes_input_json_with_relative_frames(monkeypatch, tmp_path):
     assert payload["content"]["processing_path"] == "语音转写（ASR）"
 
 
-def test_prepare_skips_empty_cues_in_stable_numbering(monkeypatch, tmp_path):
+def test_prepare_skips_empty_cues_in_stable_numbering(monkeypatch, work_root):
     from omr import review
     from omr.model import SubtitleCue
 
@@ -150,7 +150,7 @@ def test_prepare_skips_empty_cues_in_stable_numbering(monkeypatch, tmp_path):
             SubtitleCue(start=2.0, end=3.0, text="也有字。"),
         ]
     )
-    run_dir, workdir, artifacts = workspace_layout(tmp_path)
+    run_dir, workdir, artifacts = workspace_layout(work_root)
     monkeypatch.setattr(
         review.media,
         "download_media",
@@ -165,11 +165,11 @@ def test_prepare_skips_empty_cues_in_stable_numbering(monkeypatch, tmp_path):
     assert payload["cues"][1]["original_text"] == "也有字。"
 
 
-def test_prepare_reuses_keep_media_artifact_without_new_download(monkeypatch, tmp_path):
+def test_prepare_reuses_keep_media_artifact_without_new_download(monkeypatch, work_root):
     from omr import review
 
     manifest = asr_manifest()
-    run_dir, workdir, artifacts = workspace_layout(tmp_path)
+    run_dir, workdir, artifacts = workspace_layout(work_root)
     keep = artifacts / "source.mp4"
     keep.parent.mkdir(parents=True)
     keep.write_bytes(b"kept media")
@@ -192,7 +192,7 @@ def test_prepare_reuses_keep_media_artifact_without_new_download(monkeypatch, tm
     assert keep.is_file()
 
 
-def test_prepare_prefers_direct_muxed_stream(monkeypatch, tmp_path):
+def test_prepare_prefers_direct_muxed_stream(monkeypatch, work_root):
     from omr import review
     from omr.model import MediaSources
 
@@ -200,7 +200,7 @@ def test_prepare_prefers_direct_muxed_stream(monkeypatch, tmp_path):
     manifest.media_sources = MediaSources(
         muxed="https://cdn/muxed.mp4", referer="https://page"
     )
-    run_dir, workdir, artifacts = workspace_layout(tmp_path)
+    run_dir, workdir, artifacts = workspace_layout(work_root)
     record = {}
     monkeypatch.setattr(review.media, "extract_frame", fake_frames(record))
     monkeypatch.setattr(
@@ -236,7 +236,7 @@ def test_prepare_prefers_direct_muxed_stream(monkeypatch, tmp_path):
     ids=["video-fallback", "review-video"],
 )
 def test_prepare_uses_resolved_direct_video_before_downloader(
-    monkeypatch, tmp_path, video_urls, expected_url
+    monkeypatch, work_root, video_urls, expected_url
 ):
     from omr import review
     from omr.model import MediaSources
@@ -247,7 +247,7 @@ def test_prepare_uses_resolved_direct_video_before_downloader(
         referer="https://www.bilibili.com/",
         **video_urls,
     )
-    run_dir, workdir, artifacts = workspace_layout(tmp_path)
+    run_dir, workdir, artifacts = workspace_layout(work_root)
     record = {}
 
     def fake_direct(url, dest, referer=None):
@@ -274,11 +274,11 @@ def test_prepare_uses_resolved_direct_video_before_downloader(
     assert not (workdir / "review-source.mp4").exists()
 
 
-def test_prepare_downloads_minimal_video_when_only_audio(monkeypatch, tmp_path):
+def test_prepare_downloads_minimal_video_when_only_audio(monkeypatch, work_root):
     from omr import review
 
     manifest = asr_manifest()
-    run_dir, workdir, artifacts = workspace_layout(tmp_path)
+    run_dir, workdir, artifacts = workspace_layout(work_root)
     record = {}
 
     def fake_download(url, dest, mode, cookies=None):
@@ -295,11 +295,11 @@ def test_prepare_downloads_minimal_video_when_only_audio(monkeypatch, tmp_path):
     assert (run_dir / "review" / "frames" / "cue-0001-p50.jpg").is_file()
 
 
-def test_prepare_reuses_transcription_media_when_it_contains_video(monkeypatch, tmp_path):
+def test_prepare_reuses_transcription_media_when_it_contains_video(monkeypatch, work_root):
     from omr import review
 
     manifest = asr_manifest()
-    run_dir, workdir, artifacts = workspace_layout(tmp_path)
+    run_dir, workdir, artifacts = workspace_layout(work_root)
     transcription_media = workdir / "source.m4a"
     transcription_media.write_bytes(b"muxed audio download")
     record = {}
@@ -322,12 +322,12 @@ def test_prepare_reuses_transcription_media_when_it_contains_video(monkeypatch, 
     assert not (workdir / "review" / "frames" / ".probe.jpg").exists()
 
 
-def test_prepare_falls_back_to_review_download_for_audio_only_media(monkeypatch, tmp_path):
+def test_prepare_falls_back_to_review_download_for_audio_only_media(monkeypatch, work_root):
     from omr import review
     from omr.model import OMRError
 
     manifest = asr_manifest()
-    run_dir, workdir, artifacts = workspace_layout(tmp_path)
+    run_dir, workdir, artifacts = workspace_layout(work_root)
     (workdir / "source.m4a").write_bytes(b"audio only")
     record = {}
 
@@ -352,13 +352,13 @@ def test_prepare_falls_back_to_review_download_for_audio_only_media(monkeypatch,
     assert (run_dir / "review" / "frames" / "cue-0001-p50.jpg").is_file()
 
 
-def test_pipeline_marks_review_unavailable_when_evidence_incomplete(monkeypatch, tmp_path):
+def test_pipeline_marks_review_unavailable_when_evidence_incomplete(monkeypatch, work_root):
     from omr import pipeline
     from omr.model import OMRError
 
     manifest = asr_manifest()
     manifest.subtitle_tracks = []  # 无在线字幕，走真实 ASR 主路径
-    run_dir, workdir, artifacts = workspace_layout(tmp_path)
+    run_dir, workdir, artifacts = workspace_layout(work_root)
     monkeypatch.setattr(
         pipeline.media,
         "download_media",
@@ -391,13 +391,13 @@ def test_pipeline_marks_review_unavailable_when_evidence_incomplete(monkeypatch,
     assert not (run_dir / "review").exists(), "证据不完整时不得留下部分复核目录"
 
 
-def test_pipeline_skips_review_when_first_track_is_not_asr(monkeypatch, tmp_path):
+def test_pipeline_skips_review_when_first_track_is_not_asr(monkeypatch, work_root):
     from omr import pipeline
 
     manifest = asr_manifest()
     manifest.subtitle_tracks[0].kind = "manual"
     manifest.subtitle_tracks[0].language = "zh-CN"
-    run_dir, workdir, artifacts = workspace_layout(tmp_path)
+    run_dir, workdir, artifacts = workspace_layout(work_root)
     monkeypatch.setattr(
         pipeline.media,
         "download_media",
@@ -428,36 +428,36 @@ def test_pipeline_skips_review_when_first_track_is_not_asr(monkeypatch, tmp_path
 ASR_URL = "https://www.bilibili.com/video/BV1noSubs0"
 
 
-def run_read(tmp_path, fixture, extra_args=None):
+def run_read(work_root, fixture, extra_args=None):
     """以假外部命令执行主读取入口，返回 (stdout payload, run_dir)。"""
     env = dict(os.environ)
     env["OMR_FIXTURE"] = str(fixture)
-    bindir = make_fakes(tmp_path)
+    bindir = make_fakes(work_root)
     env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
     env["OMR_WHISPER_BIN"] = str(bindir / "fake-whisper")
     env["OMR_OCR_BIN"] = str(bindir / "fake-ocr")
-    env["OMR_CALLLOG"] = str(tmp_path / "calls.log")
+    env["OMR_CALLLOG"] = str(work_root / "calls.log")
     result = subprocess.run(
         [sys.executable, str(ENTRY), ASR_URL, *(extra_args or [])],
         capture_output=True,
         text=True,
         env=env,
-        cwd=tmp_path,
+        cwd=work_root,
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     return payload, Path(payload["run_dir"])
 
 
-def submit(run_dir, corrections, tmp_path):
-    cpath = tmp_path / "submitted.json"
+def submit(run_dir, corrections, work_root):
+    cpath = work_root / "submitted.json"
     cpath.write_text(json.dumps(corrections, ensure_ascii=False), encoding="utf-8")
     return subprocess.run(
         [sys.executable, str(REVIEW_ENTRY), str(run_dir), "--corrections", str(cpath)],
         capture_output=True,
         text=True,
         env={k: v for k, v in os.environ.items() if k not in ("OMR_FIXTURE", "OMR_WHISPER_BIN")},
-        cwd=tmp_path,
+        cwd=work_root,
     )
 
 
@@ -473,19 +473,19 @@ VALID_CORRECTIONS = {
 }
 
 
-def prepared_review_submission(tmp_path, fixture_name):
+def prepared_review_submission(work_root, fixture_name):
     from omr.workspace import RunWorkspace
 
-    fixture = write_fixture(tmp_path, fixture_name, ASR_FIXTURE)
-    _, run_dir = run_read(tmp_path, fixture)
-    cpath = tmp_path / "corr.json"
+    fixture = write_fixture(work_root, fixture_name, ASR_FIXTURE)
+    _, run_dir = run_read(work_root, fixture)
+    cpath = work_root / "corr.json"
     cpath.write_text(json.dumps(VALID_CORRECTIONS, ensure_ascii=False), encoding="utf-8")
     return run_dir, RunWorkspace.load(run_dir), cpath
 
 
-def test_cli_asr_run_generates_review_input_and_frames(tmp_path):
+def test_cli_asr_run_generates_review_input_and_frames(work_root):
     payload, run_dir = run_read(
-        tmp_path, write_fixture(tmp_path, "asr_review.json", ASR_FIXTURE)
+        work_root, write_fixture(work_root, "asr_review.json", ASR_FIXTURE)
     )
 
     assert payload["review_required"] is True
@@ -517,32 +517,40 @@ def test_cli_asr_run_generates_review_input_and_frames(tmp_path):
 
     text = (run_dir / "content.md").read_text(encoding="utf-8")
     assert "处理路径：语音转写（ASR）" in text
-    assert "## 完整连续字幕" in text
+    assert "## 原始字幕" in text
 
 
-def test_cli_reliable_subtitle_and_gallery_never_enter_review(tmp_path):
+def test_cli_reliable_subtitle_and_gallery_never_enter_review(work_root):
     subtitle_payload, subtitle_dir = run_read(
-        tmp_path, FIXTURES / "bilibili_subtitle.json"
+        work_root, FIXTURES / "bilibili_subtitle.json"
     )
     assert subtitle_payload["review_required"] is False
     assert "review_path" not in subtitle_payload
     assert not (subtitle_dir / "review").exists()
-    assert not list(tmp_path.glob("*.mp4"))
+    assert not list(work_root.glob("*.mp4"))
 
+    gallery_base = json.loads(
+        (FIXTURES / "xiaohongshu_note.json").read_text(encoding="utf-8")
+    )
+    img1 = work_root / "gal-1.txt"
+    img1.write_text("第一张图片的文字", encoding="utf-8")
+    gallery_base["image_items"] = [
+        {"index": 1, "url": img1.as_uri(), "ocr_text": None},
+    ]
     gallery_payload, gallery_dir = run_read(
-        tmp_path, FIXTURES / "xiaohongshu_note.json"
+        work_root, write_fixture(work_root, "gallery-no-review.json", gallery_base)
     )
     assert gallery_payload["review_required"] is False
     assert not (gallery_dir / "review").exists()
 
 
-def test_valid_correction_updates_both_transcripts_atomically(tmp_path):
+def test_valid_correction_updates_both_transcripts_atomically(work_root):
     _, run_dir = run_read(
-        tmp_path, write_fixture(tmp_path, "asr_valid.json", ASR_FIXTURE)
+        work_root, write_fixture(work_root, "asr_valid.json", ASR_FIXTURE)
     )
     before_input = (run_dir / "review" / "input.json").read_bytes()
 
-    result = submit(run_dir, VALID_CORRECTIONS, tmp_path)
+    result = submit(run_dir, VALID_CORRECTIONS, work_root)
 
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
@@ -553,7 +561,7 @@ def test_valid_correction_updates_both_transcripts_atomically(tmp_path):
     assert payload["result_path"] == str(run_dir / "content.md")
 
     text = (run_dir / "content.md").read_text(encoding="utf-8")
-    assert "## 完整连续字幕\n\n画面纠正第一句。转写第二句。\n\n" in text
+    assert "## 原始字幕\n\n画面纠正第一句。转写第二句。\n\n" in text
     assert "- [00:00:00 → 00:00:03] 画面纠正第一句。" in text
     assert "转写第一句。" not in text
 
@@ -572,16 +580,16 @@ def test_valid_correction_updates_both_transcripts_atomically(tmp_path):
     assert not list(run_dir.rglob("*.part"))
 
 
-def test_zero_corrections_records_no_usable_evidence_text(tmp_path):
+def test_zero_corrections_records_no_usable_evidence_text(work_root):
     _, run_dir = run_read(
-        tmp_path, write_fixture(tmp_path, "asr_zero.json", ASR_FIXTURE)
+        work_root, write_fixture(work_root, "asr_zero.json", ASR_FIXTURE)
     )
     before_content = (run_dir / "content.md").read_bytes()
 
     result = submit(
         run_dir,
         {"reviewed_cue_ids": [1, 2], "corrections": []},
-        tmp_path,
+        work_root,
     )
 
     assert result.returncode == 0, result.stderr
@@ -595,16 +603,16 @@ def test_zero_corrections_records_no_usable_evidence_text(tmp_path):
     assert manifest["review_reason"] == "画面无可用校对文字"
 
 
-def test_unavailable_result_keeps_original_asr(tmp_path):
+def test_unavailable_result_keeps_original_asr(work_root):
     _, run_dir = run_read(
-        tmp_path, write_fixture(tmp_path, "asr_unavail.json", ASR_FIXTURE)
+        work_root, write_fixture(work_root, "asr_unavail.json", ASR_FIXTURE)
     )
     before_content = (run_dir / "content.md").read_bytes()
 
     result = submit(
         run_dir,
         {"result": "unavailable", "reason": "当前环境无法查看本地图片"},
-        tmp_path,
+        work_root,
     )
 
     assert result.returncode == 0, result.stderr
@@ -624,35 +632,35 @@ def test_unavailable_result_keeps_original_asr(tmp_path):
     assert manifest["review_status"] == "unavailable"
 
 
-def test_review_updates_explicit_output_as_only_body(tmp_path):
-    output = tmp_path / "chosen.md"
+def test_review_updates_explicit_output_as_only_body(work_root):
+    output = work_root / "chosen.md"
     payload, run_dir = run_read(
-        tmp_path,
-        write_fixture(tmp_path, "asr_output.json", ASR_FIXTURE),
+        work_root,
+        write_fixture(work_root, "asr_output.json", ASR_FIXTURE),
         extra_args=["--output", str(output)],
     )
     assert payload["result_path"] == str(output)
 
-    result = submit(run_dir, VALID_CORRECTIONS, tmp_path)
+    result = submit(run_dir, VALID_CORRECTIONS, work_root)
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["result_path"] == str(output)
     text = output.read_text(encoding="utf-8")
-    assert "## 完整连续字幕\n\n画面纠正第一句。转写第二句。\n\n" in text
+    assert "## 原始字幕\n\n画面纠正第一句。转写第二句。\n\n" in text
     assert not (run_dir / "content.md").exists()
-    assert not list(tmp_path.glob("*.part"))
+    assert not list(work_root.glob("*.part"))
 
 
-def test_second_submission_is_rejected(tmp_path):
+def test_second_submission_is_rejected(work_root):
     _, run_dir = run_read(
-        tmp_path, write_fixture(tmp_path, "asr_twice.json", ASR_FIXTURE)
+        work_root, write_fixture(work_root, "asr_twice.json", ASR_FIXTURE)
     )
-    assert submit(run_dir, VALID_CORRECTIONS, tmp_path).returncode == 0
+    assert submit(run_dir, VALID_CORRECTIONS, work_root).returncode == 0
     after_content = (run_dir / "content.md").read_bytes()
     after_corrections = (run_dir / "review" / "corrections.json").read_bytes()
     after_manifest = (run_dir / "manifest.json").read_bytes()
 
-    result = submit(run_dir, VALID_CORRECTIONS, tmp_path)
+    result = submit(run_dir, VALID_CORRECTIONS, work_root)
 
     assert result.returncode != 0
     assert json.loads(result.stderr)["status"] == "error"
@@ -661,20 +669,20 @@ def test_second_submission_is_rejected(tmp_path):
     assert (run_dir / "manifest.json").read_bytes() == after_manifest
 
 
-def test_pending_review_reports_latest_failure(tmp_path):
+def test_pending_review_reports_latest_failure(work_root):
     _, run_dir = run_read(
-        tmp_path, write_fixture(tmp_path, "asr_latest_failure.json", ASR_FIXTURE)
+        work_root, write_fixture(work_root, "asr_latest_failure.json", ASR_FIXTURE)
     )
 
     first = submit(
         run_dir,
         {"reviewed_cue_ids": [1], "corrections": []},
-        tmp_path,
+        work_root,
     )
     second = submit(
         run_dir,
         {"result": "partial", "reviewed_cue_ids": [1, 2]},
-        tmp_path,
+        work_root,
     )
 
     first_payload = json.loads(first.stderr)
@@ -688,12 +696,12 @@ def test_pending_review_reports_latest_failure(tmp_path):
     assert manifest["error"] == second_payload["error"]
 
 
-def test_review_rejects_run_without_review_input(tmp_path):
+def test_review_rejects_run_without_review_input(work_root):
     _, run_dir = run_read(
-        tmp_path, FIXTURES / "bilibili_subtitle.json"
+        work_root, FIXTURES / "bilibili_subtitle.json"
     )
 
-    result = submit(run_dir, VALID_CORRECTIONS, tmp_path)
+    result = submit(run_dir, VALID_CORRECTIONS, work_root)
 
     assert result.returncode != 0
     payload = json.loads(result.stderr)
@@ -852,16 +860,16 @@ def _bump_input_version(run_dir):
     ],
 )
 def test_invalid_submissions_preserve_artifacts_and_report_failure(
-    tmp_path, corrections, mutate
+    work_root, corrections, mutate
 ):
-    fixture = write_fixture(tmp_path, "asr_reject.json", ASR_FIXTURE)
-    _, run_dir = run_read(tmp_path, fixture)
+    fixture = write_fixture(work_root, "asr_reject.json", ASR_FIXTURE)
+    _, run_dir = run_read(work_root, fixture)
     before_content = (run_dir / "content.md").read_bytes()
     if mutate is not None:
         mutate(run_dir)
     before_input = (run_dir / "review" / "input.json").read_bytes()
 
-    result = submit(run_dir, corrections, tmp_path)
+    result = submit(run_dir, corrections, work_root)
 
     assert result.returncode != 0, result.stdout
     payload = json.loads(result.stderr)
@@ -878,11 +886,11 @@ def test_invalid_submissions_preserve_artifacts_and_report_failure(
     assert not list(run_dir.rglob("*.part"))
 
 
-def test_review_failure_keeps_body_and_leaves_no_part(monkeypatch, tmp_path):
+def test_review_failure_keeps_body_and_leaves_no_part(monkeypatch, work_root):
     from omr import review as review_module
     from omr.workspace import RunWorkspace
 
-    run_dir, workspace, cpath = prepared_review_submission(tmp_path, "asr_atomic.json")
+    run_dir, workspace, cpath = prepared_review_submission(work_root, "asr_atomic.json")
     output = run_dir / "content.md"
     part = run_dir / "work" / "content.md.part"
     original_replace = Path.replace
@@ -910,13 +918,13 @@ def test_review_failure_keeps_body_and_leaves_no_part(monkeypatch, tmp_path):
 
 
 def test_corrections_write_failure_does_not_publish_reviewed_body(
-    monkeypatch, tmp_path
+    monkeypatch, work_root
 ):
     from omr import review as review_module
     from omr.workspace import RunWorkspace
 
     run_dir, workspace, cpath = prepared_review_submission(
-        tmp_path, "asr_corrections_atomic.json"
+        work_root, "asr_corrections_atomic.json"
     )
     before_content = (run_dir / "content.md").read_bytes()
     before_manifest = (run_dir / "manifest.json").read_bytes()
@@ -944,7 +952,7 @@ def test_corrections_write_failure_does_not_publish_reviewed_body(
     ids=["io-error", "keyboard-interrupt"],
 )
 def test_review_cleanup_failure_remains_retryable(
-    monkeypatch, tmp_path, capsys, cleanup_error, expected_exit_code
+    monkeypatch, work_root, capsys, cleanup_error, expected_exit_code
 ):
     import importlib.util
 
@@ -953,7 +961,7 @@ def test_review_cleanup_failure_remains_retryable(
     from omr.workspace import RunWorkspace
 
     run_dir, workspace, cpath = prepared_review_submission(
-        tmp_path, "asr_cleanup_retry.json"
+        work_root, "asr_cleanup_retry.json"
     )
     original_rmtree = workspace_module.shutil.rmtree
     failed = False
@@ -989,7 +997,7 @@ def test_review_cleanup_failure_remains_retryable(
 
 
 def test_review_recovers_when_cleanup_state_cannot_be_persisted(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, work_root, capsys
 ):
     import importlib.util
 
@@ -997,7 +1005,7 @@ def test_review_recovers_when_cleanup_state_cannot_be_persisted(
     from omr.workspace import RunWorkspace
 
     run_dir, workspace, cpath = prepared_review_submission(
-        tmp_path, "asr_cleanup_state_retry.json"
+        work_root, "asr_cleanup_state_retry.json"
     )
     original_rmtree = workspace_module.shutil.rmtree
     cleanup_failed = False
@@ -1045,7 +1053,7 @@ def test_review_recovers_when_cleanup_state_cannot_be_persisted(
     assert not (run_dir / "work").exists()
 
 
-def test_manifest_failure_can_retry_completed_review(monkeypatch, tmp_path, capsys):
+def test_manifest_failure_can_retry_completed_review(monkeypatch, work_root, capsys):
     import importlib.util
 
     from omr import review as review_module
@@ -1053,7 +1061,7 @@ def test_manifest_failure_can_retry_completed_review(monkeypatch, tmp_path, caps
     from omr.workspace import RunWorkspace
 
     run_dir, workspace, cpath = prepared_review_submission(
-        tmp_path, "asr_manifest_retry.json"
+        work_root, "asr_manifest_retry.json"
     )
 
     def fail_manifest(_manifest=None):
@@ -1079,7 +1087,7 @@ def test_manifest_failure_can_retry_completed_review(monkeypatch, tmp_path, caps
     assert recorded["review_status"] == "pending"
     assert recorded["error"] == failure_payload["error"]
 
-    unavailable_path = tmp_path / "unavailable.json"
+    unavailable_path = work_root / "unavailable.json"
     unavailable_path.write_text(
         json.dumps({"result": "unavailable", "reason": "改用未复核"}, ensure_ascii=False),
         encoding="utf-8",
