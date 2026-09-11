@@ -19,7 +19,7 @@
 
 唯一例外是 `verification-before-completion`：声明任务完成前必须自动调用并完整执行，无需用户点名授权。此例外只用于完成声明前的证据验证，不授权自动调用其他 `superpowers` Skill。
 
-此前任务或对话中的同意、对其他工具或 Skill 的授权，以及任务特征与某个 `superpowers` Skill 匹配，均不构成本项授权。除上述 `verification-before-completion` 例外外，若 `superpowers` 相关 Skill 被自动触发或加载，应立即停止执行并向用户报告，不得以流程或质量需要为由继续。
+此前任务或对话中的同意、对其他工具或 Skill 的授权，以及任务特征与某个 `superpowers` Skill 匹配，均不构成本项授权。除上述 `verification-before-completion` 例外外，若未经当前任务明确授权的 `superpowers` 相关 Skill 被自动触发或加载，应停止应用该 Skill 引入的流程，继续按当前任务与项目约束执行，无需因此暂停任务；不得删除 Skill 文件或声称已从会话上下文移除其内容。
 
 ### Issue tracker
 
