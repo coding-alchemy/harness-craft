@@ -1,0 +1,132 @@
+/* tech-doc-translator 默认 PDF 导出样式：A4 纵向、中文技术文档优先。
+ * 本样式不加载任何远程资源；通过 file:// 引用同 Skill 内离线资产。 */
+
+@page {
+  size: A4;
+  margin: 18mm 16mm;
+}
+
+html {
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+/* 中文字体链只包含已验证 ToUnicode 干净（可检索可复制）的字体：
+ * Songti/PingFang 等会把部分汉字写入康熙部首码位，破坏 PDF 检索，禁用。 */
+body {
+  font-family: "STFangsong", "STHeiti", "Arial Unicode MS", serif;
+  font-size: 10.5pt;
+  line-height: 1.65;
+  color: #111;
+  margin: 0;
+  hyphens: none;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: "STHeiti", "Arial Unicode MS", sans-serif;
+  line-height: 1.35;
+  break-after: avoid;
+  margin: 1.1em 0 0.5em;
+}
+
+h1 { font-size: 19pt; margin-top: 0.2em; }
+h2 { font-size: 15.5pt; }
+h3 { font-size: 12.5pt; }
+h4 { font-size: 11pt; }
+h5 { font-size: 10.5pt; }
+h6 { font-size: 10pt; color: #333; }
+
+p { margin: 0.45em 0; orphans: 2; widows: 2; }
+
+/* 图/表与其紧邻的图题、表题或引导标签保持在同一页。 */
+p:has(+ table) { break-after: avoid-page; }
+p:has(> img) { break-after: avoid-page; }
+p:has(> img) + p { break-inside: avoid; }
+img { break-after: avoid-page; }
+caption { break-after: avoid-page; }
+
+a { color: #0b5394; text-decoration: none; word-break: break-all; }
+
+/* 跨章合订：每章从新页开始；单篇时仅一章，:first-child 不产生空白首页。 */
+.chapter { break-before: page; }
+.chapter:first-child { break-before: auto; }
+
+code, pre, kbd, samp {
+  font-family: "Menlo", "Monaco", "Courier New", "STHeiti", monospace;
+}
+
+code {
+  font-size: 0.88em;
+  background: #f5f5f5;
+  padding: 0 2pt;
+  border-radius: 2pt;
+}
+
+pre {
+  font-size: 8.5pt;
+  line-height: 1.45;
+  background: #f6f8fa;
+  border: 0.5pt solid #ddd;
+  border-radius: 3pt;
+  padding: 7pt 9pt;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  margin: 0.7em 0;
+}
+
+pre code {
+  font-size: inherit;
+  background: none;
+  padding: 0;
+  border-radius: 0;
+}
+
+/* 长代码块允许跨页，禁止整块不可分页导致的溢出。 */
+pre, blockquote, table { break-inside: auto; }
+tr, blockquote p { break-inside: avoid; }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 8.5pt;
+  line-height: 1.4;
+  margin: 0.7em 0;
+}
+
+th, td {
+  border: 0.5pt solid #999;
+  padding: 2.5pt 4pt;
+  vertical-align: top;
+  overflow-wrap: break-word;
+}
+
+thead { display: table-header-group; }
+th { background: #efefef; font-family: "STHeiti", "Arial Unicode MS", sans-serif; }
+
+blockquote {
+  margin: 0.7em 0;
+  padding: 0.1em 0 0.1em 9pt;
+  border-left: 2.5pt solid #b8b8b8;
+  color: #333;
+}
+
+img, svg { max-width: 100%; height: auto; }
+
+/* 脚注与来源信息以小字呈现，保持可读。 */
+.footnotes { font-size: 8.5pt; }
+.footnotes hr { border: none; border-top: 0.5pt solid #999; width: 30%; margin: 1.2em 0 0.6em; }
+
+/* 公式：块级公式整体尽量不跨页；溢出会被导出器检查并报告，而不是缩小。 */
+.math-inline { white-space: nowrap; }
+.math-block {
+  break-inside: avoid;
+  margin: 0.7em 0;
+  text-align: center;
+  overflow: visible;
+}
+.katex-display { margin: 0; }
+.katex { font-size: 1.05em; }
+.katex-error-node { color: #b00; border-bottom: 1pt dashed #b00; }
+
+/* Pygments 高亮：浅色底、可打印。 */
+.highlight { background: none; }

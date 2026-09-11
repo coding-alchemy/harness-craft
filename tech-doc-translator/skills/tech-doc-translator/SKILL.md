@@ -1,6 +1,6 @@
 ---
 name: tech-doc-translator
-description: 将计算机、工程、数学、物理等理工科英文技术文档翻译为可回源核对的中文 Markdown；按源结构选择确定性脚本，支持分页代码、数学与深层嵌套参考手册、多页面 API 文档以及工作包拆分、术语合并与中断恢复。
+description: 将计算机、工程、数学、物理等理工科英文技术文档翻译为可回源核对的中文 Markdown；按源结构选择确定性脚本，支持分页代码、数学与深层嵌套参考手册、多页面 API 文档以及工作包拆分、术语合并与中断恢复。也支持把已有译文 Markdown 直接导出为单篇或按明确顺序合订的 PDF——用户要求"导出 PDF""合成一份 PDF"而不要求翻译时使用。
 ---
 
 # tech-doc-translator
@@ -12,6 +12,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 - 源是 HTML（单页、分页站点均可）或可被外部工具可靠转为 Markdown 的 PDF。
 - 用户已给出：权威源 URL/文件、欲翻译的范围、交付文件位置、项目术语表（若有）。
 - 单页、分页、数学/深层嵌套参考手册和多页面 API/DSL 均为当前支持的 HTML 源家族；按实际结构选择对应脚本。
+- 已有本 Skill 产出的中文 Markdown，需要导出为单篇 PDF 或按明确顺序合订为一份 PDF；用户仅提供译文时直接进入导出模式，不要求英文源或术语表。
 
 ## 何时停止并找用户确认
 
@@ -22,7 +23,11 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 
 ## 依赖
 
-`<SKILL目录>` 指本 `SKILL.md` 所在目录；本文的脚本、翻译约定、共享词库和依赖声明都通过 `<SKILL目录>` 内路径定位，不依赖仓库层级。脚本依赖 `beautifulsoup4`，按 `requirements.txt` 安装：`pip install -r <SKILL目录>/requirements.txt`。
+`<SKILL目录>` 指本 `SKILL.md` 所在目录；本文的脚本、翻译约定、共享词库和依赖声明都通过 `<SKILL目录>` 内路径定位，不依赖仓库层级。脚本依赖 `beautifulsoup4`，按 `requirements.txt` 安装：`pip install -r <SKILL目录>/requirements.txt`。PDF 导出模式按需安装 `<SKILL目录>/requirements-pdf.txt`，普通翻译不安装。
+
+## 已有 Markdown 的 PDF 导出
+
+用户要求把已有 Markdown 导出为 PDF（单篇或合订）时，先完整读取 `<SKILL目录>/references/pdf_export.md`，按其模式路由、命令合同与完成合同执行。要点：单篇与合订共用一个导出入口，输入顺序即文档顺序；机器检查通过后必须完成视觉复核与交付说明才能发布；翻译任务同时要求 PDF 时，在 Markdown 验收后进入同一导出流程。
 
 ## 执行顺序
 

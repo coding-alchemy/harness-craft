@@ -1,0 +1,12 @@
+# PDF 导出可选依赖，与普通翻译依赖（requirements.txt）分离。
+# 普通翻译任务不需要安装本文件；仅在执行已有 Markdown 的 PDF 导出/合订时安装。
+#
+# 版本为执行环境中已验证的组合（macOS / Python 3.12），详见 CHANGELOG 对应条目。
+markdown-it-py>=3.0,<4
+mdit-py-plugins>=0.4,<1
+beautifulsoup4>=4.12,<5
+pygments>=2.17,<3
+playwright>=1.42
+pypdf>=4.0
+# 安装后还需一次性获取浏览器（环境准备，不属于转换期网络依赖）：
+#   python3 -m playwright install chromium
