@@ -81,8 +81,11 @@ pre code {
   border-radius: 0;
 }
 
-/* 长代码块允许跨页，禁止整块不可分页导致的溢出。 */
-pre, blockquote, table { break-inside: auto; }
+/* 代码块尽量整块不分页：跨页代码在 PDF 文本提取时与同页表格/正文交错，
+ * 曾造成核验器连续匹配的成批误报（真实六章书验证）；超出一页的代码块
+ * 仍会自然分页，avoid 只是尽力约束。 */
+pre { break-inside: avoid; }
+blockquote, table { break-inside: auto; }
 tr, blockquote p { break-inside: avoid; }
 
 table {
@@ -109,6 +112,35 @@ blockquote {
   border-left: 2.5pt solid #b8b8b8;
   color: #333;
 }
+
+/* 印刷目录：独立导航容器；点线用边框实现，不依赖 CSS leader()。
+ * 页码列固定宽度，占位符与回填页码占位一致，保证两遍打印布局不变。 */
+.print-toc {
+  margin: 0.8em 0 1.2em;
+}
+.print-toc .toc-entry { margin: 0.18em 0; }
+.print-toc .toc-entry a {
+  display: flex;
+  align-items: baseline;
+  color: #111;
+  word-break: normal;
+  overflow-wrap: normal;
+}
+.print-toc .toc-entry.toc-level-2 .toc-text { padding-left: 1.5em; }
+.print-toc .toc-text { flex: 0 1 auto; }
+.print-toc .toc-leader {
+  flex: 1 0 2em;
+  border-bottom: 0.5pt dotted #999;
+  margin: 0 4pt;
+  transform: translateY(-0.18em);
+}
+.print-toc .toc-page {
+  flex: 0 0 3.2em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.print-toc .toc-entry a { break-inside: avoid; }
 
 img, svg { max-width: 100%; height: auto; }
 

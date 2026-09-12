@@ -30,11 +30,12 @@ _BLOCK_TAGS = {
     'hgroup', 'main', 'nav', 'section', 'summary',
 }
 
-def _image_block(tag, out):
+def _image_block(tag, out, fidelity):
     alt = tag.get('alt', '')
     src = tag.get('src', '')
     if src:
         out.append('\n![%s](%s)' % (alt, src))
+        fidelity.note_image(tag, src)
 
 
 def _has_protected_pre(tag):
@@ -74,7 +75,7 @@ def render(node, out, fidelity):
         elif name == 'table':
             out.extend(fidelity.table_block(child))
         elif name == 'img':
-            _image_block(child, out)
+            _image_block(child, out, fidelity)
         elif name == 'figure':
             # 图题是图的一部分，不能作为未知块级元素留下占位符。
             render(child, out, fidelity)
@@ -147,7 +148,13 @@ def main():
     out = []
     render(root, out, fidelity)
     open(out_path, 'w', encoding='utf-8').write('\n'.join(out).strip() + '\n')
-    print('%s: %d blocks, %d chars -> %s' % (section_id or root.name, len(out), sum(len(x) for x in out), out_path))
+    display_map = fidelity.write_display_map(out_path, html_path)
+    determined = sum(1 for e in fidelity.image_display if 'value' in e)
+    print('%s: %d blocks, %d chars -> %s%s' % (
+        section_id or root.name, len(out), sum(len(x) for x in out), out_path,
+        '（显示尺寸 %d 项，未确定 %d 项 -> %s）' % (
+            determined, len(fidelity.image_display) - determined, display_map)
+        if display_map else ''))
 
 
 if __name__ == '__main__':

@@ -34,18 +34,22 @@ def clean_caption(txt):
     return re.sub(r'\s+', ' ', txt.replace('¶', '').replace('\uf0c1', '').strip())
 
 
-def _image_block(tag, out):
+def _image_block(tag, out, fidelity):
     src = tag.get('src', '')
     if src:
-        out.append('\n[IMG: images/%s]' % src.rsplit('/', 1)[-1])
+        reference = 'images/%s' % src.rsplit('/', 1)[-1]
+        out.append('\n[IMG: %s]' % reference)
+        fidelity.note_image(tag, reference)
 
 
-def _figure_block(tag, out):
+def _figure_block(tag, out, fidelity):
     img = tag.find('img')
     if img:
         src = img.get('src', '')
         if src:
-            out.append('\n[IMG: images/%s]' % src.rsplit('/', 1)[-1])
+            reference = 'images/%s' % src.rsplit('/', 1)[-1]
+            out.append('\n[IMG: %s]' % reference)
+            fidelity.note_image(img, reference)
     cap = tag.find('figcaption')
     if cap:
         out.append('[FIGURE] ' + clean_caption(cap.get_text(' ', strip=True)))
@@ -71,7 +75,9 @@ def _emit_nested_blocks(el, out, fidelity, indent='  '):
                 if img:
                     src = img.get('src', '')
                     if src:
-                        out.append('\n%s[IMG: images/%s]' % (indent, src.rsplit('/', 1)[-1]))
+                        reference = 'images/%s' % src.rsplit('/', 1)[-1]
+                        out.append('\n%s[IMG: %s]' % (indent, reference))
+                        fidelity.note_image(img, reference)
                 cap = child.find('figcaption')
                 if cap:
                     out.append('%s[FIGURE] %s' % (indent, clean_caption(cap.get_text(' ', strip=True))))
@@ -80,7 +86,9 @@ def _emit_nested_blocks(el, out, fidelity, indent='  '):
             if child.name == 'img':
                 src = child.get('src', '')
                 if src:
-                    out.append('\n%s[IMG: images/%s]' % (indent, src.rsplit('/', 1)[-1]))
+                    reference = 'images/%s' % src.rsplit('/', 1)[-1]
+                    out.append('\n%s[IMG: %s]' % (indent, reference))
+                    fidelity.note_image(child, reference)
                 continue
             if child.name == 'pre':
                 text = child.get_text()
@@ -137,9 +145,9 @@ def render(node, out, fidelity):
         elif name == 'table':
             out.extend(fidelity.table_block(child))
         elif name == 'img':
-            _image_block(child, out)
+            _image_block(child, out, fidelity)
         elif name == 'figure':
-            _figure_block(child, out)
+            _figure_block(child, out, fidelity)
         elif name == 'blockquote':
             render(child, out, fidelity)
         elif name == 'div' and 'math' in cls:
@@ -206,8 +214,13 @@ def main():
     out = []
     render(root, out, fidelity)
     open(out_path, 'w', encoding='utf-8').write('\n'.join(out).strip() + '\n')
-    print('%s: %d blocks, %d chars -> %s' % (
-        section_id or root.name, len(out), sum(len(x) for x in out), out_path))
+    display_map = fidelity.write_display_map(out_path, html_path)
+    determined = sum(1 for e in fidelity.image_display if 'value' in e)
+    print('%s: %d blocks, %d chars -> %s%s' % (
+        section_id or root.name, len(out), sum(len(x) for x in out), out_path,
+        '（显示尺寸 %d 项，未确定 %d 项 -> %s）' % (
+            determined, len(fidelity.image_display) - determined, display_map)
+        if display_map else ''))
 
 
 if __name__ == '__main__':

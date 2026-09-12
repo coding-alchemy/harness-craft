@@ -4,9 +4,75 @@
 """
 import copy
 import html
+import json
+import os
 import re
 
 from bs4 import BeautifulSoup, Comment
+
+
+# 内联 CSS width 属性（仅取 width 声明；max-width 等不作为显示宽度依据）。
+_INLINE_WIDTH_RE = re.compile(
+    r'(?:^|;)\s*width\s*:\s*([0-9]*\.?[0-9]+)\s*([a-zA-Z%]*)\s*(?:;|$)')
+_INTEGER_RE = re.compile(r'^[0-9]+$')
+_INLINE_PX_WIDTH_RE = re.compile(
+    r'(?:^|;)\s*width\s*:\s*([0-9]*\.?[0-9]+)px\s*(?:;|$)', re.I)
+
+DISPLAY_MAP_VERSION = 1
+
+
+def image_display_width(img, soup):
+    """提取 img 节点的显示宽度，返回 entry 字典（不含出现序号与路径）。
+
+    依据优先级：可解析的内联 CSS width，再 HTML width 属性（按整数像素）。
+    百分比必须记录可确定的参照容器（祖先链中最近的内联像素宽度），否则
+    作为“百分比无参照”单列，不冒充已恢复。无宽度约束同样单列。返回的
+    basis/undetermined_reason 可回查到源节点定位。
+    """
+    node = 'img[%d]' % list(soup.find_all('img')).index(img) if soup is not None else 'img[?]'
+    style = img.get('style') or ''
+    match = _INLINE_WIDTH_RE.search(style)
+    if match:
+        value = float(match.group(1))
+        unit = (match.group(2) or 'px').lower()
+        if unit == 'px':
+            return {'value': value, 'unit': 'px', 'basis': 'inline-css-width',
+                    'reference': None, 'source_node': node}
+        if unit == '%':
+            reference = _percent_reference(img)
+            if reference is not None:
+                return {'value': value, 'unit': '%', 'basis': 'inline-css-width',
+                        'reference': reference, 'source_node': node}
+            return {'undetermined_reason': '百分比宽度缺少可确定的参照容器',
+                    'source_node': node}
+        return {'undetermined_reason': '内联 CSS width 使用不支持的单位：%s' % unit,
+                'source_node': node}
+    width_attr = img.get('width')
+    if width_attr and _INTEGER_RE.match(str(width_attr).strip()):
+        return {'value': float(str(width_attr).strip()), 'unit': 'px',
+                'basis': 'html-width-attribute', 'reference': None,
+                'source_node': node}
+    return {'undetermined_reason': '源节点无宽度约束', 'source_node': node}
+
+
+def _percent_reference(img):
+    """沿祖先链寻找最近的内联像素宽度作为百分比参照。
+
+    只有内联 style 的 px 宽度视为可确定参照（外部 CSS 布局不猜测）；
+    返回 {'container': 标签描述, 'width_px': 数值} 或 None。
+    """
+    parent = img.parent
+    depth = 0
+    while parent is not None and getattr(parent, 'name', None) and depth < 8:
+        style = parent.get('style') or ''
+        match = _INLINE_PX_WIDTH_RE.search(style)
+        if match:
+            css = ' '.join(parent.get('class') or [])
+            container = parent.name + ('.' + css.split()[0] if css else '')
+            return {'container': container, 'width_px': float(match.group(1))}
+        parent = parent.parent
+        depth += 1
+    return None
 
 
 class HtmlFidelity:
@@ -15,10 +81,13 @@ class HtmlFidelity:
     def __init__(self, unknown_footnote='[?]'):
         self._pre_blocks = []
         self._unknown_footnote = unknown_footnote
+        self.image_display = []  # 按输出顺序登记的图片显示尺寸条目
+        self._soup = None
 
     def parse(self, raw):
         """保护代码内容后解析 HTML；每次调用重置 `<pre>` 占位池。"""
         self._pre_blocks = []
+        self.image_display = []
 
         def protect_pre(match):
             body = match.group(2)
@@ -42,7 +111,47 @@ class HtmlFidelity:
         protected = re.sub(
             r'(<code[^>]*>)(.*?)(</code>)', protect_inline_code,
             protected, flags=re.S)
-        return BeautifulSoup(protected, 'html.parser')
+        soup = BeautifulSoup(protected, 'html.parser')
+        self._soup = soup
+        return soup
+
+    def note_image(self, img, src_as_written):
+        """登记一个进入输出的图片出现及其源显示宽度（暗亮只记选中版本）。"""
+        entry = image_display_width(img, self._soup)
+        entry['occurrence'] = len(self.image_display) + 1
+        entry['image'] = src_as_written
+        self.image_display.append(entry)
+
+    def write_display_map(self, out_md_path, snapshot_path):
+        """把解析期登记的显示尺寸写入 <stem>.images_display.json。
+
+        有条目才写文件；条目与未确定项分开列示，供翻译与导出链路对账。
+        """
+        determined = [
+            {'occurrence': e['occurrence'], 'image': e['image'],
+             'width': {'value': e['value'], 'unit': e['unit'],
+                       'basis': e['basis'], 'reference': e['reference']},
+             'source_node': e['source_node']}
+            for e in self.image_display if 'value' in e
+        ]
+        undetermined = [
+            {'occurrence': e['occurrence'], 'image': e['image'],
+             'reason': e['undetermined_reason'], 'source_node': e['source_node']}
+            for e in self.image_display if 'undetermined_reason' in e
+        ]
+        if not self.image_display:
+            return None
+        payload = {
+            'version': DISPLAY_MAP_VERSION,
+            'markdown': os.path.basename(out_md_path),
+            'snapshot': snapshot_path,
+            'entries': determined,
+            'undetermined': undetermined,
+        }
+        path = os.path.splitext(out_md_path)[0] + '.images_display.json'
+        with open(path, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        return path
 
     @staticmethod
     def clean_heading(text):

@@ -27,7 +27,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 
 ## 已有 Markdown 的 PDF 导出
 
-用户要求把已有 Markdown 导出为 PDF（单篇或合订）时，先完整读取 `<SKILL目录>/references/pdf_export.md`，按其模式路由、命令合同与完成合同执行。要点：单篇与合订共用一个导出入口，输入顺序即文档顺序；机器检查通过后必须完成视觉复核与交付说明才能发布；翻译任务同时要求 PDF 时，在 Markdown 验收后进入同一导出流程。
+用户要求把已有 Markdown 导出为 PDF（单篇或合订）时，先完整读取 `<SKILL目录>/references/pdf_export.md`，按其模式路由、命令合同与完成合同执行。要点：单篇与合订共用一个导出入口，输入顺序即文档顺序；多章导出且意图不明时先询问是否合订并等待，目录与术语表不计入章节数；术语表默认不入 PDF，指向术语表的链接用 `--unlink-target` 保留文字转纯文本；章首“原文”“译例说明”由导出器默认排除（Markdown 保留）；合订含 `00_目录.md` 时由导出器增强为 PDF 最前的印刷目录（两遍打印、页码为 PDF 实际页序）。机器检查通过后必须完成视觉复核与交付说明才能发布；翻译任务同时要求 PDF 时，在 Markdown 验收后进入同一导出流程。图片显示尺寸按 `<SKILL目录>/references/images_display.md` 的契约在解析、绑定与导出链路中保持。
 
 ## 执行顺序
 
@@ -62,6 +62,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
    - 主 Agent 逐条裁决候选术语后集中写入 `术语表.md` 与最终文件；未经裁决的候选不得自动入库。
    - 已通过项目验收且拟回流共享库的术语，使用 `<SKILL目录>/scripts/consolidate_glossaries.py --baseline <共享库> --draft <工作区外草稿> --report <工作区外报告> <项目术语表>` 核算。只将经人工批准的无冲突候选写入共享库；候选不能静默覆盖已有默认值。
    - 主 Agent 集中把图片下载到交付目录的 `images/` 并运行 `file`；多页面 API 合并器会把本地快照中的页面相对图片集中复制到最终产物旁的 `images/`，同名不同内容时停止。
+   - 按 `<SKILL目录>/references/translation_conventions.md` 的交付形态，默认在交付目录生成独立 `00_目录.md`（官方顺序 + 实际译文链接，章、节层级；单篇同样生成，用户明确不要才省略；局部翻译只列交付范围并标明范围）；全书目录集中在该文件，不再默认在每章文末重复，原文固有章内目录保留。
    - 验收必须针对用户指定的实际交付路径；临时目录只承载回归过程，不能替代实际产物证据。
    - 交付说明：源版本、产物、术语变化、验证结论、模型/token/墙钟时间（可获得时；不可获得时标注未知）。验证结论分别标明“硬不变量通过”“源文全量对账完成”和“语义复核完成”；未闭合页面发现或未与独立官方 TOC 对账的多页面文档不得标为后两者已完成。
 
@@ -74,7 +75,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 | 单页 HTML，含 `<article>` / `<main>` / `<body>` 与常规章节 | `<SKILL目录>/scripts/parse_single_page_html.py <html> [section_id] <out.md>` |
 | 分页、代码密集型 HTML（多页/多节，需围栏拼接） | `<SKILL目录>/scripts/parse_paginated_html.py page1.html page2.html ...` → `splice_fences.py` → `merge_sections.py` |
 | 数学密集或深层嵌套参考手册 | `<SKILL目录>/scripts/parse_reference_html.py <html> <out.md>` |
-| 多页面 API/DSL 文档 | `<SKILL目录>/scripts/discover_pages.py <site/index.html>` → `parse_api_html.py` → `merge_api.py`；页面清单必须与**独立的官方 TOC/导航快照**逐项对账，manifest 交付顺序按官方 TOC 重排（`discover_pages` 的字典序输出只用于集合发现，不作为交付顺序） |
+| 多页面 API/DSL 文档 | `<SKILL目录>/scripts/discover_pages.py <site/index.html>` → `parse_api_html.py` → `merge_api.py`；页面清单必须与**独立的官方 TOC/导航快照**逐项对账，manifest 交付顺序按官方 TOC 重排（`discover_pages` 的字典序输出只用于集合发现，不作为交付顺序）；保留图片显示尺寸时用 `merge_api.py --display-src` 自动绑定（契约见 `<SKILL目录>/references/images_display.md`） |
 | 扫描版 PDF | 仅当用户明确要求且使用宿主 OCR 工具 |
 
 工作包编排：
