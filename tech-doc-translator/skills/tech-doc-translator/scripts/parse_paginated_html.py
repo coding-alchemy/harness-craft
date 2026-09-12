@@ -32,11 +32,12 @@ _BLOCK_TAGS = {
 }
 
 
-def _image_block(tag, out):
+def _image_block(tag, out, fidelity):
     alt = tag.get('alt', '')
     src = tag.get('src', '')
     if src:
         out.append('\n![%s](%s)' % (alt, src))
+        fidelity.note_image(tag, src)
 
 
 def _math_block(tag, out):
@@ -75,7 +76,7 @@ def render(node, out, fidelity):
         elif name == 'table':
             out.extend(fidelity.table_block(child))
         elif name == 'img':
-            _image_block(child, out)
+            _image_block(child, out, fidelity)
         elif name == 'figure':
             # 只提取图片；figcaption 等未处理子元素会被继续遍历并标记
             render(child, out, fidelity)
@@ -127,6 +128,8 @@ def extract_one(html_path):
 
     out = []
     render(root, out, fidelity)
+    out_path = os.path.splitext(html_path)[0] + '.md'
+    fidelity.write_display_map(out_path, html_path)
     return '\n'.join(out).strip() + '\n'
 
 

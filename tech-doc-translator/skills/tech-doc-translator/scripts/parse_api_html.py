@@ -53,13 +53,14 @@ def _has_block_content(tag):
     return False
 
 
-def _image_block(tag, out):
+def _image_block(tag, out, fidelity):
     if _is_dark_only(tag):
         return
     src = _image_src(tag)
     alt = tag.get('alt', '')
     if src:
         out.append('\n![%s](%s)' % (alt, src))
+        fidelity.note_image(tag, src)
 
 
 def _tabs_block(tag, out, fidelity):
@@ -111,7 +112,7 @@ def render(node, out, fidelity):
         elif name == 'table':
             out.extend(fidelity.table_block(child))
         elif name == 'img':
-            _image_block(child, out)
+            _image_block(child, out, fidelity)
         elif name == 'figure':
             render(child, out, fidelity)
         elif name == 'div' and 'sphinx-tabs' in cls:
@@ -168,7 +169,13 @@ def main():
     out = []
     render(root, out, fidelity)
     open(out_path, 'w', encoding='utf-8').write('\n'.join(out).strip() + '\n')
-    print('%s: %d blocks, %d chars -> %s' % (html_path, len(out), sum(len(x) for x in out), out_path))
+    display_map = fidelity.write_display_map(out_path, html_path)
+    determined = sum(1 for e in fidelity.image_display if 'value' in e)
+    print('%s: %d blocks, %d chars -> %s%s' % (
+        html_path, len(out), sum(len(x) for x in out), out_path,
+        '（显示尺寸 %d 项，未确定 %d 项 -> %s）' % (
+            determined, len(fidelity.image_display) - determined, display_map)
+        if display_map else ''))
 
 
 if __name__ == '__main__':

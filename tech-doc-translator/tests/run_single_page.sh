@@ -136,4 +136,29 @@ if grep -q '\[FIGCAPTION\]' "$TMP/sphinx_nested_source.md"; then
   exit 1
 fi
 
+echo "==> V0.2-02：解析期图片显示尺寸（内联 CSS / HTML 属性 / 未确定）"
+cat > "$TMP/widths.html" <<'HTML'
+<html><body><article>
+<h1>Widths</h1>
+<img src="img_px.png" style="width:454px">
+<img src="img_attr.png" width="300">
+<img src="img_free.png">
+</article></body></html>
+HTML
+python3 "$PARSE" "$TMP/widths.html" "$TMP/widths.md"
+python3 - "$TMP/widths.images_display.json" <<'PY'
+import json, sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+entries = {e['occurrence']: e for e in payload['entries']}
+assert entries[1]['width'] == {
+    'value': 454, 'unit': 'px', 'basis': 'inline-css-width', 'reference': None
+}, entries[1]
+assert entries[2]['width']['basis'] == 'html-width-attribute', entries[2]
+assert entries[2]['width']['value'] == 300, entries[2]
+assert [e['reason'] for e in payload['undetermined']] == ['源节点无宽度约束'], payload
+print('宽度提取：内联 px / HTML 属性正确；无约束单列未确定')
+PY
+
 echo "==> Ticket 01 回归全部通过"

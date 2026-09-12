@@ -76,4 +76,35 @@ else
   echo "漏强 token 已正确判 FAIL"
 fi
 
+echo "==> V0.2-02：嵌套结构（figure / dd 内图片）与百分比参照的显示尺寸登记"
+cat > "$TMPDIR/widths_ref.html" <<'HTML'
+<html><body><main>
+<h1>R</h1>
+<figure><img src="fig.png" style="width:600px"><figcaption>Cap</figcaption></figure>
+<dl><dt>term</dt><dd><img src="dd.png" width="220"></dd></dl>
+<div style="width:800px"><figure><img src="pct.png" style="width:50%"></figure></div>
+<figure><img src="pct_noref.png" style="width:50%"></figure>
+</main></body></html>
+HTML
+python3 "$PARSE" "$TMPDIR/widths_ref.html" "$TMPDIR/widths_ref.md"
+python3 - "$TMPDIR/widths_ref.images_display.json" <<'PY'
+import json, sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+entries = {e['occurrence']: e for e in payload['entries']}
+assert entries[1]['image'] == 'images/fig.png', entries[1]
+assert entries[1]['width']['value'] == 600, entries[1]
+assert entries[2]['image'] == 'images/dd.png', entries[2]
+assert entries[2]['width']['basis'] == 'html-width-attribute', entries[2]
+assert entries[3]['image'] == 'images/pct.png', entries[3]
+assert entries[3]['width']['unit'] == '%' and entries[3]['width']['value'] == 50, entries[3]
+assert entries[3]['width']['reference'] == {
+    'container': 'div', 'width_px': 800.0
+}, entries[3]
+reasons = [e['reason'] for e in payload['undetermined']]
+assert reasons == ['百分比宽度缺少可确定的参照容器'], reasons
+print('嵌套 figure / dd / 百分比带参照与无参照均按出现序号正确登记')
+PY
+
 echo "==> Ticket 03 回归全部通过"

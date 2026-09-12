@@ -74,4 +74,23 @@ cp fixtures/valid_1x1.png "$TMPDIR/images/compilation_flow.png"
 echo "==> 校验合并产物与源 Markdown"
 python3 "$VERIFY" "$TMPDIR/chapter.md" "$TMPDIR/source_p1.md" "$TMPDIR/source_p2.md"
 
+echo "==> V0.2-02：分页解析输出携带显示尺寸映射"
+cat > "$TMPDIR/src_html/widths.html" <<'HTML'
+<html><body><article>
+<h1>W</h1>
+<img src="img_px.png" style="width:454px">
+<img src="img_free.png">
+</article></body></html>
+HTML
+python3 "$PARSE" "$TMPDIR/src_html/widths.html"
+python3 - "$TMPDIR/src_html/widths.images_display.json" <<'PY'
+import json, sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+assert payload['entries'][0]['width']['value'] == 454, payload
+assert [e['reason'] for e in payload['undetermined']] == ['源节点无宽度约束'], payload
+print('分页解析：显示尺寸映射与源 Markdown 同目录输出')
+PY
+
 echo "==> Ticket 02 分页、代码围栏保真与安全合并回归全部通过"
