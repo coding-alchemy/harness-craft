@@ -207,4 +207,212 @@ fi
 grep -q "出现数 .* 与译文图片数 .* 不符" "$TMP/count_err.txt" \
   || { echo "错误：出现数诊断缺失"; cat "$TMP/count_err.txt"; exit 1; }
 
+echo "==> 完整性-01：代码内独立 --- 行不得拆页（源译一致的含 --- 代码块保持通过）"
+python3 - "$SRC_DIR/api_page1.md" "$SITE/trans_api_page1.md" <<'PY'
+import sys
+
+block = '\n```text\nsection one\n---\nsection two\n```\n'
+for path in sys.argv[1:3]:
+    with open(path, 'a', encoding='utf-8') as f:
+        f.write(block)
+PY
+python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR"
+python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+  "$SRC_DIR/api_page1.md" \
+  "$SRC_DIR/index.md" \
+  "$SRC_DIR/api_page2.md"
+echo "代码内 --- 未被误拆页，含 --- 的正确产物保持 PASS"
+
+echo "==> 完整性-01 失败回归：含 --- 代码块的内容篡改必须判 FAIL"
+python3 - "$SITE/trans_api_page1.md" <<'PY'
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding='utf-8').read()
+assert 'section two' in text, '回归样本缺少目标代码行'
+open(path, 'w', encoding='utf-8').write(
+    text.replace('section two', 'section 2'))
+PY
+python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR"
+if python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+    "$SRC_DIR/api_page1.md" \
+    "$SRC_DIR/index.md" \
+    "$SRC_DIR/api_page2.md" >"$TMP/code_diff_err.txt" 2>&1; then
+  echo "错误：代码内容篡改未被检测到"
+  exit 1
+fi
+grep -q '代码逐块核对' "$TMP/code_diff_err.txt" \
+  || { echo "错误：缺少逐块核对诊断"; cat "$TMP/code_diff_err.txt"; exit 1; }
+echo "含 --- 代码块的内容篡改已正确判 FAIL"
+
+echo "==> 完整性-02：API 路线公式逐项核对（正确通过；篡改判 FAIL）"
+python3 - "$SRC_DIR/api_page1.md" "$SITE/trans_api_page1.md" <<'PY'
+import sys
+
+src_path, trans_path = sys.argv[1:3]
+math_block = '\n行内公式 $a_1+b_2$ 与块级：\n\n$$\nF = G\n$$\n'
+src = open(src_path, encoding='utf-8').read().replace('section 2', 'section two')
+open(src_path, 'w', encoding='utf-8').write(src + math_block)
+trans = open(trans_path, encoding='utf-8').read().replace('section 2', 'section two')
+open(trans_path, 'w', encoding='utf-8').write(trans + math_block)
+PY
+python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR"
+python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+  "$SRC_DIR/api_page1.md" \
+  "$SRC_DIR/index.md" \
+  "$SRC_DIR/api_page2.md"
+python3 - "$SITE/trans_api_page1.md" <<'PY'
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding='utf-8').read()
+assert '$a_1+b_2$' in text
+open(path, 'w', encoding='utf-8').write(text.replace('$a_1+b_2$', '$a_1-b_2$'))
+PY
+python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR"
+if python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+    "$SRC_DIR/api_page1.md" \
+    "$SRC_DIR/index.md" \
+    "$SRC_DIR/api_page2.md" >"$TMP/math_diff_err.txt" 2>&1; then
+  echo "错误：公式运算符篡改未被检测到"
+  exit 1
+fi
+grep -q '公式逐项核对' "$TMP/math_diff_err.txt" \
+  || { echo "错误：缺少公式差异诊断"; cat "$TMP/math_diff_err.txt"; exit 1; }
+python3 - "$SITE/trans_api_page1.md" <<'PY'
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding='utf-8').read()
+open(path, 'w', encoding='utf-8').write(text.replace('$a_1-b_2$', '$a_1+b_2$'))
+PY
+echo "API 路线公式篡改已正确判 FAIL（已还原样本）"
+
+echo "==> 完整性-04：标题层级变化与强 token 遗漏必须判 FAIL"
+python3 - "$SITE/trans_api_page1.md" <<'PY'
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding='utf-8').read()
+assert '## Parameters（参数）' in text
+open(path, 'w', encoding='utf-8').write(
+    text.replace('## Parameters（参数）', '### Parameters（参数）'))
+PY
+python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR"
+if python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+    "$SRC_DIR/api_page1.md" \
+    "$SRC_DIR/index.md" \
+    "$SRC_DIR/api_page2.md" >"$TMP/lvl_err.txt" 2>&1; then
+  echo "错误：标题层级变化未被检测到"
+  exit 1
+fi
+grep -q '层级不一致' "$TMP/lvl_err.txt" \
+  || { echo "错误：缺少层级差异诊断"; cat "$TMP/lvl_err.txt"; exit 1; }
+python3 - "$SITE/trans_api_page1.md" <<'PY'
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding='utf-8').read()
+open(path, 'w', encoding='utf-8').write(
+    text.replace('### Parameters（参数）', '## Parameters（参数）'))
+PY
+echo "API 路线标题层级变化已正确判 FAIL"
+
+python3 - "$SITE/trans_api_page1.md" <<'PY'
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding='utf-8').read()
+assert '**handle** cuBLAS handle。' in text
+open(path, 'w', encoding='utf-8').write(
+    text.replace('**handle** cuBLAS handle。', '**handle** handle。'))
+PY
+python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR"
+if python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+    "$SRC_DIR/api_page1.md" \
+    "$SRC_DIR/index.md" \
+    "$SRC_DIR/api_page2.md" --strong-token cuBLAS >"$TMP/tok_err.txt" 2>&1; then
+  echo "错误：强 token 遗漏未被检测到"
+  exit 1
+fi
+grep -q '强 token' "$TMP/tok_err.txt" \
+  || { echo "错误：缺少强 token 诊断"; cat "$TMP/tok_err.txt"; exit 1; }
+python3 - "$SITE/trans_api_page1.md" <<'PY'
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding='utf-8').read()
+open(path, 'w', encoding='utf-8').write(
+    text.replace('**handle** handle。', '**handle** cuBLAS handle。'))
+PY
+echo "API 路线强 token 遗漏已正确判 FAIL（样本已还原）"
+
+echo "==> 完整性-05：同名换图/身份映射/搬迁后离线校验"
+python3 - "$SITE" <<'PY'
+import sys
+
+site = sys.argv[1]
+# 使两图内容不同（魔数合法），否则同名换图/错序无法用摘要区分
+data = open(site + '/subdir/images/light.png', 'rb').read()
+open(site + '/subdir/images/light.png', 'wb').write(data[:8] + b'L' + data[9:])
+PY
+python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR"
+python3 - "$OUT_DIR" <<'PY'
+import sys
+
+out = sys.argv[1]
+# 交付副本被篡改为内容不同、魔数不变的同名文件
+data = open(out + '/images/diagram.png', 'rb').read()
+open(out + '/images/diagram.png', 'wb').write(data[:8] + b'F' + data[9:])
+PY
+if python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+    "$SRC_DIR/api_page1.md" \
+    "$SRC_DIR/index.md" \
+    "$SRC_DIR/api_page2.md" >"$TMP/swap_err.txt" 2>&1; then
+  echo "错误：同名换图未被检测到"
+  exit 1
+fi
+grep -q '来源身份不符' "$TMP/swap_err.txt" \
+  || { echo "错误：缺少来源身份诊断"; cat "$TMP/swap_err.txt"; exit 1; }
+cp "$SITE/images/diagram.png" "$OUT_DIR/images/diagram.png"
+echo "同名换图已正确判 FAIL（已还原原文件）"
+
+python3 - "$OUT_DIR" "$TMP" <<'PY'
+import hashlib
+import json
+import sys
+
+out, tmp = sys.argv[1:3]
+def digest(path):
+    return hashlib.sha256(open(path, 'rb').read()).hexdigest()
+json.dump({'digests': [digest(out + '/images/diagram.png'),
+                       digest(out + '/images/light.png')]},
+          open(tmp + '/map_ok.json', 'w'))
+json.dump({'digests': [digest(out + '/images/light.png'),
+                       digest(out + '/images/diagram.png')]},
+          open(tmp + '/map_swap.json', 'w'))
+PY
+python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+  "$SRC_DIR/api_page1.md" \
+  "$SRC_DIR/index.md" \
+  "$SRC_DIR/api_page2.md" --image-map "$TMP/map_ok.json"
+if python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+    "$SRC_DIR/api_page1.md" \
+    "$SRC_DIR/index.md" \
+    "$SRC_DIR/api_page2.md" --image-map "$TMP/map_swap.json" \
+    >"$TMP/map_err.txt" 2>&1; then
+  echo "错误：身份映射错序未被检测到"
+  exit 1
+fi
+grep -q '来源身份不符' "$TMP/map_err.txt" \
+  || { echo "错误：缺少映射差异诊断"; cat "$TMP/map_err.txt"; exit 1; }
+echo "图片身份映射：一致 PASS；错序已正确判 FAIL"
+
+cp -R "$OUT_DIR" "$TMP/delivery2"
+python3 "$VERIFY" "$TMP/delivery2/merged_api.md" "$MANIFEST" "$EXPECTED" "$SITE" \
+  "$SRC_DIR/api_page1.md" \
+  "$SRC_DIR/index.md" \
+  "$SRC_DIR/api_page2.md"
+echo "交付树搬迁至第二目录后按新路径校验 PASS"
+
 echo "==> Ticket 04 多页面 API 回归全部通过"

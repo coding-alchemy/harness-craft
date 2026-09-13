@@ -13,7 +13,7 @@ python3 tech-doc-translator/install_skill.py --force
 
 安装器只依赖 Python 标准库，把 Skill 源目录的全部发布文件复制到 `${CODEX_HOME:-~/.codex}/skills/tech-doc-translator`；相同内容与权限的重复安装成功且不重写文件，目标中的未知文件保留，不安装第三方依赖，也不创建翻译项目或配置。其他兼容 Agent Skills 的工具可直接把整个 `skills/tech-doc-translator/` 复制到目标 Skill 根目录（不要只复制 `SKILL.md`）。
 
-安装后从安装目录内的 [requirements.txt](./skills/tech-doc-translator/requirements.txt) 显式安装依赖：`pip install -r "${CODEX_HOME:-$HOME/.codex}/skills/tech-doc-translator/requirements.txt"`。仅 PDF 导出模式需要另装可选依赖与浏览器（一次性环境准备，普通翻译不需要）：`pip install -r <SKILL目录>/requirements-pdf.txt && python3 -m playwright install chromium`。
+安装后从安装目录内的 [requirements.txt](./skills/tech-doc-translator/requirements.txt) 显式安装依赖：`python3 -m pip install -r "${CODEX_HOME:-$HOME/.codex}/skills/tech-doc-translator/requirements.txt"`（用目标解释器的 `python3 -m pip`，避免 pip 与运行解释器不一致）。普通翻译依赖要求 Python >=3.10（`tinycss2` 1.5.x 的包元数据 `Requires-Python >=3.10`，已在 Python 3.12 验证；旧执行报告中的“>=3.9”不正确）。仅 PDF 导出模式需要另装可选依赖与浏览器（一次性环境准备，普通翻译不需要）：`python3 -m pip install -r <SKILL目录>/requirements-pdf.txt && python3 -m playwright install chromium`。
 
 ## 使用
 

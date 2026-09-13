@@ -3,6 +3,9 @@
 
 用法：
     python3 verify_api_translation.py <merged.md> <manifest.txt> <official_toc.txt> <site_root> <src1.md> [<src2.md> ...]
+        [--approved-extra-math <表达式>]...
+
+--approved-extra-math 按原文表达式逐条豁免获准译注公式（可重复；不掩盖源公式遗漏）。
 
 official_toc.txt 是独立的官方导航/TOC 快照（每行一个页面相对路径，按官方顺序），
 与 discover_pages.py 的发现结果互为独立基准；闭合对账使用官方 TOC，
@@ -20,35 +23,27 @@ import os
 import re
 import subprocess
 import sys
-from collections import Counter
 
 from bs4 import BeautifulSoup
 from _verification import (
-    heading_lines,
-    image_sources,
-    scan_fences,
-    strip_chinese_suffix,
+    check_image_file,
+    compare_code_fences,
+    compare_headings,
+    compare_math_spans,
+    extract_approved_extra_math,
+    extract_image_options,
+    extract_strong_tokens,
+    fenced_line_numbers,
+    heading_entries,
+    image_occurrence_fails,
+    image_references,
+    load_image_digests,
+    resource_identity_digest,
+    resolve_delivery_image,
+    scan_code_fences,
+    scan_math_spans,
+    strong_token_report,
 )
-
-
-def _headings(lines):
-    """返回 [(级别, 原文)]。"""
-    return [
-        (level, strip_chinese_suffix(text))
-        for level, text in heading_lines('\n'.join(lines))
-    ]
-
-
-def _unnumbered_headings(lines):
-    """排除页面首标题后的无编号标题多重集。"""
-    hs = _headings(lines)
-    if not hs:
-        return []
-    out = []
-    for lvl, t in hs[1:]:
-        if not re.match(r'^\d[\d.]*\.?\s', t):
-            out.append(t)
-    return out
 
 
 def _resolve_image(site_root, page_rel, src):
@@ -58,56 +53,6 @@ def _resolve_image(site_root, page_rel, src):
     if os.path.isabs(src):
         return None
     return os.path.normpath(os.path.join(site_root, os.path.dirname(page_rel), src))
-
-
-def _resolve_delivery_image(merged_path, src):
-    """按最终 Markdown 所在目录解析交付图片；越界、绝对或外链返回 None。"""
-    if not src or re.match(r'^[a-z][a-z0-9+.-]*:', src, re.I):
-        return None
-    clean = src.split('#', 1)[0].split('?', 1)[0]
-    if os.path.isabs(clean):
-        return None
-    base = os.path.dirname(os.path.abspath(merged_path))
-    path = os.path.abspath(os.path.normpath(os.path.join(base, clean)))
-    if os.path.commonpath([base, path]) != base:
-        return None
-    return path
-
-
-def _image_identity(src):
-    """合法本地化允许目录变化，以文件名对账图片身份。"""
-    clean = src.split('#', 1)[0].split('?', 1)[0]
-    return os.path.basename(clean)
-
-
-def _check_magic(path):
-    """读取魔数；可选调用 file 命令。返回 (ok, msg)。"""
-    with open(path, 'rb') as f:
-        head = f.read(12)
-    magics = [
-        (b'\x89PNG\r\n\x1a\n', 'PNG'),
-        (b'\xff\xd8\xff', 'JPEG'),
-        (b'GIF87a', 'GIF'),
-        (b'GIF89a', 'GIF'),
-        (b'RIFF', 'WEBP'),  # RIFF....WEBP
-    ]
-    kind = None
-    for m, name in magics:
-        if head.startswith(m):
-            kind = name
-            break
-    if kind == 'WEBP' and b'WEBP' not in head[:12]:
-        kind = None
-    if kind:
-        return True, kind
-    # 回退到 file 命令
-    try:
-        out = subprocess.run(['file', '-b', path], capture_output=True, text=True, check=True).stdout
-    except Exception:
-        return False, 'unknown magic and file unavailable'
-    if 'image' in out.lower():
-        return True, out.strip().split()[0]
-    return False, out.strip()
 
 
 def _visible_html_images(site_root, page_rel):
@@ -144,11 +89,13 @@ def _image_src(img):
 
 
 def _split_pages(text):
-    """按独立一行的 --- 切分合并文件为多页。"""
+    """按独立一行的 --- 切分合并文件为多页；代码围栏内的 --- 不参与切分。"""
+    lines = text.split('\n')
+    code_lines = fenced_line_numbers(text)
     pages = []
     cur = []
-    for line in text.split('\n'):
-        if line.strip() == '---':
+    for line_no, line in enumerate(lines, start=1):
+        if line_no not in code_lines and line.strip() == '---':
             pages.append('\n'.join(cur))
             cur = []
         else:
@@ -158,13 +105,17 @@ def _split_pages(text):
 
 
 def main():
-    if len(sys.argv) < 6:
+    argv, approved_extra_math = extract_approved_extra_math(sys.argv[1:])
+    argv, strong_tokens = extract_strong_tokens(argv)
+    argv, image_map, delivery_root = extract_image_options(argv)
+    if len(argv) < 6:
         sys.exit(__doc__)
-    merged_path = sys.argv[1]
-    manifest_path = sys.argv[2]
-    toc_path = sys.argv[3]
-    site_root = sys.argv[4]
-    src_paths = sys.argv[5:]
+    merged_path = argv[0]
+    manifest_path = argv[1]
+    toc_path = argv[2]
+    site_root = argv[3]
+    src_paths = argv[4:]
+    image_digests = load_image_digests(image_map) if image_map else None
 
     fails = []
 
@@ -195,73 +146,109 @@ def main():
     for idx, page_rel in enumerate(manifest):
         src_text = open(src_paths[idx], encoding='utf-8').read() if idx < len(src_paths) else ''
         trans_text = trans_pages[idx] if idx < len(trans_pages) else ''
-        src_lines = src_text.split('\n')
-        trans_lines = trans_text.split('\n')
 
-        # 页面标题顺序
-        src_titles = _headings(src_lines)
-        trans_titles = _headings(trans_lines)
-        if src_titles and trans_titles:
-            if src_titles[0][1] != trans_titles[0][1]:
-                fails.append('页 %s 标题顺序不一致: 源 %r vs 译 %r' % (page_rel, src_titles[0][1], trans_titles[0][1]))
+        src_label = src_paths[idx] if idx < len(src_paths) else '（缺源）'
+        doc_label = '%s 第 %d 页' % (os.path.basename(merged_path), idx + 1)
 
-        # 无编号标题多重集
-        su = _unnumbered_headings(src_lines)
-        tu = _unnumbered_headings(trans_lines)
-        if Counter(su) != Counter(tu):
-            fails.append('页 %s 无编号标题多重集不一致: 源 %s vs 译 %s' % (page_rel, Counter(su), Counter(tu)))
+        # 页面标题顺序：按 (层级, 官方原题) 有序对照（后缀边界匹配）
+        src_titles = heading_entries(src_text)
+        trans_titles = heading_entries(trans_text)
+        for diff in compare_headings(src_titles, trans_titles,
+                                     src_label, doc_label):
+            fails.append('页 %s 标题对照: %s' % (page_rel, diff))
 
         # 代码围栏
-        source_fences = scan_fences(src_text)
-        translated_fences = scan_fences(trans_text)
+        source_fences = scan_code_fences(src_text)
+        translated_fences = scan_code_fences(trans_text)
         if not source_fences.balanced:
             fails.append('页 %s 源文围栏不配对' % page_rel)
         if not translated_fences.balanced:
             fails.append('页 %s 译文围栏不配对' % page_rel)
-        if len(source_fences.blocks) != len(translated_fences.blocks):
-            fails.append('页 %s 代码块数不一致: 源 %d vs 译 %d' % (
-                page_rel, len(source_fences.blocks),
-                len(translated_fences.blocks)))
-        else:
-            for i, (s, t) in enumerate(zip(
-                    source_fences.blocks, translated_fences.blocks)):
-                if s != t:
-                    fails.append('页 %s 代码块 #%d 内容不一致' % (page_rel, i + 1))
+        for diff in compare_code_fences(
+                source_fences.blocks, translated_fences.blocks,
+                src_label, doc_label):
+            fails.append('页 %s 代码逐块核对: %s' % (page_rel, diff))
 
-        # 图片数量/顺序
-        src_imgs = image_sources(src_text)
-        trans_imgs = image_sources(trans_text)
-        if ([_image_identity(s) for s in src_imgs] !=
-                [_image_identity(s) for s in trans_imgs]):
-            fails.append('页 %s 图片列表不一致: 源 %s vs 译 %s' % (page_rel, src_imgs, trans_imgs))
+        # 公式逐项核对（类型/顺序/原表达式）
+        src_math = scan_math_spans(src_text)
+        doc_math = scan_math_spans(trans_text)
+        math_diffs, _ = compare_math_spans(
+            src_math, doc_math, src_label, doc_label,
+            approved_extra_exprs=approved_extra_math)
+        for diff in math_diffs:
+            fails.append('页 %s 公式逐项核对: %s' % (page_rel, diff))
 
-        # 最终交付目录中的图片存在性与魔数
-        for src in trans_imgs:
-            p = _resolve_delivery_image(merged_path, src)
-            if not p:
-                fails.append('页 %s 图片不是交付目录内的相对路径: %s' % (page_rel, src))
-                continue
-            if not os.path.exists(p):
-                fails.append('页 %s 交付图片缺失: %s' % (page_rel, src))
-                continue
-            ok, info = _check_magic(p)
-            if not ok:
-                fails.append('页 %s 图片魔数异常 %s: %s' % (page_rel, src, info))
+        # 强 token（项目显式指定；未配置时明示未检查）
+        token_diffs, _ = strong_token_report(src_text, trans_text,
+                                             strong_tokens,
+                                             src_label, doc_label)
+        if token_diffs is not None:
+            for diff in token_diffs:
+                fails.append('页 %s 强 token %s' % (page_rel, diff))
 
-        # 暗亮图片对只计一次：HTML 实际可见数应等于译文图片数
+        # 图片：按出现顺序以来源文件摘要核对身份（不依赖 basename），
+        # 交付引用解析、离线类型与暗亮出现数一并核验
+        trans_refs = image_references(trans_text)
+        trans_imgs = [s for _, s in trans_refs]
         html_visible = _visible_html_images(site_root, page_rel)
         if len(trans_imgs) != len(html_visible):
-            fails.append('页 %s 暗亮图片计数异常: HTML 可见 %d vs 译文 %d' % (page_rel, len(html_visible), len(trans_imgs)))
+            fails.append('页 %s 暗亮图片计数异常: HTML 可见 %d vs 译文 %d'
+                         % (page_rel, len(html_visible), len(trans_imgs)))
+        for order, src in enumerate(trans_imgs, start=1):
+            p, reason = resolve_delivery_image(
+                src, os.path.dirname(os.path.abspath(merged_path)),
+                delivery_root)
+            if reason:
+                fails.append('页 %s 图片 #%d: %s' % (page_rel, order, reason))
+                continue
+            if not os.path.isfile(p):
+                fails.append('页 %s 交付图片缺失: %s' % (page_rel, src))
+                continue
+            ok, kind, reason = check_image_file(
+                p, delivery_root or os.path.dirname(os.path.abspath(merged_path)))
+            if not ok:
+                fails.append('页 %s 图片类型异常 %s: %s' % (page_rel, src, reason))
+                continue
+            if order <= len(html_visible) and os.path.isfile(html_visible[order - 1]):
+                if resource_identity_digest(p) != resource_identity_digest(
+                        html_visible[order - 1]):
+                    fails.append('页 %s 图片 #%d 来源身份不符: %s 与快照资源摘要不一致'
+                                 % (page_rel, order, src))
+            elif order <= len(html_visible):
+                fails.append('页 %s 图片 #%d 源快照资源缺失: %s'
+                             % (page_rel, order, html_visible[order - 1]))
+
+    # 全局出现序号的来源身份映射（--image-map，按交付出现顺序）
+    global_refs = [(page_idx, order, src)
+                   for page_idx, page in enumerate(trans_pages)
+                   for order, (_, src) in enumerate(image_references(page),
+                                                    start=1)]
+    if image_digests is not None:
+        if len(global_refs) != len(image_digests):
+            fails.append('图片身份映射 %d 条与交付出现 %d 次不符'
+                         % (len(image_digests), len(global_refs)))
+        else:
+            base = os.path.dirname(os.path.abspath(merged_path))
+            for page_idx, order, src in global_refs:
+                p, reason = resolve_delivery_image(src, base, delivery_root)
+                if reason or not os.path.isfile(p):
+                    continue  # 逐页检查已报告
+                if resource_identity_digest(p) != image_digests[order - 1 + sum(
+                        len(image_references(trans_pages[i]))
+                        for i in range(page_idx))]:
+                    fails.append('第 %d 页图片 #%d 来源身份不符: %s 与 --image-map 摘要不一致'
+                                 % (page_idx + 1, order, src))
 
     print('校验: %s' % os.path.basename(merged_path))
     if fails:
         for f in fails:
             print('FAIL:', f)
         sys.exit(1)
-    print('PASS: %d pages, %d fences, %d images' % (
+    print('PASS: %d pages, %d fences, %d images%s' % (
         len(manifest),
         sum(1 for _ in re.finditer(r'^```\s*$', merged, re.M)) // 2,
-        len(image_sources(merged)),
+        len(global_refs),
+        '，来源身份映射一致' if image_digests is not None else '',
     ))
 
 

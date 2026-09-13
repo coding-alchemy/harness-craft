@@ -3,6 +3,9 @@
 
 用法：
     python3 verify_reference_translation.py <译文.md> <源文.md> [strong_token ...]
+        [--approved-extra-math <表达式>]...
+
+--approved-extra-math 按原文表达式逐条豁免获准译注公式（可重复；不掩盖源公式遗漏）。
 
 检查项：
   1. H1 唯一性
@@ -25,14 +28,25 @@ import os
 from collections import Counter
 
 from _verification import (
-    heading_lines,
-    invalid_math_delimiters,
+    compare_code_fences,
+    compare_headings,
+    compare_math_spans,
+    count_token,
+    extract_approved_extra_math,
+    extract_image_options,
+    extract_strong_tokens,
+    footnote_diffs,
+    heading_entries,
+    image_marker_refs,
+    load_image_digests,
     link_targets,
-    literal_fence_count,
-    missing_images,
-    normalize,
+    image_occurrence_fails,
+    image_references,
     residual_markers,
-    strip_chinese_suffix,
+    scan_code_fences,
+    scan_math_spans,
+    source_occurrence_digests,
+    strong_token_report,
 )
 
 
@@ -53,39 +67,9 @@ def num_of(h):
     return m.group(1).rstrip('.') if m else None
 
 
-def extract_headings(text):
-    """返回 (levels, h1s)。levels 为按文档顺序的 (level, stripped_text) 列表。"""
-    h1s = []
-    levels = []
-    for level, raw in heading_lines(text):
-        stripped = strip_chinese_suffix(raw)
-        levels.append((level, normalize(stripped)))
-        if level == 1:
-            h1s.append(normalize(stripped))
-    return levels, h1s
-
-
-def display_math_count(text):
-    """$$...$$ 块数。"""
-    return len(re.findall(r'\$\$[\s\S]*?\$\$', text))
-
-
-def inline_math_count(text):
-    """$...$ 行内公式数，排除 $$ 块。"""
-    cleaned = re.sub(r'\$\$[\s\S]*?\$\$', '', text)
-    return len(re.findall(r'\$[^$\n]+\$', cleaned))
-
-
-def fence_pairs(text):
-    return literal_fence_count(text) // 2
-
-
 def source_image_markers(text):
-    return len(re.findall(r'^\s*\[IMG:', text, re.M))
-
-
-def translation_images(text):
-    return len(re.findall(r'!\[', text))
+    """源侧 [IMG:] 标记出现数；代码围栏内的图片语法示例不计数。"""
+    return len(image_marker_refs(text))
 
 
 def def_list_region_counts(text, is_source=True):
@@ -181,58 +165,31 @@ def content_counts(text, is_source=True):
     return paras, lis, trows, admon
 
 
-def count_token(text, token):
-    if re.search(r'\w', token):
-        return len(re.findall(r'(?<!\w)' + re.escape(token) + r'(?!\w)', text))
-    return text.count(token)
-
-
-def verify(translated_path, source_path, strong_tokens):
+def verify(translated_path, source_path, strong_tokens, approved_extra_math=(),
+           delivery_root=None, image_digests=None):
     fails = []
     warns = []
     doc = read(translated_path)
     src = read(source_path)
 
-    # 1) H1 唯一性
-    doc_levels, doc_h1s = extract_headings(doc)
-    src_levels, src_h1s = extract_headings(src)
+    # 1) 标题：H1 唯一性 + 与源按 (层级, 官方原题) 有序对照
+    doc_entries = heading_entries(doc)
+    src_entries = heading_entries(src)
+    doc_h1s = [t for _, lvl, t in doc_entries if lvl == 1]
     if len(doc_h1s) != 1:
         fails.append('H1 数量: %d（应为 1）' % len(doc_h1s))
+    for diff in compare_headings(src_entries, doc_entries,
+                                 source_path, translated_path):
+        fails.append(diff)
 
-    # 2) 标题集合与顺序
-    if len(doc_levels) != len(src_levels):
-        fails.append('标题数量: 源 %d vs 译 %d' % (len(src_levels), len(doc_levels)))
-    else:
-        for i, ((sl, st), (dl, dt)) in enumerate(zip(src_levels, doc_levels)):
-            if sl != dl or st != dt:
-                fails.append('标题 #%d 不一致: 源 %s / 译 %s' % (i + 1, (sl, st), (dl, dt)))
-                break
-
-    # 3) H5-H8 深级标题
-    src_deep = [t for lv, t in src_levels if lv >= 5]
-    doc_deep = [t for lv, t in doc_levels if lv >= 5]
-    if src_deep and not doc_deep:
-        fails.append('深级标题 H5-H8 在译文中丢失')
-    elif len(doc_deep) < len(src_deep):
-        fails.append('深级标题数量减少: 源 %d vs 译 %d' % (len(src_deep), len(doc_deep)))
-
-    # 4) 块级公式
-    s_disp = display_math_count(src)
-    d_disp = display_math_count(doc)
-    if d_disp < s_disp:
-        fails.append('块级公式丢失: 源 %d vs 译 %d' % (s_disp, d_disp))
-    elif d_disp > s_disp:
-        warns.append('块级公式增加: 源 %d vs 译 %d（可能为译注公式）' % (s_disp, d_disp))
-
-    # 5) 行内公式
-    s_inline = inline_math_count(src)
-    d_inline = inline_math_count(doc)
-    if d_inline < s_inline:
-        fails.append('行内公式丢失: 源 %d vs 译 %d' % (s_inline, d_inline))
-    elif d_inline > s_inline:
-        warns.append('行内公式增加: 源 %d vs 译 %d' % (s_inline, d_inline))
-    if invalid_math_delimiters(doc):
-        fails.append('公式定界符嵌套: Markdown 与 LaTeX 定界符不得叠加')
+    # 4) 公式逐项核对（类型/顺序/原表达式，含历史包装告警）
+    src_math = scan_math_spans(src)
+    doc_math = scan_math_spans(doc)
+    math_diffs, math_warns = compare_math_spans(
+        src_math, doc_math, source_path, translated_path,
+        approved_extra_exprs=approved_extra_math)
+    fails.extend('公式逐项核对: %s' % d for d in math_diffs)
+    warns.extend(math_warns)
 
     missing_links = Counter(link_targets(src)) - Counter(link_targets(doc))
     if missing_links:
@@ -260,31 +217,49 @@ def verify(translated_path, source_path, strong_tokens):
         warns.append('表格数据行漂移: 源 %d vs 译 %d' % (s_rows, d_rows))
 
     # 8) 代码围栏
-    s_fences = fence_pairs(src)
-    d_fences = fence_pairs(doc)
-    if literal_fence_count(doc) % 2 != 0:
-        fails.append('译文代码围栏不成对')
-    if s_fences != d_fences:
-        fails.append('代码围栏数不一致: 源 %d 对 vs 译 %d 对' % (s_fences, d_fences))
+    doc_fences = scan_code_fences(doc)
+    src_fences = scan_code_fences(src)
+    if not doc_fences.balanced:
+        fails.append('译文代码围栏不成对: 第 %d 行开启的代码块未闭合'
+                     % doc_fences.unclosed_line)
+    if not src_fences.balanced:
+        fails.append('源文代码围栏不成对: 第 %d 行开启的代码块未闭合'
+                     % src_fences.unclosed_line)
+    for diff in compare_code_fences(src_fences.blocks, doc_fences.blocks,
+                                    source_path, translated_path):
+        fails.append('代码逐块核对: %s' % diff)
 
-    # 9) 图片数量与存在性
+    # 9) 图片：源 [IMG:] 出现数对照 + 离线核验（围栏内图片语法不计）。
+    #    完整通过必须建立每次出现的来源身份：--image-map 或可靠的当前源资源，
+    #    两者都不可用而译文含图时不判定完整通过
     s_imgs = source_image_markers(src)
-    d_imgs = translation_images(doc)
+    d_imgs = len(image_references(doc))
     if d_imgs < s_imgs:
         fails.append('图片数量不足: 源 %d vs 译 %d' % (s_imgs, d_imgs))
     elif d_imgs > s_imgs:
         warns.append('图片数量增加: 源 %d vs 译 %d' % (s_imgs, d_imgs))
-    for image in missing_images(doc, os.path.dirname(translated_path)):
-        fails.append('图片缺失: %s' % image)
+    identity = image_digests
+    identity_basis = '映射'
+    if identity is None:
+        identity = source_occurrence_digests(
+            src, os.path.dirname(os.path.abspath(source_path)))
+        identity_basis = '当前源资源'
+    for msg in image_occurrence_fails(
+            doc, os.path.dirname(os.path.abspath(translated_path)),
+            delivery_root, expected_digests=identity):
+        fails.append('图片核验: %s' % msg)
+    if identity is None and d_imgs:
+        fails.append('图片来源身份未核验（无 --image-map 且源资源不可解析），'
+                     '不判定完整通过')
 
-    # 10) 强 token 多重集
-    for token in strong_tokens:
-        sc = count_token(src, token)
-        dc = count_token(doc, token)
-        if dc < sc:
-            fails.append('强 token 遗漏 %s: 源 %d vs 译 %d' % (token, sc, dc))
-        elif dc > sc:
-            warns.append('强 token 增加 %s: 源 %d vs 译 %d（可能为译注引用）' % (token, sc, dc))
+    # 10) 强 token 多重集（未配置时明示未检查）
+    token_diffs, token_warns = strong_token_report(src, doc, strong_tokens,
+                                                   source_path, translated_path)
+    if token_diffs is not None:
+        fails.extend(token_diffs)
+        warns.extend(token_warns)
+    else:
+        warns.extend(token_warns)
 
     # 11) 残留解析占位符
     for marker in residual_markers(doc, _RESIDUAL_MARKERS):
@@ -307,22 +282,30 @@ def verify(translated_path, source_path, strong_tokens):
     if sa and da != sa:
         fails.append('提示框数量变化: 源 %d vs 译 %d' % (sa, da))
 
-    # 脚注配对（信息性检查，防止 [^n] 被破坏）
-    refs = set(re.findall(r'\[\^(\d+)\](?!:)', doc))
-    defs = set(re.findall(r'^\[\^(\d+)\]:', doc, re.M))
+    # 脚注：译文内部配对 + 以源引用/定义关系为基准（支持命名标签）
+    refs = set(re.findall(r'\[\^([^\]]+)\](?!:)', doc))
+    defs = set(re.findall(r'^\[\^([^\]]+)\]:', doc, re.M))
     if refs != defs:
         fails.append('脚注不配对: refs=%s defs=%s' % (sorted(refs - defs), sorted(defs - refs)))
+    fn_diffs, fn_warns = footnote_diffs(src, doc, source_path, translated_path)
+    fails.extend(fn_diffs)
+    warns.extend(fn_warns)
 
     return fails, warns
 
 
 def main():
-    if len(sys.argv) < 3:
+    argv, approved_extra_math = extract_approved_extra_math(sys.argv[1:])
+    argv, flag_tokens = extract_strong_tokens(argv)
+    argv, image_map, delivery_root = extract_image_options(argv)
+    if len(argv) < 2:
         sys.exit(__doc__)
-    translated_path = sys.argv[1]
-    source_path = sys.argv[2]
-    strong_tokens = sys.argv[3:]
-    fails, warns = verify(translated_path, source_path, strong_tokens)
+    translated_path = argv[0]
+    source_path = argv[1]
+    strong_tokens = argv[2:] + flag_tokens
+    image_digests = load_image_digests(image_map) if image_map else None
+    fails, warns = verify(translated_path, source_path, strong_tokens,
+                          approved_extra_math, delivery_root, image_digests)
 
     print('%s: %s' % (os.path.basename(translated_path), 'PASS' if not fails else 'FAIL'))
     for f in fails:
