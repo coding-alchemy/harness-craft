@@ -21,14 +21,18 @@ python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
   "1.1.1. Memory Model"
 
 echo "==> 回归：围栏内 # 注释不得计入 Markdown 标题"
-python3 - "$TMP/sample_translated.md" "$TMP/sample_fenced_comment.md" <<'PY'
+python3 - "$TMP/sample_source.md" "$TMP/sample_translated.md" "$TMP/fc_source.md" "$TMP/sample_fenced_comment.md" <<'PY'
 import sys
 
-text = open(sys.argv[1], encoding='utf-8').read()
-text += '\n```python\n# 这是代码注释，不是 H1\nprint("ok")\n```\n'
-open(sys.argv[2], 'w', encoding='utf-8').write(text)
+src_path, trans_path, fc_src_path, fc_trans_path = sys.argv[1:5]
+block = '\n```python\n# 这是代码注释，不是 H1\nprint("ok")\n```\n'
+# 源与译文同步追加同一代码块：注释必须在标题检测中被排除，且代码逐块一致
+src = open(src_path, encoding='utf-8').read()
+open(fc_src_path, 'w', encoding='utf-8').write(src + block)
+text = open(trans_path, encoding='utf-8').read()
+open(fc_trans_path, 'w', encoding='utf-8').write(text + block)
 PY
-python3 "$VERIFY" "$TMP/sample_fenced_comment.md" "$TMP/sample_source.md" \
+python3 "$VERIFY" "$TMP/sample_fenced_comment.md" "$TMP/fc_source.md" \
   "1. Compute Kernel Basics" \
   "1.1. Thread Hierarchy" \
   "1.1.1. Memory Model"
@@ -159,6 +163,821 @@ assert entries[2]['width']['basis'] == 'html-width-attribute', entries[2]
 assert entries[2]['width']['value'] == 300, entries[2]
 assert [e['reason'] for e in payload['undetermined']] == ['源节点无宽度约束'], payload
 print('宽度提取：内联 px / HTML 属性正确；无约束单列未确定')
+PY
+
+echo "==> 完整性-01：外层长围栏包含短围栏/H2/美元/图片语法/分隔线的正确译文保持通过"
+cp fixtures/valid_1x1.png "$TMP/images/nested.png"
+python3 - "$TMP" <<'PY'
+import sys
+
+tmp = sys.argv[1]
+f3, f4 = '`' * 3, '`' * 4
+src = (
+    '# 6. Complex Fencing Guide\n'
+    '\n'
+    'This section shows nested fences.\n'
+    '\n'
+    '## 6.1. Nested Fences\n'
+    '\n'
+    + f4 + 'text\n'
+    + f3 + 'python\n'
+    'print("inner fence")\n'
+    + f3 + '\n'
+    '## not a heading\n'
+    '---\n'
+    '$x$\n'
+    '![img](images/nested.png)\n'
+    + f4 + '\n'
+    '\n'
+    '~~~\n'
+    'tilde fenced\n'
+    '~~~\n'
+)
+trans = (
+    '# 6. Complex Fencing Guide（复杂围栏指南）\n'
+    '\n'
+    '本节展示嵌套围栏。\n'
+    '\n'
+    '## 6.1. Nested Fences（嵌套围栏）\n'
+    '\n'
+    + f4 + 'text\n'
+    + f3 + 'python\n'
+    'print("inner fence")\n'
+    + f3 + '\n'
+    '## not a heading\n'
+    '---\n'
+    '$x$\n'
+    '![img](images/nested.png)\n'
+    + f4 + '\n'
+    '\n'
+    '~~~\n'
+    'tilde fenced\n'
+    '~~~\n'
+)
+open(tmp + '/complex_src.md', 'w', encoding='utf-8').write(src)
+open(tmp + '/complex_trans.md', 'w', encoding='utf-8').write(trans)
+PY
+python3 "$VERIFY" "$TMP/complex_trans.md" "$TMP/complex_src.md" \
+  "6. Complex Fencing Guide" "6.1. Nested Fences"
+
+echo "==> 完整性-01 失败回归：代码内容/空白/语言标签/顺序/围栏边界篡改必须判 FAIL"
+python3 - "$TMP/complex_trans.md" "$TMP/complex_bad_body.md" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding='utf-8').read()
+open(sys.argv[2], 'w', encoding='utf-8').write(
+    text.replace('print("inner fence")', 'print("inner fence v2")'))
+PY
+if python3 "$VERIFY" "$TMP/complex_bad_body.md" "$TMP/complex_src.md" \
+    "6. Complex Fencing Guide" "6.1. Nested Fences" \
+    >"$TMP/complex_body_err.txt" 2>&1; then
+  echo "错误：代码内容篡改未被检测到"
+  exit 1
+fi
+grep -q '正文第 2 行不一致' "$TMP/complex_body_err.txt" \
+  || { echo "错误：缺少代码正文差异诊断"; cat "$TMP/complex_body_err.txt"; exit 1; }
+echo "代码内容篡改已正确判 FAIL（含逐块差异诊断）"
+
+python3 - "$TMP/complex_trans.md" "$TMP/complex_bad_lang.md" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding='utf-8').read()
+f4 = '`' * 4
+open(sys.argv[2], 'w', encoding='utf-8').write(
+    text.replace(f4 + 'text\n', f4 + 'md\n'))
+PY
+if python3 "$VERIFY" "$TMP/complex_bad_lang.md" "$TMP/complex_src.md" \
+    "6. Complex Fencing Guide" "6.1. Nested Fences" \
+    >"$TMP/complex_lang_err.txt" 2>&1; then
+  echo "错误：语言标签篡改未被检测到"
+  exit 1
+fi
+grep -q '开启行不一致' "$TMP/complex_lang_err.txt" \
+  || { echo "错误：缺少开启行差异诊断"; cat "$TMP/complex_lang_err.txt"; exit 1; }
+echo "语言标签篡改已正确判 FAIL"
+
+python3 - "$TMP/complex_trans.md" "$TMP/complex_bad_space.md" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding='utf-8').read()
+open(sys.argv[2], 'w', encoding='utf-8').write(
+    text.replace('tilde fenced\n', 'tilde fenced  \n'))
+PY
+if python3 "$VERIFY" "$TMP/complex_bad_space.md" "$TMP/complex_src.md" \
+    "6. Complex Fencing Guide" "6.1. Nested Fences"; then
+  echo "错误：代码空白篡改未被检测到"
+  exit 1
+fi
+echo "代码空白篡改已正确判 FAIL"
+
+python3 - "$TMP" <<'PY'
+import sys
+
+tmp = sys.argv[1]
+f3 = '`' * 3
+src = ('# 7. Order Sample\n\n' + f3 + 'c\nreturn 1;\n' + f3 + '\n\nmid text\n\n'
+       + f3 + 'py\nreturn 2;\n' + f3 + '\n')
+trans = ('# 7. Order Sample（顺序样本）\n\n' + f3 + 'py\nreturn 2;\n' + f3
+         + '\n\n中段文本\n\n' + f3 + 'c\nreturn 1;\n' + f3 + '\n')
+open(tmp + '/order_src.md', 'w', encoding='utf-8').write(src)
+open(tmp + '/order_trans.md', 'w', encoding='utf-8').write(trans)
+PY
+if python3 "$VERIFY" "$TMP/order_trans.md" "$TMP/order_src.md" \
+    "7. Order Sample" >"$TMP/order_err.txt" 2>&1; then
+  echo "错误：代码块顺序交换未被检测到"
+  exit 1
+fi
+grep -q '开启行不一致' "$TMP/order_err.txt" \
+  || { echo "错误：缺少顺序差异诊断"; cat "$TMP/order_err.txt"; exit 1; }
+echo "代码块顺序交换已正确判 FAIL"
+
+python3 - "$TMP/order_src.md" "$TMP/order_trans.md" "$TMP/order_bad_ret.md" <<'PY'
+import sys
+
+trans_path, out_path = sys.argv[2:4]
+trans = open(trans_path, encoding='utf-8').read()
+assert 'return 1;' in trans, '回归样本缺少目标代码行'
+# 顺序正确但改返回值：必须因正文差异失败
+open(out_path, 'w', encoding='utf-8').write(
+    trans.replace('return 1;', 'return 2;'))
+PY
+if python3 "$VERIFY" "$TMP/order_bad_ret.md" "$TMP/order_src.md" \
+    "7. Order Sample" >"$TMP/order_ret_err.txt" 2>&1; then
+  echo "错误：返回值篡改未被检测到"
+  exit 1
+fi
+grep -q '正文第 1 行不一致' "$TMP/order_ret_err.txt" \
+  || { echo "错误：缺少返回值差异诊断"; cat "$TMP/order_ret_err.txt"; exit 1; }
+echo "返回值篡改已正确判 FAIL"
+
+python3 - "$TMP/complex_trans.md" "$TMP/complex_bad_close.md" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding='utf-8').read()
+f4 = '`' * 4
+open(sys.argv[2], 'w', encoding='utf-8').write(
+    text.replace(f4 + '\n', '`' * 3 + '\n'))
+PY
+if python3 "$VERIFY" "$TMP/complex_bad_close.md" "$TMP/complex_src.md" \
+    "6. Complex Fencing Guide" "6.1. Nested Fences"; then
+  echo "错误：围栏边界篡改未被检测到"
+  exit 1
+fi
+echo "围栏边界篡改已正确判 FAIL"
+
+echo "==> 完整性-01 失败回归：缺源必须报告输入不足，不得跳过检查"
+if python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/missing_source.md" \
+    "1. Compute Kernel Basics" \
+    "1.1. Thread Hierarchy" \
+    "1.1.1. Memory Model" >"$TMP/missing_src_err.txt" 2>&1; then
+  echo "错误：缺源未被报为输入不足"
+  exit 1
+fi
+grep -q '源文缺失' "$TMP/missing_src_err.txt" \
+  || { echo "错误：缺源诊断缺失"; cat "$TMP/missing_src_err.txt"; exit 1; }
+echo "缺源已正确判 FAIL"
+
+echo "==> 完整性-02：货币/转义/行内代码不进入公式预期；获准译注公式豁免"
+python3 - "$TMP" <<'PY'
+import sys
+
+tmp = sys.argv[1]
+f3 = '`' * 3
+src = ('# 8. Math Adjacency\n\n'
+       '价格为 $5 和 $10，成本 \\$3。代码 `$x$` 保持原样。\n\n'
+       '真实公式 $a+b$ 在此。\n')
+trans = ('# 8. Math Adjacency（数学邻接）\n\n'
+         '价格为 $5 和 $10，成本 \\$3。代码 `$x$` 保持原样。\n\n'
+         '真实公式 $a+b$ 在此。\n\n译注 $n^{2}$ 说明。\n')
+open(tmp + '/mathadj_src.md', 'w', encoding='utf-8').write(src)
+open(tmp + '/mathadj_trans.md', 'w', encoding='utf-8').write(trans)
+open(tmp + '/mathadj_swap.md', 'w', encoding='utf-8').write(
+    trans.replace('$a+b$', '$b+a$'))
+PY
+if python3 "$VERIFY" "$TMP/mathadj_trans.md" "$TMP/mathadj_src.md" \
+    "8. Math Adjacency"; then
+  echo "错误：未获准译注公式未被检测到"
+  exit 1
+fi
+python3 "$VERIFY" "$TMP/mathadj_trans.md" "$TMP/mathadj_src.md" \
+    "8. Math Adjacency" --approved-extra-math 'n^{2}'
+if python3 "$VERIFY" "$TMP/mathadj_swap.md" "$TMP/mathadj_src.md" \
+    "8. Math Adjacency"; then
+  echo "错误：公式内容篡改未被检测到"
+  exit 1
+fi
+echo "货币/转义/行内代码不误报；译注豁免与公式篡改检出均 PASS"
+
+echo "==> 完整性-04：标题层级/弯引号/整对脚注/强 token/片段模式"
+python3 - "$TMP/sample_translated.md" "$TMP" <<'PY'
+import sys
+
+src_path, tmp = sys.argv[1], sys.argv[2]
+text = open(src_path, encoding='utf-8').read()
+open(tmp + '/lvl_bad.md', 'w', encoding='utf-8').write(
+    text.replace('## 1.1. Thread Hierarchy（线程层次结构）',
+                 '### 1.1. Thread Hierarchy（线程层次结构）'))
+PY
+if python3 "$VERIFY" "$TMP/lvl_bad.md" "$TMP/sample_source.md" \
+    "1. Compute Kernel Basics" >"$TMP/lvl_err.txt" 2>&1; then
+  echo "错误：标题层级变化未被检测到"
+  exit 1
+fi
+grep -q '层级不一致' "$TMP/lvl_err.txt" \
+  || { echo "错误：缺少层级差异诊断"; cat "$TMP/lvl_err.txt"; exit 1; }
+echo "标题层级变化已正确判 FAIL"
+
+python3 - "$TMP" <<'PY'
+import sys
+
+tmp = sys.argv[1]
+src = '# 8. It’s Here\n\n正文含强 token cublasSgemm 与脚注[^1]。\n\n[^1]: 注\n'
+trans = '# 8. It’s Here（在此）\n\n正文含强 token cublasSgemm 与脚注[^1]。译注[^n1]。\n\n[^1]: 注\n[^n1]: 译注\n'
+open(tmp + '/t8_src.md', 'w', encoding='utf-8').write(src)
+open(tmp + '/t8_ok.md', 'w', encoding='utf-8').write(trans)
+open(tmp + '/t8_quote.md', 'w', encoding='utf-8').write(
+    trans.replace('It’s Here', "It's Here"))
+open(tmp + '/t8_token.md', 'w', encoding='utf-8').write(
+    trans.replace('cublasSgemm', ''))
+open(tmp + '/t8_fn.md', 'w', encoding='utf-8').write(
+    trans.replace('与脚注[^1]', '').replace('[^1]: 注\n', ''))
+PY
+python3 "$VERIFY" "$TMP/t8_ok.md" "$TMP/t8_src.md" "8. It’s Here" \
+    --strong-token cublasSgemm
+if python3 "$VERIFY" "$TMP/t8_quote.md" "$TMP/t8_src.md" "8. It’s Here" \
+    >"$TMP/quote_err.txt" 2>&1; then
+  echo "错误：弯引号改变未被检测到"
+  exit 1
+fi
+grep -q '标题核对' "$TMP/quote_err.txt" \
+  || { echo "错误：缺少弯引号差异诊断"; cat "$TMP/quote_err.txt"; exit 1; }
+echo "原题弯引号改变已正确判 FAIL"
+if python3 "$VERIFY" "$TMP/t8_token.md" "$TMP/t8_src.md" "8. It’s Here" \
+    --strong-token cublasSgemm >"$TMP/token_err.txt" 2>&1; then
+  echo "错误：强 token 遗漏未被检测到"
+  exit 1
+fi
+grep -q '强 token' "$TMP/token_err.txt" \
+  || { echo "错误：缺少强 token 诊断"; cat "$TMP/token_err.txt"; exit 1; }
+echo "强 token 遗漏已正确判 FAIL"
+if python3 "$VERIFY" "$TMP/t8_fn.md" "$TMP/t8_src.md" "8. It’s Here" \
+    >"$TMP/fn_err.txt" 2>&1; then
+  echo "错误：整对脚注删除未被检测到"
+  exit 1
+fi
+grep -q '整对\|引用缺失\|定义缺失' "$TMP/fn_err.txt" \
+  || { echo "错误：缺少脚注差异诊断"; cat "$TMP/fn_err.txt"; exit 1; }
+echo "整对脚注删除已正确判 FAIL"
+python3 "$VERIFY" "$TMP/t8_ok.md" "$TMP/t8_src.md" 2>&1 | grep -q '未配置' \
+  || { echo "错误：未配置强 token 未明示"; exit 1; }
+echo "未配置强 token 明示未检查 PASS"
+
+cat > "$TMP/frag_ok.md" <<'EOF'
+## 1.1. Thread Hierarchy（线程层次结构）
+
+片段正文，无 H1。
+EOF
+cat > "$TMP/frag_src.md" <<'EOF'
+## 1.1. Thread Hierarchy
+
+片段正文。
+EOF
+cat > "$TMP/frag_bad.md" <<'EOF'
+## 1.2. Memory Model（内存模型）
+
+片段正文。
+EOF
+python3 "$VERIFY" "$TMP/frag_ok.md" "$TMP/frag_src.md" \
+    "1.1. Thread Hierarchy" --fragment
+if python3 "$VERIFY" "$TMP/frag_bad.md" "$TMP/frag_src.md" \
+    "1.1. Thread Hierarchy" --fragment >"$TMP/frag_err.txt" 2>&1; then
+  echo "错误：片段缺失预期标题未被检测到"
+  exit 1
+fi
+echo "片段模式：无 H1 合法片段通过；缺预期标题已正确判 FAIL"
+
+echo "==> 完整性-04b：片段模式仍逐项对照源标题（层级/删除/改题均 FAIL）"
+cat > "$TMP/frag_level.md" <<'EOF'
+### 1.1. Thread Hierarchy（线程层次结构）
+
+片段正文，无 H1。
+EOF
+cat > "$TMP/frag_del.md" <<'EOF'
+片段正文，标题被删除。
+EOF
+cat > "$TMP/frag_wrong.md" <<'EOF'
+### 1.1. Wrong（错）
+
+片段正文，无 H1。
+EOF
+for case in frag_level frag_del frag_wrong; do
+  if python3 "$VERIFY" "$TMP/$case.md" "$TMP/frag_src.md" \
+      --fragment >"$TMP/$case.err" 2>&1; then
+    echo "错误：片段模式 $case 场景未被检测到"
+    exit 1
+  fi
+  grep -q '标题核对' "$TMP/$case.err" \
+    || { echo "错误：$case 缺少标题核对诊断"; cat "$TMP/$case.err"; exit 1; }
+done
+python3 "$VERIFY" "$TMP/frag_ok.md" "$TMP/frag_src.md" --fragment
+echo "片段模式免检路径已封堵：层级/删除/改题 FAIL；合法片段（无官方清单）PASS"
+
+echo "==> 完整性-04c：深层标题 H7/H8 不被截断，删除即 FAIL"
+cat > "$TMP/deep_src.md" <<'EOF'
+# 1. Deep
+
+## 1.1. Branch
+
+####### 1.1.1. Deep Seven
+
+内容七。
+
+######## 1.1.2. Deep Eight
+
+内容八。
+EOF
+cat > "$TMP/deep_ok.md" <<'EOF'
+# 1. Deep（深层）
+
+## 1.1. Branch（分支）
+
+####### 1.1.1. Deep Seven（七级）
+
+内容七。
+
+######## 1.1.2. Deep Eight（八级）
+
+内容八。
+EOF
+cat > "$TMP/deep_del.md" <<'EOF'
+# 1. Deep（深层）
+
+## 1.1. Branch（分支）
+
+内容七。
+
+内容八。
+EOF
+python3 "$VERIFY" "$TMP/deep_ok.md" "$TMP/deep_src.md" \
+    "1. Deep" "1.1. Branch" "1.1.1. Deep Seven" "1.1.2. Deep Eight"
+if python3 "$VERIFY" "$TMP/deep_del.md" "$TMP/deep_src.md" \
+    "1. Deep" "1.1. Branch" >"$TMP/deep_err.txt" 2>&1; then
+  echo "错误：删除 H7/H8 未被检测到"
+  exit 1
+fi
+echo "H7/H8 合法双语标题 PASS；删除 H7/H8 已正确判 FAIL"
+
+echo "==> 完整性-05：离线图片核验（外链/绝对路径/cwd 伪匹配/伪图/空文件/身份/搬迁）"
+python3 - "$TMP" <<'PY'
+import os
+import sys
+
+tmp = sys.argv[1]
+# 伪图与空文件
+os.makedirs(tmp + '/images', exist_ok=True)
+with open(tmp + '/images/fake.png', 'wb') as f:
+    f.write(b'<html><body>404 not found</body></html>')
+with open(tmp + '/images/empty.png', 'wb') as f:
+    f.write(b'')
+# SVG 有效版本与含外部依赖版本
+with open(tmp + '/images/vec.svg', 'w', encoding='utf-8') as f:
+    f.write('<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>')
+with open(tmp + '/images/bad.svg', 'w', encoding='utf-8') as f:
+    f.write('<svg><image href="https://cdn.example/x.png"/></svg>')
+# 评审 P2-8：无效 XML / 缺失本地依赖 / 单引号命名空间
+with open(tmp + '/images/notxml.svg', 'w', encoding='utf-8') as f:
+    f.write('<svg this is not valid xml')
+with open(tmp + '/images/depmissing.svg', 'w', encoding='utf-8') as f:
+    f.write('<svg xmlns="http://www.w3.org/2000/svg">'
+            '<image href="missing_local.png"/></svg>')
+with open(tmp + '/images/sq.svg', 'w', encoding='utf-8') as f:
+    f.write("<svg xmlns='http://www.w3.org/2000/svg'><rect/></svg>")
+# 图片对账与混合语法样例图（内容不同，身份可区分）
+with open(tmp + '/images/m1.png', 'wb') as f:
+    f.write(b'\x89PNG\r\n\x1a\n' + b'M' * 32)
+with open(tmp + '/images/m2.png', 'wb') as f:
+    f.write(b'\x89PNG\r\n\x1a\n' + b'N' * 32)
+# cwd 伪匹配：文档位于子目录，引用只在上层目录存在的图片
+os.makedirs(tmp + '/sub/images', exist_ok=True)
+text = open(tmp + '/sample_translated.md', encoding='utf-8').read()
+open(tmp + '/sub/doc.md', 'w', encoding='utf-8').write(
+    text.replace('images/thread_hierarchy.png', 'thread_hierarchy.png'))
+src_text = open(tmp + '/sample_source.md', encoding='utf-8').read()
+# 源同样改用 SVG 的基准源文件：本地化后源译逐项一致才可身份通过
+open(tmp + '/svg_src.md', 'w', encoding='utf-8').write(src_text.replace(
+    '![Thread hierarchy diagram](images/thread_hierarchy.png)',
+    '![Vector](images/vec.svg)'))
+open(tmp + '/svg_sq_src.md', 'w', encoding='utf-8').write(src_text.replace(
+    '![Thread hierarchy diagram](images/thread_hierarchy.png)',
+    '![Vector](images/sq.svg)'))
+open(tmp + '/hotlink.md', 'w', encoding='utf-8').write(
+    text.replace('images/thread_hierarchy.png',
+                 'https://cdn.example/thread_hierarchy.png'))
+open(tmp + '/abs.md', 'w', encoding='utf-8').write(
+    text.replace('images/thread_hierarchy.png', '/etc/machine.png'))
+open(tmp + '/fakeimg.md', 'w', encoding='utf-8').write(
+    text.replace('images/thread_hierarchy.png', 'images/fake.png'))
+open(tmp + '/emptyimg.md', 'w', encoding='utf-8').write(
+    text.replace('images/thread_hierarchy.png', 'images/empty.png'))
+open(tmp + '/svg_ok.md', 'w', encoding='utf-8').write(text.replace(
+    '![Thread hierarchy diagram](images/thread_hierarchy.png)',
+    '![Vector](images/vec.svg)'))
+open(tmp + '/svg_bad.md', 'w', encoding='utf-8').write(text.replace(
+    '![Thread hierarchy diagram](images/thread_hierarchy.png)',
+    '![Vector](images/bad.svg)'))
+open(tmp + '/svg_notxml.md', 'w', encoding='utf-8').write(text.replace(
+    '![Thread hierarchy diagram](images/thread_hierarchy.png)',
+    '![Vector](images/notxml.svg)'))
+open(tmp + '/svg_depmissing.md', 'w', encoding='utf-8').write(text.replace(
+    '![Thread hierarchy diagram](images/thread_hierarchy.png)',
+    '![Vector](images/depmissing.svg)'))
+open(tmp + '/svg_sq.md', 'w', encoding='utf-8').write(text.replace(
+    '![Thread hierarchy diagram](images/thread_hierarchy.png)',
+    '![Vector](images/sq.svg)'))
+# 代码内图片语法示例：引用了不存在的文件也不计入真实图片
+code_block = '\n```markdown\n![示例](images/not-a-real-file.png)\n```\n'
+src_text = open(tmp + '/sample_source.md', encoding='utf-8').read()
+open(tmp + '/codeimg_src.md', 'w', encoding='utf-8').write(src_text + code_block)
+open(tmp + '/codeimg_ok.md', 'w', encoding='utf-8').write(text + code_block)
+PY
+OFFICIAL_TITLES=("1. Compute Kernel Basics" "1.1. Thread Hierarchy" "1.1.1. Memory Model")
+for case in hotlink abs fakeimg emptyimg; do
+  if python3 "$VERIFY" "$TMP/$case.md" "$TMP/sample_source.md" \
+      "${OFFICIAL_TITLES[@]}" >"$TMP/$case.err" 2>&1; then
+    echo "错误：$case 场景未被检测到"
+    exit 1
+  fi
+done
+if python3 "$VERIFY" "$TMP/sub/doc.md" "$TMP/sample_source.md" \
+    "${OFFICIAL_TITLES[@]}"; then
+  echo "错误：cwd 伪匹配未被检测到"
+  exit 1
+fi
+python3 "$VERIFY" "$TMP/svg_ok.md" "$TMP/svg_src.md" "${OFFICIAL_TITLES[@]}"
+python3 "$VERIFY" "$TMP/svg_sq.md" "$TMP/svg_sq_src.md" "${OFFICIAL_TITLES[@]}"
+if python3 "$VERIFY" "$TMP/svg_ok.md" "$TMP/sample_source.md" \
+    "${OFFICIAL_TITLES[@]}" >"$TMP/svg_swap.err" 2>&1; then
+  echo "错误：源 PNG 被换成不同内容 SVG（同数量换图）未被身份核验检出"
+  exit 1
+fi
+grep -q '来源身份不符' "$TMP/svg_swap.err" \
+  || { echo "错误：缺少换图身份诊断"; cat "$TMP/svg_swap.err"; exit 1; }
+for case in svg_bad svg_notxml svg_depmissing; do
+  if python3 "$VERIFY" "$TMP/$case.md" "$TMP/sample_source.md" \
+      "${OFFICIAL_TITLES[@]}" >"$TMP/$case.err" 2>&1; then
+    echo "错误：$case 场景未被检测到"
+    exit 1
+  fi
+done
+python3 "$VERIFY" "$TMP/codeimg_ok.md" "$TMP/codeimg_src.md" "${OFFICIAL_TITLES[@]}"
+echo "外链/绝对路径/伪图/空文件/SVG 依赖均判 FAIL；代码内示例与有效 SVG PASS"
+
+echo "==> 完整性-05b：源译图片出现次数对账常开（漏图必 FAIL，不依赖身份映射）"
+cat > "$TMP/count_src.md" <<'EOF'
+# 1. Count
+
+## 1.1. Pics
+
+![one](images/m1.png)
+
+![two](images/m2.png)
+EOF
+cat > "$TMP/count_none.md" <<'EOF'
+# 1. Count（计数）
+
+## 1.1. Pics（图）
+
+正文，图片全部丢失。
+EOF
+cat > "$TMP/count_part.md" <<'EOF'
+# 1. Count（计数）
+
+## 1.1. Pics（图）
+
+![one](images/m1.png)
+
+正文，少一张图。
+EOF
+cat > "$TMP/count_ok.md" <<'EOF'
+# 1. Count（计数）
+
+## 1.1. Pics（图）
+
+![one](images/m1.png)
+
+![two](images/m2.png)
+EOF
+if python3 "$VERIFY" "$TMP/count_none.md" "$TMP/count_src.md" \
+    "1. Count" "1.1. Pics" >"$TMP/count_none.err" 2>&1; then
+  echo "错误：整张漏图未被检测到"
+  exit 1
+fi
+grep -q '图片对账.*FAIL' "$TMP/count_none.err" \
+  || { echo "错误：缺少图片对账诊断"; cat "$TMP/count_none.err"; exit 1; }
+if python3 "$VERIFY" "$TMP/count_part.md" "$TMP/count_src.md" \
+    "1. Count" "1.1. Pics" >"$TMP/count_part.err" 2>&1; then
+  echo "错误：部分漏图未被检测到"
+  exit 1
+fi
+grep -q '图片对账.*FAIL' "$TMP/count_part.err" \
+  || { echo "错误：缺少部分漏图诊断"; cat "$TMP/count_part.err"; exit 1; }
+python3 "$VERIFY" "$TMP/count_ok.md" "$TMP/count_src.md" \
+    "1. Count" "1.1. Pics" | grep -q '出现次数一致' \
+  || { echo "错误：合法图片未按出现次数通过"; exit 1; }
+echo "整张漏图/部分漏图均 FAIL；合法未改名图片 PASS（未提供身份映射）"
+
+echo "==> 完整性-05d：同数量交换图片必须被来源身份核验检出（不依赖 --image-map）"
+cat > "$TMP/count_swap.md" <<'EOF'
+# 1. Count（计数）
+
+## 1.1. Pics（图）
+
+![one](images/m2.png)
+
+![two](images/m1.png)
+EOF
+if python3 "$VERIFY" "$TMP/count_swap.md" "$TMP/count_src.md" \
+    "1. Count" "1.1. Pics" >"$TMP/count_swap.err" 2>&1; then
+  echo "错误：同数量交换图片未被身份核验检出"
+  exit 1
+fi
+grep -q '来源身份不符' "$TMP/count_swap.err" \
+  || { echo "错误：缺少交换图片身份诊断"; cat "$TMP/count_swap.err"; exit 1; }
+echo "同数量交换图片已被当前源资源身份核验判 FAIL"
+
+echo "==> 完整性-05e：缺少必要身份依据时不得报告完整通过"
+cat > "$TMP/orphan_src.md" <<'EOF'
+# 1. Orphan
+
+## 1.1. Pic
+
+[IMG: snapshot/origin.png]
+EOF
+cat > "$TMP/orphan_ok.md" <<'EOF'
+# 1. Orphan（孤图）
+
+## 1.1. Pic（图）
+
+![图](images/m1.png)
+EOF
+if python3 "$VERIFY" "$TMP/orphan_ok.md" "$TMP/orphan_src.md" \
+    "1. Orphan" "1.1. Pic" >"$TMP/orphan_err.txt" 2>&1; then
+  echo "错误：缺少身份依据仍报告完整通过"
+  exit 1
+fi
+grep -q '来源身份未核验' "$TMP/orphan_err.txt" \
+  || { echo "错误：缺少身份未核验阻断诊断"; cat "$TMP/orphan_err.txt"; exit 1; }
+python3 - "$TMP" <<'PY'
+import hashlib
+import sys
+
+tmp = sys.argv[1]
+digest = hashlib.sha256(open(tmp + '/images/m1.png', 'rb').read()).hexdigest()
+open(tmp + '/map_orphan.json', 'w').write('{"digests": ["%s"]}' % digest)
+PY
+python3 "$VERIFY" "$TMP/orphan_ok.md" "$TMP/orphan_src.md" \
+    "1. Orphan" "1.1. Pic" --image-map "$TMP/map_orphan.json"
+echo "无法证明身份时阻断完整通过；提供有效映射后 PASS"
+
+echo "==> 完整性-05f：SVG 子资源纳入来源身份（换子资源必 FAIL，不依赖映射）"
+python3 - "$TMP" <<'PY'
+import os
+import sys
+
+tmp = sys.argv[1]
+ns = 'xmlns="http://www.w3.org/2000/svg"'
+parent = '<svg %s><image href="child.svg"/></svg>' % ns
+red = '<svg %s><rect fill="red"/></svg>' % ns
+blue = '<svg %s><rect fill="blue"/></svg>' % ns
+# 源目录与交付目录各自独立一份 parent→child 树
+os.makedirs(tmp + '/svgdep_src/images', exist_ok=True)
+open(tmp + '/svgdep_src/images/parent.svg', 'w').write(parent)
+open(tmp + '/svgdep_src/images/child.svg', 'w').write(red)
+open(tmp + '/images/parent.svg', 'w').write(parent)
+open(tmp + '/images/child.svg', 'w').write(red)
+needle = '![Thread hierarchy diagram](images/thread_hierarchy.png)'
+src_text = open(tmp + '/sample_source.md', encoding='utf-8').read()
+trans_text = open(tmp + '/sample_translated.md', encoding='utf-8').read()
+open(tmp + '/svgdep_src/source.md', 'w', encoding='utf-8').write(
+    src_text.replace(needle, '![Parent](images/parent.svg)'))
+open(tmp + '/svgdep_ok.md', 'w', encoding='utf-8').write(
+    trans_text.replace(needle, '![Parent](images/parent.svg)'))
+PY
+python3 "$VERIFY" "$TMP/svgdep_ok.md" "$TMP/svgdep_src/source.md" \
+    "${OFFICIAL_TITLES[@]}"
+# S2：切换 cwd 到不含图片资源的目录后用相对路径校验，依赖仍按文档目录
+# 解析（不回退 cwd），结果与标准调用一致
+VERIFY_ABS="$(cd "$(dirname "$VERIFY")" && pwd)/$(basename "$VERIFY")"
+if (cd "$TMP/svgdep_src" && python3 "$VERIFY_ABS" ../svgdep_ok.md \
+    source.md "${OFFICIAL_TITLES[@]}"); then
+  echo "cwd 切换不影响依赖解析（按文档目录，不回退 cwd）PASS"
+else
+  echo "错误：外部 cwd 下校验失败，疑似 cwd 依赖"
+  exit 1
+fi
+python3 - "$TMP" <<'PY'
+import sys
+
+tmp = sys.argv[1]
+blue = ('<svg xmlns="http://www.w3.org/2000/svg">'
+        '<rect fill="blue"/></svg>')
+# 仅换译侧子资源，顶层 parent.svg 不变
+open(tmp + '/images/child.svg', 'w').write(blue)
+PY
+if python3 "$VERIFY" "$TMP/svgdep_ok.md" "$TMP/svgdep_src/source.md" \
+    "${OFFICIAL_TITLES[@]}" >"$TMP/svgdep_err.txt" 2>&1; then
+  echo "错误：仅换译侧子资源未被来源身份核验检出"
+  exit 1
+fi
+grep -q '来源身份不符' "$TMP/svgdep_err.txt" \
+  || { echo "错误：缺少子资源身份诊断"; cat "$TMP/svgdep_err.txt"; exit 1; }
+python3 - "$TMP" <<'PY'
+import sys
+
+tmp = sys.argv[1]
+red = ('<svg xmlns="http://www.w3.org/2000/svg">'
+       '<rect fill="red"/></svg>')
+open(tmp + '/images/child.svg', 'w').write(red)
+PY
+python3 "$VERIFY" "$TMP/svgdep_ok.md" "$TMP/svgdep_src/source.md" \
+    "${OFFICIAL_TITLES[@]}"
+echo "顶层 SVG 相同、子资源换图已被身份核验判 FAIL；源译依赖一致时 PASS"
+
+echo "==> 完整性-05g：展示属性与 CSS 导入依赖纳入离线与身份核验"
+python3 - "$TMP" <<'PY'
+import os
+import sys
+
+tmp = sys.argv[1]
+ns = 'xmlns="http://www.w3.org/2000/svg"'
+paint = '<svg %s><rect/></svg>' % ns
+styled = ('<svg %s><style>@import "theme.css";</style>'
+          '<rect fill="url(paint.svg#p)" stroke="url(paint.svg#p)"/></svg>'
+          % ns)
+for base in ('styled_src/', ''):
+    os.makedirs(tmp + '/' + base + 'images', exist_ok=True)
+    open(tmp + '/' + base + 'images/paint.svg', 'w').write(paint)
+    open(tmp + '/' + base + 'images/theme.css', 'w').write(
+        '.r { fill: url(paint.svg#p); }')
+    open(tmp + '/' + base + 'images/styled.svg', 'w').write(styled)
+needle = '![Thread hierarchy diagram](images/thread_hierarchy.png)'
+src_text = open(tmp + '/sample_source.md', encoding='utf-8').read()
+trans_text = open(tmp + '/sample_translated.md', encoding='utf-8').read()
+open(tmp + '/styled_src/source.md', 'w', encoding='utf-8').write(
+    src_text.replace(needle, '![Styled](images/styled.svg)'))
+open(tmp + '/styled_ok.md', 'w', encoding='utf-8').write(
+    trans_text.replace(needle, '![Styled](images/styled.svg)'))
+PY
+python3 "$VERIFY" "$TMP/styled_ok.md" "$TMP/styled_src/source.md" \
+    "${OFFICIAL_TITLES[@]}"
+python3 - "$TMP" <<'PY'
+import os
+import sys
+
+tmp = sys.argv[1]
+os.remove(tmp + '/images/paint.svg')
+PY
+if python3 "$VERIFY" "$TMP/styled_ok.md" "$TMP/styled_src/source.md" \
+    "${OFFICIAL_TITLES[@]}" >"$TMP/styled_err.txt" 2>&1; then
+  echo "错误：展示属性/CSS 导入链上的缺失依赖未被检出"
+  exit 1
+fi
+grep -q '本地依赖缺失' "$TMP/styled_err.txt" \
+  || { echo "错误：缺少依赖缺失诊断"; cat "$TMP/styled_err.txt"; exit 1; }
+echo "fill/stroke url(...) 与 @import 链上的缺失依赖均被拒绝（不联网）"
+
+echo "==> 完整性-05h：合法伪 URL（CSS 字符串 / data-* 属性）源译一致时 CLI 通过"
+python3 - "$TMP" <<'PY'
+import os
+import sys
+
+tmp = sys.argv[1]
+ns = 'xmlns="http://www.w3.org/2000/svg"'
+pseudo = ('<svg %s data-example="url(example.png)" '
+          'aria-label="url(elsewhere.png)">'
+          '<style>.a { content: "url(example.png)"; }</style>'
+          '<desc>url(example.png) as text</desc>'
+          '<rect fill="url(#local)"/></svg>' % ns)
+for base in ('pseudo_src/', ''):
+    os.makedirs(tmp + '/' + base + 'images', exist_ok=True)
+    open(tmp + '/' + base + 'images/pseudo.svg', 'w').write(pseudo)
+needle = '![Thread hierarchy diagram](images/thread_hierarchy.png)'
+src_text = open(tmp + '/sample_source.md', encoding='utf-8').read()
+trans_text = open(tmp + '/sample_translated.md', encoding='utf-8').read()
+open(tmp + '/pseudo_src/source.md', 'w', encoding='utf-8').write(
+    src_text.replace(needle, '![Pseudo](images/pseudo.svg)'))
+open(tmp + '/pseudo_ok.md', 'w', encoding='utf-8').write(
+    trans_text.replace(needle, '![Pseudo](images/pseudo.svg)'))
+PY
+python3 "$VERIFY" "$TMP/pseudo_ok.md" "$TMP/pseudo_src/source.md" \
+    "${OFFICIAL_TITLES[@]}"
+python3 - "$TMP" <<'PY'
+import os
+import sys
+
+tmp = sys.argv[1]
+ns = 'xmlns="http://www.w3.org/2000/svg"'
+# 同一伪 URL 样例加入真实缺失依赖后必须按具体原因失败
+open(tmp + '/images/pseudo.svg', 'w').write(
+    '<svg %s data-example="url(example.png)">'
+    '<rect fill="url(really-missing.svg#p)"/></svg>' % ns)
+PY
+if python3 "$VERIFY" "$TMP/pseudo_ok.md" "$TMP/pseudo_src/source.md" \
+    "${OFFICIAL_TITLES[@]}" >"$TMP/pseudo_err.txt" 2>&1; then
+  echo "错误：加入真实缺失依赖后未被检出"
+  exit 1
+fi
+grep -q '本地依赖缺失' "$TMP/pseudo_err.txt" \
+  || { echo "错误：缺少真实依赖诊断"; cat "$TMP/pseudo_err.txt"; exit 1; }
+echo "合法伪 URL 源译一致 CLI 通过；真实依赖缺失按所属引用 FAIL"
+
+echo "==> 完整性-05c：同一行混合图片语法按源出现顺序核对身份"
+cat > "$TMP/mix_src.md" <<'EOF'
+# 1. Mix
+
+## 1.1. Both
+
+图示 ![A][a] 与 ![B](images/m2.png)。
+
+[a]: images/m1.png
+EOF
+cat > "$TMP/mix_ok.md" <<'EOF'
+# 1. Mix（混）
+
+## 1.1. Both（两者）
+
+图示 ![A](images/m1.png) 与 ![B](images/m2.png)。
+EOF
+cat > "$TMP/mix_swap.md" <<'EOF'
+# 1. Mix（混）
+
+## 1.1. Both（两者）
+
+图示 ![A](images/m2.png) 与 ![B](images/m1.png)。
+EOF
+python3 - "$TMP" <<'PY'
+import hashlib
+import sys
+
+tmp = sys.argv[1]
+d1 = hashlib.sha256(open(tmp + '/images/m1.png', 'rb').read()).hexdigest()
+d2 = hashlib.sha256(open(tmp + '/images/m2.png', 'rb').read()).hexdigest()
+open(tmp + '/map_mix.json', 'w').write(
+    '{"digests": ["%s", "%s"]}' % (d1, d2))
+PY
+python3 "$VERIFY" "$TMP/mix_ok.md" "$TMP/mix_src.md" \
+    "1. Mix" "1.1. Both" --image-map "$TMP/map_mix.json"
+if python3 "$VERIFY" "$TMP/mix_swap.md" "$TMP/mix_src.md" \
+    "1. Mix" "1.1. Both" --image-map "$TMP/map_mix.json" \
+    >"$TMP/mix_swap.err" 2>&1; then
+  echo "错误：实际交换图片的译文未被身份顺序检出"
+  exit 1
+fi
+grep -q '来源身份不符' "$TMP/mix_swap.err" \
+  || { echo "错误：缺少身份顺序诊断"; cat "$TMP/mix_swap.err"; exit 1; }
+echo "混合语法顺序：正确映射 PASS；交换图片 FAIL"
+
+python3 - "$TMP" <<'PY'
+import hashlib
+import os
+import sys
+
+tmp = sys.argv[1]
+digest = hashlib.sha256(
+    open(tmp + '/images/thread_hierarchy.png', 'rb').read()).hexdigest()
+open(tmp + '/map_ok.json', 'w').write(
+    '{"digests": ["%s"]}' % digest)
+open(tmp + '/map_bad.json', 'w').write(
+    '{"digests": ["%s"]}' % ('0' * 64))
+PY
+python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
+    "${OFFICIAL_TITLES[@]}" --image-map "$TMP/map_ok.json"
+if python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
+    "${OFFICIAL_TITLES[@]}" --image-map "$TMP/map_bad.json" \
+    >"$TMP/map_err.txt" 2>&1; then
+  echo "错误：来源身份不符未被检测到"
+  exit 1
+fi
+grep -q '来源身份不符\|身份映射' "$TMP/map_err.txt" \
+  || { echo "错误：缺少身份映射诊断"; cat "$TMP/map_err.txt"; exit 1; }
+echo "图片身份映射：一致 PASS；不符已正确判 FAIL"
+
+cp -R "$TMP" "$TMP/delivery2"
+python3 - "$TMP" <<'PY'
+import os
+import subprocess
+import sys
+
+tmp = sys.argv[1]
+verify = os.path.abspath('../skills/tech-doc-translator/scripts/verify_translation.py')
+env = dict(os.environ, cwd=tmp + '/delivery2')
+r = subprocess.run(
+    ['python3', verify, 'sample_translated.md', 'sample_source.md',
+     '1. Compute Kernel Basics', '1.1. Thread Hierarchy',
+     '1.1.1. Memory Model'],
+    cwd=tmp + '/delivery2', capture_output=True, text=True, env=env)
+assert r.returncode == 0, r.stdout + r.stderr
+print('交付树搬迁至第二目录并切换 cwd 后校验 PASS')
 PY
 
 echo "==> Ticket 01 回归全部通过"
