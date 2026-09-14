@@ -19,3 +19,7 @@ Harness Craft 是一个 Harness 工具箱，用于沉淀可复用的 Agent Skill
 ### [online-media-reader](./online-media-reader/README.md)
 
 在线媒体文字读取 Skill：从抖音、B站和小红书的公开单条链接自适应取得可靠字幕、语音转写或图片 OCR，生成标明来源的 Markdown，默认清理媒体与匿名 Cookie。完整 Skill 位于 `online-media-reader/skills/online-media-reader/`，可用 `python3 online-media-reader/install_skill.py` 安装到 Codex。
+
+### [agent-token-audit](./agent-token-audit/README.md)
+
+按会话或任务读取 Codex、ZCode 的本地 token 记录，展示输入、输出、缓存及数据缺口，支持不连续轮次、子代理归属和按需导出 Markdown、CSV、JSON。提供独立 Python CLI 与薄 Skill；一期整体交互验收仍在进行，当前限制见模块说明。
