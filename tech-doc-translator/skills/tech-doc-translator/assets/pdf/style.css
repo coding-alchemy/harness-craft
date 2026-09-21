@@ -100,7 +100,12 @@ th, td {
   border: 0.5pt solid #999;
   padding: 2.5pt 4pt;
   vertical-align: top;
-  overflow-wrap: break-word;
+  /* anywhere（而非 break-word）参与 min-content 计算：含长标识符的
+   * 多列表格否则按 auto 布局撑出 min-content 宽度，超出纸宽时
+   * Chromium 打印会把整文档统一缩印（真实六章书 04 章复现，
+   * 正文/图片被压到 0.575-0.71 倍）。anywhere 仅在必要时词中断行，
+   * 不溢出的表格布局不变。 */
+  overflow-wrap: anywhere;
 }
 
 thead { display: table-header-group; }
@@ -159,6 +164,16 @@ img, svg { max-width: 100%; height: auto; }
 .katex-display { margin: 0; }
 .katex { font-size: 1.05em; }
 .katex-error-node { color: #b00; border-bottom: 1pt dashed #b00; }
+/* KaTeX 的编号槽（.katex-tag，absolute + right:0）内，vlist 的 .vlist-s 支柱列
+   （2px 宽、无字形，仅提供纵向度量）与其补偿 .vlist-t2 { margin-right: -2px }
+   是成对机制：槽位收缩盒只包住补偿后的宽度，支柱列便向右逃逸出文档 2px，
+   使 scrollWidth 超过视口并触发导出溢出门禁（空槽与真实编号同样发生）。
+   在槽内成对撤销——支柱列零宽、补偿归零：支柱在绝对定位槽内没有需要横向
+   对齐的邻居，撤销后真实编号位置与渲染逐字形不变，也不裁切任何内容
+   （编号纵向本就画在元素盒外，是 vlist 的正常绘制，不可裁）。只撤销其一
+   逃逸会复发。溢出门禁本身不放宽。 */
+.math-block .katex-tag .vlist-s { min-width: 0; width: 0; }
+.math-block .katex-tag .vlist-t2 { margin-right: 0; }
 
 /* Pygments 高亮：浅色底、可打印。 */
 .highlight { background: none; }

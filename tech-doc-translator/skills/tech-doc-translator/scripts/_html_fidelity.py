@@ -75,6 +75,42 @@ def _percent_reference(img):
     return None
 
 
+def temp_root_paths():
+    """宿主临时根的真实路径集合（含平台别名，全部经符号链接解析）。"""
+    import tempfile
+    candidates = [tempfile.gettempdir(), '/tmp', '/var/tmp',
+                  os.environ.get('TMPDIR')]
+    roots = set()
+    for candidate in candidates:
+        if candidate:
+            roots.add(os.path.realpath(candidate))
+    return roots
+
+
+def warn_if_temp_output(paths):
+    """产物落入系统临时根时醒目告警；仅告警，不改变调用方退出状态。
+
+    路径先规范化并解析符号链接，再按目录包含关系判断，同名前缀的普通
+    目录不误报。返回是否发生告警。
+    """
+    import sys
+    roots = temp_root_paths()
+    hit = []
+    for path in paths:
+        if not path:
+            continue
+        real = os.path.realpath(path)
+        if any(real == root or real.startswith(root + os.sep)
+               for root in roots):
+            hit.append((path, real))
+    if hit:
+        print('警告: 以下产物位于系统临时目录，临时目录清理后将无法回查'
+              '（仅影响持久性，不影响本次命令状态）:', file=sys.stderr)
+        for path, real in hit:
+            print('  %s -> %s' % (path, real), file=sys.stderr)
+    return bool(hit)
+
+
 class HtmlFidelity:
     """保护代码并渲染各源家族一致的 Markdown 结构。"""
 

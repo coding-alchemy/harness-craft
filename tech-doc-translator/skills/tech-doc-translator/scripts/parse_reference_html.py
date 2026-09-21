@@ -20,7 +20,7 @@ import sys
 import re
 from bs4 import Tag
 
-from _html_fidelity import HtmlFidelity
+from _html_fidelity import HtmlFidelity, warn_if_temp_output
 
 
 # 按 HTML5 惯例视为块级、但本脚本未显式展开的元素；遇到时输出 [TAGNAME]。
@@ -215,6 +215,7 @@ def main():
     render(root, out, fidelity)
     open(out_path, 'w', encoding='utf-8').write('\n'.join(out).strip() + '\n')
     display_map = fidelity.write_display_map(out_path, html_path)
+    warn_if_temp_output([out_path, display_map])
     determined = sum(1 for e in fidelity.image_display if 'value' in e)
     print('%s: %d blocks, %d chars -> %s%s' % (
         section_id or root.name, len(out), sum(len(x) for x in out), out_path,

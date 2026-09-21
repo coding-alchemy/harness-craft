@@ -926,6 +926,10 @@ def project_management_fields(text):
 
 LEGACY_INLINE_RE = re.compile(r"\\\((.*)\\\)", re.S)
 LEGACY_DISPLAY_RE = re.compile(r"\\\[(.*)\\\]", re.S)
+# KaTeX 仅在 display 模式接受的环境；内联包装含此类环境时按数学含义
+# 提升为显示模式渲染（LaTeX 语义本身即为块级），否则 KaTeX 拒绝渲染。
+DISPLAY_ONLY_ENV_RE = re.compile(
+    r"\\begin\{(?:equation|align|gather|flalign|multline|alignat|split)\*?\}")
 
 
 def classify_math(content, display_mode):
@@ -941,9 +945,10 @@ def classify_math(content, display_mode):
     if match:
         return match.group(1).strip(), "display", "legacy_bracket"
     match = LEGACY_INLINE_RE.fullmatch(text)
-    if match:
-        return match.group(1).strip(), "inline", "legacy_paren"
-    return text, "inline", "dollar_inline"
+    latex = match.group(1).strip() if match else text
+    original_form = "legacy_paren" if match else "dollar_inline"
+    mode = "display" if DISPLAY_ONLY_ENV_RE.search(latex) else "inline"
+    return latex, mode, original_form
 
 
 def build_markdown(math_sink, chapter_prefix):

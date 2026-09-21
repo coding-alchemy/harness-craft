@@ -21,7 +21,7 @@ import sys
 import os
 from bs4 import Tag
 
-from _html_fidelity import HtmlFidelity
+from _html_fidelity import HtmlFidelity, warn_if_temp_output
 
 
 # 按 HTML5 惯例视为块级、但本脚本未显式展开的元素；遇到时输出 [TAGNAME]。
@@ -129,7 +129,8 @@ def extract_one(html_path):
     out = []
     render(root, out, fidelity)
     out_path = os.path.splitext(html_path)[0] + '.md'
-    fidelity.write_display_map(out_path, html_path)
+    display_map = fidelity.write_display_map(out_path, html_path)
+    warn_if_temp_output([out_path, display_map])
     return '\n'.join(out).strip() + '\n'
 
 
