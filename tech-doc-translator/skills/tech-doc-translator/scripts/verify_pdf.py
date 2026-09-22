@@ -273,6 +273,204 @@ def collect_drawn_images(pdf):
     return result
 
 
+def check_image_coverage(chapters, bindings, undetermined_map,
+                         undetermined_raw, report, require, failures):
+    """从原 Markdown、映射与资源独立重算逐次覆盖，并与导出证据对账。
+
+    真实图片出现由与导出相同的渲染级枚举重建（核验独立重读原输入建立
+    章节对象后调用同一只读枚举；行内代码/缩进代码中的图片语法与未定义
+    引用式图片不产生 <img>，不计出现）；分类口径与导出侧共用
+    （_image_preflight）。未确定条目按与确定条目相同的出现序号与资源
+    身份规则核对。导出报告的覆盖摘要与本地重算不一致、或严格策略下
+    存在未恢复项，均判 FAIL。
+    """
+    from _image_preflight import (
+        Occurrence,
+        classify_occurrences,
+        coverage_diagnostics,
+        coverage_summary,
+        undetermined_binding_diagnostics,
+    )
+
+    occurrences = []
+    for chapter in chapters:
+        enumeration = exporter.enumerate_images(chapter, [])
+        for index, record in enumerate(enumeration):
+            occurrences.append(
+                Occurrence(
+                    chapter=str(chapter.path), occurrence=index + 1,
+                    ref=record["src"], path=record["path"],
+                    sha256=record["sha256"], line=record["line"],
+                    kind=record["kind"], pixel_size=record["pixel_size"],
+                    frames=record["frames"],
+                    pixel_known=record["pixel_known"],
+                )
+            )
+        for diagnostic in undetermined_binding_diagnostics(
+                str(chapter.path),
+                (undetermined_raw or {}).get(chapter.path, []),
+                enumeration):
+            if diagnostic.get("severity") == "fail":
+                failures.append(
+                    {
+                        "code": diagnostic["code"],
+                        "message": diagnostic["message"],
+                        "input": diagnostic.get("input"),
+                    }
+                )
+    items = classify_occurrences(
+        occurrences,
+        {str(k): v for k, v in bindings.items()},
+        {(str(k[0]), k[1]): v for k, v in undetermined_map.items()},
+    )
+    summary = coverage_summary(items)
+    exported = report.get("image_coverage")
+    if exported is not None and exported != summary:
+        failures.append(
+            {
+                "code": "image-coverage-mismatch",
+                "message": "覆盖分类与导出证据不一致：核验 %r vs 导出 %r"
+                % (summary, exported),
+            }
+        )
+    for diagnostic in coverage_diagnostics(items, require,
+                                           "images-display-absent"):
+        if diagnostic.get("severity") == "fail":
+            failures.append(
+                {
+                    "code": diagnostic["code"],
+                    "message": diagnostic["message"],
+                    "input": diagnostic.get("input"),
+                }
+            )
+
+
+def check_provenance(chapters, report, pdf, args_provenance, failures,
+                     heading_pages=None):
+    """独立重建出处预期并核对前置位置（R6/D6）。
+
+    预期从原始输入重建（共享字段提取实现，不读导出器结论）；与导出证据
+    核对政策、模式与逐章分类，再从最终 PDF 文本核对前置说明先于首章。
+    章首四类管理字段的移除区间由既有投影核验独立对账。
+    """
+    exported = report.get("provenance")
+    if not exported:
+        failures.append(
+            {
+                "code": "provenance-evidence-missing",
+                "message": "导出证据缺少出处记录；旧证据须重新导出核验",
+            }
+        )
+        return
+    policy = exported.get("policy", {}).get("fields")
+    if policy != list(exporter.MANAGEMENT_FIELD_LABELS):
+        failures.append(
+            {
+                "code": "provenance-policy-mismatch",
+                "message": "出处字段政策与当前版本不一致：%r vs %r"
+                % (policy, list(exporter.MANAGEMENT_FIELD_LABELS)),
+            }
+        )
+    if (exported.get("mapping") or None) != (args_provenance or None):
+        failures.append(
+            {
+                "code": "provenance-mapping-mismatch",
+                "message": "出处区间映射参数与导出不一致（导出 %r / 核验 %r）"
+                % (exported.get("mapping"), args_provenance),
+            }
+        )
+        return
+    try:
+        provenance_map = exporter.load_provenance_map(
+            args_provenance, chapters, [])
+    except exporter.ExportError as exc:
+        failures.append({"code": "provenance-mapping-invalid",
+                         "message": str(exc)})
+        return
+    toc_chapter = next((c for c in chapters if c.is_toc), None)
+    facts = exporter.collect_provenance(chapters, toc_chapter, provenance_map)
+    if facts["incomplete"]:
+        failures.append(
+            {
+                "code": "provenance-incomplete",
+                "message": "以下章节只有无法定位具体原文的来源：%s"
+                % facts["incomplete"],
+            }
+        )
+    if facts["unavailable"]:
+        failures.append(
+            {
+                "code": "provenance-unavailable",
+                "message": "以下章节完全缺少出处信息：%s"
+                % facts["unavailable"],
+            }
+        )
+    for key in ("mode", "complete", "incomplete", "unavailable"):
+        if exported.get(key) != facts[key]:
+            failures.append(
+                {
+                    "code": "provenance-evidence-mismatch",
+                    "message": "出处 %s 与导出证据不一致：核验 %r vs 导出 %r"
+                    % (key, facts[key], exported.get(key)),
+                }
+            )
+    if pdf is None:
+        return
+    # 无渲染前置区时，被采用的集中出处段（生成前置、目录“译自…”段或
+    # 映射区间段，由 collect_provenance 以实际可见文字给出）同样必须先于
+    # 首章标题：位置保证不能只靠装载规则或文件名顺序，须在成品中实测。
+    adopted = (facts.get("adopted_front") or "").strip()
+    if not adopted:
+        return
+    # 前置说明先于首章：前置文本所在页不晚于首章标题目的地页；同页时
+    # 文本位置必须先于章首标题。首章页取自大纲目的地（heading_pages），
+    # 不被目录页中的同名条目干扰。
+    compact_pages = [re.sub(r"\s+", "", page) for page in pdf.pages]
+    first_content = next((c for c in chapters if not c.is_toc), None)
+    if first_content is None or not first_content.headings:
+        return
+    heading = first_content.headings[0]
+    heading_page = (heading_pages or {}).get(heading["id"])
+    first_line = next(
+        (line for line in adopted.split("\n") if line.strip()),
+        None)
+    if first_line is None:
+        return
+    token = re.sub(r"\s+", "", first_line)
+    token = token[: max(12, min(len(token), 30))]
+    front_page = next(
+        (i for i, text in enumerate(compact_pages) if token in text), None)
+    if front_page is None:
+        failures.append(
+            {
+                "code": "provenance-front-missing",
+                "message": "前置出处说明未出现在最终 PDF：%r" % first_line[:40],
+            }
+        )
+        return
+    if heading_page is None:
+        return
+    if front_page > heading_page:
+        failures.append(
+            {
+                "code": "provenance-position",
+                "message": "前置出处说明（第 %d 页）晚于首章标题"
+                "（第 %d 页）" % (front_page + 1, heading_page + 1),
+            }
+        )
+    elif front_page == heading_page:
+        heading_token = re.sub(r"\s+", "", heading["text"])
+        heading_token = heading_token[: max(12, min(len(heading_token), 30))]
+        if compact_pages[front_page].find(token) > \
+                compact_pages[front_page].find(heading_token):
+            failures.append(
+                {
+                    "code": "provenance-position",
+                    "message": "同页时前置出处说明未先于首章标题",
+                }
+            )
+
+
 def check_image_widths(chapters, pdf, bounds, bindings, report, failures):
     """核对映射命中的图片逐次实际绘制宽度符合 min(显示宽度, 版心上限)。
 
@@ -708,7 +906,7 @@ def check_print_toc(chapters, pdf, report, bounds, heading_pages, failures):
 # 章首管理字段投影的独立授权扫描（不照抄导出器的排除清单）
 # ---------------------------------------------------------------------------
 
-AUTHORIZED_LABELS = ("原文", "译例说明")
+AUTHORIZED_LABELS = exporter.MANAGEMENT_FIELD_LABELS
 # 章首管理引用块家族：与导出器独立声明的同一合同口径。
 _AUTHORIZED_FAMILY = {"原文", "译例说明", "来源", "抓取日期"}
 _AUTHORIZED_FIELD = re.compile(r"^>\s*\*{0,2}\s*(\S{1,15}?)\s*\*{0,2}\s*[：:]")
@@ -1719,6 +1917,17 @@ def main(argv=None):
         action="store_true",
         help="与导出一致：印刷目录加入一级节",
     )
+    parser.add_argument(
+        "--require-display-map",
+        action="store_true",
+        help="与导出一致的严格尺寸保真策略；省略时若导出为严格模式则判 FAIL",
+    )
+    parser.add_argument(
+        "--provenance",
+        default=None,
+        metavar="PATH",
+        help="与导出一致的只读出处区间映射；导出使用时核验必须传入同一文件",
+    )
     parser.add_argument("inputs", nargs="+", help="有序 Markdown 输入")
     args = parser.parse_args(argv)
 
@@ -1741,9 +1950,12 @@ def main(argv=None):
 
     # 显示尺寸映射独立重建：绑定失败同样判 FAIL，并核对与导出参数一致。
     display_diagnostics = []
-    bindings, display_map_paths = exporter.load_display_maps(
-        chapters, list(args.images_display), display_diagnostics
-    )
+    bindings, display_undetermined, display_undetermined_raw, \
+        display_map_paths = (
+            exporter.load_display_maps(
+                chapters, list(args.images_display), display_diagnostics
+            )
+        )
     for diagnostic in display_diagnostics:
         if diagnostic.get("severity") == "fail":
             failures.append(
@@ -1761,6 +1973,16 @@ def main(argv=None):
                 % (display_map_paths, report.get("images_display_maps", [])),
             }
         )
+    # 省略核验严格参数不能把一次严格导出改验成普通模式：两侧参数必须一致。
+    exported_require = bool(report.get("require_display_map"))
+    if exported_require != bool(args.require_display_map):
+        failures.append(
+            {
+                "code": "images-display-require-mismatch",
+                "message": "严格尺寸保真参数与导出不一致（导出 %s / 核验 %s）"
+                % (exported_require, bool(args.require_display_map)),
+            }
+        )
 
     pdf_path = Path(args.pdf).expanduser()
     if not pdf_path.is_file():
@@ -1774,6 +1996,11 @@ def main(argv=None):
                 {"code": "pdf-unreadable", "message": "PDF 无法解析：%s" % exc}
             )
             pdf = None
+
+    # 覆盖独立重算不依赖 PDF 存在：从原输入与映射即可核对分类与严格策略。
+    check_image_coverage(chapters, bindings, display_undetermined,
+                         display_undetermined_raw, report,
+                         bool(args.require_display_map), failures)
 
     check_projection(chapters, report, pdf, failures)
     check_unlinked_links(chapters, pdf, args.unlink_target, report, failures)
@@ -1797,6 +2024,9 @@ def main(argv=None):
             )
         heading_pages = {}
         check_headings(chapters, pdf, failures, heading_pages)
+        # 出处预期独立重建与前置位置核对（首章页依赖大纲目的地）。
+        check_provenance(chapters, report, pdf, args.provenance, failures,
+                         heading_pages)
         bounds = chapter_bounds(chapters, pdf, heading_pages, failures)
         check_blocks(chapters, pdf, bounds, failures, relaxed, "text")
         check_blocks(chapters, pdf, bounds, failures, [], "code")

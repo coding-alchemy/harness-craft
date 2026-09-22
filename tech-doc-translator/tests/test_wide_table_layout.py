@@ -56,6 +56,8 @@ class WideTableLayoutTest(unittest.TestCase):
         doc = '\n'.join([
             '# 宽表缩印回归',
             '',
+            '> **来源**：https://example.invalid/wide-table（合成测试）',
+            '',
             '这是用于测量整本文档缩放因子的普通段落，包含足够长的中文文字'
             '用来观察正文排版宽度是否被打印缩放压缩，这一行文字应当延伸到'
             '接近版心右缘的位置才会自然换行。',

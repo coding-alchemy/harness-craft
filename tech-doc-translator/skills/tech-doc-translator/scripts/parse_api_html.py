@@ -11,6 +11,7 @@
 - 保留代码围栏、公式、表格、脚注、API 签名（定义列表）等结构。
 - 未识别块级元素输出 [TAGNAME] 占位。
 """
+import os
 import re
 import sys
 
@@ -160,7 +161,9 @@ def main():
         sys.exit(__doc__)
     html_path, out_path = sys.argv[1], sys.argv[2]
 
-    fidelity = HtmlFidelity(unknown_footnote='[^?]')
+    fidelity = HtmlFidelity(
+        unknown_footnote='[^?]',
+        snapshot_dir=os.path.dirname(os.path.abspath(html_path)))
     soup = fidelity.parse(open(html_path, encoding='utf-8').read())
     root = soup.find('article') or soup.find('main') or soup.find('body')
     if root is None:

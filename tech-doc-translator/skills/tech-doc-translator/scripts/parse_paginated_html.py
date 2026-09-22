@@ -120,7 +120,8 @@ def render(node, out, fidelity):
 
 
 def extract_one(html_path):
-    fidelity = HtmlFidelity()
+    fidelity = HtmlFidelity(
+        snapshot_dir=os.path.dirname(os.path.abspath(html_path)))
     soup = fidelity.parse(open(html_path, encoding='utf-8').read())
     root = soup.find('article') or soup.find('main') or soup.find('body')
     if root is None:

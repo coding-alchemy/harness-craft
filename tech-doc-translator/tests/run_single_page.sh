@@ -141,6 +141,8 @@ if grep -q '\[FIGCAPTION\]' "$TMP/sphinx_nested_source.md"; then
 fi
 
 echo "==> V0.2-02：解析期图片显示尺寸（内联 CSS / HTML 属性 / 未确定）"
+cp fixtures/valid_1x1.png "$TMP/img_px.png" "$TMP/img_attr.png" 2>/dev/null || {
+  cp fixtures/valid_1x1.png "$TMP/img_px.png"; cp fixtures/valid_1x1.png "$TMP/img_attr.png"; }
 cat > "$TMP/widths.html" <<'HTML'
 <html><body><article>
 <h1>Widths</h1>
@@ -162,6 +164,8 @@ assert entries[1]['width'] == {
 assert entries[2]['width']['basis'] == 'html-width-attribute', entries[2]
 assert entries[2]['width']['value'] == 300, entries[2]
 assert [e['reason'] for e in payload['undetermined']] == ['源节点无宽度约束'], payload
+assert all('resource_sha256' in e for e in payload['entries']), \
+    '确定尺寸条目缺少独立来源资源身份：' + repr(payload['entries'])
 print('宽度提取：内联 px / HTML 属性正确；无约束单列未确定')
 PY
 
