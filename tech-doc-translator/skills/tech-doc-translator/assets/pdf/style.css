@@ -177,3 +177,22 @@ img, svg { max-width: 100%; height: auto; }
 
 /* Pygments 高亮：浅色底、可打印。 */
 .highlight { background: none; }
+
+/* 出处前置说明：集中呈现实际输出范围的来源与已知版本/日期；
+   位于首章容器内、章首标题之前，非正文章节，不参与章节结构。 */
+.provenance-note {
+  border: 1px solid #b8bfc9;
+  border-radius: 4px;
+  padding: 6pt 10pt;
+  margin: 0 0 14pt 0;
+  font-size: 8.5pt;
+  color: #333;
+  break-inside: avoid;
+}
+.provenance-note .provenance-title {
+  font-weight: 700;
+  margin: 0 0 3pt 0;
+}
+.provenance-note p {
+  margin: 1.5pt 0;
+}

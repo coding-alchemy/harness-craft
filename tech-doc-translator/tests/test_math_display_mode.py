@@ -94,6 +94,8 @@ class MathDisplayPdfTest(unittest.TestCase):
         doc = '\n'.join([
             '# 块级数学环境显示模式回归',
             '',
+            '> **来源**：https://example.invalid/math-display（合成测试）',
+            '',
             '普通行内 $a+b$、$x^2$ 与块级：',
             '',
             '$$E = m c^2$$',
@@ -246,6 +248,8 @@ class UnsupportedMathEnvTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='math-unsupported-') as tmp:
             root = Path(tmp)
             (root / 'doc.md').write_text(
+                '# 不支持环境回归\n\n'
+                '> **来源**：https://example.invalid/math-unsupported（合成测试）\n\n'
                 '$' + r'\(\begin{flalign} a &= 1 \\ b &= 2 \end{flalign}\)' + '$\n',
                 encoding='utf-8')
             with contextlib.redirect_stdout(io.StringIO()):

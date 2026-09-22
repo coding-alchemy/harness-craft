@@ -24,13 +24,17 @@ class PdfIntegrityTests(unittest.TestCase):
         cls.work = cls.root / 'work'
         cls.pdf = cls.root / 'book.pdf'
         image = Path(__file__).parent / 'fixtures/valid_1x1.png'
+        # 默认出处门禁（R6/D6）要求每章可定位具体原文：样例章补足
+        # 可定位来源，不改变被检验的正文/资源语义。
+        head = ('> **来源**：https://example.com/source?page=%d\n'
+                '> **抓取日期**：2026-09-15\n\n')
         sources = [
-            '# A\n\nIntro.\n\n```text\nSame paragraph.\n```\n',
-            'Same paragraph.\n',
-            '```text\nSame paragraph.\n```\n',
-            '$$x^2 + y^2 = 1$$\n',
-            '![Diagram](%s)\n' % image,
-            '####### <a id="custom"></a>Use [docs][r] and `foo` $x^2$[^n]\n\n'
+            '# A\n\n' + head % 1 + 'Intro.\n\n```text\nSame paragraph.\n```\n',
+            head % 2 + 'Same paragraph.\n',
+            head % 3 + '```text\nSame paragraph.\n```\n',
+            head % 4 + '$$x^2 + y^2 = 1$$\n',
+            head % 5 + '![Diagram](%s)\n' % image,
+            head % 6 + '####### <a id="custom"></a>Use [docs][r] and `foo` $x^2$[^n]\n\n'
             '[go](#custom)\n\n[r]: https://example.com/docs\n\n[^n]: Required note.\n',
         ]
         cls.inputs = []
@@ -113,7 +117,11 @@ class PdfIntegrityTests(unittest.TestCase):
 
     def test_subheading_same_as_next_chapter_title(self):
         paths = []
-        for name, source in [('a', '# A\n\n## B\n\nFirst.'), ('b', '# B\n\nSecond.')]:
+        head = '> **来源**：https://example.com/source?page=%s\n\n'
+        for name, source in [
+            ('a', '# A\n\n' + head % 'a' + '## B\n\nFirst.'),
+            ('b', '# B\n\n' + head % 'b' + 'Second.'),
+        ]:
             path = self.root / (name + '.md')
             path.write_text(source)
             paths.append(str(path))

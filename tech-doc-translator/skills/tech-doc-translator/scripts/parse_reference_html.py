@@ -16,6 +16,7 @@ section_id 不提供时解析 <article> / <main> / <body>。
     [FIGURE] caption              图题占位
     [TAGNAME] text                未显式处理的块级元素（不得静默丢弃）
 """
+import os
 import sys
 import re
 from bs4 import Tag
@@ -200,7 +201,9 @@ def main():
     else:
         section_id, out_path = None, sys.argv[2]
 
-    fidelity = HtmlFidelity(unknown_footnote='[^?]')
+    fidelity = HtmlFidelity(
+        unknown_footnote='[^?]',
+        snapshot_dir=os.path.dirname(os.path.abspath(html_path)))
     soup = fidelity.parse(open(html_path, encoding='utf-8').read())
     if section_id:
         root = soup.find(id=section_id)

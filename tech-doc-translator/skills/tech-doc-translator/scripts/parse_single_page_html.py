@@ -16,6 +16,7 @@ section_id 为可选锚点；不提供时解析 <article> / <main> / <body>。
     ![alt](src)                   图片
     [TAGNAME] text                未显式处理的块级元素（不得静默丢弃）
 """
+import os
 import sys
 import re
 from bs4 import Comment, Tag
@@ -134,7 +135,8 @@ def main():
     else:
         section_id, out_path = None, sys.argv[2]
 
-    fidelity = HtmlFidelity()
+    fidelity = HtmlFidelity(
+        snapshot_dir=os.path.dirname(os.path.abspath(html_path)))
     soup = fidelity.parse(open(html_path, encoding='utf-8').read())
     if section_id:
         root = soup.find(id=section_id)

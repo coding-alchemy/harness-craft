@@ -32,6 +32,17 @@ from pygments.formatters import HtmlFormatter
 from pygments.lexers import get_lexer_by_name
 from pygments.util import ClassNotFound
 
+from _html_fidelity import reason_code
+from _image_preflight import (
+    Occurrence,
+    bitmap_facts,
+    classify_occurrences,
+    coverage_diagnostics,
+    coverage_summary,
+    decode_budget,
+    undetermined_binding_diagnostics,
+)
+
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets" / "pdf"
 REPORT_NAME = "export_report.json"
 CANDIDATE_NAME = "candidate.pdf"
@@ -80,14 +91,19 @@ def _display_px(width):
 
 
 def load_display_maps(chapters, explicit_paths, diagnostics):
-    """读取各章的显示尺寸映射，返回 (绑定结果, 映射文件清单)。
+    """读取各章的显示尺寸映射，返回 (绑定, 未确定编码, 未确定原始条目, 清单)。
 
     显式 --images-display 优先；否则使用输入 Markdown 同目录的
     images_display.json（不递归猜测项目根）。条目按 markdown 归属分派；
     无映射的章按自然尺寸回退并记录，不视为失败。绑定不一致（出现越界、
-    资源路径或摘要不符、非法宽度）记为 fail。
+    资源路径或摘要不符、非法宽度）记为 fail。未确定条目按 reason_code
+    单独返回供覆盖分类与严格策略使用；其原始条目一并返回，由预检按与
+    确定条目相同的出现序号与资源身份规则核对（是否有尺寸不决定已声明
+    身份是否须核对）。
     """
     bindings = {}  # chapter.path -> {occurrence: {"px": float, "entry": dict}}
+    undetermined_map = {}  # (chapter.path, occurrence) -> reason_code
+    undetermined_raw = {}  # chapter.path -> [(entry, map_path)]
     used_paths = set()
     explicit_files = []
     for raw in explicit_paths:
@@ -109,14 +125,64 @@ def load_display_maps(chapters, explicit_paths, diagnostics):
     for chapter in chapters:
         name_counts[chapter.path.name] = name_counts.get(chapter.path.name, 0) + 1
         input_paths.add(chapter.path)
+
+    def attribute(payload, map_path, chapter, key):
+        """把映射中 key 列表的条目按 markdown 归属分派到本章。"""
+        entries = []
+        map_entries = payload.get(key, [])
+        base_counts = {}
+        for entry in map_entries:
+            markdown = entry.get("markdown", payload.get("markdown", ""))
+            if isinstance(markdown, str) and markdown:
+                name = Path(markdown).name
+                base_counts[name] = base_counts.get(name, 0) + 1
+        for entry in map_entries:
+            markdown = entry.get("markdown", payload.get("markdown", ""))
+            entry_path = (
+                (map_path.parent / str(markdown)).resolve()
+                if isinstance(markdown, str) and markdown else None
+            )
+            if entry_path == chapter.path:
+                entries.append(entry)
+                continue
+            if (
+                isinstance(markdown, str) and markdown
+                and Path(markdown).name == chapter.path.name
+            ):
+                if entry_path in input_paths:
+                    continue  # 条目已精确归属其他输入章，不参与兜底
+                if (name_counts.get(chapter.path.name, 0) > 1
+                        or base_counts.get(chapter.path.name, 0) > 1):
+                    # 同名多章或多条目同名：按文件名无法唯一归属，
+                    # 拒绝绑定并要求映射改用完整相对路径，不静默串用。
+                    diagnostics.append(
+                        {
+                            "severity": "fail",
+                            "code": "images-display-ambiguous-markdown",
+                            "message": "显示尺寸条目按文件名命中多个同名 "
+                            "Markdown，需用完整相对路径消歧：%s" % chapter.path,
+                            "input": str(map_path),
+                        }
+                    )
+                else:
+                    entries.append(entry)
+        return entries
+
     for chapter in chapters:
         candidates = list(explicit_files)
         same_dir = chapter.dir / DISPLAY_MAP_NAME
         if same_dir.is_file() and same_dir not in candidates:
             candidates.append(same_dir)
         chapter_entries = []
+        chapter_undetermined = []
+        undetermined_raw[chapter.path] = []
+        processed_maps = set()  # 显式路径与缺省路径指向同一文件时只读一次
         for map_path in candidates:
-            used_paths.add(str(map_path.resolve()))
+            resolved_map = str(map_path.resolve())
+            if resolved_map in processed_maps:
+                continue
+            processed_maps.add(resolved_map)
+            used_paths.add(resolved_map)
             try:
                 payload = json.loads(map_path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
@@ -129,43 +195,13 @@ def load_display_maps(chapters, explicit_paths, diagnostics):
                     }
                 )
                 continue
-            map_entries = payload.get("entries", [])
-            base_counts = {}
-            for entry in map_entries:
-                markdown = entry.get("markdown", payload.get("markdown", ""))
-                if isinstance(markdown, str) and markdown:
-                    name = Path(markdown).name
-                    base_counts[name] = base_counts.get(name, 0) + 1
-            for entry in map_entries:
-                markdown = entry.get("markdown", payload.get("markdown", ""))
-                entry_path = (
-                    (map_path.parent / str(markdown)).resolve()
-                    if isinstance(markdown, str) and markdown else None
-                )
-                if entry_path == chapter.path:
-                    chapter_entries.append((entry, map_path))
-                    continue
-                if (
-                    isinstance(markdown, str) and markdown
-                    and Path(markdown).name == chapter.path.name
-                ):
-                    if entry_path in input_paths:
-                        continue  # 条目已精确归属其他输入章，不参与兜底
-                    if (name_counts.get(chapter.path.name, 0) > 1
-                            or base_counts.get(chapter.path.name, 0) > 1):
-                        # 同名多章或多条目同名：按文件名无法唯一归属，
-                        # 拒绝绑定并要求映射改用完整相对路径，不静默串用。
-                        diagnostics.append(
-                            {
-                                "severity": "fail",
-                                "code": "images-display-ambiguous-markdown",
-                                "message": "显示尺寸条目按文件名命中多个同名 "
-                                "Markdown，需用完整相对路径消歧：%s" % chapter.path,
-                                "input": str(map_path),
-                            }
-                        )
-                    else:
-                        chapter_entries.append((entry, map_path))
+            chapter_entries.extend(
+                (entry, map_path)
+                for entry in attribute(payload, map_path, chapter, "entries"))
+            chapter_undetermined.extend(
+                (entry, map_path)
+                for entry in attribute(payload, map_path, chapter,
+                                       "undetermined"))
         occurrence_map = {}
         for entry, map_path in chapter_entries:
             occurrence = entry.get("occurrence")
@@ -219,8 +255,25 @@ def load_display_maps(chapters, explicit_paths, diagnostics):
             if held is None:
                 occurrence_map[occurrence] = {"px": px, "record": record,
                                               "map_path": map_path}
+        for entry, map_path in chapter_undetermined:
+            occurrence = entry.get("occurrence")
+            if not isinstance(occurrence, int) or occurrence < 1:
+                diagnostics.append(
+                    {
+                        "severity": "fail",
+                        "code": "images-display-binding",
+                        "message": "未确定尺寸条目出现序号非法：%r" % (entry,),
+                        "input": str(chapter.path),
+                    }
+                )
+                continue
+            code = entry.get("reason_code")
+            if code not in ("no-source-constraint", "unresolved-size"):
+                code = reason_code(entry.get("reason") or "")
+            undetermined_map[(chapter.path, occurrence)] = code
+            undetermined_raw[chapter.path].append((entry, map_path))
         bindings[chapter.path] = occurrence_map
-    return bindings, sorted(used_paths)
+    return bindings, undetermined_map, undetermined_raw, sorted(used_paths)
 
 
 def apply_display_widths(chapter, bindings, diagnostics):
@@ -293,6 +346,348 @@ def apply_display_widths(chapter, bindings, diagnostics):
 def soup_images(chapter):
     return [img for img in chapter.soup.find_all("img") if img.get("src")]
 
+
+def build_provenance_section(facts):
+    """把需要集中保留的来源组合渲染为前置说明（导出视图，非正文章节）。"""
+    lines = [line for line in (facts.get("front_text") or "").split("\n")
+             if line]
+    if not lines:
+        return None
+    items = "".join("<p>%s</p>" % escape(line) for line in lines)
+    return ('<div class="provenance-note">'
+            '<p class="provenance-title">出处</p>%s</div>' % items)
+
+
+def inject_provenance(chapters, facts):
+    """把前置说明插到首个正文章节容器最前（同页先于章首标题）。"""
+    html = build_provenance_section(facts)
+    if html is None:
+        return False
+    target = next((c for c in chapters if not c.is_toc), None)
+    if target is None:
+        return False
+    fragment = BeautifulSoup(html, "html.parser")
+    container = target.soup
+    for node in reversed(list(fragment.children)):
+        container.insert(0, node)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 出处前置与生成门禁（R6/D6：字段投影单源；来源不足在任何打印前失败）
+# ---------------------------------------------------------------------------
+
+# 可定位原文的标记：URL、机器路径或指向具体页面/文档文件的引用。
+# 仅有文档名称或网站首页文字不构成“可定位具体原文”。
+_PROVENANCE_LOCATOR_RE = re.compile(
+    r"(https?://\S+|/[^\s）)】]，。]*|[^\s）)】]，。]*\.(?:html?|md|pdf))", re.I)
+
+
+def head_field_values(text):
+    """章首管理字段内容（含完整续行），边界与投影共用同一实现。
+
+    投影删除的字段段（含无标签续行、lazy 续行与列表延续）就是收集
+    保留的同一段：已知版本/日期写在续行时既不从 PDF 丢失，也不靠
+    行首关键词另猜边界。首行剥离字段标签，续行原样并入该字段内容。
+    """
+    values = {}
+    lines = text.split("\n")
+    for label, start, end in _management_field_segments(text):
+        chunks = []
+        for number in range(start, end + 1):
+            stripped = lines[number - 1].strip()
+            content = stripped[1:].strip() \
+                if stripped.startswith(">") else stripped
+            if number == start:
+                match = HEAD_FIELD_RE.match(stripped)
+                if match:
+                    content = match.group(2).strip()
+            if content:
+                chunks.append(content)
+        if chunks:
+            values.setdefault(label, []).append("\n".join(chunks))
+    return values
+
+
+def _norm_prov(text):
+    """出处文字比较口径：空白折叠。"""
+    return _WS_PROV_RE.sub("", text or "")
+
+
+_WS_PROV_RE = re.compile(r"\s+")
+
+
+def has_provenance_locator(text):
+    """来源文字是否可定位具体原文（A15 最低标准）。
+
+    机器路径或指向具体文档文件的引用算定位；URL 必须带有主机内路径
+    （指向具体页面/文档），裸域名或站点首页不算。"""
+    for token in _PROVENANCE_LOCATOR_RE.findall(text or ""):
+        if token.lower().startswith("http"):
+            rest = re.sub(r"^[a-z]+://[^/]+", "", token, flags=re.I)
+            rest = rest.rstrip("/#?")
+            if not rest:
+                continue  # 裸域名/站点首页
+            if re.match(r"^[^/]+\.[a-z]{2,}$", rest.split("/")[0],
+                        re.I) and "/" not in rest:
+                continue  # 仅域名+无路径
+            return True
+        if token.startswith("/") or token.lower().endswith(
+                (".html", ".md", ".pdf")):
+            return True
+        parts = [seg for seg in token.split("/") if seg]
+        if len(parts) >= 2:
+            return True
+    return False
+
+
+def find_toc_provenance(toc_chapter):
+    """目录中的完整出处普通段落：以“译自”开头且含可定位来源的块。"""
+    if toc_chapter is None:
+        return None
+    paragraphs = []
+    current = []
+    for line in toc_chapter.text.split("\n"):
+        stripped = line.strip()
+        if stripped:
+            current.append(stripped)
+        elif current:
+            paragraphs.append("\n".join(current))
+            current = []
+    if current:
+        paragraphs.append("\n".join(current))
+    for paragraph in paragraphs:
+        body = paragraph.lstrip("> ").strip()
+        if body.startswith("译自") and has_provenance_locator(paragraph):
+            return paragraph
+    return None
+
+
+def visible_provenance_text(markdown_text):
+    """出处段的实际可见文字：按 CommonMark 渲染后取文本，链接只留显示文字。
+
+    核验用该可见文字在成品 PDF 中定位被采用的出处段——读者在 PDF 中
+    看到的是渲染后的文字而非 Markdown 标记；链接目标本身仍由既有链接
+    核验负责，位置核验只关心实际显示内容。块级段落边界保留为换行：
+    不同段落是各自独立的可见文字，不合并成假想的连续文本。
+    """
+    if not markdown_text:
+        return ""
+    html = _HEAD_STRUCTURE_MD.render(markdown_text)
+    soup = BeautifulSoup(html, "html.parser")
+    blocks = [child.get_text(" ", strip=True)
+              for child in soup.find_all(recursive=False)]
+    blocks = [text for text in blocks if text]
+    if not blocks:
+        return soup.get_text(" ", strip=True)
+    return "\n".join(blocks)
+
+
+def load_provenance_map(path, chapters, diagnostics):
+    """读取并校验只读出处区间映射（--provenance）；非法即失败。
+
+    映射格式：{"inputs": [{"path": "...", "sha256": "...",
+    "sections": [{"lines": [起, 止], "chapters": [1, 2, ...]}]}], ...}
+    行区间为输入文件中构成完整出处说明的段落；chapters 为 1 起输入序号，
+    声明该段落覆盖的章。区间映射只证明来源与章节对应，不掩盖来源缺失。
+    输入摘要必填且必须匹配（缺失或替换输入即拒绝，不能用映射绕开输入
+    绑定）；区间只支持目录文件（00_目录.md，渲染在最前）中的出处段落，
+    正文章节内的区间不构成前置出处，明确拒绝。
+    """
+    if path is None:
+        return None
+    try:
+        payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ExportError("出处区间映射无法解析：%s（%s）" % (path, exc))
+    by_path = {str(chapter.path): chapter for chapter in chapters}
+    toc_chapter = next((c for c in chapters if c.is_toc), None)
+    if toc_chapter is not None and chapters[0] is not toc_chapter:
+        # 映射的效力以目录渲染在最前为前提；目录未列首位时被采用出处段
+        # 必然落在其后的章之后，无法满足前置要求。不擅自重排输入，沿用
+        # 生成门禁的既有失败保护明确拒绝（零生成、已有 PDF 不变）。
+        raise ExportError(
+            "目录文件未列在输入首位，出处区间映射无法保证被采用出处段"
+            "先于首章：请将 %s 列在输入首位后重试" % TOC_FILE_NAME)
+    covered = {}
+    resolve = lambda p: str(Path(p).expanduser().resolve())
+    for item in payload.get("inputs", []):
+        chapter = by_path.get(resolve(item.get("path", "")))
+        if chapter is None:
+            raise ExportError(
+                "出处区间映射指向未纳入输入的文件：%r" % item.get("path"))
+        if toc_chapter is None or chapter is not toc_chapter:
+            raise ExportError(
+                "出处区间映射只支持目录文件（00_目录.md）中的前置出处"
+                "段落，不支持正文章节内区间：%r" % item.get("path"))
+        digest = item.get("sha256")
+        if not digest:
+            raise ExportError(
+                "出处区间映射缺少输入摘要（sha256 必填）：%s"
+                % item.get("path"))
+        if digest != sha256_file(chapter.path):
+            raise ExportError(
+                "出处区间映射摘要与输入不符：%s" % item.get("path"))
+        for section in item.get("sections", []):
+            start, end = section.get("lines", [0, 0])
+            lines = chapter.text.split("\n")
+            if not (1 <= start <= end <= len(lines)):
+                raise ExportError(
+                    "出处区间越界：%s L%d-L%d"
+                    % (item.get("path"), start, end))
+            mapped_text = "\n".join(lines[start - 1:end])
+            if not has_provenance_locator(mapped_text):
+                raise ExportError(
+                    "出处区间不含可定位来源：%s L%d-L%d"
+                    % (item.get("path"), start, end))
+            for index in section.get("chapters", []):
+                if not 1 <= index <= len(chapters):
+                    raise ExportError("出处区间覆盖章序号越界：%r" % index)
+                covered[index] = mapped_text
+    if not covered:
+        raise ExportError("出处区间映射未声明任何章节覆盖")
+    # 章节覆盖关系（covered）与实际出处段落分开：同一段落覆盖多章时
+    # 实际段落只有一份，核验定位按实际段落进行；真正不同的段落（不同
+    # 来源、版本或日期）原样保留，不合并、不丢弃。
+    paragraphs = []
+    for index in sorted(covered):
+        if covered[index] not in paragraphs:
+            paragraphs.append(covered[index])
+    return {"text": "\n\n".join(paragraphs),
+            "covered": covered}
+
+
+def collect_provenance(chapters, toc_chapter, provenance_map):
+    """收集实际输出范围的出处事实并按最低标准分类，返回事实字典。
+
+    最低标准：每章均可定位其具体原文；输入中已知的版本/日期原样保留，
+    源未提供不编造。章首四类管理字段全部从章首移除后，彼此不同的来源
+    信息以组合形式保留在前置说明；与目录出处段/映射文本完全一致的组合
+    不再重复。返回事实字典供门禁、报告与前置区渲染使用。
+    """
+    chapter_facts = []
+    for chapter in chapters:
+        values = head_field_values(chapter.text)
+        chapter_facts.append(
+            {
+                "chapter": chapter,
+                "source": " ".join(values.get("来源", [])),
+                "original": " ".join(values.get("原文", [])),
+                "fetch_date": "；".join(values.get("抓取日期", [])),
+            }
+        )
+    toc_text = find_toc_provenance(toc_chapter)
+    covered = dict(provenance_map["covered"]) if provenance_map else {}
+    basis_text = (toc_text or "") + "\n" + (
+        provenance_map["text"] if provenance_map else "")
+    def represented(combo):
+        """组合是否已由目录出处段/映射文本集中呈现。
+
+        已知版本/日期与原文限定说明属于不可丢失字段：组合中每个非空
+        字段（来源定位符、原文文字、抓取日期）都必须出现在集中说明里，
+        否则该组合仍需在前置区保留，不能只比对来源 URL。
+        """
+        source = combo["combo"]["source"]
+        original = combo["combo"]["original"]
+        fetch_date = combo["combo"]["fetch_date"]
+        if fetch_date and fetch_date not in basis_text:
+            return False
+        if original and _norm_prov(original) not in _norm_prov(basis_text):
+            return False
+        if source:
+            if has_provenance_locator(source):
+                locators = _PROVENANCE_LOCATOR_RE.findall(source)
+                if not all(token in basis_text for token in locators):
+                    return False
+                # 定位符之外的剩余文字（版本/抓取说明等）同样不可丢失
+                remainder = _norm_prov(source)
+                for token in locators:
+                    remainder = remainder.replace(_norm_prov(token), ' ')
+                remainder = remainder.strip()
+                return (not remainder
+                        or _norm_prov(remainder) in _norm_prov(basis_text))
+            return _norm_prov(source) in _norm_prov(basis_text)
+        return True
+
+    def _combo_represented(fact):
+        return represented({"combo": {
+            "source": fact["source"], "original": fact["original"],
+            "fetch_date": fact["fetch_date"]}})
+
+
+    complete, incomplete, unavailable = [], [], []
+    combos = []
+    for index, fact in enumerate(chapter_facts, start=1):
+        chapter = fact["chapter"]
+        if chapter.is_toc:
+            continue  # 目录文件不是正文章节，不适用每章可定位原文标准
+        if index in covered:
+            complete.append(index)
+        elif has_provenance_locator(fact["source"]) \
+                or has_provenance_locator(fact["original"]):
+            complete.append(index)
+        elif (toc_text is not None or provenance_map is not None) \
+                and (fact["source"] or fact["original"]) \
+                and _combo_represented(fact):
+            # 目录出处段/映射集中说明存在，且该章的来源文字确实被集中
+            # 说明覆盖（定位符/文字逐项出现在其中）；无法对应的章节
+            # （如写了另一本书的来源）不能借目录段落通过门禁。
+            complete.append(index)
+        elif fact["source"] or fact["original"]:
+            incomplete.append(index)
+        else:
+            unavailable.append(index)
+        if not (fact["source"] or fact["original"] or fact["fetch_date"]):
+            continue
+        combo = {"source": fact["source"], "original": fact["original"],
+                 "fetch_date": fact["fetch_date"]}
+        for existing in combos:
+            if existing["combo"] == combo:
+                existing["chapters"].append(index)
+                break
+        else:
+            combos.append({"combo": combo, "chapters": [index]})
+
+    front_combos = [item for item in combos if not represented(item)]
+    front_lines = []
+    for item in front_combos:
+        combo = item["combo"]
+        parts = []
+        if combo["source"]:
+            parts.append("来源：%s" % combo["source"])
+        if combo["original"]:
+            parts.append("原文：%s" % combo["original"])
+        if combo["fetch_date"]:
+            parts.append("抓取日期：%s" % combo["fetch_date"])
+        scope = "、".join("第 %d 章" % i for i in item["chapters"])
+        front_lines.append("%s（适用：%s）" % ("；".join(parts), scope))
+    front_text = "\n".join(front_lines)
+    # 实际采用的集中出处段（核验成品位置用）：生成前置 > 目录“译自…”段
+    # > 映射区间段。目录/映射段以渲染后的可见文字传递——Markdown 链接等
+    # 标记不会出现在 PDF 可见文本中，用原始源码定位会误判缺失。
+    if front_text:
+        adopted_front = front_text
+    elif toc_text is not None:
+        adopted_front = visible_provenance_text(toc_text)
+    elif provenance_map is not None:
+        adopted_front = visible_provenance_text(provenance_map["text"])
+    else:
+        adopted_front = ""
+    return {
+        "mode": ("mapping" if provenance_map is not None
+                 else "toc" if toc_text is not None else "generated"),
+        "complete": complete,
+        "incomplete": incomplete,
+        "unavailable": unavailable,
+        "combos": [{"source": item["combo"]["source"],
+                    "original": item["combo"]["original"],
+                    "fetch_date": item["combo"]["fetch_date"],
+                    "chapters": item["chapters"]} for item in combos],
+        "front_text": front_text,
+        "toc_paragraph": toc_text,
+        "adopted_front": adopted_front,
+        "covered": sorted(covered),
+    }
 
 # ---------------------------------------------------------------------------
 # 印刷目录（显式目录角色：00_目录.md；两遍打印，页码为 PDF 实际页序）
@@ -782,8 +1177,9 @@ def extract_toc_pages(pdf_path, entries):
 # 章首管理字段投影（只作用于导出视图；Markdown 原文与输入摘要不变）
 # ---------------------------------------------------------------------------
 
-# PDF 默认排除的章首模板字段；独立“来源”字段未被点名，保留。
-MANAGEMENT_FIELD_LABELS = ("原文", "译例说明")
+# PDF 默认排除的章首模板字段（D6/A14）：管理字段全部移出章首，出处信息
+# 集中前置到第一章之前；具体可定位来源缺失时在打印前阻断（见出处门禁）。
+MANAGEMENT_FIELD_LABELS = ("原文", "译例说明", "来源", "抓取日期")
 # 章首管理引用块的家族标签：引用块首个块是这些标签的字段段时才属于
 # 章首管理区；注（Note）等其他标签的引用块是技术正文边界。
 MANAGEMENT_FAMILY_LABELS = ("原文", "译例说明", "来源", "抓取日期")
@@ -835,21 +1231,16 @@ def _quote_child_blocks(tokens, open_index, close_index, base_level, lines):
     return blocks
 
 
-def project_management_fields(text):
-    """按 Markdown 块结构投影章首管理字段，返回 (投影文本, 排除区间列表)。
+def _management_field_segments(text):
+    """章首管理区字段段：[(label, start_line, end_line)]，1 起含完整续行。
 
-    章首区域由块级 token 顺延构成：标题、主题分隔线与管理引用块；管理
-    引用块的首个子块必须是家族标签（原文/译例说明/来源/抓取日期）的
-    字段段，其后的块（围栏、列表、嵌套引用、段落，含 CommonMark lazy
-    续行，续行由解析器并入字段段）都算字段延续，直到下一个字段行。
-    首个非章首内容——正文段、列表、表格、缩进代码、Note 等其他标签
-    引用块——即技术正文边界。只排除"原文""译例说明"字段段及其在
-    同一引用块内的延续块；代码围栏、缩进代码与嵌套结构由解析器给出
-    确定边界，不按文本行猜测。区间为 1 起始行号，end 为最后被排除行。
+    与字段投影共用同一 token 边界（引用块、围栏、缩进代码、嵌套引用与
+    CommonMark lazy 续行均由解析器判定）：投影删除的每一段就是出处
+    收集要保留的同一段，二者不各自按行猜测。
     """
     tokens = _HEAD_STRUCTURE_MD.parse(text)
     lines = text.split("\n")
-    exclusions = []
+    segments = []
     index = 0
     total = len(tokens)
     while index < total:
@@ -882,7 +1273,6 @@ def project_management_fields(text):
         # 字段段按行识别：同一引用段落可能合并多个字段行（模板中
         # “原文”“来源”间常无空行），块内逐行定字段边界；段落与列表
         # 块的无标签行是延续，围栏/嵌套引用/其他块是技术内容，终止延续。
-        segments = []
         active = None
         for start, block_end, _label, kind in blocks:
             if kind == "paragraph":
@@ -897,17 +1287,33 @@ def project_management_fields(text):
                 active[2] = max(active[2], block_end)
             else:
                 active = None
-        exclusions.extend(
-            {
-                "label": label,
-                "start_line": seg_start,
-                "end_line": seg_end,
-                "reason": EXCLUSION_REASON,
-            }
-            for label, seg_start, seg_end in segments
-            if label in MANAGEMENT_FIELD_LABELS
-        )
         index = close_index + 1
+    return segments
+
+
+def project_management_fields(text):
+    """按 Markdown 块结构投影章首管理字段，返回 (投影文本, 排除区间列表)。
+
+    章首区域由块级 token 顺延构成：标题、主题分隔线与管理引用块；管理
+    引用块的首个子块必须是家族标签（原文/译例说明/来源/抓取日期）的
+    字段段，其后的块（围栏、列表、嵌套引用、段落，含 CommonMark lazy
+    续行，续行由解析器并入字段段）都算字段延续，直到下一个字段行。
+    首个非章首内容——正文段、列表、表格、缩进代码、Note 等其他标签
+    引用块——即技术正文边界。只排除"原文""译例说明"字段段及其在
+    同一引用块内的延续块；代码围栏、缩进代码与嵌套结构由解析器给出
+    确定边界，不按文本行猜测。区间为 1 起始行号，end 为最后被排除行。
+    """
+    lines = text.split("\n")
+    exclusions = [
+        {
+            "label": label,
+            "start_line": start,
+            "end_line": end,
+            "reason": EXCLUSION_REASON,
+        }
+        for label, start, end in _management_field_segments(text)
+        if label in MANAGEMENT_FIELD_LABELS
+    ]
     if not exclusions:
         return text, []
     removed = set()
@@ -1392,9 +1798,14 @@ def resolve_links(chapter, chapters, diagnostics, unlink_targets=()):
         )
 
 
-def inline_images(chapter, diagnostics, resource_registry):
-    soup = chapter.soup
-    for image in soup.find_all("img"):
+def enumerate_images(chapter, diagnostics):
+    """只读枚举本章真实图片出现：解析路径并判型，不修改 soup、不内联。
+
+    与内联共用同一遍历顺序（soup 中带 src 的 img）；外部引用与缺失
+    资源在此即记 fail，供内联/打印前的预检门禁提前阻断。
+    """
+    enumeration = []
+    for image in chapter.soup.find_all("img"):
         src = image.get("src")
         if src is None:
             continue
@@ -1422,37 +1833,60 @@ def inline_images(chapter, diagnostics, resource_registry):
                     "line": line,
                 }
             )
-            image.decompose()
             continue
-        digest = sha256_file(path)
-        key = str(path)
+        kind, pixel_size, frames, pixel_known = bitmap_facts(str(path))
+        enumeration.append(
+            {
+                "img": image,
+                "src": src,
+                "path": str(path),
+                "sha256": sha256_file(path),
+                "line": line,
+                "kind": kind,
+                "pixel_size": pixel_size,
+                "frames": frames,
+                "pixel_known": pixel_known,
+            }
+        )
+    return enumeration
+
+
+def inline_images(chapter, diagnostics, resource_registry, enumeration):
+    """把预检通过的枚举结果内联为 data URI（原始字节）；每个文件只编码一次。"""
+    for record in enumeration:
+        image = record["img"]
+        path = record["path"]
+        key = path
         if key not in resource_registry:
-            mime = mimetypes.guess_type(str(path))[0]
+            mime = mimetypes.guess_type(path)
+            mime = mime[0] if mime and mime[0] else None
             if not mime:
                 diagnostics.append(
                     {
                         "severity": "fail",
                         "code": "unknown-image-type",
-                        "message": "无法识别图片类型：%s" % path.name,
+                        "message": "无法识别图片类型：%s"
+                        % Path(path).name,
                         "input": str(chapter.path),
-                        "line": line,
+                        "line": record["line"],
                     }
                 )
                 image.decompose()
                 continue
-            payload = base64.b64encode(path.read_bytes()).decode("ascii")
+            payload_bytes = Path(path).read_bytes()
+            payload = base64.b64encode(payload_bytes).decode("ascii")
             resource_registry[key] = {
-                "path": str(path),
-                "sha256": digest,
-                "bytes": path.stat().st_size,
+                "path": path,
+                "sha256": record["sha256"],
+                "bytes": Path(path).stat().st_size,
                 "mime": mime,
                 "data_uri": "data:%s;base64,%s" % (mime, payload),
             }
-        record = resource_registry[key]
-        image["src"] = record["data_uri"]
+        registry = resource_registry[key]
+        image["src"] = registry["data_uri"]
         chapter.images.append(
-            {k: record[k] for k in ("path", "sha256", "bytes")}
-            | {"src": src, "source_line": line}
+            {k: registry[k] for k in ("path", "sha256", "bytes")}
+            | {"src": record["src"], "source_line": record["line"]}
         )
 
 
@@ -1611,7 +2045,8 @@ def summarize_inputs(chapters):
 
 
 def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
-           toc_sections=False):
+           toc_sections=False, require_display_map=False,
+           provenance_map_path=None):
     work_dir.mkdir(parents=True, exist_ok=True)
     diagnostics = []
     report = {"diagnostics": diagnostics}
@@ -1629,9 +2064,10 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
 
     resource_registry = {}
     # 显示尺寸映射先于渲染读取：命中条目在图片内联后注入受限宽度。
-    bindings, display_map_paths = load_display_maps(
-        chapters, list(images_display_paths), diagnostics
-    )
+    bindings, display_undetermined, display_undetermined_raw, \
+        display_map_paths = load_display_maps(
+            chapters, list(images_display_paths), diagnostics
+        )
     # 先完成全部章节解析，再做链接消解：跨章文件链接与片段链接都依赖
     # 所有章节的目标映射就绪。
     for chapter in chapters:
@@ -1662,11 +2098,159 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
 
     for chapter in chapters:
         collect_chapter_facts(chapter)
+
+    # 出处门禁（R6/D6）：字段投影单源；来源不足在任何内联/打印前失败，
+    # 不生成候选或成品；已知版本/日期原样保留，缺失不编造。
+    try:
+        provenance_map = load_provenance_map(provenance_map_path, chapters,
+                                             diagnostics)
+    except ExportError as exc:
+        report["status"] = STATUS_MACHINE_FAIL
+        report["error"] = str(exc)
+        (work_dir / REPORT_NAME).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print("FAIL: %s" % exc, file=sys.stderr)
+        return 1
+    provenance_facts = collect_provenance(chapters, toc_chapter,
+                                          provenance_map)
+    if provenance_facts["incomplete"]:
+        chapters_text = "、".join(
+            "第 %d 章" % i for i in provenance_facts["incomplete"])
+        diagnostics.append(
+            {
+                "severity": "fail",
+                "code": "provenance-incomplete",
+                "message": "以下章节只有无法定位具体原文的来源（文档名/首页"
+                "不算定位）：%s" % chapters_text,
+            }
+        )
+    if provenance_facts["unavailable"]:
+        chapters_text = "、".join(
+            "第 %d 章" % i for i in provenance_facts["unavailable"])
+        diagnostics.append(
+            {
+                "severity": "fail",
+                "code": "provenance-unavailable" if not provenance_facts["incomplete"]
+                else "provenance-incomplete",
+                "message": "以下章节完全缺少出处信息：%s" % chapters_text,
+            }
+        )
+    report["provenance"] = {
+        "policy": {"fields": list(MANAGEMENT_FIELD_LABELS)},
+        "mode": provenance_facts["mode"],
+        "complete": provenance_facts["complete"],
+        "incomplete": provenance_facts["incomplete"],
+        "unavailable": provenance_facts["unavailable"],
+        "combos": provenance_facts["combos"],
+        "front_generated": bool(provenance_facts["front_text"]),
+        "mapping": str(provenance_map_path) if provenance_map_path else None,
+    }
+    inject_provenance(chapters, provenance_facts)
+
+    # 资源预检（内联/解码/打印之前）：只读枚举真实图片出现，逐项核对
+    # 尺寸覆盖并估算解码预算。任何 fail（含严格策略）都在此阻断，不新增
+    # 候选或成品；预算与回退告警不阻断，真实错误保留原因。
+    enumerations = {}
+    for chapter in chapters:
+        enumerations[chapter.path] = enumerate_images(chapter, diagnostics)
+    occurrences = [
+        Occurrence(
+            chapter=str(chapter.path),
+            occurrence=index + 1,
+            ref=record["src"],
+            path=record["path"],
+            sha256=record["sha256"],
+            line=record["line"],
+            kind=record["kind"],
+            pixel_size=record["pixel_size"],
+            frames=record["frames"],
+            pixel_known=record["pixel_known"],
+        )
+        for chapter in chapters
+        for index, record in enumerate(enumerations[chapter.path])
+    ]
+    preflight_items = classify_occurrences(
+        occurrences,
+        {str(k): v for k, v in bindings.items()},
+        {(str(k[0]), k[1]): v for k, v in display_undetermined.items()},
+    )
+    # 未确定条目身份核对：与确定条目同一出现序号/路径/摘要规则。
+    for chapter in chapters:
+        diagnostics.extend(undetermined_binding_diagnostics(
+            str(chapter.path),
+            display_undetermined_raw.get(chapter.path, []),
+            enumerations[chapter.path],
+        ))
+    diagnostics.extend(
+        coverage_diagnostics(
+            preflight_items, require_display_map, "images-display-absent"))
+    image_budget, budget_diagnostics = decode_budget(preflight_items)
+    diagnostics.extend(budget_diagnostics)
+    report["require_display_map"] = bool(require_display_map)
+    report["image_coverage"] = coverage_summary(preflight_items)
+    report["image_budget"] = image_budget
+    preflight_failures = [d for d in diagnostics if d.get("severity") == "fail"]
+    if preflight_failures:
+        report["status"] = STATUS_MACHINE_FAIL
+        (work_dir / REPORT_NAME).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(
+            "FAIL: 打印前预检未通过（%d 项），未生成候选或成品 PDF"
+            % len(preflight_failures),
+            file=sys.stderr,
+        )
+        for diag in preflight_failures:
+            print(
+                "  [%s] %s:%s %s"
+                % (
+                    diag["code"],
+                    diag.get("input", "?"),
+                    diag.get("line", "?"),
+                    diag["message"],
+                ),
+                file=sys.stderr,
+            )
+        return 1
+
+    # 预算与覆盖提示在内联/解码开始前输出（承诺的提前提示）：此后任何
+    # 内联或浏览器失败，用户已能看见逐章覆盖与两种口径的预算估算。
+    # 已生成的预算告警（超阈值主要资源、无法估算项、多帧额外开销）在同
+    # 一处展示可定位明细；它们仍是纯告警，不改变退出语义，成功尾部不再
+    # 重复。
+    coverage = report.get("image_coverage", {})
+    total_occ = sum(v["total"] for v in coverage.values())
+    missing = sum(v["missing"] for v in coverage.values())
+    no_constraint = sum(v["no-source-constraint"] for v in coverage.values())
+    unresolved = sum(v["unresolved-size"] for v in coverage.values())
+    if total_occ:
+        print(
+            "覆盖分类（按出现次数）：总数 %d = 已恢复 %d + 未恢复 %d"
+            "（无映射条目 %d、源无尺寸约束 %d、源尺寸无法确定 %d）。"
+            % (total_occ, total_occ - missing - no_constraint - unresolved,
+               missing + no_constraint + unresolved,
+               missing, no_constraint, unresolved)
+        )
+        budget = report.get("image_budget", {})
+        if budget:
+            print(
+                "解码预算估算：按出现累加 %.1f MiB / 按摘要去重 %.1f MiB"
+                "（阈值 %d MiB，仅为候选估算）；无法估算项 %d 处。"
+                % (budget.get("occurrence_estimate_bytes", 0) / (1 << 20),
+                   budget.get("dedup_estimate_bytes", 0) / (1 << 20),
+                   budget.get("threshold_bytes", 0) // (1 << 20),
+                   len(budget.get("unknown_items", [])))
+            )
+            for diag in budget_diagnostics:
+                print("  [%s] %s" % (diag["code"], diag["message"]))
+
     display_records = {}
     natural_fallback = {}
     for chapter in chapters:
         resolve_links(chapter, chapters, diagnostics, unlink_targets)
-        inline_images(chapter, diagnostics, resource_registry)
+        inline_images(chapter, diagnostics, resource_registry,
+                      enumerations[chapter.path])
         applied = apply_display_widths(chapter, bindings, diagnostics)
         display_records[str(chapter.path)] = applied
         valid_occurrences = {r["occurrence"] for r in applied}
@@ -1970,6 +2554,19 @@ def main(argv=None):
         action="store_true",
         help="印刷目录在章级条目外加入一级节（默认仅章级）",
     )
+    parser.add_argument(
+        "--require-display-map",
+        action="store_true",
+        help="严格尺寸保真：每次真实图片出现都必须有确定有效的源尺寸，"
+             "缺失、部分覆盖与未确定均拒绝导出（无图输入豁免）",
+    )
+    parser.add_argument(
+        "--provenance",
+        default=None,
+        metavar="PATH",
+        help="只读出处区间映射 JSON：声明目录段落行区间与覆盖章，"
+             "用于非标准出处段落；不以映射掩盖来源缺失",
+    )
     parser.add_argument("inputs", nargs="+", help="有序 Markdown 输入")
     args = parser.parse_args(argv)
     try:
@@ -1980,6 +2577,8 @@ def main(argv=None):
             unlink_targets=args.unlink_target,
             images_display_paths=args.images_display,
             toc_sections=args.toc_sections,
+            require_display_map=args.require_display_map,
+            provenance_map_path=args.provenance,
         )
     except ExportError as exc:
         print("FAIL: %s" % exc, file=sys.stderr)

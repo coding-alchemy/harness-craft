@@ -19,6 +19,8 @@ cp fixtures/valid_1x1.png "$TMP/images/pattern_a.png"
 cat > "$TMP/sample.md" <<'MD'
 # 1. 测试章节（Demo）
 
+> **来源**：https://example.com/prov-TMP-sample-md
+
 > **注（Note）**：这是一个提示块，包含 $\(x^2 + y^2 = r^2\)$ 行内公式与 [外部链接](https://example.com/docs)。
 
 目录：见 [1.2 节](#12-第二个子节)。
@@ -245,6 +247,8 @@ cp "$TMP/_comp_b.png" "$TMP/comp/B_images/shared.png"
 cat > "$TMP/comp/z_second.md" <<'MD'
 # 第二章 A（顺序测试）
 
+> **来源**：https://example.com/prov-TMP-comp-z-second-md
+
 本章目录：[同名小节](#同名小节)，另见 [A 章引用](https://example.com/a)。跨章文件链接：[打开第一章 B](a_first.md)，跨章小节链接：[第一章 B 的同名小节](a_first.md#同名小节)。
 
 ## 同名小节
@@ -262,6 +266,8 @@ MD
 
 cat > "$TMP/comp/a_first.md" <<'MD'
 # 第一章 B（顺序测试）
+
+> **来源**：https://example.com/prov-TMP-comp-a-first-md
 
 本章目录：[同名小节](#同名小节)，另见 [B 章引用](https://example.com/b)。跨章跳转：[第二章 A](#第二章-a顺序测试)。
 
@@ -386,6 +392,8 @@ echo "缺失输入文件已拒绝"
 
 echo "==> 阶段02：链接到无标题章节不崩溃且转为章容器目标"
 cat > "$TMP/comp/c_plain.md" <<'MD'
+> **来源**：https://example.com/provc-plain
+
 这一章只有正文段落，没有任何标题。
 MD
 cp "$TMP/comp/z_second.md" "$TMP/comp/z_with_plain.md"
@@ -465,6 +473,8 @@ echo "==> 复审修复：跨行行内代码中的 ####### 不得拆为深层标�
 cat > "$TMP/inline_deep.md" <<'MD'
 # 行内代码跨行样例
 
+> **来源**：https://example.com/prov-TMP-inline-deep-md
+
 Example: `begin
 ####### literal
 end`
@@ -504,6 +514,8 @@ echo "==> 复审修复：第 11 个显式锚点不得发生占位符碰撞"
 {
   echo "# 锚点碰撞回归"
   echo
+  echo "> **来源**：https://example.com/prov-anchor-collision"
+  echo
   for i in $(seq 0 10); do
     printf '<a id="a%d"></a> 标记 %d，[跳到 a%d](#a%d)。\n\n' "$i" "$i" "$i" "$i"
   done
@@ -538,9 +550,13 @@ mkdir -p "$TMP/plain_ch"
 cat > "$TMP/plain_ch/a_min.md" <<'MD'
 # 有标题章
 
+> **来源**：https://example.com/prov-TMP-plain-ch-a-min-md
+
 正文 A，链接到 [B 章](b_min.md)。
 MD
 cat > "$TMP/plain_ch/b_min.md" <<'MD'
+> **来源**：https://example.com/prov-TMP-plain-ch-b-min-md
+
 B 章只有正文段落，没有任何标题，用于验证无标题章节的边界与链接目标。
 MD
 python3 "$EXPORT" --output "$TMP/out/plain_min.pdf" --work-dir "$TMP/work_plain_min" \
@@ -577,6 +593,8 @@ echo "无标题章节正文核验未被跳过"
 echo "==> 复审修复：转义反引号不得破坏跨行行内代码"
 cat > "$TMP/escaped_tick.md" <<'MD'
 # 转义反引号样例
+
+> **来源**：https://example.com/prov-TMP-escaped-tick-md
 
 Example: \`ignored `begin
 ####### literal
@@ -615,11 +633,15 @@ mkdir -p "$TMP/dup_ch"
 cat > "$TMP/dup_ch/a_dup.md" <<'MD'
 # A 章标题
 
+> **来源**：https://example.com/prov-TMP-dup-ch-a-dup-md
+
 Same paragraph.
 
 A 章独有段落，[打开 B 章](b_dup.md)。
 MD
 cat > "$TMP/dup_ch/b_dup.md" <<'MD'
+> **来源**：https://example.com/prov-TMP-dup-ch-b-dup-md
+
 Same paragraph.
 
 B 章独有段落。
@@ -643,6 +665,8 @@ PY
 echo "==> 复审修复：标题行内含代码不得整行误判为代码内容"
 cat > "$TMP/heading_code.md" <<'MD'
 # 标题内代码样例
+
+> **来源**：https://example.com/prov-TMP-heading-code-md
 
 ####### Use ``foo`` and bar
 
@@ -673,6 +697,8 @@ PY
 echo "==> 复审修复：深层标题中的公式必须渲染"
 cat > "$TMP/deep_math.md" <<'MD'
 # 深层公式样例
+
+> **来源**：https://example.com/prov-TMP-deep-math-md
 
 ####### The $x^2$ norm
 
@@ -707,9 +733,13 @@ mkdir -p "$TMP/same_ch"
 cat > "$TMP/same_ch/a_same.md" <<'MD'
 # A 章标题
 
+> **来源**：https://example.com/prov-TMP-same-ch-a-same-md
+
 Same paragraph.
 MD
 cat > "$TMP/same_ch/b_same.md" <<'MD'
+> **来源**：https://example.com/prov-TMP-same-ch-b-same-md
+
 Same paragraph.
 MD
 python3 "$EXPORT" --output "$TMP/out/same.pdf" --work-dir "$TMP/work_same" \
@@ -795,7 +825,7 @@ work, pdf_path, md_path, before = sys.argv[1:]
 report = json.loads((Path(work) / "export_report.json").read_text(encoding="utf-8"))
 chapter = report["chapters"][0]
 assert [(s["label"], s["start_line"], s["end_line"]) for s in chapter["management_exclusions"]] \
-    == [("原文", 3, 3), ("译例说明", 7, 9)], chapter["management_exclusions"]
+    == [("原文", 3, 3), ("来源", 4, 4), ("抓取日期", 5, 5), ("译例说明", 7, 9)], chapter["management_exclusions"]
 unlinked = chapter["unlinked_links"]
 # 头部字段内的 [术语表](术语表.md) 已随授权投影移除；只有正文链接转纯文本。
 assert [u["text"] for u in unlinked] == ["项目术语表"], unlinked
@@ -814,14 +844,21 @@ for probe in ("原文：CUDAProgrammingGuide，版本v13.3",
               "术语译法遵循本项目",
               "本文档为第1章"):
     assert probe not in text, f"被排除字段内容泄漏进 PDF：{probe}"
-for keep in ("来源：https://docs.nvidia.com/cuda/cuda-programming-guide/",
-             "抓取日期：2026-08-28",
-             "正文提到“原文”与“译例说明”同名文字，必须完整保留",
+# 默认出处前置（R6/D6）：已知来源/日期集中前置且只出现一次。
+front = ("来源：https://docs.nvidia.com/cuda/cuda-programming-guide/",
+         "抓取日期：2026-08-28")
+for keep in front:
+    assert norm(keep) in text, f"前置出处缺失：{keep}"
+first_heading = text.find("1.IntroductiontoCUDA")  # 首章标题必晚于前置区
+for locator in (norm(front[0]), norm(front[1])):
+    assert text.find(locator) < first_heading, "前置出处未先于正文"
+assert text.count(norm(front[0])) == 1, "来源定位符在成品中重复出现"
+for keep in ("正文提到“原文”与“译例说明”同名文字，必须完整保留",
              ">**原文**：代码围栏中的字面字段行，必须原样保留。",
              "项目术语表",
              "CUDA是并行计算平台"):
     assert norm(keep) in text, f"应保留内容缺失：{keep}"
-print("章首字段排除、来源保留、正文/代码同名文字与术语表链接纯文本均正确")
+print("章首四字段移除、出处前置一次、正文/代码同名文字与术语表链接纯文本均正确")
 PY
 
 echo "==> V0.2-01：伪造排除证据必须 FAIL（核验器不信任导出清单）"
@@ -892,10 +929,12 @@ digests['b/same'] = png(root / 'b_imgs/same.png', (200, 120, 30))   # 同名不�
 digests['b/w900'] = png(root / 'b_imgs/w900.png', (120, 30, 200))
 
 (root / 'a.md').write_text(
-    '# A 章\n\n![小宽](a_imgs/w300.png)\n\n![共享图 A](a_imgs/same.png)\n\n'
+    '# A 章\n\n> **来源**：https://example.com/prov-disp-a\n\n'
+    '![小宽](a_imgs/w300.png)\n\n![共享图 A](a_imgs/same.png)\n\n'
     '![自然尺寸](a_imgs/natural.png)\n', encoding='utf-8')
 (root / 'b.md').write_text(
-    '# B 章\n\n![共享图 B](b_imgs/same.png)\n\n![超版心](b_imgs/w900.png)\n',
+    '# B 章\n\n> **来源**：https://example.com/prov-disp-b\n\n'
+    '![共享图 B](b_imgs/same.png)\n\n![超版心](b_imgs/w900.png)\n',
     encoding='utf-8')
 
 entries = [
@@ -1014,8 +1053,8 @@ echo "==> V0.2-02：同名 Markdown 按完整路径绑定；文件名兜底歧�
 mkdir -p "$TMP/same/a" "$TMP/same/b"
 cp "$FIXTURE_IMAGE" "$TMP/same/a/img.png"
 cp "$FIXTURE_IMAGE" "$TMP/same/b/img.png"
-printf '# 第 A 章\n\nA 章正文。\n\n![img](img.png)\n' > "$TMP/same/a/chapter.md"
-printf '# 第 B 章\n\nB 章正文。\n\n![img](img.png)\n' > "$TMP/same/b/chapter.md"
+printf '# 第 A 章\n\n> **来源**：https://example.com/prov-same-a\n\nA 章正文。\n\n![img](img.png)\n' > "$TMP/same/a/chapter.md"
+printf '# 第 B 章\n\n> **来源**：https://example.com/prov-same-b\n\nB 章正文。\n\n![img](img.png)\n' > "$TMP/same/b/chapter.md"
 python3 - "$TMP/same" "$FIXTURE_IMAGE" <<'PY'
 import hashlib
 import json
@@ -1073,6 +1112,8 @@ echo "==> 收尾 N01/N04：非导航说明与代码字面量缺失必须由内�
 mkdir -p "$TMP/neg"
 cat > "$TMP/neg/00_目录.md" <<'MD'
 # 负向目录
+
+译自：https://example.com/neg-source
 
 各章译文：
 
@@ -1356,6 +1397,8 @@ for c in 1 2 3; do
   {
     echo "# 第 ${c} 章"
     echo
+    echo "> **来源**：https://example.com/prov-toc-big-c${c}"
+    echo
     echo "第 ${c} 章正文。"
     for s in $(seq 1 20); do
       echo
@@ -1398,6 +1441,8 @@ mkdir -p "$TMP/mix"
 cat > "$TMP/mix/01_章.md" <<'MD'
 # 第 1 章 基础
 
+> **来源**：https://example.com/prov-TMP-mix-01-md
+
 第 1 章正文。
 
 ## 1.1. 简介（简介）
@@ -1410,6 +1455,8 @@ cat > "$TMP/mix/01_章.md" <<'MD'
 MD
 cat > "$TMP/mix/02_章.md" <<'MD'
 # 第 2 章 进阶
+
+> **来源**：https://example.com/prov-TMP-mix-02-md
 
 第 2 章正文。
 
@@ -1532,6 +1579,8 @@ for name in 01_引言 02_同名 03_同名二; do
   cat > "$TMP/toc/$name.md" <<MD
 # $name 章标题
 
+> **来源**：https://example.com/prov-toc-$name
+
 第 ${name} 章正文。
 
 ## 节标题
@@ -1637,3 +1686,708 @@ PY
 python3 "$VERIFY" --pdf "$TMP/toc/book.pdf" --work-dir "$TMP/toc_work" "${TOC_IN[@]}" >/dev/null
 
 echo "==> Ticket 01 PDF 导出回归全部通过"
+echo "==> R2/R5（留痕 03）：普通/严格覆盖策略、预算与代码内图片语法"
+STRICT="$TMP/strict_case"; rm -rf "$STRICT"; mkdir -p "$STRICT/imgs" "$STRICT/imgsel"
+cp fixtures/valid_1x1.png "$STRICT/imgs/small.png"
+cp fixtures/valid_1x1.png "$STRICT/imgs/free.png"
+python3 - "$STRICT" <<'PY'
+import struct, sys, zlib
+from pathlib import Path
+
+base = Path(sys.argv[1])
+
+def make_png(path, w, h):
+    def chunk(tag, data):
+        body = tag + data
+        return (struct.pack('>I', len(data)) + body
+                + struct.pack('>I', zlib.crc32(body)))
+    ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+    raw = b''.join(b'\x00' + b'\x10\x20\x30' * w for _ in range(h))
+    Path(path).write_bytes(
+        b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
+        + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+make_png(base / 'imgsel/big.png', 900, 500)   # 去重后的第二大资源
+(base / 'a.md').write_text(
+    '# 章 A\n\n> **来源**：https://example.com/prov-strict-a\n\n'
+    '![小图](imgs/small.png)\n\n'
+    '```text\n![代码内示例](imgs/missing.png)\n```\n\n'
+    '![自由图](imgs/free.png)\n', encoding='utf-8')
+(base / 'b.md').write_text(
+    '# 章 B\n\n> **来源**：https://example.com/prov-strict-b\n\n'
+    '![大图](imgsel/big.png)\n\n'
+    '![大图重复](imgsel/big.png)\n', encoding='utf-8')
+PY
+# 普通模式：无映射/未覆盖仅告警继续（含代码内图片语法不计）
+python3 "$EXPORT" --output "$STRICT/plain.pdf" --work-dir "$STRICT/w_plain" \
+  "$STRICT/a.md" "$STRICT/b.md" >"$STRICT/plain.txt" 2>&1
+grep -q "总数 4 = 已恢复 0 + 未恢复 4（无映射条目 4" "$STRICT/plain.txt" \
+  || { cat "$STRICT/plain.txt"; echo "错误：覆盖汇总口径不符（代码内示例不得计数）"; exit 1; }
+python3 - "$STRICT" <<'PYCHK'
+import json, sys
+from pathlib import Path
+
+report = json.loads((Path(sys.argv[1]) / 'w_plain' / 'export_report.json')
+                    .read_text(encoding='utf-8'))
+codes = [d['code'] for d in report['diagnostics']]
+assert codes.count('images-display-absent-missing') == 4, codes
+coverage = report['image_coverage']
+a = next(v for k, v in coverage.items() if k.endswith('a.md'))
+b = next(v for k, v in coverage.items() if k.endswith('b.md'))
+assert a['total'] == 2 and b['total'] == 2, coverage
+print('普通模式诊断与逐章覆盖分类正确（代码内示例未计数）')
+PYCHK
+echo "普通模式：未覆盖告警继续、代码内图片语法不计数 PASS"
+
+# 严格模式：全部出现须有确定尺寸 → 拒绝且不新增成品
+if python3 "$EXPORT" --output "$STRICT/strict.pdf" --work-dir "$STRICT/w_strict" \
+    --require-display-map "$STRICT/a.md" "$STRICT/b.md" \
+    >"$STRICT/strict.txt" 2>&1; then
+  echo "错误：严格模式未拒绝部分覆盖"; cat "$STRICT/strict.txt"; exit 1
+fi
+grep -q "images-display-required" "$STRICT/strict.txt" \
+  || { cat "$STRICT/strict.txt"; echo "错误：严格拒绝诊断缺失"; exit 1; }
+test ! -f "$STRICT/strict.pdf" || { echo "错误：严格失败仍生成成品"; exit 1; }
+test ! -f "$STRICT/w_strict/candidate.pdf" \
+  || { echo "错误：严格失败仍生成候选"; exit 1; }
+echo "严格模式：部分覆盖被拒绝，无候选/成品 PASS"
+
+# 完整确定映射：严格模式通过；verify 缺严格参数判 FAIL
+python3 - "$STRICT" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+
+base = Path(sys.argv[1])
+
+def sha(p):
+    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+entries = [
+    {"markdown": "a.md", "occurrence": 1, "image": "imgs/small.png",
+     "sha256": sha(base / 'imgs/small.png'),
+     "width": {"value": 300, "unit": "px", "basis": "inline-css-width",
+               "reference": None},
+     "source": {"snapshot": "s.html", "node": "img[1]"}},
+    {"markdown": "a.md", "occurrence": 2, "image": "imgs/free.png",
+     "sha256": sha(base / 'imgs/free.png'),
+     "width": {"value": 900, "unit": "px", "basis": "inline-css-width",
+               "reference": None},
+     "source": {"snapshot": "s.html", "node": "img[2]"}},
+    {"markdown": "b.md", "occurrence": 1, "image": "imgsel/big.png",
+     "sha256": sha(base / 'imgsel/big.png'),
+     "width": {"value": 700, "unit": "px", "basis": "inline-css-width",
+               "reference": None},
+     "source": {"snapshot": "s.html", "node": "img[3]"}},
+    {"markdown": "b.md", "occurrence": 2, "image": "imgsel/big.png",
+     "sha256": sha(base / 'imgsel/big.png'),
+     "width": {"value": 400, "unit": "px", "basis": "inline-css-width",
+               "reference": None},
+     "source": {"snapshot": "s.html", "node": "img[4]"}},
+]
+(base / 'images_display.json').write_text(
+    json.dumps({"version": 1, "entries": entries}, ensure_ascii=False),
+    encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$STRICT/full.pdf" --work-dir "$STRICT/w_full" \
+  --images-display "$STRICT/images_display.json" --require-display-map \
+  "$STRICT/a.md" "$STRICT/b.md" >"$STRICT/full.txt" 2>&1 \
+  || { cat "$STRICT/full.txt"; echo "错误：全量确定映射严格导出应通过"; exit 1; }
+if python3 "$VERIFY" --pdf "$STRICT/full.pdf" --work-dir "$STRICT/w_full" \
+    --images-display "$STRICT/images_display.json" \
+    "$STRICT/a.md" "$STRICT/b.md" >"$STRICT/v_mismatch.txt" 2>&1; then
+  echo "错误：核验省略严格参数未被检出"; exit 1
+fi
+grep -q "images-display-require-mismatch" "$STRICT/v_mismatch.txt" \
+  || { cat "$STRICT/v_mismatch.txt"; echo "错误：严格参数不一致诊断缺失"; exit 1; }
+python3 "$VERIFY" --pdf "$STRICT/full.pdf" --work-dir "$STRICT/w_full" \
+  --images-display "$STRICT/images_display.json" --require-display-map \
+  "$STRICT/a.md" "$STRICT/b.md" >"$STRICT/v_full.txt" 2>&1 \
+  || { cat "$STRICT/v_full.txt"; echo "错误：严格核验应通过"; exit 1; }
+echo "严格导出/严格核验一致通过；核验参数漂移被检出 PASS"
+
+# 严格失败不覆盖旧 PDF：full.pdf 摘要在被拒导出后保持不变
+BEFORE=$(shasum -a 256 "$STRICT/full.pdf" | cut -d' ' -f1)
+mv "$STRICT/images_display.json" "$STRICT/images_display.json.bak"
+if python3 "$EXPORT" --output "$STRICT/full.pdf" --work-dir "$STRICT/w_strict2" \
+    --require-display-map "$STRICT/a.md" "$STRICT/b.md" \
+    >"$STRICT/strict2.txt" 2>&1; then
+  echo "错误：缺映射严格导出未被拒绝"; exit 1
+fi
+AFTER=$(shasum -a 256 "$STRICT/full.pdf" | cut -d' ' -f1)
+test "$BEFORE" = "$AFTER" || { echo "错误：严格失败覆盖了旧 PDF"; exit 1; }
+mv "$STRICT/images_display.json.bak" "$STRICT/images_display.json"
+echo "严格失败保护旧 PDF 摘要不变 PASS"
+
+# 预算：重复资源按出现累加 > 按摘要去重；SVG 列为无法估算
+python3 "$EXPORT" --output "$STRICT/plain2.pdf" --work-dir "$STRICT/w_plain2" \
+  "$STRICT/a.md" "$STRICT/b.md" >"$STRICT/plain2.txt" 2>&1
+grep -q "image-decode-budget\|解码预算估算" "$STRICT/plain2.txt" \
+  || { cat "$STRICT/plain2.txt"; echo "错误：预算估算未输出"; exit 1; }
+python3 - "$STRICT" <<'PY'
+import json, sys
+from pathlib import Path
+
+work = Path(sys.argv[1]) / 'w_plain2'
+report = json.loads((work / 'export_report.json').read_text(encoding='utf-8'))
+budget = report['image_budget']
+occ = budget['occurrence_estimate_bytes']
+dedup = budget['dedup_estimate_bytes']
+# big.png 900x500 出现两次 + 小图/自由图各一次：去重 < 按出现
+assert dedup < occ, (dedup, occ)
+assert set(budget['unknown_items']) == set(), budget['unknown_items']
+# 最大资源条目携带章/出现/资源名定位（复用 Occurrence 事实）
+top = budget['largest'][0]
+assert 'big.png' in top['location'] and '#1' in top['location'], top
+print('预算双口径（去重 %.2f MiB < 按出现 %.2f MiB）正确，'
+      '最大资源定位 %s' % (dedup / (1 << 20), occ / (1 << 20),
+                           top['location']))
+PY
+
+# 预算告警明细在内联前展示：超阈值主要资源与多帧额外开销随摘要一同输出
+# （patch 尺寸元信息与内联入口，不分配真实巨图）
+python3 - "$TMP" <<'PY'
+import contextlib
+import io
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path('../skills/tech-doc-translator/scripts').resolve()))
+import export_pdf as e
+
+base = Path(sys.argv[1]) / 'budget_warn'
+base.mkdir(exist_ok=True)
+(base / 'big.png').write_bytes(Path('fixtures/valid_1x1.png').read_bytes())
+doc = base / 'doc.md'
+doc.write_text('# 章 BG\n\n> **来源**：https://example.com/pv-budget\n\n'
+               '![big](big.png)\n', encoding='utf-8')
+captured = io.StringIO()
+
+
+class StopInline(Exception):
+    pass
+
+
+def stop_inline(*args, **kwargs):
+    raise StopInline()
+
+
+with contextlib.redirect_stdout(captured), \
+        patch.object(e, 'bitmap_facts',
+                     return_value=('GIF', (15000, 15000), 3, True)), \
+        patch.object(e, 'inline_images', side_effect=stop_inline):
+    try:
+        e.export([str(doc)], base / 'never.pdf', base / 'w')
+    except StopInline:
+        pass
+out = captured.getvalue()
+assert '解码预算估算' in out, out
+assert '[image-decode-budget]' in out and '最大资源' in out, out
+assert '[image-budget-multiframe]' in out and '（3 帧）' in out, out
+print('预算告警明细（超阈值主要资源、多帧额外开销）在内联前展示 PASS')
+PY
+
+# 普通单帧大图超阈值：告警在内联前输出且直接包含实际资源定位
+# （单帧无多帧提示，定位只能来自最大资源告警本身；纯告警不阻断内联入口）
+python3 - "$TMP" <<'PY'
+import contextlib
+import io
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path('../skills/tech-doc-translator/scripts').resolve()))
+import export_pdf as e
+
+base = Path(sys.argv[1]) / 'budget_single_frame'
+base.mkdir(exist_ok=True)
+(base / 'big.png').write_bytes(Path('fixtures/valid_1x1.png').read_bytes())
+doc = base / 'doc.md'
+doc.write_text('# 章 SF\n\n> **来源**：https://example.com/pv-single-frame\n\n'
+               '![big](big.png)\n', encoding='utf-8')
+captured = io.StringIO()
+
+
+class StopInline(Exception):
+    pass
+
+
+def stop_inline(*args, **kwargs):
+    raise StopInline()
+
+
+with contextlib.redirect_stdout(captured), \
+        patch.object(e, 'bitmap_facts',
+                     return_value=('PNG', (15000, 15000), 1, True)), \
+        patch.object(e, 'inline_images', side_effect=stop_inline):
+    try:
+        e.export([str(doc)], base / 'never.pdf', base / 'w')
+    except StopInline:
+        pass
+out = captured.getvalue()
+assert '[image-decode-budget]' in out and '最大资源' in out, out
+# 直接断言实际资源定位（章#出现序号 资源名），不只匹配“最大资源”字样
+assert 'doc.md#1 big.png' in out, out
+# 单帧场景没有多帧提示，定位只能来自最大资源告警本身
+assert '[image-budget-multiframe]' not in out, out
+print('普通单帧大图告警在内联前输出实际资源定位 PASS')
+PY
+
+# 行内代码中的引用式图片示例不计图片出现（渲染级枚举两侧一致）
+INL="$TMP/inline_ref_case"; rm -rf "$INL"; mkdir -p "$INL"
+cp fixtures/valid_1x1.png "$INL/real.png"
+cat > "$INL/doc.md" <<'MD'
+# 章内引用示例
+
+> **来源**：https://example.com/inline-ref-prov
+
+行内代码示例：`![example][img]`，其后有真实图片。
+
+![real](real.png)
+
+[img]: real.png
+MD
+python3 "$EXPORT" --output "$INL/out.pdf" --work-dir "$INL/w" \
+  "$INL/doc.md" >"$INL/e.txt" 2>&1 \
+  || { cat "$INL/e.txt"; echo "错误：行内代码引用式图片示例阻断导出"; exit 1; }
+python3 "$VERIFY" --pdf "$INL/out.pdf" --work-dir "$INL/w" \
+  "$INL/doc.md" >"$INL/v.txt" 2>&1 \
+  || { cat "$INL/v.txt"; echo "错误：行内代码引用式图片示例被核验误拒"; exit 1; }
+python3 - "$INL/w" <<'PY'
+import json, sys
+from pathlib import Path
+cov = json.loads((Path(sys.argv[1]) / 'export_report.json')
+                 .read_text(encoding='utf-8'))['image_coverage']
+totals = [v['total'] for v in cov.values()]
+assert totals == [1], totals  # 仅真实图片计 1 次
+print('行内代码引用式图片示例不计数，导出与核验一致 PASS')
+PY
+
+# 未确定条目身份与确定条目同口径核对（错路径/越界均拒绝，导出与核验双侧）
+UDI="$TMP/undet_identity"; rm -rf "$UDI"; mkdir -p "$UDI"
+cp fixtures/valid_1x1.png "$UDI/actual.png"
+printf '# 章 UI\n\n> **来源**：https://example.com/undet-identity\n\n![a](actual.png)\n' \
+  > "$UDI/doc.md"
+python3 - "$UDI" <<'PY'
+import json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+(base / 'bad_map.json').write_text(json.dumps({
+    'version': 1, 'markdown': 'doc.md',
+    'undetermined': [
+        {'occurrence': 1, 'image': 'other.png',
+         'reason_code': 'no-source-constraint'},
+        {'occurrence': 99, 'image': 'actual.png',
+         'reason_code': 'no-source-constraint'},
+    ]}), encoding='utf-8')
+PY
+if python3 "$EXPORT" --output "$UDI/out.pdf" --work-dir "$UDI/w" \
+    --images-display "$UDI/bad_map.json" "$UDI/doc.md" >"$UDI/e.txt" 2>&1; then
+  echo "错误：坏身份未确定条目未被拒绝"; exit 1
+fi
+grep -q "images-display-binding" "$UDI/e.txt" \
+  || { cat "$UDI/e.txt"; echo "错误：未确定条目资源不符诊断缺失"; exit 1; }
+grep -q "超出本章图片数" "$UDI/e.txt" \
+  || { cat "$UDI/e.txt"; echo "错误：未确定条目越界诊断缺失"; exit 1; }
+if python3 "$VERIFY" --pdf "$UDI/out.pdf" --work-dir "$UDI/w" \
+    --images-display "$UDI/bad_map.json" "$UDI/doc.md" >"$UDI/v.txt" 2>&1; then
+  echo "错误：核验未拒坏身份未确定条目"; exit 1
+fi
+grep -q "images-display-binding" "$UDI/v.txt" \
+  || { cat "$UDI/v.txt"; echo "错误：核验侧身份诊断缺失"; exit 1; }
+echo "未确定条目身份/越界导出与核验双侧拒绝 PASS"
+
+echo "==> R6/A15（留痕 04）：缺出处零生成、来源不足定位、补齐后恢复"
+PV="$TMP/prov_gate"; rm -rf "$PV"; mkdir -p "$PV"
+cp "$STRICT/full.pdf" "$PV/old.pdf"
+BEFORE_PV=$(shasum -a 256 "$PV/old.pdf" | cut -d' ' -f1)
+
+python3 - "$PV" <<'PY'
+from pathlib import Path
+base = Path(sys.argv[1]) if False else Path(__import__('sys').argv[1])
+(base / 'ok.md').write_text(
+    '# 章 OK\n\n> **来源**：https://example.com/pv-ok（抓取日期：2026-09-15）\n\n正文。\n',
+    encoding='utf-8')
+(base / 'weak.md').write_text(
+    '# 章 WEAK\n\n> **来源**：NVIDIA CUDA Programming Guide 官网\n\n正文。\n',
+    encoding='utf-8')
+(base / 'none.md').write_text('# 章 NONE\n\n正文。\n', encoding='utf-8')
+PY
+# 正例：来源可定位但源未提供版本/日期 → 不阻断（不编造）
+python3 "$EXPORT" --output "$PV/nodate.pdf" --work-dir "$PV/w_nodate" \
+  "$PV/ok.md" >"$PV/nodate.txt" 2>&1 \
+  || { cat "$PV/nodate.txt"; echo "错误：源无版本/日期不应阻断"; exit 1; }
+grep -q "prov-nodate\|pv-ok" "$PV/nodate.txt" >/dev/null 2>&1 || true
+echo "来源无版本/日期正例：导出通过（不编造字段） PASS"
+
+# 反例 1：来源只是文档名/官网（无法定位具体原文）→ provenance-incomplete
+if python3 "$EXPORT" --output "$PV/old.pdf" --work-dir "$PV/w_weak" \
+    "$PV/ok.md" "$PV/weak.md" >"$PV/weak.txt" 2>&1; then
+  echo "错误：不可定位来源未被拒绝"; exit 1
+fi
+grep -q "provenance-incomplete" "$PV/weak.txt" \
+  || { cat "$PV/weak.txt"; echo "错误：incomplete 诊断缺失"; exit 1; }
+grep -q "第 2 章" "$PV/weak.txt" \
+  || { cat "$PV/weak.txt"; echo "错误：未定位受影响章节"; exit 1; }
+test ! -f "$PV/w_weak/candidate.pdf" || { echo "错误：缺出处仍生成候选"; exit 1; }
+AFTER_PV=$(shasum -a 256 "$PV/old.pdf" | cut -d' ' -f1)
+test "$BEFORE_PV" = "$AFTER_PV" || { echo "错误：缺出处失败覆盖旧 PDF"; exit 1; }
+echo "来源不足：定位章节、零生成、旧 PDF 不变 PASS"
+
+# 反例 2：完全缺来源 → provenance-unavailable
+if python3 "$EXPORT" --output "$PV/old.pdf" --work-dir "$PV/w_none" \
+    "$PV/none.md" >"$PV/none.txt" 2>&1; then
+  echo "错误：完全缺来源未被拒绝"; exit 1
+fi
+grep -q "provenance-unavailable" "$PV/none.txt" \
+  || { cat "$PV/none.txt"; echo "错误：unavailable 诊断缺失"; exit 1; }
+echo "完全缺来源：unavailable 拒绝 PASS"
+
+# 恢复：补齐来源后可生成（且核验确认前置先于首章）
+python3 - "$PV" <<'PY'
+from pathlib import Path
+base = Path(__import__('sys').argv[1])
+(base / 'weak.md').write_text(
+    '# 章 WEAK\n\n> **来源**：https://example.com/pv-weak\n\n正文。\n',
+    encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$PV/fixed.pdf" --work-dir "$PV/w_fixed" \
+  "$PV/ok.md" "$PV/weak.md" >"$PV/fixed.txt" 2>&1 \
+  || { cat "$PV/fixed.txt"; echo "错误：补齐来源后仍拒绝"; exit 1; }
+python3 "$VERIFY" --pdf "$PV/fixed.pdf" --work-dir "$PV/w_fixed" \
+  "$PV/ok.md" "$PV/weak.md" >"$PV/fixed_v.txt" 2>&1 \
+  || { cat "$PV/fixed_v.txt"; echo "错误：补齐后核验失败"; exit 1; }
+echo "补齐来源后导出与核验恢复 PASS"
+
+# --provenance 区间映射：目录说明段被授权为准；篡改摘要即拒绝
+cat > "$PV/00_目录.md" <<'MD'
+# 合订书目录
+
+译自 NVIDIA CUDA Programming Guide v13.4：https://example.com/pv-toc-book
+
+- [章 OK](ok.md)
+- [章 WEAK](weak.md)
+MD
+cat > "$PV/map.json" <<EOF
+{"inputs": [{"path": "$PV/00_目录.md", "sha256": "$(shasum -a 256 "$PV/00_目录.md" | cut -d' ' -f1)",
+  "sections": [{"lines": [3, 3], "chapters": [2]}]}]}
+EOF
+python3 "$EXPORT" --output "$PV/mapped.pdf" --work-dir "$PV/w_map" \
+  --provenance "$PV/map.json" "$PV/00_目录.md" "$PV/ok.md" "$PV/weak.md" \
+  >"$PV/map.txt" 2>&1 \
+  || { cat "$PV/map.txt"; echo "错误：合法映射导出失败"; exit 1; }
+python3 - "$PV/w_map" <<'PY'
+import json, sys
+from pathlib import Path
+report = json.loads((Path(sys.argv[1]) / "export_report.json").read_text(encoding="utf-8"))
+prov = report["provenance"]
+assert prov["mode"] == "mapping", prov
+assert prov["complete"] == [2, 3], prov  # 目录文件豁免；两章可定位
+# 各章与映射段落不同的来源组合仍须前置保留（差异不丢失）
+assert prov["front_generated"] is True and len(prov["combos"]) == 2, prov
+print("映射模式：目录段落覆盖全书出处，各章独立来源组合仍前置保留")
+PY
+# 篡改映射（换摘要）→ 拒绝
+python3 - "$PV" <<'PY'
+import json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+data = json.loads((base / 'map.json').read_text(encoding='utf-8'))
+data["inputs"][0]["sha256"] = "0" * 64
+(base / 'map_bad.json').write_text(json.dumps(data))
+PY
+if python3 "$EXPORT" --output "$PV/mapped.pdf" --work-dir "$PV/w_map_bad" \
+    --provenance "$PV/map_bad.json" "$PV/00_目录.md" "$PV/ok.md" "$PV/weak.md" \
+    >"$PV/map_bad.txt" 2>&1; then
+  echo "错误：篡改映射未被拒绝"; exit 1
+fi
+grep -q "摘要与输入不符" "$PV/map_bad.txt" \
+  || { cat "$PV/map_bad.txt"; echo "错误：映射摘要诊断缺失"; exit 1; }
+echo "出处区间映射：合法通过、篡改拒绝 PASS"
+
+# 映射负例：指向正文章节的区间与缺摘要的映射都必须被拒绝（不能绕开输入绑定或位置保证）
+python3 - "$PV" <<'PY'
+import json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+(base / 'content_map.json').write_text(json.dumps({"inputs": [{
+    "path": str(base / 'ok.md'),
+    "sha256": __import__('hashlib').sha256(
+        (base / 'ok.md').read_bytes()).hexdigest(),
+    "sections": [{"lines": [3, 3], "chapters": [2]}]}]}), encoding='utf-8')
+(base / 'nodigest_map.json').write_text(json.dumps({"inputs": [{
+    "path": str(base / '00_目录.md'),
+    "sections": [{"lines": [3, 3], "chapters": [2]}]}]}), encoding='utf-8')
+PY
+if python3 "$EXPORT" --output "$PV/bad1.pdf" --work-dir "$PV/w_bad1" \
+    --provenance "$PV/content_map.json" "$PV/ok.md" "$PV/weak.md" \
+    >"$PV/bad1.txt" 2>&1; then
+  echo "错误：正文章节内区间映射未被拒绝"; exit 1
+fi
+grep -q "只支持目录文件" "$PV/bad1.txt" \
+  || { cat "$PV/bad1.txt"; echo "错误：正文区间诊断缺失"; exit 1; }
+if python3 "$EXPORT" --output "$PV/bad2.pdf" --work-dir "$PV/w_bad2" \
+    --provenance "$PV/nodigest_map.json" "$PV/00_目录.md" "$PV/ok.md" "$PV/weak.md" \
+    >"$PV/bad2.txt" 2>&1; then
+  echo "错误：缺摘要映射未被拒绝"; exit 1
+fi
+grep -q "缺少输入摘要" "$PV/bad2.txt" \
+  || { cat "$PV/bad2.txt"; echo "错误：缺摘要诊断缺失"; exit 1; }
+echo "映射负例：正文区间与缺摘要均拒绝 PASS"
+
+# 目录未列输入首位时映射明确拒绝（无法保证被采用出处段先于首章；零生成，不重排输入）
+if python3 "$EXPORT" --output "$PV/last.pdf" --work-dir "$PV/w_last" \
+    --provenance "$PV/map.json" "$PV/ok.md" "$PV/00_目录.md" "$PV/weak.md" \
+    >"$PV/last.txt" 2>&1; then
+  echo "错误：目录未列首位的映射未被拒绝"; exit 1
+fi
+grep -q "未列在输入首位" "$PV/last.txt" \
+  || { cat "$PV/last.txt"; echo "错误：目录顺序诊断缺失"; exit 1; }
+test ! -f "$PV/w_last/candidate.pdf" \
+  || { echo "错误：目录未列首位仍生成候选"; exit 1; }
+echo "目录未列首位时映射明确拒绝且零生成 PASS"
+
+# 映射为唯一出处来源（章内无管理字段）：目录首位时导出与核验通过，
+# 核验实测被采用映射段在成品中先于首章
+PV3="$TMP/prov_mapsole"; rm -rf "$PV3"; mkdir -p "$PV3"
+cat > "$PV3/00_目录.md" <<'MD'
+# 目录
+
+Source manual: https://example.com/pv-mapsole/book.html
+
+- [章 SOLE](sole.md)
+MD
+printf '# 章 SOLE\n\n正文。\n' > "$PV3/sole.md"
+python3 - "$PV3" <<'PY'
+import json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+digest = __import__('hashlib').sha256(
+    (base / '00_目录.md').read_bytes()).hexdigest()
+(base / 'map.json').write_text(json.dumps({"inputs": [{
+    "path": str(base / '00_目录.md'), "sha256": digest,
+    "sections": [{"lines": [3, 3], "chapters": [2]}]}]}), encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$PV3/out.pdf" --work-dir "$PV3/w" \
+  --provenance "$PV3/map.json" "$PV3/00_目录.md" "$PV3/sole.md" \
+  >"$PV3/e.txt" 2>&1 \
+  || { cat "$PV3/e.txt"; echo "错误：映射唯一来源导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$PV3/out.pdf" --work-dir "$PV3/w" \
+  --provenance "$PV3/map.json" "$PV3/00_目录.md" "$PV3/sole.md" \
+  >"$PV3/v.txt" 2>&1 \
+  || { cat "$PV3/v.txt"; echo "错误：映射唯一来源核验失败"; exit 1; }
+echo "映射为唯一出处来源：目录首位时导出与核验通过 PASS"
+
+# 目录出处段含 Markdown 链接：核验以实际可见文字定位，正常通过（不再误报缺失）
+PV4="$TMP/prov_toclink"; rm -rf "$PV4"; mkdir -p "$PV4"
+cat > "$PV4/00_目录.md" <<'MD'
+# 目录
+
+译自 [Guide](https://example.com/pv-guide/book.html)
+
+- [章 LINK](link.md)
+MD
+printf '# 章 LINK\n\n> **来源**：https://example.com/pv-guide/book.html\n\n正文。\n' \
+  > "$PV4/link.md"
+python3 "$EXPORT" --output "$PV4/out.pdf" --work-dir "$PV4/w" \
+  "$PV4/00_目录.md" "$PV4/link.md" >"$PV4/e.txt" 2>&1 \
+  || { cat "$PV4/e.txt"; echo "错误：链接出处导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$PV4/out.pdf" --work-dir "$PV4/w" \
+  "$PV4/00_目录.md" "$PV4/link.md" >"$PV4/v.txt" 2>&1 \
+  || { cat "$PV4/v.txt"; echo "错误：链接出处被核验误拒"; exit 1; }
+echo "目录 Markdown 链接出处以可见文字定位通过 PASS"
+
+# 同一出处段覆盖两章：实际段落只显示一次，导出与核验均通过（真实 Chromium/PDF）
+PV5="$TMP/prov_shared"; rm -rf "$PV5"; mkdir -p "$PV5"
+cat > "$PV5/00_目录.md" <<'MD'
+# 目录
+
+Source [Guide](https://example.com/pv-shared/guide.html)
+
+- [章 A](a.md)
+- [章 B](b.md)
+MD
+printf '# 章 A\n\n正文 A。\n' > "$PV5/a.md"
+printf '# 章 B\n\n正文 B。\n' > "$PV5/b.md"
+python3 - "$PV5" <<'PY'
+import json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+digest = __import__('hashlib').sha256(
+    (base / '00_目录.md').read_bytes()).hexdigest()
+(base / 'map.json').write_text(json.dumps({"inputs": [{
+    "path": str(base / '00_目录.md'), "sha256": digest,
+    "sections": [{"lines": [3, 3], "chapters": [2, 3]}]}]}), encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$PV5/out.pdf" --work-dir "$PV5/w" \
+  --provenance "$PV5/map.json" "$PV5/00_目录.md" "$PV5/a.md" "$PV5/b.md" \
+  >"$PV5/e.txt" 2>&1 \
+  || { cat "$PV5/e.txt"; echo "错误：共享出处段覆盖两章导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$PV5/out.pdf" --work-dir "$PV5/w" \
+  --provenance "$PV5/map.json" "$PV5/00_目录.md" "$PV5/a.md" "$PV5/b.md" \
+  >"$PV5/v.txt" 2>&1 \
+  || { cat "$PV5/v.txt"; echo "错误：共享出处段覆盖两章被核验误拒"; exit 1; }
+echo "同一出处段覆盖两章：实际段落定位一次，导出与核验通过 PASS"
+
+# 函数级（纯规则）：同段多章覆盖去重为一段；真正不同的出处段保留边界不合并
+python3 - "$TMP" <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path('../skills/tech-doc-translator/scripts').resolve()))
+import export_pdf as e
+
+base = Path(sys.argv[1]) / 'prov_distinct'
+base.mkdir(exist_ok=True)
+(base / '00_目录.md').write_text(
+    '# 目录\n\n'
+    'Source Guide v1: https://example.com/pv-dist/a (2026-01-01)\n\n'
+    'Source Guide v2: https://example.com/pv-dist/b (2026-02-02)\n\n'
+    '- [章 A](a.md)\n- [章 B](b.md)\n', encoding='utf-8')
+(base / 'a.md').write_text('# 章 A\n\n正文 A。\n', encoding='utf-8')
+(base / 'b.md').write_text('# 章 B\n\n正文 B。\n', encoding='utf-8')
+digest = e.sha256_file(base / '00_目录.md')
+
+
+def build(sections):
+    (base / 'map.json').write_text(json.dumps({'inputs': [{
+        'path': str(base / '00_目录.md'), 'sha256': digest,
+        'sections': sections}]}), encoding='utf-8')
+    chapters = e.load_inputs([str(base / '00_目录.md'), str(base / 'a.md'),
+                              str(base / 'b.md')])
+    for c in chapters:
+        e.parse_chapter(c)
+    pmap = e.load_provenance_map(base / 'map.json', chapters, [])
+    facts = e.collect_provenance(chapters, chapters[0], pmap)
+    return pmap, facts
+
+
+# 同一段覆盖两章：覆盖关系保留两章，实际段落只有一份，定位串只出现一次
+pmap, facts = build([{'lines': [3, 3], 'chapters': [2, 3]}])
+assert pmap['covered'][2] == pmap['covered'][3]
+assert pmap['text'] == pmap['covered'][2], pmap['text']
+assert facts['covered'] == [2, 3], facts
+assert facts['adopted_front'].count('Guide v1') == 1, facts['adopted_front']
+
+# 两个不同出处段（不同版本/日期）：内容与覆盖关系不被合并，边界保留
+pmap, facts = build([{'lines': [3, 3], 'chapters': [2]},
+                     {'lines': [5, 5], 'chapters': [3]}])
+assert pmap['covered'][2] != pmap['covered'][3]
+assert 'Guide v1' in pmap['text'] and 'Guide v2' in pmap['text'], pmap['text']
+assert '2026-01-01' in pmap['text'] and '2026-02-02' in pmap['text'], \
+    pmap['text']
+lines = facts['adopted_front'].split('\n')
+assert len(lines) == 2, facts['adopted_front']
+assert 'Guide v1' in lines[0] and 'Guide v2' in lines[1], facts['adopted_front']
+print('出处段落与覆盖关系分离：同段去重、不同段保留边界与版本日期 PASS')
+PY
+
+# 被采用映射段的成品位置实测（函数级损伤）：正确位置通过，移至章后或缺失拒绝
+python3 - "$PV3" <<'PY'
+import json, sys
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path('../skills/tech-doc-translator/scripts').resolve()))
+import export_pdf as e
+import verify_pdf as v
+
+base = Path(sys.argv[1])
+chapters = e.load_inputs([str(base / '00_目录.md'), str(base / 'sole.md')])
+for c in chapters:
+    e.parse_chapter(c)
+pmap = e.load_provenance_map(base / 'map.json', chapters, [])
+facts = e.collect_provenance(chapters, chapters[0], pmap)
+report = {'provenance': {**facts, 'mapping': str(base / 'map.json'),
+                         'policy': {'fields': list(e.MANAGEMENT_FIELD_LABELS)}}}
+visible = 'Source manual: https://example.com/pv-mapsole/book.html'
+assert facts['adopted_front'] == visible, facts['adopted_front']
+heading_pages = {chapters[1].headings[0]['id']: 1}
+cases = {
+    'correct': ['Contents\n%s' % visible, '章 SOLE\n正文。'],
+    'moved': ['Contents', '章 SOLE\n正文。\n%s' % visible],
+    'missing': ['Contents', '章 SOLE\n正文。'],
+}
+out = {}
+for name, pages in cases.items():
+    failures = []
+    v.check_provenance(chapters, report, SimpleNamespace(pages=pages),
+                       str(base / 'map.json'), failures, heading_pages)
+    out[name] = [f['code'] for f in failures]
+assert out['correct'] == [], out
+assert out['moved'] == ['provenance-position'], out
+assert out['missing'] == ['provenance-front-missing'], out
+print('被采用映射段成品位置实测：正确通过、移位/缺失拒绝 PASS')
+PY
+
+
+echo "==> R6（留痕 04 补充）：目录段落不可替不相关来源；已知日期不得在前置去重中丢失"
+PV2="$TMP/prov_cov"; rm -rf "$PV2"; mkdir -p "$PV2"
+python3 - "$PV2" <<'PY'
+from pathlib import Path
+base = Path(__import__('sys').argv[1])
+(base / '00_目录.md').write_text(
+    '# 目录\n\n译自 NVIDIA CUDA Programming Guide：https://example.com/pv-book\n\n'
+    '- [章](a.md)\n', encoding='utf-8')
+# 章节来源为无定位符的泛指文字：目录段落不可替其通过门禁
+(base / 'a.md').write_text(
+    '# 章\n\n> **来源**：另一本书（无链接，无法定位具体原文）\n\n正文。\n',
+    encoding='utf-8')
+PY
+if python3 "$EXPORT" --output "$PV2/out.pdf" --work-dir "$PV2/w" \
+    --toc-sections "$PV2/00_目录.md" "$PV2/a.md" >"$PV2/neg.txt" 2>&1; then
+  echo "错误：不相关目录出处被放行"; exit 1
+fi
+grep -q "provenance-incomplete" "$PV2/neg.txt" \
+  || { cat "$PV2/neg.txt"; echo "错误：不相关来源诊断缺失"; exit 1; }
+echo "不相关目录出处无法替章节通过门禁 PASS"
+
+# 已知日期不在目录出处中 → 前置区必须保留该日期（不得去重丢失）
+python3 - "$PV2" <<'PY'
+from pathlib import Path
+base = Path(__import__('sys').argv[1])
+(base / 'a.md').write_text(
+    '# 章\n\n> **来源**：https://example.com/pv-book 版本 v1.9\n'
+    '> **抓取日期**：2026-09-12\n\n正文。\n', encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$PV2/date.pdf" --work-dir "$PV2/w_date" \
+  "$PV2/00_目录.md" "$PV2/a.md" >"$PV2/date.txt" 2>&1 \
+  || { cat "$PV2/date.txt"; echo "错误：目录出处覆盖导出失败"; exit 1; }
+python3 - "$PV2" <<'PY'
+import json, sys
+import pypdf
+from pathlib import Path
+base = Path(sys.argv[1])
+report = json.loads((base / 'w_date' / 'export_report.json').read_text(encoding='utf-8'))
+assert report['provenance']['front_generated'] is True, report['provenance']
+text = ''.join(p.extract_text() or '' for p in pypdf.PdfReader(str(base / 'date.pdf')).pages)
+assert '2026-09-12' in text, '已知抓取日期在前置去重中丢失'
+print('目录出处覆盖时已知日期仍在前置区保留 PASS')
+PY
+
+# 字段续行中的版本/日期随出处一并保留：投影删除的每段就是收集的同段
+python3 - "$PV2" <<'PY'
+from pathlib import Path
+import sys
+base = Path(sys.argv[1])
+(base / 'cont.md').write_text(
+    '# 章 B\n\n'
+    '> **来源**：https://example.com/pv-cont\n'
+    '> 版本 v1.9，抓取日期 2026-09-20\n\n正文。\n', encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$PV2/cont.pdf" --work-dir "$PV2/w_cont" \
+  "$PV2/cont.md" >"$PV2/cont.txt" 2>&1 \
+  || { cat "$PV2/cont.txt"; echo "错误：续行来源导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$PV2/cont.pdf" --work-dir "$PV2/w_cont" \
+  "$PV2/cont.md" >"$PV2/cont_v.txt" 2>&1 \
+  || { cat "$PV2/cont_v.txt"; echo "错误：续行来源核验失败"; exit 1; }
+python3 - "$PV2" <<'PY'
+import sys
+import pypdf
+from pathlib import Path
+base = Path(sys.argv[1])
+text = ''.join(p.extract_text() or '' for p in
+               pypdf.PdfReader(str(base / 'cont.pdf')).pages)
+assert '版本 v1.9' in text and '2026-09-20' in text, '续行中的版本/日期丢失'
+assert text.count('2026-09-20') == 1, '续行日期在成品中重复'
+print('字段续行中的版本/日期随前置保留且只出现一次 PASS')
+PY
