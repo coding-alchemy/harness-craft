@@ -466,7 +466,7 @@ if python3 "$VERIFY" --pdf "$TMP/out/single.pdf" --work-dir "$TMP/work_single" \
     "$TMP/sample_dup.md" 2>"$TMP/err_dup_block.txt"; then
   echo "错误：重复代码块缺份未被检出"; exit 1
 fi
-grep -q "code-missing" "$TMP/err_dup_block.txt" || { echo "错误：重复块缺失诊断缺失"; cat "$TMP/err_dup_block.txt"; exit 1; }
+grep -q "code-line-missing" "$TMP/err_dup_block.txt" || { echo "错误：重复块缺失诊断缺失"; cat "$TMP/err_dup_block.txt"; exit 1; }
 echo "重复代码块缺份已正确判 FAIL"
 
 echo "==> 复审修复：跨行行内代码中的 ####### 不得拆为深层标题"
@@ -988,7 +988,8 @@ assert len(capped) == 1 and capped[0]["occurrence"] == 2, capped  # B 章 900px 
 
 # 独立量测：逐次绘制宽度与期望一致（1 CSS px = 0.75 pt，容差 0.75pt）。
 # 文档顺序：A[300, 454, 自然(无映射)] + B[250, 900→封顶]。
-drawn = [w for page in verifier.collect_drawn_images(verifier.PdfFacts(pdf)) for w in page]
+drawn = [w for page in verifier.collect_drawn_images(verifier.PdfFacts(pdf))
+         for w, _bottom, _top in page]
 checks = [(0, 300 * 0.75), (1, 454 * 0.75), (3, 250 * 0.75),
           (4, min(900, verifier.exporter.CONTENT_WIDTH_PX) * 0.75)]
 for position, want in checks:
@@ -1198,7 +1199,7 @@ if python3 "$VERIFY" --pdf "$TMP/neg/wrong.pdf" --work-dir "$TMP/neg_wrong" \
 fi
 grep -q "text-missing" "$TMP/neg_v.txt" \
   || { echo "错误：说明缺失未由内容检查检出"; cat "$TMP/neg_v.txt"; exit 1; }
-grep -q "code-missing" "$TMP/neg_v.txt" \
+grep -qE "code-(line-)?missing" "$TMP/neg_v.txt" \
   || { echo "错误：代码字面量缺失未由代码检查检出"; cat "$TMP/neg_v.txt"; exit 1; }
 echo "N01/N04：非导航说明与代码字面量缺失均由内容核验检出"
 
@@ -1686,6 +1687,7 @@ PY
 python3 "$VERIFY" --pdf "$TMP/toc/book.pdf" --work-dir "$TMP/toc_work" "${TOC_IN[@]}" >/dev/null
 
 echo "==> Ticket 01 PDF 导出回归全部通过"
+
 echo "==> R2/R5（留痕 03）：普通/严格覆盖策略、预算与代码内图片语法"
 STRICT="$TMP/strict_case"; rm -rf "$STRICT"; mkdir -p "$STRICT/imgs" "$STRICT/imgsel"
 cp fixtures/valid_1x1.png "$STRICT/imgs/small.png"
@@ -2319,6 +2321,147 @@ assert out['missing'] == ['provenance-front-missing'], out
 print('被采用映射段成品位置实测：正确通过、移位/缺失拒绝 PASS')
 PY
 
+echo "==> R8（留痕 05）：A20/A21/A22 短块整块、长块续排、交错可验"
+CP="$TMP/code_pagination"; rm -rf "$CP"; mkdir -p "$CP"
+python3 - "$CP" <<'PY'
+import sys
+from pathlib import Path
+
+base = Path(sys.argv[1])
+lines9 = "\n".join("a%d = %d" % (i, i) for i in range(1, 10))
+lines10 = "\n".join("b%d = %d" % (i, i) for i in range(1, 11))
+lines11 = "\n".join("c%d = %d" % (i, i) for i in range(1, 12))
+lines25 = "\n".join("def f%d(): return %d" % (i, i) for i in range(1, 26))
+block_with_blanks = "x = 1\n\n\nx += 2\n"
+(base / "a.md").write_text(
+    "# 章一\n\n"
+    "> **来源**：https://example.com/prov-cp-a\n\n"
+    "9 行短块：\n\n```python\n" + lines9 + "\n```\n\n"
+    "10 行短块（允许整体移页留白）：\n\n```python\n" + lines10 + "\n```\n\n"
+    "带空行与真实末尾空行的短块：\n\n```\n" + block_with_blanks + "\n```\n\n"
+    "缩进代码短块：\n\n    indented_a = 1\n    indented_b = 2\n\n"
+    "11 行长块（可跨页）：\n\n```unknownlang\n" + lines11 + "\n```\n",
+    encoding="utf-8")
+(base / "b.md").write_text(
+    "# 章二\n\n"
+    "> **来源**：https://example.com/prov-cp-b\n\n"
+    "页首导语之后紧跟长块，必须从当前页续排：\n\n"
+    "```python\n" + lines25 + "\n```\n\n"
+    "| 列 A | 列 B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\n"
+    "长块尾随表格，制造跨页提取交错场景。\n",
+    encoding="utf-8")
+PY
+python3 "$EXPORT" --output "$CP/book.pdf" --work-dir "$CP/work" \
+  "$CP/a.md" "$CP/b.md" >"$CP/export.txt" 2>&1 \
+  || { cat "$CP/export.txt"; echo "错误：代码分页样例导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$CP/book.pdf" --work-dir "$CP/work" \
+  "$CP/a.md" "$CP/b.md" >"$CP/verify.txt" 2>&1 \
+  || { cat "$CP/verify.txt"; echo "错误：代码分页样例核验失败"; exit 1; }
+python3 - "$CP/work" "$CP/book.pdf" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+import pypdf
+
+work = Path(sys.argv[1])
+report = json.loads((work / "export_report.json").read_text(encoding="utf-8"))
+verify = json.loads((work / "verify_report.json").read_text(encoding="utf-8"))
+assert verify["status"] == "machine-pass-pending-visual", verify["failures"]
+codes = [f["code"] for f in verify["failures"]]
+assert "code-page-gap" not in codes, codes
+# 10 行短块容器带 code-short 类（从 HTML 证据核对）
+html = (work / "combined.html").read_text(encoding="utf-8")
+assert 'class="code-block code-short"' in html, "短块未标记"
+assert 'class="code-block code-long"' in html, "长块未标记"
+# A20：末尾换行不增行（b 块 10 行应为短块）
+assert html.count('code-block code-short') >= 4, html.count('code-block code-short')
+# A22：跨页长块与表格交错的解释性记录存在（位置证据）
+segments = [r.get("segment", "") for r in verify["relaxed_matches"]]
+assert any("交错" in s for s in segments) or any("空行" in s for s in segments), segments[:5]
+print("A20 短块分类/末尾换行不增行、A21 长块续排、A22 交错解释 PASS")
+PY
+
+echo "==> R8（留痕 05）：A23 代码内容篡改与整行删除必须 FAIL"
+python3 - "$CP" <<'PY'
+import hashlib, json, re, sys
+from pathlib import Path
+
+import pypdf
+from pypdf.generic import DecodedStreamObject, NameObject
+
+base = Path(sys.argv[1])
+reader = pypdf.PdfReader(str(base / "book.pdf"))
+report = json.loads((base / "work" / "export_report.json")
+                    .read_text(encoding="utf-8"))
+report["pdf_sha256"] = hashlib.sha256((base / "book.pdf").read_bytes()).hexdigest()
+
+def char_codes(font):
+    cmap_ref = font.get("/ToUnicode")
+    if cmap_ref is None:
+        return {}
+    text = cmap_ref.get_object().get_data().decode("latin-1")
+    codes = {}
+    for block in re.findall(r"beginbfchar(.*?)endbfchar", text, re.S):
+        for src, dst in re.findall(r"<([0-9A-Fa-f]{2,4})>\s*<([0-9A-Fa-f]{4,})>", block):
+            codes[int(src, 16)] = dst.upper()
+    for block in re.findall(r"beginbfrange(.*?)endbfrange", text, re.S):
+        for src, end, dst in re.findall(
+                r"<([0-9A-Fa-f]{2,4})>\s*<([0-9A-Fa-f]{2,4})>\s*"
+                r"<([0-9A-Fa-f]{4})>", block):
+            start_code, end_code = int(src, 16), int(end, 16)
+            if end_code - start_code > 1024:
+                continue
+            for offset, code in enumerate(range(start_code, end_code + 1)):
+                codes[code] = "%04X" % (int(dst, 16) + offset)
+    return codes
+
+# 找到含代码行 f1() 的页；把 return 1 中的数字 1 字形改成 7
+target = None
+for index, page in enumerate(reader.pages):
+    text = page.extract_text() or ""
+    if "def f1(): return 1" in re.sub(r"\s+", " ", text):
+        target = index
+        break
+assert target is not None, "未找到代码页"
+font_codes = {}
+for name, ref in ((reader.pages[target].get("/Resources") or {})
+                  .get("/Font") or {}).items():
+    font_codes[name] = char_codes(ref.get_object())
+one_hex = "1".encode("utf-16-be").hex().upper()
+seven_hex = "7".encode("utf-16-be").hex().upper()
+writer = pypdf.PdfWriter(clone_from=reader)
+page = writer.pages[target]
+contents = page.get_contents().get_data()
+changed = 0
+for name, codes in font_codes.items():
+    src_code = next((c for c, dst in codes.items() if dst == one_hex), None)
+    dst7 = next((c for c, dst in codes.items() if dst == seven_hex), None)
+    if src_code is None or dst7 is None:
+        continue
+    # Chromium 可能以 <..> Tj 或 TJ 数组绘制；按字形编码整体替换该页
+    # 所有数字 1 字形（页面上其他 1 也一起变化，不影响负例判定）。
+    pattern = re.compile(rb"<0*%X>" % src_code)
+    contents, n = pattern.subn(b"<%X>" % dst7, contents)
+    changed += n
+assert changed >= 1, "代码行数字字形未被改写"
+stream = DecodedStreamObject()
+stream.set_data(contents)
+page[NameObject("/Contents")] = writer._add_object(stream)
+out = base / "tampered.pdf"
+with open(out, "wb") as handle:
+    writer.write(handle)
+report["pdf_sha256"] = hashlib.sha256(out.read_bytes()).hexdigest()
+(base / "work" / "export_report.json").write_text(
+    json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+print("已把代码行中的数字 1 字形改为 7，并重签摘要")
+PY
+if python3 "$VERIFY" --pdf "$CP/tampered.pdf" --work-dir "$CP/work" \
+    "$CP/a.md" "$CP/b.md" >"$CP/tamper_v.txt" 2>&1; then
+  echo "错误：代码内容篡改未被检出"; exit 1
+fi
+grep -q "code-line-missing" "$CP/tamper_v.txt" \
+  || { cat "$CP/tamper_v.txt"; echo "错误：逐行核验未定位篡改行"; exit 1; }
+echo "A23 代码改字（含摘要重签）被逐行核验拒绝 PASS"
 
 echo "==> R6（留痕 04 补充）：目录段落不可替不相关来源；已知日期不得在前置去重中丢失"
 PV2="$TMP/prov_cov"; rm -rf "$PV2"; mkdir -p "$PV2"

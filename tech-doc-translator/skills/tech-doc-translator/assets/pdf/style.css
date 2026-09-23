@@ -196,3 +196,16 @@ img, svg { max-width: 100%; height: auto; }
 .provenance-note p {
   margin: 1.5pt 0;
 }
+
+/* 代码分页（R8/D7）：10 逻辑行以下短块两层都避免分页，允许整体移页
+   产生的页尾空白；超过 10 行的长块两层都允许跨页，按完整可见行续排，
+   不为整体移页留下大半页空白。字号、行距与配色不因分类改变。 */
+.code-block.code-short, .code-block.code-short pre { break-inside: avoid; }
+.code-block.code-long, .code-block.code-long pre {
+  break-inside: auto;
+  /* Chromium 默认 orphans/widows=2：页尾只放得下一行时会把整块后移，
+     与导出器自身 A21（code-page-gap）契约矛盾。长块按完整可见行续排，
+     允许孤行/寡行各 1 行。 */
+  orphans: 1;
+  widows: 1;
+}
