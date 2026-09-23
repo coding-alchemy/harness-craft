@@ -8,6 +8,7 @@ beautifulsoup4>=4.12,<5
 pygments>=2.17,<3
 playwright>=1.42
 pypdf>=4.0
+uniseg==0.10.0
 Pillow>=12.3,<13
 # 安装后还需一次性获取浏览器（环境准备，不属于转换期网络依赖）：
 #   python3 -m playwright install chromium

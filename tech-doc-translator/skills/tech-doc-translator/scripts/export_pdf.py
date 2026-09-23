@@ -343,6 +343,35 @@ def apply_display_widths(chapter, bindings, diagnostics):
     return applied
 
 
+# ---------------------------------------------------------------------------
+# 代码块分页分类（R8/D7：10 个逻辑行分界，末尾换行不增行）
+# ---------------------------------------------------------------------------
+CODE_BLOCK_MAX_LINES = 10
+
+
+def logical_code_lines(code):
+    """代码块的逻辑行列表：统一 CRLF/LF，末尾单个终止换行不增行，
+    内部与真实末尾空行计入；空块为 0 行。视觉折行不改变逻辑行数。"""
+    text = code.replace("\r\n", "\n").replace("\r", "\n")
+    if text.endswith("\n"):
+        text = text[:-1]
+    if text == "":
+        return []
+    return text.split("\n")
+
+
+def code_block_class(code):
+    """10 行及以下短块（整体避免分页），超过 10 行长块（允许跨页续排）。"""
+    return "code-long" if len(logical_code_lines(code)) > CODE_BLOCK_MAX_LINES \
+        else "code-short"
+
+
+def wrap_code_block(rendered_html, code):
+    """在统一收集边界为渲染后的代码块加分页分类容器。"""
+    return '<div class="code-block %s">%s</div>' % (
+        code_block_class(code), rendered_html)
+
+
 def soup_images(chapter):
     return [img for img in chapter.soup.find_all("img") if img.get("src")]
 
@@ -1411,9 +1440,15 @@ def build_markdown(math_sink, chapter_prefix):
             body = pygments_highlight(token.content, lexer, formatter)
         except ClassNotFound:
             body = "<pre><code>%s</code></pre>" % escape(token.content)
-        return body
+        return wrap_code_block(body, token.content)
+
+    def render_code_block(_renderer, tokens, idx, options, env):
+        token = tokens[idx]
+        body = "<pre><code>%s</code></pre>" % escape(token.content)
+        return wrap_code_block(body, token.content)
 
     markdown.add_render_rule("fence", render_fence)
+    markdown.add_render_rule("code_block", render_code_block)
     return markdown, formatter
 
 
@@ -1851,8 +1886,60 @@ def enumerate_images(chapter, diagnostics):
     return enumeration
 
 
+# 嵌入位图的长边界限：Chromium 对超大位图的解码存在实际上限（本真实样例
+# 11 张 >2600px 原图全部解码失败）。重采样只影响 data URI，交付文件的
+# 字节、身份核对（枚举阶段按原文件完成）与显示宽度注入均不受影响。
+EMBED_MAX_EDGE = 2600
+
+
+def _resampled_embed(path, record):
+    """超限位图的嵌入负载；返回 (负载字节或 None, 重采样记录或 None)。
+
+    PNG/JPEG 单帧之外（GIF/WEBP/多帧/尺寸未知）与未超限者原样内联；
+    重采样失败同样回退原字节，真实解码问题仍由浏览器检查暴露，不静默。
+    """
+    if not record.get("pixel_known") or record.get("kind") not in ("PNG", "JPEG"):
+        return None, None
+    if (record.get("frames") or 1) > 1:
+        return None, None
+    width, height = record["pixel_size"]
+    edge = max(width, height)
+    if edge <= EMBED_MAX_EDGE:
+        return None, None
+    try:
+        from io import BytesIO
+
+        from PIL import Image, ImageOps
+        with Image.open(path) as image:
+            # EXIF 方向必须烘焙进负载像素：重采样结果不再携带方向标记，
+            # 浏览器按像素自然显示；不转置会把竖图交付成横图（方向丢失）。
+            oriented = ImageOps.exif_transpose(image)
+            display_width, display_height = oriented.size
+            scale = EMBED_MAX_EDGE / max(display_width, display_height)
+            resized = oriented.resize(
+                (max(1, round(display_width * scale)),
+                 max(1, round(display_height * scale))),
+                Image.LANCZOS)
+            buffer = BytesIO()
+            if record["kind"] == "JPEG":
+                resized.save(buffer, format="JPEG", quality=90, optimize=True)
+            else:
+                resized.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue(), {
+            "original": [width, height],
+            "embedded": list(resized.size),
+            # 原图的浏览器自然显示宽度（EXIF 方向已计入）：负载像素变小
+            # 后由它钉住无映射图片的显示宽度；高度随固有比例自动保持
+            # （style.css 的 img height:auto），明确映射的 style 宽度
+            # 照旧优先于该呈现提示。
+            "display_width": display_width,
+        }
+    except Exception:  # noqa: BLE001 回退原字节；解码失败由浏览器检查判 FAIL
+        return None, None
+
+
 def inline_images(chapter, diagnostics, resource_registry, enumeration):
-    """把预检通过的枚举结果内联为 data URI（原始字节）；每个文件只编码一次。"""
+    """把预检通过的枚举结果内联为 data URI；每个文件只编码一次。"""
     for record in enumeration:
         image = record["img"]
         path = record["path"]
@@ -1873,7 +1960,9 @@ def inline_images(chapter, diagnostics, resource_registry, enumeration):
                 )
                 image.decompose()
                 continue
-            payload_bytes = Path(path).read_bytes()
+            payload_bytes, embed_resample = _resampled_embed(path, record)
+            if payload_bytes is None:
+                payload_bytes = Path(path).read_bytes()
             payload = base64.b64encode(payload_bytes).decode("ascii")
             resource_registry[key] = {
                 "path": path,
@@ -1881,9 +1970,14 @@ def inline_images(chapter, diagnostics, resource_registry, enumeration):
                 "bytes": Path(path).stat().st_size,
                 "mime": mime,
                 "data_uri": "data:%s;base64,%s" % (mime, payload),
+                "embed_resample": embed_resample,
             }
         registry = resource_registry[key]
         image["src"] = registry["data_uri"]
+        if registry.get("embed_resample"):
+            # 重采样只准改变嵌入负载：钉住原图的自然显示宽度，无映射
+            # 图片的版心内显示尺寸不随内联负载缩小。
+            image["width"] = str(registry["embed_resample"]["display_width"])
         chapter.images.append(
             {k: registry[k] for k in ("path", "sha256", "bytes")}
             | {"src": record["src"], "source_line": record["line"]}
@@ -1943,6 +2037,30 @@ CHECK_SCRIPT = """
   window.__pdfExportChecks = checks;
   window.__pdfExportDone = true;
 })();
+"""
+
+
+# 短块（≤10 逻辑行）超页预检（设计 §4.9）：连一整页版心都放不下时报告
+# code-short-too-tall，不私自拆块/缩字/裁切。量测必须在打印版心宽度、
+# 字体已加载的视图中进行——默认 1280px 窗口的折行与 A4 打印不一致
+# （评审实测同一短块默认宽度下高 673px，打印宽度下达 1268px），
+# 会漏诊超页短块。版心宽为 @page A4 210mm 减 16mm×2 横边距的 96dpi
+# 换算，与 PdfStyleGeometryContractTest 的样式契约锁定一致。
+PRINT_CONTENT_WIDTH_PX = round((210 - 16 * 2) / 25.4 * 96)
+
+CODE_SHORT_TALL_SCRIPT = """
+(() => {
+  const pageContentPx = (297 - 18 * 2) / 25.4 * 96;
+  const tooTall = [];
+  // 后代选择器同时覆盖回退 <pre> 与 Pygments 的 .highlight 包装节点。
+  document.querySelectorAll('.code-block.code-short pre').forEach(pre => {
+    const h = pre.getBoundingClientRect().height;
+    if (h > pageContentPx) {
+      tooTall.push({height: Math.round(h)});
+    }
+  });
+  return tooTall;
+})()
 """
 
 
@@ -2042,6 +2160,35 @@ def summarize_inputs(chapters):
                 {"path": image["path"], "sha256": image["sha256"], "bytes": image["bytes"]},
             )
     return inputs, sorted(resources.values(), key=lambda r: r["path"])
+
+
+def candidate_code_check(input_paths, unlink_targets, toc_sections,
+                         candidate_path):
+    """对候选 PDF 运行与核验器同一实现的代码检查（设计 §4.9）。
+
+    候选完成目录页码收敛后、复制到最终目标前调用：独立重读候选内容
+    流与原 Markdown（不信任导出器统计），覆盖块对账、短块整块与长块
+    页尾续排检查。返回失败列表（空 = 通过）；任何失败阻止候选替换
+    成品，旧 PDF 保持原样。惰性导入避免模块级循环（本模块常作为
+    verify_pdf 的依赖被先行加载）。
+    """
+    import verify_pdf as verifier
+
+    failures = []
+    chapters = verifier.reparse_inputs(
+        list(input_paths), failures, list(unlink_targets), toc_sections)
+    pdf = verifier.PdfFacts(candidate_path)
+    heading_pages = {}
+    verifier.check_headings(chapters, pdf, failures, heading_pages)
+    bounds = verifier.chapter_bounds(chapters, pdf, heading_pages, failures)
+    relaxed = []
+    infos = verifier.check_code_blocks_per_line(
+        chapters, pdf, bounds, failures, relaxed)
+    verifier.check_short_block_not_split(bounds, failures, infos)
+    gate_relaxed = []
+    verifier.check_code_pagination(chapters, pdf, bounds, failures, [],
+                                   infos, gate_relaxed)
+    return failures
 
 
 def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
@@ -2279,6 +2426,17 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                     }
                 )
 
+    report["embed_resampled"] = [
+        {
+            "path": entry["path"],
+            "sha256": entry["sha256"],
+            "original": entry["embed_resample"]["original"],
+            "embedded": entry["embed_resample"]["embedded"],
+        }
+        for entry in resource_registry.values()
+        if entry.get("embed_resample")
+    ]
+
     title = chapters[0].headings[0]["text"] if chapters[0].headings else chapters[0].path.stem
     html_path = work_dir / HTML_NAME
     candidate = work_dir / CANDIDATE_NAME
@@ -2304,6 +2462,11 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             page.goto(file_uri(html_path), wait_until="load")
             page.wait_for_function("window.__pdfExportDone === true", timeout=120000)
             checks = page.evaluate("window.__pdfExportChecks")
+            # 短块超页预检切到打印版心宽度量测（见 PRINT_CONTENT_WIDTH_PX）。
+            page.emulate_media(media="print")
+            page.set_viewport_size(
+                {"width": PRINT_CONTENT_WIDTH_PX, "height": 1123})
+            checks["codeShortTooTall"] = page.evaluate(CODE_SHORT_TALL_SCRIPT)
             # Chromium 的 PDF 结构树不保留 KaTeX 的 MathML；仅在打印阶段让
             # 实际绘制的公式字形参与标记，否则纯公式章节会从结构树消失。
             page.evaluate("document.querySelectorAll('.katex-html').forEach("
@@ -2361,6 +2524,13 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     hard_failures = [
         d for d in diagnostics if d.get("severity") == "fail"
     ]
+    # 候选代码门禁（设计 §4.9 分页验收与失败保护）：候选完成目录页码
+    # 收敛后调用与核验器同一实现的代码检查，不通过则不复制到最终目标，
+    # 已有成品保持原样。
+    code_gate_failures = candidate_code_check(
+        [str(c.path) for c in chapters], unlink_targets, toc_sections,
+        candidate)
+    hard_failures.extend(code_gate_failures)
     fonts = browser_checks.get("fonts", {}) if browser_checks else {}
     # 正文与代码的 CJK 回退族必须至少一项可用，否则中文会退到不可控字体。
     cjk_font_ok = any(fonts.get(f, False) for f in ("STFangsong", "STHeiti"))
@@ -2370,6 +2540,7 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
         and not browser_checks.get("katex")
         and not browser_checks.get("images")
         and not browser_checks.get("overflow")
+        and not browser_checks.get("codeShortTooTall")
         and browser_checks.get("scrollWidth", 0) <= browser_checks.get("clientWidth", 0) + 1
         and cjk_font_ok
     )
@@ -2380,6 +2551,7 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             "candidate": str(candidate),
             "pdf_sha256": sha256_file(candidate),
             "output_target": str(output),
+            "code_gate_failures": code_gate_failures,
             "unlink_targets": sorted(
                 str(Path(p).expanduser().resolve()) for p in unlink_targets
             ),
@@ -2466,6 +2638,12 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             print(
                 "  [image-error] 图片解码失败：%s（%s）"
                 % (error.get("src"), error.get("error")),
+                file=sys.stderr,
+            )
+        for tall in (browser_checks or {}).get("codeShortTooTall", []):
+            print(
+                "  [code-short-too-tall] 短代码块（10 行以内）高度 %spx 超过一整页版心，"
+                "无法满足不分页约束" % tall.get("height"),
                 file=sys.stderr,
             )
         for overflow in (browser_checks or {}).get("overflow", []):

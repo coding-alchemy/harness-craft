@@ -96,10 +96,11 @@ class WideTableLayoutTest(unittest.TestCase):
     def test_probe_image_keeps_natural_width_no_document_shrink(self):
         # 整文档缩印的直接几何观测：探针图按自然尺寸绘制说明打印缩放
         # 因子为 1；break-word 下同一文档实测被压到约 0.77×（114.7pt）。
-        widths = verifier.collect_drawn_images(
+        drawn_per_page = verifier.collect_drawn_images(
             verifier.PdfFacts(str(self.root / 'book.pdf')))
+        widths = [image[0] for page in drawn_per_page for image in page]
         self.assertEqual(len(widths), 1, widths)
-        self.assertAlmostEqual(widths[0][0], PROBE_WIDTH_PT, delta=1.0,
+        self.assertAlmostEqual(widths[0], PROBE_WIDTH_PT, delta=1.0,
                                msg='探针图被缩放，整文档处于缩印状态：%r' % widths)
 
     def test_no_text_beyond_content_box(self):
