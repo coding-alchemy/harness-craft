@@ -165,12 +165,21 @@ def content_counts(text, is_source=True):
     return paras, lis, trows, admon
 
 
-def verify(translated_path, source_path, strong_tokens, approved_extra_math=(),
-           delivery_root=None, image_digests=None):
+def verify(doc_text, src_text, strong_tokens, approved_extra_math=(),
+           delivery_root=None, image_digests=None, doc_dir=None,
+           doc_label='译文', src_label='源文'):
+    """参考手册检查核心：接收候选文本与实际目标目录，返回 (fails, warns)。
+
+    doc_text 可来自工作区外临时候选（草稿预检）；doc_dir 必须是最终
+    Markdown 目录——图片等资源一律按最终目标路径定位，不按候选临时
+    路径定位。doc_label/src_label 沿用调用方路径标签用于诊断定位。
+    """
     fails = []
     warns = []
-    doc = read(translated_path)
-    src = read(source_path)
+    doc = doc_text
+    src = src_text
+    if doc_dir is None:
+        doc_dir = os.path.curdir
 
     # 1) 标题：H1 唯一性 + 与源按 (层级, 官方原题) 有序对照
     doc_entries = heading_entries(doc)
@@ -179,15 +188,15 @@ def verify(translated_path, source_path, strong_tokens, approved_extra_math=(),
     if len(doc_h1s) != 1:
         fails.append('H1 数量: %d（应为 1）' % len(doc_h1s))
     for diff in compare_headings(src_entries, doc_entries,
-                                 source_path, translated_path):
+                                 src_label, doc_label):
         fails.append(diff)
 
     # 4) 公式逐项核对（类型/顺序/原表达式，含历史包装告警）
     src_math = scan_math_spans(src)
     doc_math = scan_math_spans(doc)
     math_diffs, math_warns = compare_math_spans(
-        src_math, doc_math, source_path, translated_path,
-        approved_extra_exprs=approved_extra_math)
+        src_math, doc_math, src_label, doc_label,
+        approved_extra_exprs=approved_extra_math, doc_text=doc)
     fails.extend('公式逐项核对: %s' % d for d in math_diffs)
     warns.extend(math_warns)
 
@@ -226,7 +235,7 @@ def verify(translated_path, source_path, strong_tokens, approved_extra_math=(),
         fails.append('源文代码围栏不成对: 第 %d 行开启的代码块未闭合'
                      % src_fences.unclosed_line)
     for diff in compare_code_fences(src_fences.blocks, doc_fences.blocks,
-                                    source_path, translated_path):
+                                    src_label, doc_label):
         fails.append('代码逐块核对: %s' % diff)
 
     # 9) 图片：源 [IMG:] 出现数对照 + 离线核验（围栏内图片语法不计）。
@@ -242,10 +251,10 @@ def verify(translated_path, source_path, strong_tokens, approved_extra_math=(),
     identity_basis = '映射'
     if identity is None:
         identity = source_occurrence_digests(
-            src, os.path.dirname(os.path.abspath(source_path)))
+            src, os.path.dirname(os.path.abspath(src_label)))
         identity_basis = '当前源资源'
     for msg in image_occurrence_fails(
-            doc, os.path.dirname(os.path.abspath(translated_path)),
+            doc, doc_dir,
             delivery_root, expected_digests=identity):
         fails.append('图片核验: %s' % msg)
     if identity is None and d_imgs:
@@ -254,7 +263,7 @@ def verify(translated_path, source_path, strong_tokens, approved_extra_math=(),
 
     # 10) 强 token 多重集（未配置时明示未检查）
     token_diffs, token_warns = strong_token_report(src, doc, strong_tokens,
-                                                   source_path, translated_path)
+                                                   src_label, doc_label)
     if token_diffs is not None:
         fails.extend(token_diffs)
         warns.extend(token_warns)
@@ -287,25 +296,44 @@ def verify(translated_path, source_path, strong_tokens, approved_extra_math=(),
     defs = set(re.findall(r'^\[\^([^\]]+)\]:', doc, re.M))
     if refs != defs:
         fails.append('脚注不配对: refs=%s defs=%s' % (sorted(refs - defs), sorted(defs - refs)))
-    fn_diffs, fn_warns = footnote_diffs(src, doc, source_path, translated_path)
+    fn_diffs, fn_warns = footnote_diffs(src, doc, src_label, doc_label)
     fails.extend(fn_diffs)
     warns.extend(fn_warns)
 
     return fails, warns
 
 
-def main():
-    argv, approved_extra_math = extract_approved_extra_math(sys.argv[1:])
+def parse_args(argv):
+    """解析既有 CLI 参数，返回语义结构（本 CLI 的单一解释入口）。"""
+    argv, approved_extra_math = extract_approved_extra_math(argv)
     argv, flag_tokens = extract_strong_tokens(argv)
     argv, image_map, delivery_root = extract_image_options(argv)
     if len(argv) < 2:
         sys.exit(__doc__)
-    translated_path = argv[0]
-    source_path = argv[1]
-    strong_tokens = argv[2:] + flag_tokens
+    return {
+        'translated_path': argv[0],
+        'source_path': argv[1],
+        'strong_tokens': list(argv[2:]) + flag_tokens,
+        'approved_extra_math': approved_extra_math,
+        'image_map': image_map,
+        'delivery_root': delivery_root,
+    }
+
+
+def main():
+    parsed = parse_args(sys.argv[1:])
+    translated_path = parsed['translated_path']
+    source_path = parsed['source_path']
+    strong_tokens = parsed['strong_tokens']
+    approved_extra_math = parsed['approved_extra_math']
+    delivery_root = parsed['delivery_root']
+    image_map = parsed['image_map']
     image_digests = load_image_digests(image_map) if image_map else None
-    fails, warns = verify(translated_path, source_path, strong_tokens,
-                          approved_extra_math, delivery_root, image_digests)
+    fails, warns = verify(
+        read(translated_path), read(source_path), strong_tokens,
+        approved_extra_math, delivery_root, image_digests,
+        doc_dir=os.path.dirname(os.path.abspath(translated_path)),
+        doc_label=translated_path, src_label=source_path)
 
     print('%s: %s' % (os.path.basename(translated_path), 'PASS' if not fails else 'FAIL'))
     for f in fails:

@@ -17,20 +17,22 @@ Deep text.
 Deeper text.
 
 ## 2.2. Nested Elements
-  - list item with figure Fig 1. List caption
+  - list item with figure
 
   [IMG: images/thread_hierarchy.png]
-  [FIGURE] Fig 1. List caption
+
+  [FIGCAPTION] Fig 1. List caption
 
   ```
 __global__ void listKernel() {}
   ```
 
 [DEF-LIST]
-  **Term** definition with figure Fig 2. Definition caption
+  **Term** definition with figure
 
   [IMG: images/thread_hierarchy.png]
-  [FIGURE] Fig 2. Definition caption
+
+  [FIGCAPTION] Fig 2. Definition caption
 
   ```
 __global__ void defKernel() {}

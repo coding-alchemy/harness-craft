@@ -21,7 +21,9 @@ import sys
 import re
 from bs4 import Tag
 
-from _html_fidelity import HtmlFidelity, warn_if_temp_output
+from _html_fidelity import (HtmlFidelity, contains_block_content,
+                            warn_if_temp_output)
+from _source_reconcile import reconcile_html_to_markdown
 
 
 # 按 HTML5 惯例视为块级、但本脚本未显式展开的元素；遇到时输出 [TAGNAME]。
@@ -53,71 +55,17 @@ def _figure_block(tag, out, fidelity):
             fidelity.note_image(img, reference)
     cap = tag.find('figcaption')
     if cap:
-        out.append('[FIGURE] ' + clean_caption(cap.get_text(' ', strip=True)))
-
-
-def _emit_nested_blocks(el, out, fidelity, indent='  '):
-    """提取 li/dd/blockquote 等嵌套容器内的 figure/pre/img，保持源顺序。
-
-    注意：<pre> 在解析前已被替换为占位注释，因此必须同时处理 Comment 占位。
-    """
-    def walk(node):
-        for child in node.children:
-            fenced = fidelity.fenced_pre(child)
-            if fenced is not None:
-                out.append(fenced.replace('\n```', '\n%s```' % indent))
-                continue
-            if isinstance(child, str):
-                continue
-            if not isinstance(child, Tag):
-                continue
-            if child.name == 'figure':
-                img = child.find('img')
-                if img:
-                    src = img.get('src', '')
-                    if src:
-                        reference = 'images/%s' % src.rsplit('/', 1)[-1]
-                        out.append('\n%s[IMG: %s]' % (indent, reference))
-                        fidelity.note_image(img, reference)
-                cap = child.find('figcaption')
-                if cap:
-                    out.append('%s[FIGURE] %s' % (indent, clean_caption(cap.get_text(' ', strip=True))))
-                # figure 内部已由本分支整体处理，不再递归
-                continue
-            if child.name == 'img':
-                src = child.get('src', '')
-                if src:
-                    reference = 'images/%s' % src.rsplit('/', 1)[-1]
-                    out.append('\n%s[IMG: %s]' % (indent, reference))
-                    fidelity.note_image(child, reference)
-                continue
-            if child.name == 'pre':
-                text = child.get_text()
-                out.append('\n%s```\n%s\n%s```' % (indent, text.rstrip('\n'), indent))
-                continue
-            walk(child)
-
-    walk(el)
-
-
-def _definition_list(tag, out, fidelity):
-    dts = tag.find_all('dt', recursive=False)
-    is_fn = dts and all(
-        re.fullmatch(r'\[\d+\]|\(\d+\)|\d+', d.get_text(strip=True))
-        for d in dts
-    )
-    out.append('\n[FOOTNOTE-LIST]' if is_fn else '\n[DEF-LIST]')
-    for dt, dd in zip(tag.find_all('dt'), tag.find_all('dd')):
-        dt_text = dt.get_text(' ', strip=True)
-        dd_text = fidelity.render_inline(dd)
-        if is_fn:
-            out.append('  [%s] %s' % (dt_text, dd_text))
-        else:
-            out.append('  **%s** %s' % (dt_text, dd_text))
-            _emit_nested_blocks(dd, out, fidelity, indent='  ')
+        # 图题按行内语义序列化（去 headerlink、行内代码保真）
+        out.append('[FIGURE] ' + clean_caption(fidelity.heading_text(cap)))
 
 
 def render(node, out, fidelity):
+    _render_children(node, out, fidelity)
+
+
+def _render_children(node, out, fidelity):
+    render_block = lambda tag, o: _render_children(tag, o, fidelity)
+    emit_image = lambda tag, o: _image_block(tag, o, fidelity)
     for child in node.children:
         fenced = fidelity.fenced_pre(child)
         if fenced is not None:
@@ -129,26 +77,35 @@ def render(node, out, fidelity):
             continue
         name, cls = child.name, ' '.join(child.get('class') or [])
         if name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
-            out.append('\n' + '#' * int(name[1]) + ' ' + fidelity.clean_heading(child.get_text(' ', strip=True)))
+            out.append('\n' + '#' * int(name[1]) + ' '
+                       + fidelity.clean_heading(fidelity.heading_text(child)))
         elif name == 'p':
             t = fidelity.render_inline(child)
             if t:
                 out.append('\n' + t)
         elif name in ('ul', 'ol'):
-            for li in child.find_all('li', recursive=False):
-                out.append('  - ' + fidelity.render_inline(li))
-                _emit_nested_blocks(li, out, fidelity, indent='  ')
+            fidelity.list_lines(child, out, '  ', render_block, emit_image)
         elif name == 'pre':
             text = child.get_text()
             out.append('\n```\n' + text.rstrip('\n') + '\n```')
         elif name == 'dl':
-            _definition_list(child, out, fidelity)
+            out.extend(fidelity.definition_list(child, render_block,
+                                               emit_image))
         elif name == 'table':
             out.extend(fidelity.table_block(child))
         elif name == 'img':
             _image_block(child, out, fidelity)
         elif name == 'figure':
             _figure_block(child, out, fidelity)
+        elif name == 'aside' and fidelity.is_footnote_aside(child):
+            out.extend(fidelity.footnote_aside_lines(child))
+        elif name == 'details':
+            summary = child.find('summary')
+            label = fidelity.render_inline(summary) if summary else ''
+            out.append('\n[DETAILS] %s' % label.strip())
+            fidelity.rich_container_lines(
+                child, out, render_block=render_block, emit_image=emit_image,
+                skip={summary} if summary is not None else None)
         elif name == 'blockquote':
             render(child, out, fidelity)
         elif name == 'div' and 'math' in cls:
@@ -159,13 +116,13 @@ def render(node, out, fidelity):
             title = child.find(['p', 'div'], class_='admonition-title')
             label = title.get_text(strip=True) if title else 'Note'
             out.append('\n> **ADMONITION [%s]**' % label)
-            for p in child.find_all('p'):
-                if 'admonition-title' in ' '.join(p.get('class') or []):
-                    continue
-                out.append('> ' + fidelity.render_inline(p))
+            fidelity.admonition_content_lines(
+                child, out, render_block, emit_image)
         elif name == 'div':
-            if child.find(['p', 'pre', 'ul', 'ol', 'table', 'dl', 'div', 'section',
-                             'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'figure', 'blockquote'], recursive=True):
+            if contains_block_content(
+                    child, ['p', 'ul', 'ol', 'table', 'dl', 'div', 'section',
+                            'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'figure',
+                            'blockquote']):
                 render(child, out, fidelity)
             else:
                 t = fidelity.render_inline(child)
@@ -183,8 +140,10 @@ def render(node, out, fidelity):
                 render(child, out, fidelity)
         else:
             # 未知元素：若内部含块级结构则显式占位；否则当成行内容器递归
-            if child.find(['p', 'pre', 'ul', 'ol', 'table', 'dl', 'h1', 'h2', 'h3',
-                           'h4', 'h5', 'h6', 'figure', 'blockquote'], recursive=True):
+            if contains_block_content(
+                    child, ['p', 'ul', 'ol', 'table', 'dl',
+                            'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'figure',
+                            'blockquote']):
                 t = child.get_text(' ', strip=True)
                 if t:
                     out.append('\n[' + name.upper() + '] ' + t)
@@ -204,7 +163,8 @@ def main():
     fidelity = HtmlFidelity(
         unknown_footnote='[^?]',
         snapshot_dir=os.path.dirname(os.path.abspath(html_path)))
-    soup = fidelity.parse(open(html_path, encoding='utf-8').read())
+    raw = open(html_path, encoding='utf-8').read()
+    soup = fidelity.parse(raw)
     if section_id:
         root = soup.find(id=section_id)
         if root is None:
@@ -216,7 +176,16 @@ def main():
 
     out = []
     render(root, out, fidelity)
-    open(out_path, 'w', encoding='utf-8').write('\n'.join(out).strip() + '\n')
+    md_text = '\n'.join(out).strip() + '\n'
+    diffs = reconcile_html_to_markdown(raw, md_text, 'reference',
+                                       section_id=section_id,
+                                       html_label=html_path,
+                                       md_label=out_path)
+    if diffs:
+        sys.exit('源对账失败: %s 与 %s 不一致，已阻断分派\n%s' % (
+            html_path, out_path,
+            '\n'.join('  - ' + d for d in diffs)))
+    open(out_path, 'w', encoding='utf-8').write(md_text)
     display_map = fidelity.write_display_map(out_path, html_path)
     warn_if_temp_output([out_path, display_map])
     determined = sum(1 for e in fidelity.image_display if 'value' in e)

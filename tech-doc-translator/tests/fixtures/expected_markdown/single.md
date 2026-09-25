@@ -1,6 +1,6 @@
 # 1. Compute Kernel Basics
 
-A kernel is a function that runs on the [GPU](https://docs.nvidia.com/cuda/cuda-c-programming-guide/). Its launch syntax is kernel<<<blocks, threads>>>(args).
+A kernel is a function that runs on the [GPU](https://docs.nvidia.com/cuda/cuda-c-programming-guide/). Its launch syntax is `kernel<<<blocks, threads>>>(args)`.
 
 > **ADMONITION [Note]**
 > Always check return codes in host code.

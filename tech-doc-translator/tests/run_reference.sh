@@ -289,3 +289,51 @@ fi
 echo "热链与交付缺失图片已正确判 FAIL"
 
 echo "==> Ticket 03 回归全部通过"
+
+echo "==> 翻译留痕 01：富容器保真与独立对账（参考手册家族）"
+python3 "$PARSE" fixtures/rich_reference.html "$TMPDIR/rich_source.md"
+python3 - "$TMPDIR/rich_source.md" <<'PY'
+import sys
+
+sys.path.insert(0, '../skills/tech-doc-translator/scripts')
+from _source_reconcile import reconcile_html_to_markdown
+from _verification import scan_code_fences
+
+text = open(sys.argv[1], encoding='utf-8').read()
+bodies = [f.body for f in scan_code_fences(text).blocks]
+expected = [
+    'print("wrapped")',
+    '#include <bar.h>\nint main() { return 10; }',
+    'note_code()',
+    'list_code()',
+    'details_code()',
+    'dd_code()',
+    'table_code()',
+]
+assert bodies == expected, '代码块顺序或内容不符: %r' % (bodies,)
+assert '$$\n\\[ \\sum_{i=1}^{n} i \\]\n$$' in text, '块级公式丢失'
+assert '## 1.1. C# Interop' in text and '¶' not in text, 'C# 标题/headerlink 异常'
+assert '[TABLE-CODE r=2 c=2#1]' in text, '含代码表格缺少行列定位'
+assert '[FOOTNOTE-LIST]' in text and '[[1]] footnote body text' in text, \
+    '脚注定义丢失'
+raw = open('fixtures/rich_reference.html', encoding='utf-8').read()
+assert reconcile_html_to_markdown(raw, text, 'reference') == [], \
+    '正确解析被对账误判'
+for name, mutate in [
+    ('漏公式', lambda t: t.replace('$$\n\\[ \\sum_{i=1}^{n} i \\]\n$$\n', '')),
+    ('等数换内容', lambda t: t.replace('details_code()', 'details_coded()')),
+    ('乱序', lambda t: t.replace('dd_code()', '@@T@@')
+        .replace('table_code()', 'dd_code()').replace('@@T@@', 'table_code()')),
+]:
+    diffs = reconcile_html_to_markdown(raw, mutate(text), 'reference')
+    assert diffs, '%s 未被对账检出' % name
+    print('参考手册家族对账损伤 %s: %s' % (name, diffs[0]))
+print('参考手册家族富容器保真与独立对账 PASS')
+PY
+
+echo "==> 翻译留痕 02/A1：临时输出告警存在且退出 0"
+python3 "$PARSE" fixtures/rich_reference.html "$TMPDIR/a1_probe.md" \
+  2>"$TMPDIR/a1.err"
+grep -q '系统临时目录' "$TMPDIR/a1.err" \
+  || { echo "错误：临时目录解析未告警"; cat "$TMPDIR/a1.err"; exit 1; }
+echo "A1 临时路径告警 PASS"
