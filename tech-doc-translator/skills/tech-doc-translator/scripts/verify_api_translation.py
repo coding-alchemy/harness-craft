@@ -104,29 +104,21 @@ def _split_pages(text):
     return [p for p in pages if p.strip()]
 
 
-def main():
-    argv, approved_extra_math = extract_approved_extra_math(sys.argv[1:])
-    argv, strong_tokens = extract_strong_tokens(argv)
-    argv, image_map, delivery_root = extract_image_options(argv)
-    if len(argv) < 6:
-        sys.exit(__doc__)
-    merged_path = argv[0]
-    manifest_path = argv[1]
-    toc_path = argv[2]
-    site_root = argv[3]
-    src_paths = argv[4:]
-    image_digests = load_image_digests(image_map) if image_map else None
+def run_checks(merged_text, merged_dir, manifest, official, site_root,
+               src_texts, *, merged_label, delivery_root=None,
+               image_digests=None, approved_extra_math=(),
+               strong_tokens=()):
+    """多页 API 检查核心：接收候选文本与实际目标目录，返回失败诊断列表。
 
+    merged_text 可来自工作区外临时候选（草稿预检）；merged_dir 必须是
+    最终 Markdown 目录——图片按最终目标路径定位，不按候选临时路径定位。
+    """
     fails = []
 
-    with open(manifest_path, encoding='utf-8') as f:
-        manifest = [l.strip() for l in f if l.strip()]
     if not manifest:
-        sys.exit('empty manifest')
+        raise SystemExit('empty manifest')
 
     # 1) 闭合校验：manifest 与独立官方 TOC 快照一致（集合与顺序）
-    with open(toc_path, encoding='utf-8') as f:
-        official = [l.strip() for l in f if l.strip()]
     if manifest != official:
         missing = [p for p in official if p not in manifest]
         extra = [p for p in manifest if p not in official]
@@ -134,21 +126,20 @@ def main():
                      % (missing or '无', extra or '无',
                         missing == [] and extra == [] and manifest == official))
 
-    if len(src_paths) != len(manifest):
-        fails.append('源文件数 %d 与清单 %d 不一致' % (len(src_paths), len(manifest)))
+    if len(src_texts) != len(manifest):
+        fails.append('源文件数 %d 与清单 %d 不一致' % (len(src_texts), len(manifest)))
 
-    merged = open(merged_path, encoding='utf-8').read()
-    trans_pages = _split_pages(merged)
+    trans_pages = _split_pages(merged_text)
     if len(trans_pages) != len(manifest):
         fails.append('合并文件页数 %d 与清单 %d 不一致' % (len(trans_pages), len(manifest)))
 
     # 逐页校验
     for idx, page_rel in enumerate(manifest):
-        src_text = open(src_paths[idx], encoding='utf-8').read() if idx < len(src_paths) else ''
+        src_text = src_texts[idx] if idx < len(src_texts) else ''
         trans_text = trans_pages[idx] if idx < len(trans_pages) else ''
 
-        src_label = src_paths[idx] if idx < len(src_paths) else '（缺源）'
-        doc_label = '%s 第 %d 页' % (os.path.basename(merged_path), idx + 1)
+        src_label = '源页 %d' % (idx + 1)
+        doc_label = '%s 第 %d 页' % (merged_label, idx + 1)
 
         # 页面标题顺序：按 (层级, 官方原题) 有序对照（后缀边界匹配）
         src_titles = heading_entries(src_text)
@@ -174,7 +165,7 @@ def main():
         doc_math = scan_math_spans(trans_text)
         math_diffs, _ = compare_math_spans(
             src_math, doc_math, src_label, doc_label,
-            approved_extra_exprs=approved_extra_math)
+            approved_extra_exprs=approved_extra_math, doc_text=trans_text)
         for diff in math_diffs:
             fails.append('页 %s 公式逐项核对: %s' % (page_rel, diff))
 
@@ -195,17 +186,14 @@ def main():
             fails.append('页 %s 暗亮图片计数异常: HTML 可见 %d vs 译文 %d'
                          % (page_rel, len(html_visible), len(trans_imgs)))
         for order, src in enumerate(trans_imgs, start=1):
-            p, reason = resolve_delivery_image(
-                src, os.path.dirname(os.path.abspath(merged_path)),
-                delivery_root)
+            p, reason = resolve_delivery_image(src, merged_dir, delivery_root)
             if reason:
                 fails.append('页 %s 图片 #%d: %s' % (page_rel, order, reason))
                 continue
             if not os.path.isfile(p):
                 fails.append('页 %s 交付图片缺失: %s' % (page_rel, src))
                 continue
-            ok, kind, reason = check_image_file(
-                p, delivery_root or os.path.dirname(os.path.abspath(merged_path)))
+            ok, kind, reason = check_image_file(p, delivery_root or merged_dir)
             if not ok:
                 fails.append('页 %s 图片类型异常 %s: %s' % (page_rel, src, reason))
                 continue
@@ -228,9 +216,9 @@ def main():
             fails.append('图片身份映射 %d 条与交付出现 %d 次不符'
                          % (len(image_digests), len(global_refs)))
         else:
-            base = os.path.dirname(os.path.abspath(merged_path))
             for page_idx, order, src in global_refs:
-                p, reason = resolve_delivery_image(src, base, delivery_root)
+                p, reason = resolve_delivery_image(src, merged_dir,
+                                                   delivery_root)
                 if reason or not os.path.isfile(p):
                     continue  # 逐页检查已报告
                 if resource_identity_digest(p) != image_digests[order - 1 + sum(
@@ -238,6 +226,56 @@ def main():
                         for i in range(page_idx))]:
                     fails.append('第 %d 页图片 #%d 来源身份不符: %s 与 --image-map 摘要不一致'
                                  % (page_idx + 1, order, src))
+    return fails
+
+
+def parse_args(argv):
+    """解析既有 CLI 参数，返回语义结构（本 CLI 的单一解释入口）。"""
+    argv, approved_extra_math = extract_approved_extra_math(argv)
+    argv, strong_tokens = extract_strong_tokens(argv)
+    argv, image_map, delivery_root = extract_image_options(argv)
+    if len(argv) < 6:
+        sys.exit(__doc__)
+    return {
+        'merged_path': argv[0],
+        'manifest_path': argv[1],
+        'toc_path': argv[2],
+        'site_root': argv[3],
+        'src_paths': list(argv[4:]),
+        'strong_tokens': strong_tokens,
+        'approved_extra_math': approved_extra_math,
+        'image_map': image_map,
+        'delivery_root': delivery_root,
+    }
+
+
+def main():
+    parsed = parse_args(sys.argv[1:])
+    merged_path = parsed['merged_path']
+    manifest_path = parsed['manifest_path']
+    toc_path = parsed['toc_path']
+    site_root = parsed['site_root']
+    src_paths = parsed['src_paths']
+    strong_tokens = parsed['strong_tokens']
+    approved_extra_math = parsed['approved_extra_math']
+    delivery_root = parsed['delivery_root']
+    image_map = parsed['image_map']
+    image_digests = load_image_digests(image_map) if image_map else None
+
+    with open(manifest_path, encoding='utf-8') as f:
+        manifest = [l.strip() for l in f if l.strip()]
+    with open(toc_path, encoding='utf-8') as f:
+        official = [l.strip() for l in f if l.strip()]
+    merged = open(merged_path, encoding='utf-8').read()
+    src_texts = [open(p, encoding='utf-8').read() for p in src_paths]
+
+    fails = run_checks(
+        merged, os.path.dirname(os.path.abspath(merged_path)),
+        manifest, official, site_root, src_texts,
+        merged_label=os.path.basename(merged_path),
+        delivery_root=delivery_root, image_digests=image_digests,
+        approved_extra_math=approved_extra_math,
+        strong_tokens=strong_tokens)
 
     print('校验: %s' % os.path.basename(merged_path))
     if fails:
@@ -247,7 +285,8 @@ def main():
     print('PASS: %d pages, %d fences, %d images%s' % (
         len(manifest),
         sum(1 for _ in re.finditer(r'^```\s*$', merged, re.M)) // 2,
-        len(global_refs),
+        len([s for page in _split_pages(merged)
+             for _, s in image_references(page)]),
         '，来源身份映射一致' if image_digests is not None else '',
     ))
 

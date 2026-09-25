@@ -984,4 +984,251 @@ assert r.returncode == 0, r.stdout + r.stderr
 print('交付树搬迁至第二目录并切换 cwd 后校验 PASS')
 PY
 
+echo "==> 翻译留痕 02/A1：临时输出准确告警、正常路径不误报、别名可解析"
+NORMAL_BASE=$(mktemp -d "$HOME/.cache/tech-doc-a1-XXXXXX")
+python3 "$PARSE" fixtures/rich_single_page.html "$NORMAL_BASE/normal.md" \
+  2>"$TMP/a1_normal.err"
+test -s "$TMP/a1_normal.err" \
+  && { echo "错误：正常路径出现临时目录告警"; cat "$TMP/a1_normal.err"; exit 1; }
+mkdir -p "$NORMAL_BASE/tmp_page"
+python3 "$PARSE" fixtures/rich_single_page.html \
+  "$NORMAL_BASE/tmp_page/normal.md" 2>>"$TMP/a1_normal.err"
+test ! -s "$TMP/a1_normal.err" \
+  || { echo "错误：名字相似的普通目录被误报"; cat "$TMP/a1_normal.err"; exit 1; }
+python3 "$PARSE" fixtures/rich_single_page.html "$TMP/alias_target.md" \
+  2>"$TMP/a1_temp.err"
+test -s "$TMP/a1_temp.err" || { echo "错误：临时输出未告警"; exit 1; }
+grep -q '系统临时目录' "$TMP/a1_temp.err" \
+  || { echo "错误：告警未说明临时目录后果"; cat "$TMP/a1_temp.err"; exit 1; }
+ln -s "$TMP" "$TMP/alias_link"
+python3 "$PARSE" fixtures/rich_single_page.html "$TMP/alias_link/via.md" \
+  2>>"$TMP/a1_temp.err"
+grep -q 'via.md' "$TMP/a1_temp.err" \
+  || { echo "错误：经符号链接别名落入临时目录未被解析识别"; cat "$TMP/a1_temp.err"; exit 1; }
+rm -rf "$NORMAL_BASE"
+echo "A1 临时/正常/别名对照 PASS（临时路径下调试仍成功退出）"
+
+echo "==> 翻译留痕 01：富容器保真（高亮包装/行号/提示框/列表/details/定义项/含代码表格/脚注/C#）"
+python3 "$PARSE" fixtures/rich_single_page.html "$TMP/rich_source.md"
+python3 - "$TMP/rich_source.md" <<'PY'
+import sys
+
+sys.path.insert(0, '../skills/tech-doc-translator/scripts')
+from _verification import scan_code_fences
+
+text = open(sys.argv[1], encoding='utf-8').read()
+bodies = [fence.body for fence in scan_code_fences(text).blocks]
+expected = [
+    'print("wrapped")',
+    '#include <bar.h>\nint main() { return 10; }',
+    'note_code()',
+    'list_code()',
+    'details_code()',
+    'dd_code()',
+    'table_code()',
+]
+assert bodies == expected, '代码块顺序或内容不符:\n%r\nvs\n%r' % (bodies, expected)
+assert '<code>' not in text, '残留 <code> 包装'
+assert 'linenos' not in text, '残留行号标记'
+assert '## 1.1. C# Interop' in text, 'C# 标题被破坏或 headerlink 残留'
+assert '¶' not in text, 'headerlink ¶ 残留'
+assert 'literal <span> tag' in text, '行内字面 <span> 丢失'
+assert 'C# style' in text, '行内代码 C# 丢失'
+assert text.index('> note text before code') < text.index('note_code()') \
+    < text.index('> note text after code'), '提示框内代码与说明乱序'
+assert text.index('- item with code') < text.index('list_code()') \
+    < text.index('item tail'), '列表项内代码与说明乱序'
+assert '[DETAILS] expand me' in text and 'details_code()' in text, 'details 结构丢失'
+assert '[TABLE-CODE r=2 c=2#1]' in text, '含代码表格缺少行列定位'
+assert '[^1]' in text and '[[1]] footnote body text' in text, '脚注引用/定义丢失'
+print('富容器保真正例 PASS')
+PY
+
+echo "==> 翻译留痕 01：独立对账损伤必须定位（漏代码/等数换内容/乱序/重复/删图）"
+python3 - fixtures/rich_single_page.html "$TMP/rich_source.md" <<'PY'
+import sys
+
+sys.path.insert(0, '../skills/tech-doc-translator/scripts')
+from _source_reconcile import reconcile_html_to_markdown
+
+raw = open(sys.argv[1], encoding='utf-8').read()
+md = open(sys.argv[2], encoding='utf-8').read()
+assert reconcile_html_to_markdown(raw, md, 'single') == [], '正确解析被误判为损伤'
+
+def damaged(name, transform, expect):
+    diffs = reconcile_html_to_markdown(raw, transform(md), 'single')
+    assert diffs, '%s 未被对账检出' % name
+    assert any(expect in d for d in diffs), \
+        '%s 诊断未定位（%r）' % (name, diffs[:3])
+    print('对账损伤 %s: %s' % (name, diffs[0]))
+
+damaged('漏代码',
+        # 项内围栏按层级缩进
+        lambda t: t.replace('  ```\nlist_code()\n  ```\n', ''),
+        '数量不一致')
+damaged('等数换内容',
+        lambda t: t.replace('print("wrapped")', 'print("changed")'),
+        '第 1 项不一致')
+damaged('换标题', lambda t: t.replace('C# Interop', 'C Sharp Interop'),
+        '第 2 项不一致')
+damaged('乱序', lambda t: t.replace('note_code()', '@@TMP@@')
+        .replace('list_code()', 'note_code()').replace('@@TMP@@', 'list_code()'),
+        '第 3 项不一致')
+damaged('重复块', lambda t: t.replace(
+        # 项内围栏按层级缩进
+        '  ```\nlist_code()\n  ```',
+        '  ```\nlist_code()\n  ```\n\n  ```\nlist_code()\n  ```'),
+    '数量不一致')
+PY
+
+echo "==> 翻译留痕 01：A28 草稿预检（工作区外候选回填 + 目标路径资源检查）"
+python3 - "$TMP" <<'PY'
+import hashlib
+import os
+import sys
+
+sys.path.insert(0, '../skills/tech-doc-translator/scripts')
+import splice_fences
+from verify_translation import run_checks
+
+tmp = sys.argv[1]
+translated = open(tmp + '/sample_translated.md', encoding='utf-8').read()
+source = open(tmp + '/sample_source.md', encoding='utf-8').read()
+
+# 草稿：围栏替换为占位符；候选与最终图片目录分离
+draft_lines = []
+in_fence = False
+for line in translated.split('\n'):
+    stripped = line.strip()
+    if not in_fence and stripped.startswith('```'):
+        in_fence = True
+        draft_lines.append('⟦CODE⟧')
+        continue
+    if in_fence:
+        if stripped == '```':
+            in_fence = False
+        continue
+    draft_lines.append(line)
+assert not in_fence, '译文围栏不配对'
+draft = '\n'.join(draft_lines)
+os.makedirs(tmp + '/cand', exist_ok=True)
+open(tmp + '/draft.md', 'w', encoding='utf-8').write(draft)
+draft_digest = hashlib.sha256(draft.encode()).hexdigest()
+assert '⟦CODE⟧' in draft, '草稿必须含占位符'
+
+import contextlib
+import io
+
+def splice(draft_path, src_path, out_path):
+    argv = sys.argv
+    sys.argv = ['splice_fences.py', draft_path, src_path, out_path]
+    try:
+        splice_fences.main()
+    finally:
+        sys.argv = argv
+
+with contextlib.redirect_stdout(io.StringIO()):
+    splice(tmp + '/draft.md', tmp + '/sample_source.md',
+           tmp + '/cand/candidate.md')
+candidate = open(tmp + '/cand/candidate.md', encoding='utf-8').read()
+from _verification import scan_code_fences
+cand_bodies = [f.body for f in scan_code_fences(candidate).blocks]
+src_bodies = [f.body for f in scan_code_fences(source).blocks]
+assert cand_bodies == src_bodies, '回填候选围栏正文应与源逐字节一致'
+assert '⟦CODE⟧' not in candidate, '回填后不得残留占位符'
+assert hashlib.sha256(draft.encode()).hexdigest() == draft_digest, \
+    '预检不得修改原草稿'
+
+official = ['1. Compute Kernel Basics', '1.1. Thread Hierarchy',
+            '1.1.1. Memory Model']
+fail, lines = run_checks(
+    candidate, source, official,
+    doc_dir=os.path.abspath(tmp),  # 资源按最终目标目录定位
+    doc_label='cand/candidate.md（临时候选）',
+    src_label=tmp + '/sample_source.md')
+assert fail == 0, '正确草稿候选预检应通过:\n%s' % '\n'.join(lines)
+print('A28 正确草稿：候选回填一致、原草稿不变、按目标路径核验 PASS')
+
+# 负例 1：占位数量错误 → splice 拒绝
+open(tmp + '/draft_short.md', 'w', encoding='utf-8').write(
+    draft.replace('⟦CODE⟧\n', '', 1))
+try:
+    with contextlib.redirect_stdout(io.StringIO()):
+        splice(tmp + '/draft_short.md', tmp + '/sample_source.md',
+               tmp + '/cand/bad.md')
+    raise AssertionError('占位数量错误未被 splice 拒绝')
+except AssertionError as exc:
+    if '占位' not in str(exc) and '围栏' not in str(exc):
+        raise
+print('A28 负例：占位数量错误被 splice 拒绝 PASS')
+
+# 负例 2：公式等数改符号
+bad_math = candidate
+if '$N$' in bad_math:
+    bad_math = bad_math.replace('$N$', '$M$')
+else:
+    bad_math = bad_math.replace('GPU', 'GPU$')
+fail, lines = run_checks(
+    bad_math, source, official, doc_dir=os.path.abspath(tmp),
+    doc_label='bad_math.md', src_label=tmp + '/sample_source.md')
+assert fail > 0, '公式损伤未被拒绝'
+print('A28 负例：公式等数改符号被拒绝 PASS')
+
+# 负例 3：错误图片身份（候选引用同名目录中另一张真实图片）
+imp1 = open('fixtures/valid_1x1.png', 'rb').read()
+os.makedirs(tmp + '/images', exist_ok=True)
+open(tmp + '/images/imposter.png', 'wb').write(imp1 + b'\x00')
+bad_img = candidate.replace('images/thread_hierarchy.png',
+                            'images/imposter.png')
+fail, lines = run_checks(
+    bad_img, source, official, doc_dir=os.path.abspath(tmp),
+    doc_label='bad_img.md', src_label=tmp + '/sample_source.md')
+assert fail > 0 and any('来源身份不符' in l for l in lines), \
+    '错误图片身份未被拒绝:\n%s' % '\n'.join(lines)
+print('A28 负例：错误图片身份被拒绝 PASS')
+
+# 负例 4：残留解析标记
+bad_mark = candidate + '\n[TABLE]\n'
+fail, lines = run_checks(
+    bad_mark, source, official, doc_dir=os.path.abspath(tmp),
+    doc_label='bad_mark.md', src_label=tmp + '/sample_source.md')
+assert fail > 0 and any('[TABLE]' in l for l in lines), '残留标记未被拒绝'
+print('A28 负例：残留解析标记被拒绝 PASS')
+
+# 四反引号/波浪线复杂围栏回填
+quad_src = '''# T
+
+intro
+
+~~~~
+code_tilde()
+~~~~
+
+````python
+code_quad("with ~~~ inside")
+````
+
+tail [^1]
+
+[^1]: note
+'''
+draft_quad = quad_src.replace('~~~~\ncode_tilde()\n~~~~', '⟦CODE⟧') \
+    .replace('````python\ncode_quad("with ~~~ inside")\n````', '⟦CODE⟧')
+open(tmp + '/quad_src.md', 'w', encoding='utf-8').write(quad_src)
+open(tmp + '/quad_draft.md', 'w', encoding='utf-8').write(draft_quad)
+with contextlib.redirect_stdout(io.StringIO()):
+    splice(tmp + '/quad_draft.md', tmp + '/quad_src.md',
+           tmp + '/cand/quad_candidate.md')
+quad_candidate = open(tmp + '/cand/quad_candidate.md',
+                      encoding='utf-8').read()
+assert 'code_tilde()' in quad_candidate \
+    and 'code_quad("with ~~~ inside")' in quad_candidate, '复杂围栏回填失败'
+fail, lines = run_checks(
+    quad_candidate, quad_src, [], fragment=True,
+    doc_dir=os.path.abspath(tmp), doc_label='quad_candidate.md',
+    src_label=tmp + '/quad_src.md')
+assert fail == 0, '复杂围栏候选预检应通过:\n%s' % '\n'.join(lines)
+print('A28 四反引号/波浪线围栏回填与预检 PASS')
+PY
+
 echo "==> Ticket 01 回归全部通过"

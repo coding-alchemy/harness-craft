@@ -1999,6 +1999,143 @@ grep -q "images-display-binding" "$UDI/v.txt" \
   || { cat "$UDI/v.txt"; echo "错误：核验侧身份诊断缺失"; exit 1; }
 echo "未确定条目身份/越界导出与核验双侧拒绝 PASS"
 
+echo "==> R3/A7（留痕 03）：回补映射导出后按 PDF 实测逐次宽度"
+R3="$TMP/rebuild_export"; rm -rf "$R3"; mkdir -p "$R3/source/images" "$R3/delivery/images"
+cp fixtures/valid_1x1.png "$R3/source/images/pic.png"
+cp fixtures/valid_1x1.png "$R3/delivery/images/pic.png"
+python3 - "$R3" <<'PY'
+import sys
+from pathlib import Path
+base = Path(sys.argv[1])
+(base / 'source/page.html').write_text(
+    '<html><body><article><h1>T</h1>'
+    '<img src="images/pic.png" style="width:200px">'
+    '<img src="images/pic.png" style="width:600px">'
+    '</article></body></html>', encoding='utf-8')
+(base / 'delivery/final.md').write_text(
+    '# 章\n\n> **来源**：https://example.com/prov-r3\n\n'
+    '![一](images/pic.png)\n\n![二](images/pic.png)\n',
+    encoding='utf-8')
+import json
+(base / 'manifest.json').write_text(json.dumps({
+    'version': 1, 'source_version': 'test', 'family': 'single',
+    'pages': [{'snapshot': 'source/page.html',
+               'markdown': 'delivery/final.md'}]}), encoding='utf-8')
+PY
+python3 "../skills/tech-doc-translator/scripts/rebuild_images_display.py" --manifest "$R3/manifest.json" \
+  --output "$R3/delivery/export/images_display.json" \
+  --work-dir "$R3/work_rebuild" \
+  || { echo "错误：回补失败"; exit 1; }
+python3 "$EXPORT" --output "$R3/out/book.pdf" --work-dir "$R3/work_export" \
+  --images-display "$R3/delivery/export/images_display.json" \
+  --require-display-map "$R3/delivery/final.md" \
+  >"$R3/export.txt" 2>&1 || { cat "$R3/export.txt"; echo "错误：回补映射导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$R3/out/book.pdf" --work-dir "$R3/work_export" \
+  --images-display "$R3/delivery/export/images_display.json" \
+  --require-display-map "$R3/delivery/final.md" \
+  >"$R3/verify.txt" 2>&1 || { cat "$R3/verify.txt"; echo "错误：回补映射核验失败"; exit 1; }
+grep -q "总数 2 = 已恢复 2 + 未恢复 0" "$R3/export.txt" \
+  || { cat "$R3/export.txt"; echo "错误：回补后覆盖未全量恢复"; exit 1; }
+echo "回补→导出→量测：2 次出现全量恢复且逐次宽度经内容流核验 PASS"
+
+echo "==> 精简 04/A7：四类家族回补→导出→内容流逐次实测宽度 + 连续回补不退化"
+R4F="$TMP/rebuild_four"; rm -rf "$R4F"; mkdir -p "$R4F"
+python3 - "$R4F" <<'PY'
+import shutil, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+shutil.copy('fixtures/valid_1x1.png', base / 'pic_a.png')
+shutil.copy('fixtures/valid_1x1.png', base / 'pic_b.png')
+PY
+python3 - "$R4F" <<'PY'
+import json, sys
+from pathlib import Path
+
+base = Path(sys.argv[1])
+html_img = ('<img src="images/pic_a.png" style="width:200px">'
+            '<img src="images/pic_b.png" style="width:600px">')
+families = {
+    'single': {
+        'html': '<html><body><article><h1>T</h1>' + html_img
+                + '<table><tr><th colspan="2">复杂表头</th></tr>'
+                  '<tr><td>a</td><td>b</td></tr></table>'
+                + '</article></body></html>',
+        'srcs': ['images/pic_a.png', 'images/pic_b.png']},
+    'paginated': {
+        'html': '<html><body><article><h1>T</h1>' + html_img
+                + '</article></body></html>',
+        'srcs': ['images/pic_a.png', 'images/pic_b.png']},
+    'reference': {
+        'html': ('<html><body><article><h1>T</h1>'
+                 '<img src="_static/pic_a.png" style="width:200px">'
+                 '<img src="_static/pic_b.png" style="width:600px">'
+                 '</article></body></html>'),
+        'srcs': ['_static/pic_a.png', '_static/pic_b.png']},
+    'api': {
+        'html': ('<html><body><article><h1>T</h1>'
+                 '<img class="only-dark" src="images/dark.png">'
+                 '<img src="images/pic_a.png" data-light="images/pic_a.png"'
+                 ' data-dark="images/dark.png" style="width:200px">'
+                 '<img src="images/pic_b.png" style="width:600px">'
+                 '</article></body></html>'),
+        'srcs': ['images/pic_a.png', 'images/pic_b.png']},
+}
+for family, spec in families.items():
+    root = base / family
+    (root / 'source').mkdir(parents=True)
+    (root / 'delivery/images').mkdir(parents=True)
+    (root / 'source/images').mkdir(parents=True, exist_ok=True)
+    (root / 'source/_static').mkdir(parents=True, exist_ok=True)
+    for rel in spec['srcs']:
+        target = root / 'source' / rel
+        if not target.exists():
+            target.hardlink_to(base / 'pic_a.png'
+                               if rel.endswith('pic_a.png') else base / 'pic_b.png')
+    for name in ('pic_a.png', 'pic_b.png'):
+        (root / 'delivery/images' / name).hardlink_to(base / name)
+    (root / 'source/page.html').write_text(spec['html'], encoding='utf-8')
+    (root / 'delivery/final.md').write_text(
+        '# 章\n\n> **来源**：https://example.com/prov-four-%s\n\n'
+        '![一](images/pic_a.png)\n\n![二](images/pic_b.png)\n' % family,
+        encoding='utf-8')
+    (root / 'manifest.json').write_text(json.dumps({
+        'version': 1, 'source_version': '13.4-test', 'family': family,
+        'pages': [{'snapshot': 'source/page.html',
+                   'markdown': 'delivery/final.md'}]}), encoding='utf-8')
+print('四类家族夹具就绪')
+PY
+for family in single paginated reference api; do
+  FAM_DIR="$R4F/$family"
+  MAP="$FAM_DIR/delivery/export/images_display.json"
+  for round in 1 2 3; do
+    python3 "../skills/tech-doc-translator/scripts/rebuild_images_display.py" \
+      --manifest "$FAM_DIR/manifest.json" --output "$MAP" \
+      --work-dir "$FAM_DIR/work_rebuild" \
+      || { echo "错误：$family 第 $round 轮回补失败"; exit 1; }
+    if [ "$round" -gt 1 ]; then
+      # 连续回补不退化：映射字节稳定（同输入语义一致），无根目录副本
+      cmp -s "$MAP" "$FAM_DIR/map_baseline.json" \
+        || { echo "错误：$family 第 $round 轮回补映射退化"; exit 1; }
+    else
+      cp "$MAP" "$FAM_DIR/map_baseline.json"
+    fi
+  done
+  test ! -f "$FAM_DIR/delivery/images_display.json" \
+    || { echo "错误：$family 存在根目录映射副本"; exit 1; }
+  python3 "$EXPORT" --output "$FAM_DIR/out/book.pdf" \
+    --work-dir "$FAM_DIR/work_export" --images-display "$MAP" \
+    --require-display-map "$FAM_DIR/delivery/final.md" \
+    >"$FAM_DIR/export.txt" 2>&1 \
+    || { cat "$FAM_DIR/export.txt"; echo "错误：$family 回补映射导出失败"; exit 1; }
+  grep -q "总数 2 = 已恢复 2 + 未恢复 0" "$FAM_DIR/export.txt" \
+    || { cat "$FAM_DIR/export.txt"; echo "错误：$family 未全量恢复"; exit 1; }
+  python3 "$VERIFY" --pdf "$FAM_DIR/out/book.pdf" --work-dir "$FAM_DIR/work_export" \
+    --images-display "$MAP" --require-display-map "$FAM_DIR/delivery/final.md" \
+    >"$FAM_DIR/verify.txt" 2>&1 \
+    || { cat "$FAM_DIR/verify.txt"; echo "错误：$family 逐次宽度内容流核验失败"; exit 1; }
+done
+echo "四类家族回补→导出→内容流实测宽度（200/600px 逐次）、连续三轮回补不退化 PASS"
+
 echo "==> R6/A15（留痕 04）：缺出处零生成、来源不足定位、补齐后恢复"
 PV="$TMP/prov_gate"; rm -rf "$PV"; mkdir -p "$PV"
 cp "$STRICT/full.pdf" "$PV/old.pdf"

@@ -49,65 +49,59 @@ _RESIDUAL_MARKERS = [
 ]
 
 
-def main():
-    argv, approved_extra_math = extract_approved_extra_math(sys.argv[1:])
-    argv, strong_tokens = extract_strong_tokens(argv)
-    argv, image_map, delivery_root = extract_image_options(argv)
-    fragment = '--fragment' in argv
-    argv = [a for a in argv if a != '--fragment']
-    if len(argv) < 2:
-        sys.exit(__doc__)
-    doc_path = argv[0]
-    src_path = argv[1]
-    official = list(argv[2:])
-    image_digests = load_image_digests(image_map) if image_map else None
+def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
+               src_label, image_digests=None, delivery_root=None,
+               strong_tokens=(), approved_extra_math=(), fragment=False):
+    """通用单页检查核心：接收候选文本与实际目标目录，返回 (失败数, 输出行)。
 
-    if not os.path.isfile(src_path):
-        sys.exit('源文缺失或不可读: %s FAIL（输入不足，不得把缺源解释成跳过检查）'
-                 % src_path)
-    doc = open(doc_path, encoding='utf-8').read()
-    src = open(src_path, encoding='utf-8').read()
+    doc_text 可来自工作区外临时候选（草稿预检）；doc_dir 必须是最终
+    Markdown 目录——图片等资源一律按最终目标路径定位，不按候选临时
+    路径定位。CLI 与预检共用本核心，输出行与既有 CLI 完全一致。
+    """
     fail = 0
+    lines = []
+    doc = doc_text
+    src = src_text
     doc_headings = heading_entries(doc)
     src_headings = heading_entries(src)
     h1s = [t for _, lvl, t in doc_headings if lvl == 1]
 
     # 1) H1 唯一性（完整文档约束；--fragment 片段只免除这一项，不豁免其余）
     if fragment:
-        print('H1 唯一性: 片段模式跳过（片段不要求 H1）')
+        lines.append('H1 唯一性: 片段模式跳过（片段不要求 H1）')
     elif len(h1s) != 1:
         fail += 1
-        print('H1 数量: %d（应为 1）FAIL: %s' % (len(h1s), h1s[:3]))
+        lines.append('H1 数量: %d（应为 1）FAIL: %s' % (len(h1s), h1s[:3]))
 
     # 2) 标题核对：与源逐项对照层级与官方原题（后缀边界对照）。
     #    片段模式的源实参即片段源切片，同样逐项对照；只免除整篇 H1 要求。
     heading_diffs = compare_headings(src_headings, doc_headings,
-                                     src_path, doc_path)
+                                     src_label, doc_label)
     if heading_diffs:
         for diff in heading_diffs:
             fail += 1
-            print('标题核对: %s FAIL' % diff)
+            lines.append('标题核对: %s FAIL' % diff)
     else:
-        print('标题核对: %d 条与源逐项一致（层级与官方原题） PASS'
-              % len(doc_headings))
+        lines.append('标题核对: %d 条与源逐项一致（层级与官方原题） PASS'
+                     % len(doc_headings))
     if official:
         # 官方标题清单作为独立基准（防源文件标题本身缺漏时盲从源文）
         got = [t for _, _, t in doc_headings]
         if len(got) == len(official) and all(
                 heading_title_matches(e, g) for e, g in zip(official, got)):
-            print('标题: 与官方清单一致（含顺序） PASS')
+            lines.append('标题: 与官方清单一致（含顺序） PASS')
         else:
             fail += 1
-            print('标题: 与官方清单不一致 FAIL（译文 %d 条 vs 官方 %d 条）'
-                  % (len(got), len(official)))
+            lines.append('标题: 与官方清单不一致 FAIL（译文 %d 条 vs 官方 %d 条）'
+                         % (len(got), len(official)))
 
     # 3) 残留解析标记
     for marker in residual_markers(doc, _RESIDUAL_MARKERS):
         fail += 1
         if marker in _RESIDUAL_MARKERS:
-            print('残留标记: %s FAIL' % marker)
+            lines.append('残留标记: %s FAIL' % marker)
         else:
-            print('残留块级占位符: %s FAIL' % marker)
+            lines.append('残留块级占位符: %s FAIL' % marker)
 
     # 4) 脚注：译文内部配对 + 以源引用/定义关系为基准
     for num in sorted(set(re.findall(r'\[\^(\d+)\]', doc))):
@@ -115,23 +109,23 @@ def main():
         defs = len(re.findall(r'^\[\^%s\]:' % num, doc, re.M))
         if not (refs and defs):
             fail += 1
-            print('脚注 [^%s]: 引用 %d / 定义 %d 不成对 FAIL' % (num, refs, defs))
-    fn_diffs, fn_warns = footnote_diffs(src, doc, src_path, doc_path)
+            lines.append('脚注 [^%s]: 引用 %d / 定义 %d 不成对 FAIL' % (num, refs, defs))
+    fn_diffs, fn_warns = footnote_diffs(src, doc, src_label, doc_label)
     for diff in fn_diffs:
         fail += 1
-        print('脚注核对: %s FAIL' % diff)
+        lines.append('脚注核对: %s FAIL' % diff)
     for warn in fn_warns:
-        print('脚注核对: %s WARN' % warn)
+        lines.append('脚注核对: %s WARN' % warn)
 
     # 5) 强 token（项目显式指定；未配置时明示未检查）
     token_diffs, token_warns = strong_token_report(src, doc, strong_tokens,
-                                                   src_path, doc_path)
+                                                   src_label, doc_label)
     if token_diffs is not None:
         for diff in token_diffs:
             fail += 1
-            print('强 token: %s FAIL' % diff)
+            lines.append('强 token: %s FAIL' % diff)
     for warn in token_warns:
-        print('强 token: %s WARN' % warn)
+        lines.append('强 token: %s WARN' % warn)
 
     # 6) 图片核验：源译出现次数对账（常开）+ 外链/绝对路径/cwd 伪匹配/
     #    伪图/缺图/身份不符均阻断。完整通过必须建立每次出现的来源身份：
@@ -140,32 +134,31 @@ def main():
     doc_image_count = len(image_references(doc))
     if doc_image_count < src_image_count:
         fail += 1
-        print('图片对账: 源出现 %d 次但译文仅 %d 次 FAIL（漏图）'
-              % (src_image_count, doc_image_count))
+        lines.append('图片对账: 源出现 %d 次但译文仅 %d 次 FAIL（漏图）'
+                     % (src_image_count, doc_image_count))
     elif doc_image_count > src_image_count:
-        print('图片对账: 译文出现 %d 次多于源 %d 次 WARN（回源确认是否译注图）'
-              % (doc_image_count, src_image_count))
+        lines.append('图片对账: 译文出现 %d 次多于源 %d 次 WARN（回源确认是否译注图）'
+                     % (doc_image_count, src_image_count))
     else:
-        print('图片对账: 源译出现次数一致（%d 次） PASS' % src_image_count)
+        lines.append('图片对账: 源译出现次数一致（%d 次） PASS' % src_image_count)
     identity = image_digests
     identity_basis = '映射'
     if identity is None:
         identity = source_occurrence_digests(
-            src, os.path.dirname(os.path.abspath(src_path)))
+            src, os.path.dirname(os.path.abspath(src_label)))
         identity_basis = '当前源资源'
     image_fails = image_occurrence_fails(
-        doc, os.path.dirname(os.path.abspath(doc_path)), delivery_root,
-        expected_digests=identity)
+        doc, doc_dir, delivery_root, expected_digests=identity)
     if image_fails:
         for msg in image_fails:
             fail += 1
-            print('图片核验: %s FAIL' % msg)
+            lines.append('图片核验: %s FAIL' % msg)
     elif identity is not None:
-        print('图片核验: 离线引用、类型与来源身份（%s） PASS' % identity_basis)
+        lines.append('图片核验: 离线引用、类型与来源身份（%s） PASS' % identity_basis)
     if identity is None and doc_image_count:
         fail += 1
-        print('图片核验: 来源身份未核验（无 --image-map 且源资源不可解析），'
-              '不判定完整通过 FAIL')
+        lines.append('图片核验: 来源身份未核验（无 --image-map 且源资源不可解析），'
+                     '不判定完整通过 FAIL')
 
     # 7) 代码围栏配对与逐块内容核对
     doc_fences = scan_code_fences(doc)
@@ -173,46 +166,46 @@ def main():
     code_fails = 0
     if not doc_fences.balanced:
         code_fails += 1
-        print('代码围栏不成对: 第 %d 行开启的代码块未闭合 FAIL'
-              % doc_fences.unclosed_line)
+        lines.append('代码围栏不成对: 第 %d 行开启的代码块未闭合 FAIL'
+                     % doc_fences.unclosed_line)
     if not src_fences.balanced:
         code_fails += 1
-        print('源文代码围栏不成对: 第 %d 行开启的代码块未闭合 FAIL'
-              % src_fences.unclosed_line)
+        lines.append('源文代码围栏不成对: 第 %d 行开启的代码块未闭合 FAIL'
+                     % src_fences.unclosed_line)
     for diff in compare_code_fences(src_fences.blocks, doc_fences.blocks,
-                                    src_path, doc_path):
+                                    src_label, doc_label):
         code_fails += 1
-        print('代码逐块核对: %s FAIL' % diff)
+        lines.append('代码逐块核对: %s FAIL' % diff)
     if code_fails:
         fail += code_fails
     elif doc_fences.blocks:
-        print('代码逐块核对: %d 块与源一致（开启行/语言/正文/关闭行） PASS'
-              % len(doc_fences.blocks))
+        lines.append('代码逐块核对: %d 块与源一致（开启行/语言/正文/关闭行） PASS'
+                     % len(doc_fences.blocks))
 
     # 8) 公式逐项核对（类型/顺序/原表达式）与链接目标
     src_math = scan_math_spans(src)
     doc_math = scan_math_spans(doc)
     math_diffs, math_warns = compare_math_spans(
-        src_math, doc_math, src_path, doc_path,
-        approved_extra_exprs=approved_extra_math)
+        src_math, doc_math, src_label, doc_label,
+        approved_extra_exprs=approved_extra_math, doc_text=doc)
     for diff in math_diffs:
         fail += 1
-        print('公式逐项核对: %s FAIL' % diff)
+        lines.append('公式逐项核对: %s FAIL' % diff)
     for warn in math_warns:
-        print('公式逐项核对: %s WARN' % warn)
+        lines.append('公式逐项核对: %s WARN' % warn)
     if not math_diffs and src_math:
-        print('公式逐项核对: %d 处（行内 %d/块级 %d）与源逐项一致 PASS'
-              % (len(doc_math),
-                 sum(1 for s in doc_math if s.kind == 'inline'),
-                 sum(1 for s in doc_math if s.kind == 'block')))
+        lines.append('公式逐项核对: %d 处（行内 %d/块级 %d）与源逐项一致 PASS'
+                     % (len(doc_math),
+                        sum(1 for s in doc_math if s.kind == 'inline'),
+                        sum(1 for s in doc_math if s.kind == 'block')))
     if src:
         missing_links = Counter(link_targets(src)) - Counter(link_targets(doc))
         if missing_links:
             fail += 1
-            print('链接目标缺失: %s FAIL' % dict(missing_links))
+            lines.append('链接目标缺失: %s FAIL' % dict(missing_links))
         else:
-            print('链接目标: 源 %d / 译 %d PASS' %
-                  (len(link_targets(src)), len(link_targets(doc))))
+            lines.append('链接目标: 源 %d / 译 %d PASS' %
+                         (len(link_targets(src)), len(link_targets(doc))))
 
     # 9) 内容块覆盖率（信息性）
     if src:
@@ -224,9 +217,63 @@ def main():
              len([l for l in doc.splitlines() if l.strip().startswith(('- ', '* '))])),
         ]
         for name, s, d in pairs:
-            print('覆盖率 %s: 源 %d / 译 %d（差值供人工判断）' % (name, s, d))
+            lines.append('覆盖率 %s: 源 %d / 译 %d（差值供人工判断）' % (name, s, d))
 
-    print('结果: %s' % ('ALL PASS' if fail == 0 else '%d 项 FAIL' % fail))
+    lines.append('结果: %s' % ('ALL PASS' if fail == 0 else '%d 项 FAIL' % fail))
+    return fail, lines
+
+
+def parse_args(argv):
+    """解析既有 CLI 参数，返回语义结构（本 CLI 的单一解释入口）。
+
+    doc_path/src_path 为路径；official 为官方标题字面值；--strong-token、
+    --approved-extra-math、--image-map、--delivery-root、--fragment 按真实
+    语义拆出。路径与字面值不做任何改写，由调用方按自己的基点解释。
+    """
+    argv, approved_extra_math = extract_approved_extra_math(argv)
+    argv, strong_tokens = extract_strong_tokens(argv)
+    argv, image_map, delivery_root = extract_image_options(argv)
+    fragment = '--fragment' in argv
+    argv = [a for a in argv if a != '--fragment']
+    if len(argv) < 2:
+        sys.exit(__doc__)
+    return {
+        'doc_path': argv[0],
+        'src_path': argv[1],
+        'official': list(argv[2:]),
+        'strong_tokens': strong_tokens,
+        'approved_extra_math': approved_extra_math,
+        'image_map': image_map,
+        'delivery_root': delivery_root,
+        'fragment': fragment,
+    }
+
+
+def main():
+    parsed = parse_args(sys.argv[1:])
+    doc_path = parsed['doc_path']
+    src_path = parsed['src_path']
+    official = parsed['official']
+    strong_tokens = parsed['strong_tokens']
+    approved_extra_math = parsed['approved_extra_math']
+    fragment = parsed['fragment']
+    image_map = parsed['image_map']
+    delivery_root = parsed['delivery_root']
+    image_digests = load_image_digests(image_map) if image_map else None
+
+    if not os.path.isfile(src_path):
+        sys.exit('源文缺失或不可读: %s FAIL（输入不足，不得把缺源解释成跳过检查）'
+                 % src_path)
+    doc = open(doc_path, encoding='utf-8').read()
+    src = open(src_path, encoding='utf-8').read()
+    fail, lines = run_checks(
+        doc, src, official,
+        doc_dir=os.path.dirname(os.path.abspath(doc_path)),
+        doc_label=doc_path, src_label=src_path,
+        image_digests=image_digests, delivery_root=delivery_root,
+        strong_tokens=strong_tokens,
+        approved_extra_math=approved_extra_math, fragment=fragment)
+    print('\n'.join(lines))
     sys.exit(0 if fail == 0 else 1)
 
 

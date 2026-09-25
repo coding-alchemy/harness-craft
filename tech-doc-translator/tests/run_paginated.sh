@@ -254,3 +254,52 @@ print('分页解析：显示尺寸映射与源 Markdown 同目录输出')
 PY
 
 echo "==> Ticket 02 分页、代码围栏保真与安全合并回归全部通过"
+
+echo "==> 翻译留痕 01：富容器保真与独立对账（分页家族）"
+cp fixtures/rich_paginated.html "$TMPDIR/src_html/"
+python3 "$PARSE" "$TMPDIR/src_html/rich_paginated.html"
+python3 - "$TMPDIR/src_html/rich_paginated.md" "$TMPDIR/src_html/rich_paginated.html" <<'PY'
+import sys
+
+sys.path.insert(0, '../skills/tech-doc-translator/scripts')
+from _source_reconcile import reconcile_html_to_markdown
+from _verification import scan_code_fences
+
+md_path, html_path = sys.argv[1], sys.argv[2]
+text = open(md_path, encoding='utf-8').read()
+bodies = [f.body for f in scan_code_fences(text).blocks]
+expected = [
+    'print("wrapped")',
+    '#include <bar.h>\nint main() { return 10; }',
+    'note_code()',
+    'list_code()',
+    'details_code()',
+    'dd_code()',
+    'table_code()',
+]
+assert bodies == expected, '代码块顺序或内容不符: %r' % (bodies,)
+assert '$$\\frac{a}{b}$$' in text, '块级公式丢失'
+assert '## 1.1. C# Interop' in text and '¶' not in text, 'C# 标题/headerlink 异常'
+assert '[TABLE-CODE r=2 c=2#1]' in text, '含代码表格缺少行列定位'
+assert reconcile_html_to_markdown(open(html_path, encoding='utf-8').read(),
+                                  text, 'paginated') == [], \
+    '正确解析被对账误判'
+raw = open(html_path, encoding='utf-8').read()
+for name, mutate in [
+    ('漏代码', lambda t: t.replace('```\nnote_code()\n```\n', '')),
+    ('等数换内容', lambda t: t.replace('dd_code()', 'dd_coded()')),
+    # 项内围栏按层级缩进（列表项内代码），突变使用缩进形式
+    ('重复块', lambda t: t.replace('  ```\nlist_code()\n  ```',
+                                   '  ```\nlist_code()\n  ```\n\n  ```\nlist_code()\n  ```')),
+]:
+    diffs = reconcile_html_to_markdown(raw, mutate(text), 'paginated')
+    assert diffs, '%s 未被对账检出' % name
+    print('分页家族对账损伤 %s: %s' % (name, diffs[0]))
+print('分页家族富容器保真与独立对账 PASS')
+PY
+
+echo "==> 翻译留痕 02/A1：临时输出告警存在且退出 0"
+python3 "$PARSE" "$TMPDIR/src_html/rich_paginated.html" 2>"$TMPDIR/a1.err"
+grep -q '系统临时目录' "$TMPDIR/a1.err" \
+  || { echo "错误：临时目录解析未告警"; cat "$TMPDIR/a1.err"; exit 1; }
+echo "A1 临时路径告警 PASS"

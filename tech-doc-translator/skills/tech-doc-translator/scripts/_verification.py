@@ -9,6 +9,7 @@ import subprocess
 from dataclasses import dataclass
 
 import tinycss2
+from markdown_it import MarkdownIt
 
 
 _BLOCK_PLACEHOLDER = re.compile(r'^\[([A-Z][A-Z0-9_-]*)\]\s', re.M)
@@ -58,9 +59,13 @@ class _OpenFence:
 def scan_code_fences(text):
     """扫描围栏代码块，返回 CodeScan。
 
-    - 开启行：0-3 个空格缩进后至少 3 个相同围栏字符（`` ` `` 或 `` ~ ``），
+    - 开启行：任意空格缩进后至少 3 个相同围栏字符（`` ` `` 或 `` ~ ``），
       其后为信息串；反引号围栏的信息串内不得再含反引号。
-    - 关闭行：0-3 个空格缩进、同字符且长度不小于开启标记，不得带信息串。
+    - 关闭行：任意空格缩进、同字符且长度不小于开启标记，不得带信息串。
+    - 缩进上限不设 3 空格：本管线的 Markdown 子集由渲染器形状定义，
+      列表项内围栏按项层级 2×level 缩进（可达 4+ 空格），缩进代码块
+      不是受支持输出；`verify_pdf.raw_scan` 与 markdown_it 结构层同按
+      任意缩进识别围栏，此处保持同一口径。
     - 围栏内部一切内容（短围栏、标题、分隔线、公式、图片语法）不参与外部结构。
     - body/start/end 均为原文切片或偏移，不做任何换行或空白重组。
     """
@@ -75,21 +80,19 @@ def scan_code_fences(text):
         line_start = offset
         offset += len(line) + 1
         indented = line.lstrip(' ')
-        indent = len(line) - len(indented)
         if open_state is None:
-            if indent <= 3:
-                mark = _FENCE_OPEN.match(indented)
-                if mark:
-                    fence = mark.group(1)
-                    info = mark.group(2).strip()
-                    if not (fence[0] == '`' and '`' in info):
-                        open_state = _OpenFence(
-                            fence[0], len(fence), line, info,
-                            line_start, line_no)
-                        body_start = line_start + len(line) + 1
-                        boundary_count += 1
+            mark = _FENCE_OPEN.match(indented)
+            if mark:
+                fence = mark.group(1)
+                info = mark.group(2).strip()
+                if not (fence[0] == '`' and '`' in info):
+                    open_state = _OpenFence(
+                        fence[0], len(fence), line, info,
+                        line_start, line_no)
+                    body_start = line_start + len(line) + 1
+                    boundary_count += 1
         else:
-            close_mark = _FENCE_CLOSE.match(indented) if indent <= 3 else None
+            close_mark = _FENCE_CLOSE.match(indented)
             if (close_mark and close_mark.group(1)[0] == open_state.fence_char
                     and len(close_mark.group(1)) >= open_state.fence_length):
                 blocks.append(CodeFence(
@@ -275,7 +278,12 @@ def _mask_inline_code(line):
 
 
 def _math_scan_mask(text):
-    """返回与原文等长的掩蔽副本：代码围栏行、行内代码、\\$ 转义替换为空格。"""
+    r"""返回与原文等长的掩蔽副本：代码围栏行、行内代码、链接标签内的
+    转义字符与 \$ 转义替换为空格。
+
+    链接标签中的合法 $…$ 保持参与公式扫描（标签内公式损伤必须可检出，
+    S09）；只掩蔽已确定为链接语法的转义字符（如 [Python Constant\[T\]]
+    中的 \[ \] 不是块级公式定界），不掩蔽整段标签。"""
     fenced = fenced_line_numbers(text)
     out = []
     for line_no, line in enumerate(text.split('\n'), start=1):
@@ -283,7 +291,15 @@ def _math_scan_mask(text):
             out.append(' ' * len(line))
         else:
             masked = _mask_inline_code(line).replace('\\$', '  ')
-            out.append(masked)
+            chars = list(masked)
+            for match in re.finditer(
+                    r'\[((?:\\.|[^\[\]])*)\]\([^()]*\)', masked):
+                for esc in re.finditer(r'\\.', match.group(1)):
+                    for i in range(match.start(1) + esc.start(),
+                                   match.start(1) + esc.end()):
+                        if chars[i] != '\n':
+                            chars[i] = ' '
+            out.append(''.join(chars))
     return '\n'.join(out)
 
 
@@ -326,16 +342,53 @@ def scan_math_spans(text):
     return spans
 
 
+# 与实际导出渲染同配置（export_pdf.build_markdown：html=False）：字面
+# HTML 行只是普通文字，不吞并其后紧邻的表格（F5）；表格块范围与交付
+# 渲染同源，不为复用配置导入 PDF 导出模块
+_TABLE_ROWS_MD = MarkdownIt('commonmark', {'html': False}).enable('table')
+
+
+def markdown_table_row_lines(text):
+    """真实 Markdown 表格块的行号集合（表头行、分隔行与连续数据行）。
+
+    表格块范围与实际渲染同源：取 commonmark+table 解析（与 export_pdf/
+    verify_pdf 结构层同一 markdown_it 依赖）的 table token 行范围。
+    转义管道列数（``\\|`` 不分列）、引用层级、列表/标题/围栏等块边界
+    由真实解析器裁决，不维护手写近似（S10：表外绝对值改范数必须可检，
+    表内合法 ``\\|`` 转义必须归一）。
+    """
+    rows = set()
+    for token in _TABLE_ROWS_MD.parse(text):
+        if token.type == 'table_open' and token.map:
+            rows.update(range(token.map[0] + 1, token.map[1] + 1))
+    return rows
+
+
 def compare_math_spans(src_spans, doc_spans, src_label='源文', doc_label='译文',
-                       approved_extra_exprs=()):
+                       approved_extra_exprs=(), doc_text=None):
     """按（类型、顺序、原表达式）逐项比较公式。
 
     返回 (diffs, warns)：diffs 非空即硬失败；warns 为回源定性告警
     （如源译一致的历史包装）。doc 侧表达式逐条命中 approved_extra_exprs
     的视为获准译注公式，豁免后参与对账，不掩盖源公式遗漏。
+
+    译文使用真实 Markdown 表格时，表格行内公式的 ``|`` 必须转义为
+    ``\\|``（否则破坏列界）；提供 doc_text 时，译文公式所在行为真实
+    表格行（markdown_table_row_lines 判定）则把 ``\\|`` 归一为 ``|``
+    参与比较——与源 ``[TABLE]`` 行中的未转义管道是同一数学内容。
+    表格外不归一（LaTeX ``\\|`` 是合法范数记号）。
     """
     diffs = []
     warns = []
+    if doc_text is not None:
+        table_rows = markdown_table_row_lines(doc_text)
+        doc_spans = [
+            span if (span.start_line not in table_rows
+                     or '\\|' not in span.expr) else
+            MathSpan(kind=span.kind, expr=span.expr.replace('\\|', '|'),
+                     raw=span.raw, start=span.start, end=span.end,
+                     start_line=span.start_line)
+            for span in doc_spans]
 
     doc_aligned = []
     pending = list(approved_extra_exprs)
@@ -379,9 +432,6 @@ def compare_math_spans(src_spans, doc_spans, src_label='源文', doc_label='译�
                 src.kind == 'inline' or src.expr.strip() != doc.expr.strip()):
             # 行内表达式逐字节比较；块级表达式仅首尾空白属排版差异
             # （内部空白与换行仍逐字节保留）
-            diffs.append('%s 表达式不一致: 源 %s L%d %r vs 译 %s L%d %r'
-                         % (tag, src_label, src.start_line, src.expr,
-                            doc_label, doc.start_line, doc.expr))
             diffs.append('%s 表达式不一致: 源 %s L%d %r vs 译 %s L%d %r'
                          % (tag, src_label, src.start_line, src.expr,
                             doc_label, doc.start_line, doc.expr))
@@ -623,16 +673,85 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+_MD_IMAGE_SYNTAX_RE = re.compile(r'!\[[^\]]*\]\([^)]*\)')
+
+
+def parse_inline_code_spans(line):
+    """按 CommonMark 代码跨度规则解析一行中的行内代码，返回 (内容, 区间)。
+
+    开闭界符均为完整反引号串（前后不与反引号相邻）且等长：一串两个
+    反引号不能闭合单个反引号开启的跨度，`` `a`` `` 是字面文本而非代码。
+    内容首尾同时为空格且非全空白时剥除各一层。未配对的反引号保持字面
+    文本，不构成代码跨度。
+    """
+    spans = []
+    cursor = 0
+    pattern = re.compile(r'`+')
+    while cursor < len(line):
+        match = pattern.search(line, cursor)
+        if match is None:
+            break
+        closer = re.compile(
+            r'(?<!`)`{%d}(?!`)' % len(match.group(0)))
+        close = closer.search(line, match.end())
+        if close is None:
+            cursor = match.end()
+            continue
+        content = line[match.end():close.start()]
+        if content.startswith(' ') and content.endswith(' ') \
+                and content.strip():
+            content = content[1:-1]
+        spans.append((content, (match.start(), close.end())))
+        cursor = close.end()
+    return spans
+
+
+def line_code_spans(line):
+    """单行的真实行内代码跨度：图片引用 alt 文本内的反引号不参与配对。
+
+    判定按几何关系：图片引用跨越跨度起点（部分重叠）说明该跨度由
+    alt 反引号误配对产生，剔除该图片后重解析；图片整体在跨度内则
+    属于代码内容（A28：代码内图片语法不是真实图片出现）。剔除以等长
+    空格替换，列位置不因处理漂移。图片枚举与行内代码事实共用此结果，
+    不并存两套代码跨度口径。
+    """
+    working = line
+    while True:
+        spans = parse_inline_code_spans(working)
+        phantom = None
+        for match in _MD_IMAGE_SYNTAX_RE.finditer(working):
+            for _content, (start, end) in spans:
+                if match.start() < start < match.end():
+                    phantom = match
+                    break
+            if phantom is not None:
+                break
+        if phantom is None:
+            return spans
+        working = (working[:phantom.start()]
+                   + ' ' * (phantom.end() - phantom.start())
+                   + working[phantom.end():])
+
+
+def in_code_span(spans, start, end):
+    """语法区间 [start, end) 是否整体位于某个行内代码跨度内。"""
+    return any(cs <= start and end <= ce for _content, (cs, ce) in spans)
+
+
 _IMAGE_REF_STYLE = re.compile(r'!\[[^\]]*\]\[([^\]]+)\]')
 
 
-def image_references(text):
-    """按文档顺序返回实际图片引用 (line_no, src)。
+def image_reference_spans(text):
+    """按文档顺序返回实际图片引用 (line_no, start, end, src)。
 
-    排除代码围栏内的图片字符串（图片语法示例不计为真实图片）；支持内联
-    `` ![alt](src) `` 与引用式 `` ![alt][label] ``（由 `` [label]: url ``
-    定义解析；未定义的引用 src 记为 None，按缺失处理）。同一行内两种
-    语法混用时按实际字符位置统一排序，出现顺序与源文一致。
+    start/end 是图片语法在内联 `` ![alt](src) `` 或引用式
+    `` ![alt][label] `` 所在行的完整字符区间；排除代码围栏内与行内
+    代码跨度内的图片字符串（代码中的图片语法示例是代码内容，不计为
+    真实图片，03-S3 起由本共享枚举统一排除，各消费方同一口径）。
+    引用式由 `` [label]: url `` 定义解析，未定义的引用 src 记为 None，
+    按缺失处理。同一行内两种语法混用时按字符位置统一排序，出现顺序
+    与源文一致。位置取自语法本身，不从 URL 文本反查（A28：代码字面量
+    与真实引用同名共存时，真实引用位置不得被同名字符串抢占）。
     """
     fenced = fenced_line_numbers(text)
     lines = text.split('\n')
@@ -647,23 +766,39 @@ def image_references(text):
     for line_no, line in enumerate(lines, start=1):
         if line_no in fenced:
             continue
+        code_spans = line_code_spans(line)
         found = []
         for m in _IMAGE.finditer(line):
-            found.append((m.start(), m.group(1)))
+            if in_code_span(code_spans, m.start(), m.end()):
+                continue
+            found.append((m.start(), m.end(), m.group(1)))
         for m in _IMAGE_REF_STYLE.finditer(line):
+            if in_code_span(code_spans, m.start(), m.end()):
+                continue
             label = m.group(1).strip().lower()
-            found.append((m.start(), defs.get(label)))
+            found.append((m.start(), m.end(), defs.get(label)))
         found.sort(key=lambda item: item[0])
-        for _, src in found:
-            refs.append((line_no, src))
+        for start, end, src in found:
+            refs.append((line_no, start, end, src))
     return refs
+
+
+def image_references(text):
+    """按文档顺序返回实际图片引用 (line_no, src)。
+
+    语义同 image_reference_spans（围栏与行内代码排除、引用式定义解析
+    与位置排序），仅省略语法区间；需要语法区间时用 image_reference_spans。
+    """
+    return [(line_no, src)
+            for line_no, _start, _end, src in image_reference_spans(text)]
 
 
 _IMG_MARKER_LINE = re.compile(r'^\s*\[IMG:\s*([^\]]+)\]')
 
 
-def image_marker_refs(text):
-    """按文档顺序返回非代码围栏内 `` [IMG: path] `` 标记 (line_no, path)。
+def image_marker_spans(text):
+    """按文档顺序返回非代码围栏内 `` [IMG: path] `` 标记的完整语法区间
+    (line_no, start, end, path)。
 
     代码示例中的 `` [IMG:…] `` 字符串不是真实图片出现，不计入对账与身份。
     """
@@ -674,8 +809,14 @@ def image_marker_refs(text):
             continue
         m = _IMG_MARKER_LINE.match(line)
         if m:
-            refs.append((line_no, m.group(1).strip()))
+            refs.append((line_no, m.start(), m.end(), m.group(1).strip()))
     return refs
+
+
+def image_marker_refs(text):
+    """按文档顺序返回非代码围栏内 `` [IMG: path] `` 标记 (line_no, path)。"""
+    return [(line_no, path)
+            for line_no, _start, _end, path in image_marker_spans(text)]
 
 
 def image_occurrence_count(text):

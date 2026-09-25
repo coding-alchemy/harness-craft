@@ -1,0 +1,45 @@
+<!doctype html>
+<html><body><article>
+  <h1>1. Rich Blocks Probe</h1>
+  <p>Intro with literal <span class="pre">&lt;span&gt;</span> tag and <code>C# style</code> inline code.</p>
+  <h2>1.1. C# Interop<a class="headerlink" href="#csharp">¶</a></h2>
+  <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><code>print("wrapped")</code></pre></div></div>
+  <div class="highlight-c"><div class="highlight"><pre><span class="linenos">1</span><span class="cp">#include</span> &lt;bar.h&gt;
+<span class="linenos">2</span>int main() { return 10; }
+</pre></div></div>
+  <div class="math">
+\frac{a}{b}
+</div>
+  <div class="admonition note">
+    <p class="admonition-title">Note</p>
+    <p>note text before code</p>
+    <div class="highlight"><pre><span></span><code>note_code()</code></pre></div>
+    <p>note text after code</p>
+  </div>
+  <ul>
+    <li>plain item</li>
+    <li>item with code
+      <div class="highlight"><pre>list_code()</pre></div>
+      <p>item tail</p>
+    </li>
+  </ul>
+  <details>
+    <summary>expand me</summary>
+    <p>details body</p>
+    <div class="highlight"><pre>details_code()</pre></div>
+  </details>
+  <dl>
+    <dt>Term</dt>
+    <dd>definition text
+      <div class="highlight"><pre>dd_code()</pre></div>
+    </dd>
+  </dl>
+  <table>
+    <tr><th>API</th><th>Behavior</th></tr>
+    <tr><td><span class="pre">cuInit</span></td><td>init call<div class="highlight"><pre>table_code()</pre></div></td></tr>
+  </table>
+  <p>A footnote ref<span class="footnote-reference brackets"><a href="#fn1">[1]</a></span>.</p>
+  <dl class="footnote brackets">
+    <dt class="label" id="fn1">[1]</dt><dd>footnote body text</dd>
+  </dl>
+</article></body></html>

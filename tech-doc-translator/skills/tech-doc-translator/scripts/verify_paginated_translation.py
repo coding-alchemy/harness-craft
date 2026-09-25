@@ -45,7 +45,7 @@ _RESIDUAL_MARKERS = [
 ]
 
 
-def check_headings(merged_path, src_paths):
+def check_headings(merged_text, src_texts):
     """按 (层级, 官方原题) 有序核对标题。
 
     本路线的已批准标题装配：章节头 H1 由头部文件提供（跳过逐项对照），
@@ -54,7 +54,7 @@ def check_headings(merged_path, src_paths):
     fails = 0
     msgs = []
 
-    merged = heading_entries(open(merged_path, encoding='utf-8').read())
+    merged = heading_entries(merged_text)
     h1_count = sum(1 for _, lvl, _ in merged if lvl == 1)
 
     if h1_count != 1:
@@ -64,8 +64,8 @@ def check_headings(merged_path, src_paths):
         msgs.append('H1 唯一性: 1 个 PASS')
 
     src_entries = []
-    for p in src_paths:
-        src_entries.extend(heading_entries(open(p, encoding='utf-8').read()))
+    for text in src_texts:
+        src_entries.extend(heading_entries(text))
 
     diffs = compare_headings(src_entries, merged, '源文拼接', '合并产物',
                              level_shift=1, doc_skip_head=1)
@@ -81,10 +81,9 @@ def check_headings(merged_path, src_paths):
     return fails, msgs
 
 
-def check_fences(path):
+def check_fences(text):
     fails = 0
     msgs = []
-    text = open(path, encoding='utf-8').read()
     fences = scan_code_fences(text)
     if not fences.balanced:
         fails += 1
@@ -95,12 +94,10 @@ def check_fences(path):
     return fails, msgs
 
 
-def check_code_blocks(merged_path, src_paths):
+def check_code_blocks(merged_text, src_text, src_label, merged_label):
     """合并产物代码围栏与拼接源逐块核对（开启行/语言/正文/关闭行）。"""
     fails = 0
     msgs = []
-    merged_text = open(merged_path, encoding='utf-8').read()
-    src_text = ''.join(open(p, encoding='utf-8').read() for p in src_paths)
     src_scan = scan_code_fences(src_text)
     doc_scan = scan_code_fences(merged_text)
     if not src_scan.balanced:
@@ -111,10 +108,8 @@ def check_code_blocks(merged_path, src_paths):
         fails += 1
         msgs.append('代码围栏: 第 %d 行开启的代码块未闭合 FAIL'
                     % doc_scan.unclosed_line)
-    src_label = '源文拼接(%s)' % '+'.join(
-        os.path.basename(p) for p in src_paths)
     for diff in compare_code_fences(src_scan.blocks, doc_scan.blocks,
-                                    src_label, os.path.basename(merged_path)):
+                                    src_label, merged_label):
         fails += 1
         msgs.append('代码逐块核对: %s FAIL' % diff)
     if fails == 0:
@@ -122,19 +117,16 @@ def check_code_blocks(merged_path, src_paths):
     return fails, msgs
 
 
-def check_math(merged_path, src_paths, approved_extra_math):
+def check_math(merged_text, src_text, approved_extra_math,
+               src_label, merged_label):
     """合并产物公式与拼接源逐项核对（类型/顺序/原表达式）。"""
     fails = 0
     msgs = []
-    merged_text = open(merged_path, encoding='utf-8').read()
-    src_text = ''.join(open(p, encoding='utf-8').read() for p in src_paths)
     src_math = scan_math_spans(src_text)
     doc_math = scan_math_spans(merged_text)
-    src_label = '源文拼接(%s)' % '+'.join(
-        os.path.basename(p) for p in src_paths)
     math_diffs, math_warns = compare_math_spans(
-        src_math, doc_math, src_label, os.path.basename(merged_path),
-        approved_extra_exprs=approved_extra_math)
+        src_math, doc_math, src_label, merged_label,
+        approved_extra_exprs=approved_extra_math, doc_text=merged_text)
     for diff in math_diffs:
         fails += 1
         msgs.append('公式逐项核对: %s FAIL' % diff)
@@ -144,12 +136,10 @@ def check_math(merged_path, src_paths, approved_extra_math):
     return fails, msgs
 
 
-def check_footnotes(merged_path, src_paths):
+def check_footnotes(merged_text, src_text):
     """脚注以源引用/定义关系为基准核对（支持命名标签）。"""
     fails = 0
     msgs = []
-    merged_text = open(merged_path, encoding='utf-8').read()
-    src_text = ''.join(open(p, encoding='utf-8').read() for p in src_paths)
     diffs, warns = footnote_diffs(src_text, merged_text, '源文拼接', '合并产物')
     for diff in diffs:
         fails += 1
@@ -160,27 +150,27 @@ def check_footnotes(merged_path, src_paths):
     return fails, msgs
 
 
-def check_images(merged_path, src_paths, delivery_root, image_digests):
+def check_images(merged_text, merged_dir, src_texts, src_dirs,
+                 delivery_root, image_digests):
     """合并产物图片核验：源译出现次数对账（常开）+ 离线引用/类型/来源身份。
 
     完整通过必须建立每次出现的来源身份：优先 --image-map，其次按各源文件
     目录从可靠的当前源资源推导；两者都不可用而译文含图时不判定完整通过。
+    merged_dir 为资源解析基点（最终 Markdown 目录），候选文本可来自
+    工作区外临时目录。
     """
     fails = 0
     msgs = []
-    text = open(merged_path, encoding='utf-8').read()
     src_count = 0
     derived = []
-    for p in src_paths:
-        src_text = open(p, encoding='utf-8').read()
+    for src_text, src_dir in zip(src_texts, src_dirs):
         src_count += image_occurrence_count(src_text)
-        digests = source_occurrence_digests(
-            src_text, os.path.dirname(os.path.abspath(p)))
+        digests = source_occurrence_digests(src_text, src_dir)
         if digests is None:
             derived = None
         elif derived is not None:
             derived.extend(digests)
-    doc_count = len(image_references(text))
+    doc_count = len(image_references(merged_text))
     if doc_count < src_count:
         fails += 1
         msgs.append('图片对账: 源出现 %d 次但译文仅 %d 次 FAIL（漏图）'
@@ -196,8 +186,7 @@ def check_images(merged_path, src_paths, delivery_root, image_digests):
         identity = derived
         identity_basis = '当前源资源'
     image_fails = image_occurrence_fails(
-        text, os.path.dirname(os.path.abspath(merged_path)), delivery_root,
-        expected_digests=identity)
+        merged_text, merged_dir, delivery_root, expected_digests=identity)
     if image_fails:
         fails += len(image_fails)
         msgs.extend('图片核验: %s FAIL' % m for m in image_fails)
@@ -211,12 +200,10 @@ def check_images(merged_path, src_paths, delivery_root, image_digests):
     return fails, msgs
 
 
-def check_syntax(merged_path, src_paths, strong_tokens):
+def check_syntax(merged_text, src_text, strong_tokens):
     """项目强 token 多重集差异（未配置时明示未检查）。"""
     fails = 0
     msgs = []
-    merged_text = open(merged_path, encoding='utf-8').read()
-    src_text = ''.join(open(p, encoding='utf-8').read() for p in src_paths)
     diffs, warns = strong_token_report(src_text, merged_text, strong_tokens,
                                        '源文拼接', '合并产物')
     if diffs is None:
@@ -231,10 +218,9 @@ def check_syntax(merged_path, src_paths, strong_tokens):
     return fails, msgs
 
 
-def check_residual(merged_path):
+def check_residual(text):
     fails = 0
     msgs = []
-    text = open(merged_path, encoding='utf-8').read()
     for marker in residual_markers(text, _RESIDUAL_MARKERS):
         fails += 1
         if marker in _RESIDUAL_MARKERS:
@@ -246,10 +232,8 @@ def check_residual(merged_path):
     return fails, msgs
 
 
-def coverage_warnings(merged_path, src_paths):
+def coverage_warnings(merged_text, src_text):
     msgs = []
-    merged_text = open(merged_path, encoding='utf-8').read()
-    src_text = ''.join(open(p, encoding='utf-8').read() for p in src_paths)
     pairs = [
         ('代码围栏', src_text.count('```') // 2, merged_text.count('```') // 2),
         ('提示框', src_text.count('ADMONITION'),
@@ -264,31 +248,34 @@ def coverage_warnings(merged_path, src_paths):
     return msgs
 
 
-def main():
-    argv, approved_extra_math = extract_approved_extra_math(sys.argv[1:])
-    argv, strong_tokens = extract_strong_tokens(argv)
-    argv, image_map, delivery_root = extract_image_options(argv)
-    if len(argv) < 2:
-        sys.exit(__doc__)
+def run_checks(merged_text, src_texts, src_dirs, *, merged_dir,
+               merged_label, src_label, delivery_root=None,
+               image_digests=None, strong_tokens=(),
+               approved_extra_math=()):
+    """分页路线检查核心：接收候选文本与实际目标目录，返回 (失败数, 输出行)。
 
-    merged_path = argv[0]
-    src_paths = argv[1:]
-    image_digests = load_image_digests(image_map) if image_map else None
-
+    merged_text 可来自工作区外临时候选（草稿预检）；merged_dir 必须是
+    最终 Markdown 目录，资源按最终目标路径定位。src_label 为既有的
+    “源文拼接(文件名+文件名)”标签，由调用方按实际源文件名构造。
+    输出行与既有 CLI 一致。
+    """
+    src_text = ''.join(src_texts)
     total_fail = 0
     all_msgs = []
-
     for fn, func, args in [
-        ('标题与顺序', check_headings, (merged_path, src_paths)),
-        ('代码围栏', check_fences, (merged_path,)),
-        ('代码逐块核对', check_code_blocks, (merged_path, src_paths)),
+        ('标题与顺序', check_headings, (merged_text, src_texts)),
+        ('代码围栏', check_fences, (merged_text,)),
+        ('代码逐块核对', check_code_blocks,
+         (merged_text, src_text, src_label, merged_label)),
         ('公式逐项核对', check_math,
-         (merged_path, src_paths, approved_extra_math)),
-        ('脚注核对', check_footnotes, (merged_path, src_paths)),
+         (merged_text, src_text, approved_extra_math, src_label,
+          merged_label)),
+        ('脚注核对', check_footnotes, (merged_text, src_text)),
         ('图片核验', check_images,
-         (merged_path, src_paths, delivery_root, image_digests)),
-        ('强 token', check_syntax, (merged_path, src_paths, strong_tokens)),
-        ('残留解析标记', check_residual, (merged_path,)),
+         (merged_text, merged_dir, src_texts, src_dirs, delivery_root,
+          image_digests)),
+        ('强 token', check_syntax, (merged_text, src_text, strong_tokens)),
+        ('残留解析标记', check_residual, (merged_text,)),
     ]:
         f, msgs = func(*args)
         total_fail += f
@@ -296,10 +283,55 @@ def main():
         all_msgs.extend(msgs)
 
     all_msgs.append('## 覆盖率警告（信息性）')
-    all_msgs.extend(coverage_warnings(merged_path, src_paths))
+    all_msgs.extend(coverage_warnings(merged_text, src_text))
+    all_msgs.append('')
+    all_msgs.append('结果: %s'
+                    % ('ALL PASS' if total_fail == 0
+                       else '%d 项 FAIL' % total_fail))
+    return total_fail, all_msgs
+
+
+def parse_args(argv):
+    """解析既有 CLI 参数，返回语义结构（本 CLI 的单一解释入口）。"""
+    argv, approved_extra_math = extract_approved_extra_math(argv)
+    argv, strong_tokens = extract_strong_tokens(argv)
+    argv, image_map, delivery_root = extract_image_options(argv)
+    if len(argv) < 2:
+        sys.exit(__doc__)
+    return {
+        'merged_path': argv[0],
+        'src_paths': list(argv[1:]),
+        'strong_tokens': strong_tokens,
+        'approved_extra_math': approved_extra_math,
+        'image_map': image_map,
+        'delivery_root': delivery_root,
+    }
+
+
+def main():
+    parsed = parse_args(sys.argv[1:])
+    merged_path = parsed['merged_path']
+    src_paths = parsed['src_paths']
+    strong_tokens = parsed['strong_tokens']
+    approved_extra_math = parsed['approved_extra_math']
+    delivery_root = parsed['delivery_root']
+    image_map = parsed['image_map']
+    image_digests = load_image_digests(image_map) if image_map else None
+
+    merged_text = open(merged_path, encoding='utf-8').read()
+    src_texts = [open(p, encoding='utf-8').read() for p in src_paths]
+    src_dirs = [os.path.dirname(os.path.abspath(p)) for p in src_paths]
+    total_fail, all_msgs = run_checks(
+        merged_text, src_texts, src_dirs,
+        merged_dir=os.path.dirname(os.path.abspath(merged_path)),
+        merged_label=os.path.basename(merged_path),
+        src_label='源文拼接(%s)' % '+'.join(
+            os.path.basename(p) for p in src_paths),
+        delivery_root=delivery_root, image_digests=image_digests,
+        strong_tokens=strong_tokens,
+        approved_extra_math=approved_extra_math)
 
     print('\n'.join(all_msgs))
-    print('\n结果: %s' % ('ALL PASS' if total_fail == 0 else '%d 项 FAIL' % total_fail))
     sys.exit(0 if total_fail == 0 else 1)
 
 

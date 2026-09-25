@@ -126,7 +126,8 @@ def _candidate_check_failures(candidate_text, source_text, out_dir,
         fails.append('代码逐块核对: %s' % diff)
     math_diffs, _ = compare_math_spans(
         scan_math_spans(source_text), scan_math_spans(candidate_text),
-        '源文', label, approved_extra_exprs=approved_extra_math)
+        '源文', label, approved_extra_exprs=approved_extra_math,
+        doc_text=candidate_text)
     fails.extend('公式逐项核对: %s' % d for d in math_diffs)
     fn_diffs, _ = footnote_diffs(source_text, candidate_text, '源文', label)
     fails.extend(fn_diffs)
