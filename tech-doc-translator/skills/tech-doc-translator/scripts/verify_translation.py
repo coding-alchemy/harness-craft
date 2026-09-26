@@ -224,7 +224,7 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
 
 
 def parse_args(argv):
-    """解析既有 CLI 参数，返回语义结构（本 CLI 的单一解释入口）。
+    """解析既有 CLI 参数，返回语义结构（verify_delivery 复用同一解释）。
 
     doc_path/src_path 为路径；official 为官方标题字面值；--strong-token、
     --approved-extra-math、--image-map、--delivery-root、--fragment 按真实

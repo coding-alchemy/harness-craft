@@ -143,6 +143,19 @@ class TableStructureError(ValueError):
     """表格含无法可靠表示的跨行/跨列结构；必须定位并阻断分派。"""
 
 
+def _img_node(soup, img):
+    """源节点定位：按对象身份取 find_all 文档序（§9.6.1）。
+
+    Tag 的 == 按内容比较，完全相同的图片标签经 list.index 会误中首项；
+    消费端 _source_reconcile 以 id() 对象身份编号，两端命名空间语义
+    必须一致。img 不属于该 soup 时显式报错，不静默降级。
+    """
+    for index, candidate in enumerate(soup.find_all('img')):
+        if candidate is img:
+            return 'img[%d]' % index
+    raise ValueError('img 节点不属于给定 soup，无法定位源节点')
+
+
 def image_display_width(img, soup, snapshot_dir=None):
     """提取 img 节点的显示宽度，返回 entry 字典（不含出现序号与路径）。
 
@@ -153,7 +166,7 @@ def image_display_width(img, soup, snapshot_dir=None):
     未知、资源缺失或约束冲突均单列未确定原因。返回的
     basis/undetermined_reason 可回查到源节点定位。
     """
-    node = 'img[%d]' % list(soup.find_all('img')).index(img) if soup is not None else 'img[?]'
+    node = _img_node(soup, img) if soup is not None else 'img[?]'
     style = img.get('style') or ''
     match = _INLINE_WIDTH_RE.search(style)
     if match:

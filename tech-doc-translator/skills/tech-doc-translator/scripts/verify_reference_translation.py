@@ -304,7 +304,7 @@ def verify(doc_text, src_text, strong_tokens, approved_extra_math=(),
 
 
 def parse_args(argv):
-    """解析既有 CLI 参数，返回语义结构（本 CLI 的单一解释入口）。"""
+    """解析既有 CLI 参数，返回语义结构（verify_delivery 复用同一解释）。"""
     argv, approved_extra_math = extract_approved_extra_math(argv)
     argv, flag_tokens = extract_strong_tokens(argv)
     argv, image_map, delivery_root = extract_image_options(argv)
