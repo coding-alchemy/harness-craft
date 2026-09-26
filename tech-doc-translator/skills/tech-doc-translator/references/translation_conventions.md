@@ -65,6 +65,8 @@
 - 校验脚本也是待验证的软件：遇到 FAIL 先定位是产物问题还是口径问题；修改脚本后用已知正确产物回归，再按完整输入口径验证新产物。
 - 任何内容、术语、合并或校验脚本修复都构成新的出错面；修复后重跑受影响检查，最终合并产物必须完整重验。
 
-## 映射回补
+## 交付完成检查与映射回补
 
-- 存量译文恢复图片尺寸：`rebuild_images_display.py --manifest <清单> --output <交付映射>`（清单声明范围与同版本来源；只核对图片出现、尺寸与独立身份，不做全文对账，契约见 `<SKILL目录>/references/images_display.md`）。交付级映射固定写入 `export/images_display.json`（导出与核验两侧命令显式传入 `--images-display export/images_display.json`，回补 `--output` 指向同一位置）。
+- 交付根目录布局、两份可选用户说明与映射迁移规则见 `<SKILL目录>/references/pdf_export.md`；交付级映射固定写入 `export/images_display.json`（导出与核验两侧命令显式传入 `--images-display export/images_display.json`，回补 `--output` 指向同一位置）。
+- 存量译文恢复图片尺寸：`rebuild_images_display.py --manifest <清单> --output <交付映射>`（清单声明范围与同版本来源；只核对图片出现、尺寸与独立身份，不做全文对账，契约见 `<SKILL目录>/references/images_display.md`）。
+- 宣称交付完成前运行 `verify_delivery.py --record <记录> --evidence-dir <持久目录>`：目录允许清单、身份、核验复跑与证据索引统一核验（记录参数按各工具真实 CLI 解释，机器证据取自本次核验计算，不依赖预存核验 JSON；报告写入独立批次后原子替换索引）；人工视觉复核闭合才允许通过。

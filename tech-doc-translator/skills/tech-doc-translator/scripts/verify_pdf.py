@@ -3311,7 +3311,8 @@ def check_outline(chapters, pdf, heading_pages, failures):
                              "message": "大纲目标页与标题实际页不一致：" + heading["text"]})
 
 
-def main(argv=None):
+def parse_args(argv=None):
+    """解析核验 CLI 参数（交付检查复用同一解释，参数单源）。"""
     parser = argparse.ArgumentParser(
         description="独立核验导出 PDF 与原始输入的一致性（机器层）。"
     )
@@ -3348,18 +3349,34 @@ def main(argv=None):
         help="与导出一致的只读出处区间映射；导出使用时核验必须传入同一文件",
     )
     parser.add_argument("inputs", nargs="+", help="有序 Markdown 输入")
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
 
+
+def run_verification(args):
+    """核验计算（不落盘、不打印）：返回 (机器是否通过, 核验报告 dict)。
+
+    CLI 与交付入口共用同一计算：交付检查直接取得本次结果作为机器证据，
+    不读取或比较任何预存核验 JSON。导出报告（export_report.json）与其中
+    绑定的政策仍是必需输入；缺失或不可解析按 export-evidence-missing
+    失败，不回落到任何旧报告。
+    """
     work_dir = Path(args.work_dir).expanduser()
     report_path = work_dir / REPORT_NAME
-    if not report_path.is_file():
-        print("FAIL: 找不到导出证据 %s" % report_path, file=sys.stderr)
-        return 1
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-
+    report = None
+    if report_path.is_file():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except ValueError:
+            report = None
+    report_usable = isinstance(report, dict)
+    if not report_usable:
+        report = {}
     failures = []
     relaxed = []
     reviews = []
+    if not report_usable:
+        failures.append({"code": "export-evidence-missing",
+                         "message": "导出证据缺失或不可解析: %s" % report_path})
 
     chapters = reparse_inputs(
         args.inputs, failures, args.unlink_target, args.toc_sections
@@ -3477,9 +3494,20 @@ def main(argv=None):
             {"input": str(c.path), "links": c.unlinked_links} for c in chapters
         ],
     }
+    return machine_pass, verify_report
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    work_dir = Path(args.work_dir).expanduser()
+
+    machine_pass, verify_report = run_verification(args)
     (work_dir / VERIFY_NAME).write_text(
         json.dumps(verify_report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    failures = verify_report["failures"]
+    relaxed = verify_report["relaxed_matches"]
+    reviews = verify_report["reviews"]
 
     if not machine_pass:
         print("FAIL: 核验未通过（%d 项），详见 %s" % (len(failures), work_dir / VERIFY_NAME), file=sys.stderr)
@@ -3492,7 +3520,7 @@ def main(argv=None):
         return 1
     print(
         "机器检查通过，成品待视觉复核：%s（核验证据 %s）"
-        % (pdf_path, work_dir / VERIFY_NAME)
+        % (Path(args.pdf).expanduser(), work_dir / VERIFY_NAME)
     )
     for item in relaxed:
         print(

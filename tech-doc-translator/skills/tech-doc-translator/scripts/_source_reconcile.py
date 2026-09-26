@@ -180,6 +180,7 @@ class _SourceFacts:
                     or soup.find('body'))
         self.root = root
         self.family = family
+        self._soup = soup
         # 标题行内序列化与渲染端共用同一实现（S02），源事实仍从原始
         # HTML 的独立 DOM 提取，不接触渲染器输出
         self._inline = HtmlFidelity()
@@ -193,6 +194,22 @@ class _SourceFacts:
             for ordinal, idx in enumerate(
                 i for i, node in enumerate(self._flat)
                 if isinstance(node, Tag) and re.fullmatch(r'h[1-6]', node.name))}
+        if root is None:
+            # 选区根缺失：事实流为空，由调用方（snapshot_image_stream/
+            # snapshot_image_facts）按 None 合同处理，不抛属性异常。
+            self.headings = []
+            self.code = []
+            self.math = []
+            self.inline_code = []
+            self.images = []
+            self.image_facts = []
+            self.footnote_refs = []
+            self.footnote_defs = []
+            self.admonitions = []
+            self.table_records = []
+            self.list_records = []
+            self.terms = []
+            return
         self.headings = self._headings()
         self.code = self._code()
         self.math = self._math()
@@ -327,16 +344,35 @@ class _SourceFacts:
 
     def _images(self):
         refs = []
+        self.image_facts = []
+        # 源节点序号与解析期映射的 source_node 同一命名空间：全文 img 中
+        # 排除 pre 内图片后的文档序（HtmlFidelity 解析时 pre 被占位保护，
+        # 其 find_all('img') 同样不含 pre 内图片）。
+        selectable = [img for img in self._soup.find_all('img')
+                      if not _in_pre(img)]
+        ordinals = {id(img): index
+                    for index, img in enumerate(selectable)}
         for img in self.root.find_all('img'):
             if _in_pre(img):
                 continue
-            src = self._image_src(img)
-            if not src:
+            source_ref = self._image_src(img)
+            if not source_ref:
                 continue
+            src = source_ref
             if self.family == 'reference':
                 src = 'images/%s' % src.rsplit('/', 1)[-1]
             refs.append((self._section_of(img), self._index[id(img)], 0,
                          'image', src))
+            # 结构化事实保留原始源引用（reference 的 images/<basename>
+            # 改写只用于交付匹配/对账投影，不覆盖源路径）与源节点，
+            # 供交付身份按声明快照目录定位资源（§9.3）。
+            self.image_facts.append({
+                'section': self._section_of(img),
+                'order': self._index[id(img)],
+                'node': 'img[%d]' % ordinals[id(img)],
+                'src': src,
+                'source_ref': source_ref,
+            })
         return refs
 
     def _footnote_refs(self):
@@ -1108,18 +1144,33 @@ class _MarkdownFacts:
         return pairs
 
 
-def snapshot_image_stream(raw_html, family, section_id=None):
-    """从原始快照独立提取图片出现流，返回按文档顺序的引用列表。
+def snapshot_image_facts(raw_html, family, section_id=None):
+    """从原始快照独立提取结构化图片事实，按文档顺序返回字典列表。
 
     与渲染/尺寸提取不同路径（全新 BeautifulSoup、无 pre 保护替换），
-    家族口径一致：api 只取亮版、reference 改写为 images/<basename>、
-    排除 pre 内图片。供回补入口独立核对图片出现，不能由尺寸提取结果
-    自证完整。快照未找到选区根时返回 None。
+    家族口径一致：api 只取亮版、排除 pre 内图片。每条事实保留：
+    source_ref（原始源引用，相对声明快照目录解析；reference 的
+    images/<basename> 改写不覆盖它）、src（投影引用，与解析结果对账
+    口径一致）、node（源节点，与解析期映射 source_node 同一命名空间）、
+    section/order（章节与文档序）。快照未找到选区根时返回 None。
     """
     facts = _SourceFacts(raw_html, family, section_id)
     if facts.root is None:
         return None
-    return [src for _sec, _idx, _sub, _cat, src in facts.images]
+    return list(facts.image_facts)
+
+
+def snapshot_image_stream(raw_html, family, section_id=None):
+    """从原始快照独立提取图片出现流，返回按文档顺序的引用列表。
+
+    由 snapshot_image_facts 的同一事实投影（reference 改写为
+    images/<basename>），供回补入口独立核对图片出现，不能由尺寸提取
+    结果自证完整。快照未找到选区根时返回 None。
+    """
+    facts = snapshot_image_facts(raw_html, family, section_id)
+    if facts is None:
+        return None
+    return [fact['src'] for fact in facts]
 
 
 def _section_ordered_diffs(category, src_tagged, md_tagged, src_label,
