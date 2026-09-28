@@ -6,7 +6,8 @@
 以原始输入重建预期，与导出证据及最终 PDF 相互核对：输入摘要保护、逐章
 标题顺序、文本/代码覆盖、公式机器检查、内外链接目标与大纲。核验器独立
 重读输入，不信任导出器统计；原始扫描与解析结果相互交叉核对。机器检查
-通过只表示机器层通过，成品仍需 Agent 视觉复核后才能发布。
+通过只表示机器层通过，成品仍需 Agent 视觉复核后才能发布。显式
+--visual-aid 只追加逐页渲染辅助统计（定位线索），不构成视觉复核。
 """
 import argparse
 import json
@@ -46,6 +47,160 @@ def normalize(text):
     并做 NFKC 归一（防御个别字体把汉字映射到兼容码位）。"""
     cleaned = re.sub(r"[\s\uFE0E\uFE0F]+", "", text or "")
     return unicodedata.normalize("NFKC", cleaned)
+
+
+# ---------------------------------------------------------------------------
+# 无图像输入时的逐页辅助检查（PDF 源翻译需求 R8/A8，设计 §4.8）
+# ---------------------------------------------------------------------------
+# 统计只提供定位线索：渲染成功与否、墨迹覆盖率、图片对象与链接注解
+# 目标都不能证明无缺字、重叠、局部裁切或跨页损伤，也不构成视觉复核。
+# 覆盖率口径（渲染像素中 RGB 任一分量低于阈值的像素占比）与渲染 dpi
+# 必须随报告记录；覆盖率阈值只用于标记疑似空白页，不套用任何项目的
+# 比例范围作通用合格阈值。
+VISUAL_AID_DEFAULT_DPI = 96
+VISUAL_AID_DEFAULT_BLANK_THRESHOLD = 0.001
+VISUAL_AID_INK_CHANNEL_MAX = 250
+VISUAL_AID_DISCLAIMER = (
+    "逐页辅助统计仅作定位线索：不构成无缺字、重叠、局部裁切或跨页损伤的"
+    "证明，也不构成视觉复核；成品发布前仍需真实目检全部页面、代码/表格/"
+    "图形与跨页接缝并实际点击代表性链接，且复核须绑定当前成品摘要。"
+)
+
+
+def _load_aid_renderer():
+    """按需探测辅助渲染依赖（D5）：未安装返回 None，不自动安装。"""
+    try:
+        import pymupdf
+        return pymupdf
+    except ImportError:
+        try:
+            import fitz
+            return fitz
+        except ImportError:
+            return None
+
+
+def _aid_renderer_version(renderer):
+    version = getattr(renderer, "VersionBind", None)
+    return "PyMuPDF %s" % version if version else "PyMuPDF"
+
+
+def _render_page_ink_coverage(page, renderer, dpi):
+    """渲染单页并返回墨迹覆盖率（RGB 任一分量 < 阈值 的像素占比）。"""
+    zoom = dpi / 72.0
+    pixmap = page.get_pixmap(matrix=renderer.Matrix(zoom, zoom))
+    data = pixmap.samples
+    step = pixmap.n
+    ink = 0
+    total = pixmap.width * pixmap.height
+    if total == 0 or not data:
+        return None
+    limit = VISUAL_AID_INK_CHANNEL_MAX
+    for offset in range(0, len(data), step):
+        if (data[offset] < limit or data[offset + 1] < limit
+                or data[offset + 2] < limit):
+            ink += 1
+    return ink / total
+
+
+def _page_link_targets(page, renderer):
+    """枚举页面链接注解目标：内部跳转页码（1 基）、外部 URI 或命名目标。"""
+    targets = []
+    for link in page.get_links():
+        kind = link.get("kind")
+        if kind == renderer.LINK_GOTO:
+            targets.append(
+                {"type": "internal",
+                 "page": (link.get("page") or 0) + 1})
+        elif kind == renderer.LINK_URI:
+            targets.append({"type": "external", "uri": link.get("uri")})
+        elif kind == renderer.LINK_NAMED:
+            targets.append({"type": "named", "name": link.get("name")})
+        else:
+            targets.append(
+                {"type": "other", "kind": str(kind)})
+    return targets
+
+
+def collect_visual_aid(pdf_path, dpi=VISUAL_AID_DEFAULT_DPI,
+                       blank_threshold=VISUAL_AID_DEFAULT_BLANK_THRESHOLD):
+    """逐页渲染辅助统计（R8/§4.8）：渲染结果、墨迹覆盖率、图片对象数与
+    链接注解目标。
+
+    只返回定位线索，不输出任何视觉复核结论。渲染依赖按需探测，缺失时
+    在报告中记录检查缺口（dependency_error）；单页渲染失败该页
+    render_ok=False 并记录缺口，其余页照常统计。
+    """
+    report = {
+        "purpose": "无图像输入时的逐页辅助统计（仅定位线索，不构成视觉复核）",
+        "disclaimer": VISUAL_AID_DISCLAIMER,
+        "dpi": dpi,
+        "blank_threshold": blank_threshold,
+        "ink_definition": (
+            "墨迹覆盖率 = 渲染像素中 RGB 任一分量 < %d 的像素占比"
+            % VISUAL_AID_INK_CHANNEL_MAX
+        ),
+        "pages": [],
+    }
+    renderer = _load_aid_renderer()
+    if renderer is None:
+        report["dependency_error"] = (
+            "辅助渲染依赖 PyMuPDF 不可用（requirements-pdf-source.txt）；"
+            "不自动安装，本次辅助检查未完成，缺口交人工视觉复核。"
+        )
+        return report
+    report["renderer"] = _aid_renderer_version(renderer)
+    try:
+        document = renderer.open(str(pdf_path))
+    except Exception as exc:  # noqa: BLE001  无法打开按检查缺口报告
+        report["dependency_error"] = (
+            "辅助渲染无法打开 PDF：%s；本次辅助检查未完成，缺口交人工"
+            "视觉复核。" % exc
+        )
+        return report
+    try:
+        for index in range(document.page_count):
+            page = document.load_page(index)
+            entry = {
+                "page": index + 1,
+                "render_ok": True,
+                "ink_coverage": None,
+                "image_objects": None,
+                "link_targets": [],
+                "blank_suspect": False,
+            }
+            try:
+                entry["image_objects"] = len(page.get_images())
+            except Exception as exc:  # noqa: BLE001  对象枚举失败按缺口记录
+                entry["image_objects"] = None
+                entry["objects_gap"] = "图片对象枚举失败：%s" % exc
+            try:
+                entry["link_targets"] = _page_link_targets(page, renderer)
+            except Exception as exc:  # noqa: BLE001
+                entry["link_targets"] = []
+                entry["links_gap"] = "链接注解枚举失败：%s" % exc
+            try:
+                entry["ink_coverage"] = _render_page_ink_coverage(
+                    page, renderer, dpi)
+            except Exception as exc:  # noqa: BLE001  渲染失败按缺口记录
+                entry["render_ok"] = False
+                entry["render_gap"] = "渲染失败：%s" % exc
+            entry["blank_suspect"] = bool(
+                entry["render_ok"]
+                and entry["ink_coverage"] is not None
+                and entry["ink_coverage"] < blank_threshold
+            )
+            report["pages"].append(entry)
+    finally:
+        document.close()
+    report["summary"] = {
+        "pages": len(report["pages"]),
+        "render_failed": [entry["page"] for entry in report["pages"]
+                          if not entry["render_ok"]],
+        "blank_suspects": [entry["page"] for entry in report["pages"]
+                           if entry["blank_suspect"]],
+    }
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -3348,6 +3503,27 @@ def parse_args(argv=None):
         metavar="PATH",
         help="与导出一致的只读出处区间映射；导出使用时核验必须传入同一文件",
     )
+    parser.add_argument(
+        "--visual-aid",
+        action="store_true",
+        help="无图像输入时逐页渲染辅助统计（仅定位线索，不构成视觉复核；"
+             "渲染依赖 PyMuPDF 按需探测，不自动安装）",
+    )
+    parser.add_argument(
+        "--visual-aid-dpi",
+        type=int,
+        default=VISUAL_AID_DEFAULT_DPI,
+        metavar="DPI",
+        help="辅助渲染分辨率（默认 %(default)s，写入报告）",
+    )
+    parser.add_argument(
+        "--visual-aid-blank-threshold",
+        type=float,
+        default=VISUAL_AID_DEFAULT_BLANK_THRESHOLD,
+        metavar="RATIO",
+        help="疑似空白页墨迹覆盖率阈值（默认 %(default)s，仅定位线索，"
+             "写入报告）",
+    )
     parser.add_argument("inputs", nargs="+", help="有序 Markdown 输入")
     return parser.parse_args(argv)
 
@@ -3494,6 +3670,34 @@ def run_verification(args):
             {"input": str(c.path), "links": c.unlinked_links} for c in chapters
         ],
     }
+    # 辅助检查（R8/§4.8）：显式选项启用时才计算；只追加定位线索，不影响
+    # 机器通过与失败判定，也不写入任何视觉复核结论。渲染失败页与依赖
+    # 缺口进入 reviews 作为待处置缺口（无真实视觉复核时维持候选状态）。
+    if getattr(args, "visual_aid", False):
+        aid = collect_visual_aid(
+            pdf_path,
+            getattr(args, "visual_aid_dpi", VISUAL_AID_DEFAULT_DPI),
+            getattr(args, "visual_aid_blank_threshold",
+                    VISUAL_AID_DEFAULT_BLANK_THRESHOLD))
+        verify_report["visual_aid"] = aid
+        for entry in aid.get("pages", []):
+            if not entry.get("render_ok"):
+                reviews.append(
+                    {
+                        "code": "visual-aid-render-failed",
+                        "message": "辅助渲染第 %d 页失败（%s）：该页辅助统计"
+                                   "缺失，缺口交人工视觉复核"
+                                   % (entry["page"],
+                                      entry.get("render_gap", "未知原因")),
+                    }
+                )
+        if aid.get("dependency_error"):
+            reviews.append(
+                {
+                    "code": "visual-aid-unavailable",
+                    "message": aid["dependency_error"],
+                }
+            )
     return machine_pass, verify_report
 
 
@@ -3532,6 +3736,23 @@ def main(argv=None):
             "  待处置 [%s] %s:%s %s"
             % (review["code"], review.get("input", ""), review.get("line", ""), review["message"])
         )
+    aid = verify_report.get("visual_aid")
+    if aid is not None:
+        print("逐页辅助统计（仅定位线索，不构成视觉复核）：")
+        for entry in aid.get("pages", []):
+            if entry.get("render_ok"):
+                print(
+                    "  第 %d 页：墨迹覆盖率 %.4f，图片对象 %s，链接目标 %d 个%s"
+                    % (entry["page"], entry.get("ink_coverage") or 0.0,
+                       entry.get("image_objects"),
+                       len(entry.get("link_targets") or []),
+                       "（疑似空白页）" if entry.get("blank_suspect") else "")
+                )
+            else:
+                print("  第 %d 页：渲染失败（%s）" % (entry["page"], entry.get("render_gap")))
+        if aid.get("dependency_error"):
+            print("  %s" % aid["dependency_error"])
+        print(aid["disclaimer"])
     return 0
 
 

@@ -36,7 +36,10 @@ h4 { font-size: 11pt; }
 h5 { font-size: 10.5pt; }
 h6 { font-size: 10pt; color: #333; }
 
-p { margin: 0.45em 0; orphans: 2; widows: 2; }
+p { margin: 0.45em 0; orphans: 2; widows: 2;
+    /* 长不可断 token（参考文献 URL、长标识符等）在词内折行：不折行的
+     * 溢出会触发打印时整页缩放，破坏版心与图片宽度对账 */
+    overflow-wrap: break-word; }
 
 /* 图/表与其紧邻的图题、表题或引导标签保持在同一页。 */
 p:has(+ table) { break-after: avoid-page; }

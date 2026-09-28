@@ -2193,10 +2193,30 @@ def candidate_code_check(input_paths, unlink_targets, toc_sections,
 
 def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
            toc_sections=False, require_display_map=False,
-           provenance_map_path=None):
+           provenance_map_path=None, translation_record_path=None):
     work_dir.mkdir(parents=True, exist_ok=True)
     diagnostics = []
     report = {"diagnostics": diagnostics}
+
+    # 翻译验收身份门禁（§4.7，只读）：翻译加导出必须传入验收记录；
+    # 生成任何候选之前核对验收绑定与当前翻译身份并重跑当前检查。
+    readiness_projection = None
+    if translation_record_path:
+        from verify_delivery import check_translation_readiness_cli
+        ready, readiness = check_translation_readiness_cli(
+            translation_record_path,
+            [str(Path(p).expanduser().resolve()) for p in paths])
+        if not ready:
+            report["status"] = STATUS_MACHINE_FAIL
+            report["error"] = "；".join(readiness.get("reasons") or [])
+            (work_dir / REPORT_NAME).write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            print("FAIL: 翻译验收就绪检查未通过，本次导出停止（旧成品不变）: %s"
+                  % report["error"], file=sys.stderr)
+            return 1
+        readiness_projection = readiness.get("identity") or {}
 
     try:
         chapters = load_inputs(paths)
@@ -2610,6 +2630,14 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             ],
         }
     )
+    if translation_record_path:
+        # 导出证据记录本次只读就绪身份投影（运行事实；验收记录路径关联）
+        report["translation_readiness"] = {
+            "record": str(translation_record_path),
+            "ready": True,
+            "identity": readiness_projection,
+            "reconfirmed_before_replace": False,
+        }
     (work_dir / REPORT_NAME).write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -2662,6 +2690,7 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
         return 1
 
     # 全部检查通过后才允许触碰最终目标；目标不得是输入文件或原始资源。
+    # 替换目标前以同一口径再确认翻译验收身份：运行中变化不覆盖旧 PDF。
     protected = {Path(item["path"]).resolve() for item in inputs}
     protected |= {Path(r["path"]).resolve() for r in resources}
     if output.resolve() in protected:
@@ -2669,8 +2698,24 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             "FAIL: 输出路径不得指向输入文件或原始资源：%s" % output, file=sys.stderr
         )
         return 1
+    if translation_record_path:
+        from verify_delivery import check_translation_readiness_cli
+        ready, readiness = check_translation_readiness_cli(
+            translation_record_path,
+            [str(Path(p).expanduser().resolve()) for p in paths])
+        if not ready:
+            print("FAIL: 导出期间输入或验收身份变化，按同一口径复确认失败，"
+                  "不替换旧成品: %s" % "；".join(readiness.get("reasons") or []),
+                  file=sys.stderr)
+            return 1
+        readiness_projection = readiness.get("identity") or {}
     output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(candidate, output)
+    if translation_record_path:
+        report["translation_readiness"]["reconfirmed_before_replace"] = True
+        (work_dir / REPORT_NAME).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     print(
         "机器检查通过：%s（候选与证据见 %s）\n成品待视觉复核后才能发布。"
         % (output, work_dir)
@@ -2745,6 +2790,15 @@ def main(argv=None):
         help="只读出处区间映射 JSON：声明目录段落行区间与覆盖章，"
              "用于非标准出处段落；不以映射掩盖来源缺失",
     )
+    parser.add_argument(
+        "--translation-record",
+        default=None,
+        metavar="PATH",
+        help="翻译验收交付记录（translation/translation+pdf 模式）：翻译"
+             "加导出必须传入；导出前与替换目标前只读核对验收身份与当前"
+             "翻译身份（含检查复跑），漂移或证据不足即停止且旧成品不变；"
+             "仅导出既有 Markdown 时不传，行为不变",
+    )
     parser.add_argument("inputs", nargs="+", help="有序 Markdown 输入")
     args = parser.parse_args(argv)
     try:
@@ -2757,6 +2811,7 @@ def main(argv=None):
             toc_sections=args.toc_sections,
             require_display_map=args.require_display_map,
             provenance_map_path=args.provenance,
+            translation_record_path=args.translation_record,
         )
     except ExportError as exc:
         print("FAIL: %s" % exc, file=sys.stderr)

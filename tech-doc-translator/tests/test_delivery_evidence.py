@@ -2761,5 +2761,502 @@ class DeliveryEvidenceTest(unittest.TestCase):
         assert_protected(result)
 
 
+
+
+class PdfSourceDeliveryTests(unittest.TestCase):
+    """pdf-source 来源家族的交付证据与复核绑定（设计 §4.6）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import pymupdf
+        except ImportError:
+            try:
+                import fitz as pymupdf
+            except ImportError:
+                raise unittest.SkipTest(
+                    "PyMuPDF 不可用，pdf-source 交付测试跳过")
+        cls.base = Path(tempfile.mkdtemp(prefix='pdf-source-'))
+        cls.root = cls.base / 'project'
+        cls.root.mkdir()
+        root = cls.root
+
+        doc = pymupdf.open()
+        page = doc.new_page(width=500, height=400)
+        page.insert_text((40, 50), "1 Intro", fontsize=14)
+        page.insert_text((40, 80),
+                         "The system runs in 44 ms with 9% gain.",
+                         fontsize=10)
+        y = 110
+        for line in ("def run():", "    return 44"):
+            page.insert_text((60, y), line, fontsize=10,
+                             fontname="courier")
+            y += 14
+        base = pymupdf.Point(60, 160)
+        for i, label in enumerate(("Batch A", "Batch B")):
+            rect = pymupdf.Rect(base.x + i * 45, base.y - 50 - i * 15,
+                                base.x + i * 45 + 30, base.y)
+            page.draw_rect(rect, fill=(0.7, 0.7, 0.9))
+            page.insert_text((rect.x0 + 8, base.y + 12), label,
+                             fontsize=8)
+        page.draw_line(pymupdf.Point(50, base.y),
+                       pymupdf.Point(200, base.y), color=(0,))
+        page.insert_text((70, 50), "series one", fontsize=8)
+        page.insert_text((40, 330), "1Note text.", fontsize=8)
+        doc.save(root / 'paper.pdf')
+        doc.close()
+        cls.pdf = root / 'paper.pdf'
+
+        inspect_dir = root / 'source'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS / 'prepare_pdf_source.py'),
+             'inspect', str(cls.pdf), '--pages', 'all',
+             '--output', str(inspect_dir)],
+            capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        checklist_path = inspect_dir / 'adjudication_checklist.json'
+        payload = json.loads(checklist_path.read_text(encoding='utf-8'))
+        payload['blocks'] = [
+            {'id': 'b001', 'order': 1, 'type': 'heading', 'page': 1,
+             'rect': [38, 40, 200, 55], 'level': 2, 'text': '1 Intro',
+             'adjudication': {'status': 'accepted', 'basis': '编号+字号'}},
+            {'id': 'b002', 'order': 2, 'type': 'paragraph', 'page': 1,
+             'rect': [38, 70, 420, 90],
+             'adjudication': {'status': 'accepted', 'basis': '正文'}},
+            {'id': 'b003', 'order': 3, 'type': 'code_region', 'page': 1,
+             'rect': [50, 100, 400, 135], 'golden': 'golden/code.txt',
+             'lang': 'python',
+             'adjudication': {'status': 'accepted', 'basis': '代码区'}},
+            {'id': 'b004', 'order': 4, 'type': 'figure_region', 'page': 1,
+             'rect': [40, 40, 220, 190], 'image': '../images/chart.png',
+             'label': '图 A',
+             'adjudication': {'status': 'accepted', 'basis': '图 A'}},
+            {'id': 'b005', 'order': 5, 'type': 'paragraph', 'page': 1,
+             'rect': [38, 322, 300, 335], 'footnote_label': '1',
+             'adjudication': {'status': 'accepted', 'basis': '脚注 1'}},
+        ]
+        payload['reading_order'] = {'adjudicated': True, 'basis': '单栏'}
+        payload['conventions']['strong_tokens'] = ["44 ms", "9%", "run"]
+        checklist_path.write_text(json.dumps(payload, ensure_ascii=False),
+                                  encoding='utf-8')
+        cls.checklist = checklist_path
+        for sub, args in (('extract-code', ()), ('extract-figures', ())):
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS / 'prepare_pdf_source.py'),
+                 sub, str(cls.pdf), '--checklist', str(checklist_path),
+                 '--output', str(inspect_dir)],
+                capture_output=True, text=True)
+            assert result.returncode == 0, result.stderr
+        cls.source_md = inspect_dir / 'source_draft.md'
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS / 'prepare_pdf_source.py'),
+             'materialize', str(cls.pdf), '--checklist',
+             str(checklist_path), '--output', str(cls.source_md)],
+            capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert (inspect_dir / 'source_draft.md.images_display.json') \
+            .is_file()
+
+        draft = ("## 1 Intro（引言）\n\n"
+                 "【译文】系统运行耗时 44 ms，增益 9%。\n\n"
+                 "⟦CODE⟧\n\n"
+                 "![图 A](images/chart.png)\n\n"
+                 "正文带脚注[^1]。\n\n"
+                 "[^1]: 注文（译注）\n")
+        draft_path = cls.base / 'draft_zh.md'
+        draft_path.write_text(draft, encoding='utf-8')
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS / 'splice_fences.py'),
+             str(draft_path), str(cls.source_md), str(root / '01_章.md')],
+            capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+        # 交付级映射（export/images_display.json 位置合同）
+        updated = json.loads(checklist_path.read_text(encoding='utf-8'))
+        figure_block = next(b for b in updated['blocks']
+                            if b.get('type') == 'figure_region')
+        width_px = (figure_block.get('figure_extraction') or {}) \
+            .get('display_width_px')
+        (root / 'export').mkdir(exist_ok=True)
+        (root / 'export' / 'images_display.json').write_text(
+            json.dumps({
+                'version': 1, 'markdown': '01_章.md',
+                'entries': [{
+                    'markdown': '../01_章.md', 'occurrence': 1,
+                    'image': '../images/chart.png',
+                    'sha256': figure_block['image_sha256'],
+                    'width': {'value': width_px, 'unit': 'px',
+                              'basis': 'physical-width',
+                              'reference': None},
+                    'source': {
+                        'pdf': updated['source']['realpath'],
+                        'pdf_sha256': updated['source']['sha256'],
+                        'page': figure_block['page'],
+                        'rect': figure_block['rect'],
+                        'dpi': 200,
+                        'resource_sha256': figure_block['image_sha256'],
+                    },
+                }],
+                'undetermined': [],
+            }, ensure_ascii=False), encoding='utf-8')
+        cls.evidence = Path(os.path.expanduser(
+            '~/.cache/tech-doc-evidence-pdfsrc-%s'
+            % uuid.uuid4().hex[:8]))
+        cls._evidence_made = True
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, '_evidence_made', False):
+            shutil.rmtree(cls.evidence, True)
+        shutil.rmtree(cls.base, True)
+
+    def record(self, mutator=None):
+        entry = {
+            'family': 'pdf-source', 'source_version': '1.0-test',
+            'pdf': 'paper.pdf',
+            'checklist': 'source/adjudication_checklist.json',
+            'source_markdown': 'source/source_draft.md',
+            'layout_snapshot': 'source/snapshots_layout.txt',
+            'reading_snapshot': 'source/snapshots_reading.txt',
+            'covers': ['01_章.md'],
+        }
+        record = {
+            'version': 1, 'mode': 'translation',
+            'delivery_root': str(self.root),
+            'inputs': ['01_章.md'], 'outputs': [],
+            'images_display': 'export/images_display.json',
+            'files': {'01_章.md': 'chapter', 'paper.pdf': 'pdf'},
+            'sources': [entry],
+            'checks': [{
+                'tool': 'verify_pdf_source',
+                'args': ['paper.pdf',
+                         '--checklist', 'source/adjudication_checklist.json',
+                         '--source-md', 'source/source_draft.md',
+                         '--translation', '01_章.md']}],
+        }
+        if mutator:
+            mutator(record)
+        return record
+
+    def run_delivery(self, record):
+        record_path = self.base / 'record.json'
+        record_path.write_text(json.dumps(record, ensure_ascii=False,
+                                          indent=2), encoding='utf-8')
+        return subprocess.run(
+            [sys.executable, str(SCRIPTS / 'verify_delivery.py'),
+             '--record', str(record_path),
+             '--evidence-dir', str(self.evidence)],
+            capture_output=True, text=True)
+
+    def closed_reviews(self, record):
+        contexts = delivery_contexts(str(self.root), record)
+        reviews = []
+        for kind in ('source-reconcile', 'semantic'):
+            binding = expected_binding(kind, '01_章.md', self.root,
+                                       record, contexts)
+            reviews.append({
+                'kind': kind, 'target': '01_章.md', 'status': 'closed',
+                'sha256': sha(self.root / '01_章.md'),
+                'binding': binding,
+                'note': '%s 复核闭合（机器对账通过后的独立登记）' % kind})
+        return reviews
+
+    def test_pdf_source_end_to_end_publishes(self):
+        record = self.record()
+        record['reviews'] = self.closed_reviews(record)
+        result = self.run_delivery(record)
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        index = json.loads((self.evidence / 'delivery_index.json')
+                           .read_text(encoding='utf-8'))
+        self.assertEqual(index['checks'][0]['exit_code'], 0)
+        source_identity = index['identity']['sources'][0]
+        self.assertEqual(source_identity['family'], 'pdf-source')
+        self.assertTrue(source_identity['goldens'][0]['sha256'])
+        self.assertTrue(source_identity['images'][0]['sha256'])
+        self.assertEqual(
+            source_identity['images'][0]['sha256'],
+            self.record()['sources'][0] and json.loads(
+                (self.root / 'source' / 'adjudication_checklist.json')
+                .read_text(encoding='utf-8'))
+            ['blocks'][3]['image_sha256'])
+
+    def test_unknown_tool_not_executed(self):
+        record = self.record()
+        record['checks'] = [{'tool': 'evil_shell',
+                             'args': ['rm', '-rf', '/']}]
+        problems = []
+        delivery_verifier.rerun_checks(str(self.root), record, problems)
+        self.assertTrue(any('未知的核验入口' in p for p in problems))
+
+    def test_tampered_source_markdown_reconcile_fails(self):
+        record = self.record()
+        original = self.source_md.read_text(encoding='utf-8')
+        try:
+            self.source_md.write_text(original + '\n篡改一行。\n',
+                                      encoding='utf-8')
+            problems = []
+            entries = delivery_verifier.check_source_chains(
+                str(self.root), record, problems)
+            self.assertFalse(problems, problems)
+            delivery_verifier.run_source_reconcile(
+                str(self.root), record, entries, problems)
+            self.assertTrue(
+                any('PDF 源独立对账失败' in p for p in problems),
+                problems)
+        finally:
+            self.source_md.write_text(original, encoding='utf-8')
+
+    def test_tampered_golden_rejected_at_preflight(self):
+        # 同路径换基准：golden 与清单固化身份不符在源链预检定位，
+        # 旧复核/发布不能继续
+        record = self.record()
+        golden = self.root / 'source' / 'golden' / 'code.txt'
+        original = golden.read_bytes()
+        try:
+            golden.write_bytes(original + b'\n# tamper\n')
+            problems = []
+            delivery_verifier.check_source_chains(str(self.root), record,
+                                                  problems)
+            self.assertTrue(
+                any('golden 与清单固化身份不符' in p for p in problems),
+                problems)
+        finally:
+            golden.write_bytes(original)
+
+    def test_pdf_change_invalidates_published_evidence(self):
+        record = self.record()
+        record['reviews'] = self.closed_reviews(record)
+        first = self.run_delivery(record)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        original = self.pdf.read_bytes()
+        try:
+            self.pdf.write_bytes(original + b'\n')
+            second = self.run_delivery(record)
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn('FAIL', second.stderr)
+        finally:
+            self.pdf.write_bytes(original)
+
+    def test_unresolved_pending_blocks_publish(self):
+        # R3/A10：清单存在未解决素材项（未补全/未裁决）时完成门禁拒绝发布
+        checklist_path = (self.root / 'source' /
+                          'adjudication_checklist.json')
+        original = checklist_path.read_text(encoding='utf-8')
+        record = self.record()
+        record['reviews'] = self.closed_reviews(record)
+        try:
+            payload = json.loads(original)
+            payload['pending'] = [{
+                'kind': 'bitmap', 'page': 1, 'rect': [40, 40, 220, 190],
+                'status': '位图素材待回源确认处理方式',
+            }]
+            checklist_path.write_text(json.dumps(payload, ensure_ascii=False),
+                                      encoding='utf-8')
+            result = self.run_delivery(record)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('未解决', result.stderr)
+        finally:
+            checklist_path.write_text(original, encoding='utf-8')
+
+    def test_bitmap_region_pending_blocks_publish(self):
+        # P1-1：页内位图区域待裁决项未解决时完成门禁拒绝发布
+        checklist_path = (self.root / 'source' /
+                          'adjudication_checklist.json')
+        original = checklist_path.read_text(encoding='utf-8')
+        record = self.record()
+        record['reviews'] = self.closed_reviews(record)
+        try:
+            payload = json.loads(original)
+            payload['pending'] = [{
+                'kind': 'bitmap_region', 'page': 1,
+                'rect': [30.0, 250.0, 370.0, 480.0], 'area_ratio': 0.39,
+                'status': '待裁决：插图素材或需 OCR 正文区域',
+            }]
+            checklist_path.write_text(json.dumps(payload, ensure_ascii=False),
+                                      encoding='utf-8')
+            result = self.run_delivery(record)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('未解决', result.stderr)
+            self.assertIn('bitmap_region', result.stderr)
+        finally:
+            checklist_path.write_text(original, encoding='utf-8')
+
+    def test_translation_input_pending_marker_blocks_publish(self):
+        # P1-3：源稿干净但实际译文输入含 [PENDING-*] → 拒绝发布
+        target = self.root / '01_章.md'
+        original = target.read_text(encoding='utf-8')
+        record = self.record()
+        record['reviews'] = self.closed_reviews(record)
+        try:
+            lines = original.split('\n')
+            lines.insert(1, '[PENDING-FORMULA page=1 rect=(1,2,3,4)]')
+            target.write_text('\n'.join(lines), encoding='utf-8')
+            result = self.run_delivery(record)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('译文输入', result.stderr)
+            self.assertIn('待处理标记', result.stderr)
+        finally:
+            target.write_text(original, encoding='utf-8')
+
+    def test_pending_marker_check_locates_line(self):
+        # 源 Markdown 残留 [PENDING-*] 标记：完成门禁直接定位（纵深防御）
+        import verify_delivery as delivery_mod
+        md = self.root / 'source' / 'source_draft.md'
+        original = md.read_text(encoding='utf-8')
+        try:
+            lines = original.split('\n')
+            lines.insert(2, '[PENDING-FORMULA page=1 rect=(1,2,3,4) 待回源处理]')
+            md.write_text('\n'.join(lines), encoding='utf-8')
+            problems = []
+            delivery_mod.check_pdf_source_pending(
+                str(self.root), self.record(), problems)
+            self.assertTrue(any('待处理标记' in p and 'L3' in p
+                                for p in problems), problems)
+        finally:
+            md.write_text(original, encoding='utf-8')
+
+    def test_resolved_pending_does_not_block_publish(self):
+        # 已 resolved 的 bitmap_region/ocr_region 不阻断发布（正向门禁）
+        checklist_path = (self.root / 'source' /
+                          'adjudication_checklist.json')
+        original = checklist_path.read_text(encoding='utf-8')
+        try:
+            payload = json.loads(original)
+            payload['classification']['type'] = 'mixed'
+            payload['classification']['adjudicated'] = {
+                'status': 'accepted', 'basis': 'P1 含已处置的扫描正文区域'}
+            payload['pending'] = [
+                {'kind': 'bitmap_region', 'page': 1,
+                 'rect': [30.0, 250.0, 370.0, 480.0], 'area_ratio': 0.39,
+                 'resolved': True,
+                 'resolution_basis': '对照原页确认为插图素材'},
+                {'kind': 'ocr_region', 'page': 1,
+                 'rect': [30.0, 40.0, 370.0, 120.0],
+                 'adjudication': 'user-resolved',
+                 'status': '用户授权宿主 OCR 并处置'},
+            ]
+            checklist_path.write_text(json.dumps(payload, ensure_ascii=False),
+                                      encoding='utf-8')
+            record = self.record()
+            record['reviews'] = self.closed_reviews(record)
+            result = self.run_delivery(record)
+            self.assertEqual(result.returncode, 0,
+                             result.stdout + result.stderr)
+        finally:
+            checklist_path.write_text(original, encoding='utf-8')
+
+    def test_material_user_resolved_alone_blocks_publish(self):
+        # 复审反例：素材类（bitmap/bitmap_region/formula）仅有 OCR 授权
+        # 处置状态、无 resolved 及依据时仍拒绝发布——授权与内容补全不是
+        # 同一事实（D3/D4）；user-resolved 仅对 ocr_region 有效
+        checklist_path = (self.root / 'source' /
+                          'adjudication_checklist.json')
+        original = checklist_path.read_text(encoding='utf-8')
+        try:
+            payload = json.loads(original)
+            payload['pending'] = [
+                {'kind': 'bitmap', 'page': 1, 'rect': [40, 40, 220, 190],
+                 'adjudication': 'user-resolved',
+                 'status': '位图素材待回源确认处理方式'},
+                {'kind': 'formula', 'page': 1, 'rect': [40, 240, 220, 290],
+                 'adjudication': 'user-resolved',
+                 'status': '文本层公式待回源处理'},
+                {'kind': 'bitmap_region', 'page': 1,
+                 'rect': [30.0, 330.0, 370.0, 480.0],
+                 'adjudication': 'user-resolved',
+                 'status': '待裁决：插图素材或需 OCR 正文区域'},
+            ]
+            checklist_path.write_text(json.dumps(payload, ensure_ascii=False),
+                                      encoding='utf-8')
+            record = self.record()
+            record['reviews'] = self.closed_reviews(record)
+            result = self.run_delivery(record)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('未解决', result.stderr)
+        finally:
+            checklist_path.write_text(original, encoding='utf-8')
+
+    def test_resolved_without_basis_blocks_publish(self):
+        # 复审反例：素材类仅 resolved: true、未附处理依据时仍拒绝发布——
+        # 无依据不能证明 D3 要求的回源确认与补全
+        checklist_path = (self.root / 'source' /
+                          'adjudication_checklist.json')
+        original = checklist_path.read_text(encoding='utf-8')
+        try:
+            payload = json.loads(original)
+            payload['pending'] = [{
+                'kind': 'bitmap_region', 'page': 1,
+                'rect': [30.0, 330.0, 370.0, 480.0],
+                'resolved': True,
+            }]
+            checklist_path.write_text(json.dumps(payload, ensure_ascii=False),
+                                      encoding='utf-8')
+            record = self.record()
+            record['reviews'] = self.closed_reviews(record)
+            result = self.run_delivery(record)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('未解决', result.stderr)
+        finally:
+            checklist_path.write_text(original, encoding='utf-8')
+
+    def test_non_boolean_resolved_blocks_publish(self):
+        # 复审反例：resolved 为非布尔真值（如字符串 "false"）不算补全，
+        # 完成门禁 fail-closed 拒绝发布
+        checklist_path = (self.root / 'source' /
+                          'adjudication_checklist.json')
+        original = checklist_path.read_text(encoding='utf-8')
+        try:
+            payload = json.loads(original)
+            payload['pending'] = [{
+                'kind': 'formula', 'page': 1, 'rect': [40, 240, 220, 290],
+                'resolved': 'false',
+                'resolution_basis': '待回源确认',
+            }]
+            checklist_path.write_text(json.dumps(payload, ensure_ascii=False),
+                                      encoding='utf-8')
+            record = self.record()
+            record['reviews'] = self.closed_reviews(record)
+            result = self.run_delivery(record)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('未解决', result.stderr)
+        finally:
+            checklist_path.write_text(original, encoding='utf-8')
+
+    def test_machine_clue_basis_not_resolution_evidence(self):
+        # 复审反例（真实 inspect 输出形态）：候选保留机器勘察自动写入的
+        # 线索 basis（面积/相交等"用途待裁决"事实），仅加 resolved: true、
+        # 不写 resolution_basis 时必须拒绝——候选线索不是解决依据（D3）
+        checklist_path = (self.root / 'source' /
+                          'adjudication_checklist.json')
+        original = checklist_path.read_text(encoding='utf-8')
+        try:
+            payload = json.loads(original)
+            payload['pending'] = [{
+                'kind': 'bitmap_region', 'page': 1,
+                'rect': [30.0, 330.0, 370.0, 480.0], 'area_ratio': 0.39,
+                'status': '待裁决：插图素材或需 OCR 正文区域，由主 Agent '
+                          '对照原页确定并记录依据；裁决前不得按全文完成交付',
+                'basis': '嵌入位图区域：面积占比 39.00%、不与文本块相交',
+                'resolved': True,
+            }]
+            checklist_path.write_text(json.dumps(payload, ensure_ascii=False),
+                                      encoding='utf-8')
+            record = self.record()
+            record['reviews'] = self.closed_reviews(record)
+            result = self.run_delivery(record)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('未解决', result.stderr)
+        finally:
+            checklist_path.write_text(original, encoding='utf-8')
+
+    def test_missing_delivery_map_rejected(self):
+        record = self.record(lambda r: r.pop('images_display'))
+        problems = []
+        delivery_verifier.check_source_chains(str(self.root), record,
+                                              problems)
+        self.assertTrue(any('两级映射' in p for p in problems), problems)
+
+
 if __name__ == '__main__':
     unittest.main()
