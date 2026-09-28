@@ -1,0 +1,12 @@
+# PDF 源处理可选依赖，与普通翻译依赖（requirements.txt）及 PDF 导出依赖
+# （requirements-pdf.txt）分离。普通 HTML 翻译任务不需要安装本文件；
+# 仅在提交文字版/扫描版 PDF 作为翻译源、运行 prepare_pdf_source.py /
+# verify_pdf_source.py 时按需安装。
+#
+# 版本为执行环境中已验证的组合（macOS / Python 3.12 + PyMuPDF 1.28.2），
+# 兼容下限 Python 3.10；用目标解释器安装：
+#   python3 -m pip install -r <SKILL目录>/requirements-pdf-source.txt
+#
+# verify_pdf_source.py 复用共享结构扫描器（_verification 的围栏事实），
+# 需已安装基础依赖 requirements.txt（beautifulsoup4/tinycss2/markdown-it-py）。
+pymupdf>=1.28,<2

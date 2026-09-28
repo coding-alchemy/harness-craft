@@ -1,6 +1,6 @@
 ---
 name: tech-doc-translator
-description: 将计算机、工程、数学、物理等理工科英文技术文档翻译为可回源核对的中文 Markdown；按源结构选择确定性脚本，支持分页代码、数学与深层嵌套参考手册、多页面 API 文档以及工作包拆分、术语合并与中断恢复。也支持把已有译文 Markdown 直接导出为单篇或按明确顺序合订的 PDF——用户要求"导出 PDF""合成一份 PDF"而不要求翻译时使用。
+description: 将计算机、工程、数学、物理等理工科英文技术文档翻译为可回源核对的中文 Markdown；按源结构选择确定性脚本，支持分页代码、数学与深层嵌套参考手册、多页面 API 文档、文字版 PDF 源以及工作包拆分、术语合并与中断恢复。也支持把已有译文 Markdown 直接导出为单篇或按明确顺序合订的 PDF——用户要求"导出 PDF""合成一份 PDF"而不要求翻译时使用。
 ---
 
 # tech-doc-translator
@@ -9,7 +9,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 
 ## 何时适用
 
-- 源是 HTML（单页、分页站点均可）或可被外部工具可靠转为 Markdown 的 PDF。
+- 源是 HTML（单页、分页站点均可）；源是文字版 PDF（学术论文等）时先完整读取 `<SKILL目录>/references/pdf_source.md`，按勘察→裁决→物化→独立对账执行。
 - 用户已给出：权威源 URL/文件、欲翻译的范围、交付文件位置、项目术语表（若有）。
 - 单页、分页、数学/深层嵌套参考手册和多页面 API/DSL 均为当前支持的 HTML 源家族；按实际结构选择对应脚本。
 - 已有本 Skill 产出的中文 Markdown，需要导出为单篇 PDF 或按明确顺序合订为一份 PDF；用户仅提供译文时直接进入导出模式，不要求英文源或术语表。
@@ -23,11 +23,11 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 
 ## 依赖
 
-`<SKILL目录>` 指本 `SKILL.md` 所在目录；本文的脚本、翻译约定、共享词库和依赖声明都通过 `<SKILL目录>` 内路径定位，不依赖仓库层级。脚本依赖 `beautifulsoup4`、`tinycss2` 与 `markdown-it-py`（表格块按实际渲染语义核验），按 `requirements.txt` 用目标解释器安装：`python3 -m pip install -r <SKILL目录>/requirements.txt`（`python -m pip` 与运行解释器保持一致，不直接用 `pip`）。兼容环境为 Python >=3.10（`tinycss2` 1.5.x 包元数据要求，已在 Python 3.12 验证）。PDF 导出模式按需安装 `<SKILL目录>/requirements-pdf.txt`，普通翻译不安装。
+`<SKILL目录>` 指本 `SKILL.md` 所在目录；本文的脚本、翻译约定、共享词库和依赖声明都通过 `<SKILL目录>` 内路径定位，不依赖仓库层级。脚本依赖 `beautifulsoup4`、`tinycss2` 与 `markdown-it-py`（表格块按实际渲染语义核验），按 `requirements.txt` 用目标解释器安装：`python3 -m pip install -r <SKILL目录>/requirements.txt`（`python -m pip` 与运行解释器保持一致，不直接用 `pip`）。兼容环境为 Python >=3.10（`tinycss2` 1.5.x 包元数据要求，已在 Python 3.12 验证）。PDF 导出模式按需安装 `<SKILL目录>/requirements-pdf.txt`，普通翻译不安装。PDF 源处理按需安装 `<SKILL目录>/requirements-pdf-source.txt`（普通 HTML 翻译与 PDF 导出均不安装），工作流、坐标口径、清单 schema 与依赖探测见 `<SKILL目录>/references/pdf_source.md`。
 
 ## 已有 Markdown 的 PDF 导出
 
-用户要求把已有 Markdown 导出为 PDF（单篇或合订）时，先完整读取 `<SKILL目录>/references/pdf_export.md`，按其模式路由、命令合同与完成合同执行。要点：单篇与合订共用一个导出入口，输入顺序即文档顺序；多章导出且意图不明时先询问是否合订并等待，目录与术语表不计入章节数；术语表默认不入 PDF，指向术语表的链接用 `--unlink-target` 保留文字转纯文本；章首“原文”“译例说明”“来源”“抓取日期”四类管理字段由导出器默认排除并集中前置到首章之前（Markdown 保留；缺可定位来源在生成前拒绝）；合订含 `00_目录.md` 时由导出器增强为 PDF 最前的印刷目录（两遍打印、页码为 PDF 实际页序）。代码块按 10 个逻辑行分界分页（短块保持整体、长块跨页续排并利用页尾），长边超 2600px 的 PNG/JPEG 单帧位图仅在 PDF 嵌入负载内重采样且原件不变。机器检查通过后必须完成视觉复核与交付说明才能发布；宣称交付完成前用 `verify_delivery.py --record <记录> --evidence-dir <持久目录>` 统一核验（目录允许清单、身份、核验复跑、证据索引；复核记录须绑定当前译文与源资源摘要、检查器身份及语义参数口径；目录见 `<SKILL目录>/references/pdf_export.md`）。翻译任务同时要求 PDF 时，在 Markdown 验收后进入同一导出流程。图片显示尺寸按 `<SKILL目录>/references/images_display.md` 的契约在解析、绑定与导出链路中保持（新交付映射固定在交付根 `export/images_display.json`，条目相对映射目录解析）。
+用户要求把已有 Markdown 导出为 PDF（单篇或合订）时，先完整读取 `<SKILL目录>/references/pdf_export.md`，按其模式路由、命令合同与完成合同执行。要点：单篇与合订共用一个导出入口，输入顺序即文档顺序；多章导出且意图不明时先询问是否合订并等待，目录与术语表不计入章节数；术语表默认不入 PDF，指向术语表的链接用 `--unlink-target` 保留文字转纯文本；章首“原文”“译例说明”“来源”“抓取日期”四类管理字段由导出器默认排除并集中前置到首章之前（Markdown 保留；缺可定位来源在生成前拒绝）；合订含 `00_目录.md` 时由导出器增强为 PDF 最前的印刷目录（两遍打印、页码为 PDF 实际页序）。代码块按 10 个逻辑行分界分页（短块保持整体、长块跨页续排并利用页尾），长边超 2600px 的 PNG/JPEG 单帧位图仅在 PDF 嵌入负载内重采样且原件不变。执行模型无图像输入时，核验可加 `--visual-aid` 取得逐页辅助统计（渲染成功与否、墨迹覆盖率、图片对象数、链接注解目标，渲染参数与阈值写入报告）定位疑似空白页或异常链接；统计仅作定位线索，不构成无缺字/重叠/裁切的证明，也不构成视觉复核，完成合同不变。机器检查通过后必须完成视觉复核与交付说明才能发布；宣称交付完成前用 `verify_delivery.py --record <记录> --evidence-dir <持久目录>` 统一核验（目录允许清单、身份、核验复跑、证据索引；复核记录须绑定当前译文与源资源摘要、检查器身份及语义参数口径；目录见 `<SKILL目录>/references/pdf_export.md`）。翻译任务同时要求 PDF 时，在 Markdown 验收后进入同一导出流程，且必须传入 `--translation-record <交付记录.json>`：导出前与替换目标前只读核对验收绑定与当前翻译身份并重跑当前检查，漂移或证据不足即停止、旧成品不变；不传该参数的独立导出行为不变。图片显示尺寸按 `<SKILL目录>/references/images_display.md` 的契约在解析、绑定与导出链路中保持（新交付映射固定在交付根 `export/images_display.json`，条目相对映射目录解析）。
 
 ## 执行顺序
 
@@ -81,6 +81,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 | 分页、代码密集型 HTML（多页/多节，需围栏拼接） | `<SKILL目录>/scripts/parse_paginated_html.py page1.html page2.html ...` → `splice_fences.py` → `merge_sections.py` |
 | 数学密集或深层嵌套参考手册 | `<SKILL目录>/scripts/parse_reference_html.py <html> <out.md>` |
 | 多页面 API/DSL 文档 | `<SKILL目录>/scripts/discover_pages.py <site/index.html>` → `parse_api_html.py` → `merge_api.py`；页面清单必须与**独立的官方 TOC/导航快照**逐项对账，manifest 交付顺序按官方 TOC 重排（`discover_pages` 的字典序输出只用于集合发现，不作为交付顺序）；保留图片显示尺寸时用 `merge_api.py --display-src` 自动绑定（契约见 `<SKILL目录>/references/images_display.md`） |
+| 文字版 PDF（正文有可靠文本层；含位图插图仍按文字版判定，素材单列） | 先完整读取 `<SKILL目录>/references/pdf_source.md`；`<SKILL目录>/scripts/prepare_pdf_source.py inspect <pdf> --pages <范围> --output <项目source/>` → 主 Agent 对照原页逐项裁决清单 → `extract-code` / `extract-figures` 提取并回源确认 → `materialize` → `<SKILL目录>/scripts/verify_pdf_source.py --translation <译文.md>` 机器硬检查通过后才交付；机器 PASS 不登记语义复核；不自动 OCR、不自动提取位图/公式，未闭合素材写显式 `[PENDING-*]` 标记 |
 | 扫描版 PDF | 仅当用户明确要求且使用宿主 OCR 工具 |
 
 工作包编排：
