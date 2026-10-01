@@ -1,5 +1,20 @@
 # 变更日志
 
+## 未发布
+
+- JSON 报告升级为 `format_version=2`：同一统计结果新增保存定位证据（会话/截止点确认方式与限制）、五类内部来源支持状态（只记录已核查事实，未核查与来源未提供区分）及模型/代理/轮次三个独立视图；多轮累计区间在轮次视图只出现一次，后代调用归发起轮次。
+- 报告读取器同时支持合法 v1/v2：v1 原样展示并明确标注未保存的维度，不从旧记录推算视图；v2 校验新增结构与 `--detail` 投影一致性；损坏 JSON、非法整数/比例/时间、正文认证字段及不支持版本明确失败。`--detail` 改为保存视图的投影，不再独立计算。旧版本工具无法读取 v2 报告。
+- Codex 请求候选排除系统注入消息：`content_item_kinds` 不含 `user.text` 的 user 角色消息（环境上下文、skill 注入、应用事件等）不再作为请求候选或 `--request-id` 截止点；含 `user.text` 的真实消息与提问回答保持合法，无该元数据的旧消息分类未知。`--current` 失败区分环境变量缺失与身份不匹配两种原因。
+- ZCode 数据库读取器核对同级 rollout 模型日志并在报告中以"补充来源"独立展示其可读用量（标注跨源重叠未知，不并入小计、不进图表分母）：rollout requestId 与数据库 logical_request_id 不在同一身份空间，经真实来源核查无调用级桥接，两入口保持分开计量。重试行为不变：数据库仅保留逻辑请求最终结果时如实标注缺口，不虚报调用总数、不反推失败用量。
+- ZCode 供应商 usage 语义验证扩展到 `account:bigmodel-individual-coding-plan` 与 `account:bigmodel-start-plan`（同一遥测写入器、同一 BigModel API 字段结构；全量真实行 input+output==total 且 cacheRead≤input 校验通过），其会话由仅计数变为可计量；未验证供应商仍保持未知。
+- Codex 压缩调用按明确身份归类：`compacted.compaction_response_id` 与逐调用 usage 记录的 response_id 一致（真实来源验证的明确关联，非时间猜测），该调用从主代理常规移入内部辅助并标 `internal_kind=compaction`；`latest_token_usage_record` 是同调用副本不再加总；标记无可关联 usage 时保留"可能已计或缺失"缺口说明。ZCode `compact` 调用同样标 `internal_kind` 并保持内部辅助组计量。
+- ZCode 后台工作流归后代：`task_type='workflow_child'` 会话不再被当作分叉（其 972 条调用原先在父会话报告中不可见），按源内 parent 关系归入后代常规组并标 `origin_kind`；`session_title` 调用标 `internal_kind=session_aux`，任务报告中继续单列不摊任务。Codex 标题/会话辅助经真实样例核查为来源未提供（checked_absent），与"尚未核查"区分。
+- 新增离线只读报告查看器（viewer/index.html，随 Skill 安装交付）：浏览器直接打开，通过文件选择加载单个 v1/v2 JSON；内置 lossless-json（MIT，随包附带许可）实现超 JavaScript 安全范围整数的精确显示；加载即校验报告合同（含明细/视图投影一致性与正文认证字段拒绝），损坏或不支持版本明确失败并清空展示，重开页面回到空态；全程不访问日志、不联网、不执行统计、不写浏览器存储。
+- 查看器新增消耗分布图表与明细视图操作：分组/模型/代理/轮次四个维度与输入/输出/缓存读取/总量四个指标可切换的 SVG 条形图；行筛选（条件与隐藏行提示可见、清除入口、原范围/截止点/合计/占比分母不变、不产生筛选子集合计）；行展开显示该行完整保存指标。未知无数值条、零与部分量有标记，占比分母直接取原报告合计，维度间不相加，交互保持零副作用。
+- 限制不变：ZCode 数据库仅保留逻辑请求结果时重试调用总数及失败用量可能缺失（数据库 attempt_index 恒为 0、486 行 retry_count>0、error/cancelled 行无 usage 为真实核查结论）；Codex 压缩标记无可独立关联的 usage 时保留缺口说明；ZCode 桌面 3.14.4 不向工具进程传递会话身份变量，`--current` 在该入口不可用。
+
+- 二期于 2026-10-02 撤回新增规则、恢复已验收 SKILL 后，按用户批准的验收边界闭合：Codex 桌面/CLI 入口身份、Codex CLI 与 ZCode 子代理恢复、同会话范围更新及来源明确的候选选择已核验；ZCode 缺真实分叉样例、Codex 分叉无 usage 副本对象两项差异获批准，来源行为变化后重验。stat4 未遵循候选等待规则的失败记录保留，接受新干净样例并暂不修改产品，不宣称历史失败已修复。
+
 ## V0.1
 
 - 修复 ZCode 活跃轮次候选与请求截止点：合并 `model_usage`、`turn_usage` 和明确轮次事件的稳定 ID，同时保留生命周期未知；已确认的合成系统 message 不再作为用户请求候选或 `--request-id` 截止点，入队输入仅在 `promoted_message_id` 明确关联时与提升后 message 合并。

@@ -6,11 +6,16 @@ import shutil
 import sqlite3
 import tempfile
 from .codex import discover
-from .core import cell, deduplicate, normalize, source_lines
+from .core import aggregate, cell, deduplicate, normalize, source_lines
 
 MAPPING = {'input': 'inputTokens', 'output': 'outputTokens', 'cache_read': 'cacheReadTokens',
            'cache_write': 'cacheWriteTokens', 'reasoning': 'reasoningTokens'}
 COMPLETIONS = ('model.sdk.stream.completed', 'model.sdk.generate.completed')
+# Usage is digested by one telemetry writer; provider names only select the billing plan of the
+# same BigModel API. Field semantics verified on every row of real sources: all rows with usage
+# satisfy input+output==totalTokens and cacheReadTokens<=inputTokens (2026-10-01, 5,211+ rows).
+VERIFIED_PROVIDERS = ('builtin:bigmodel-coding-plan', 'builtin:bigmodel-start-plan',
+                      'account:bigmodel-individual-coding-plan', 'account:bigmodel-start-plan')
 
 
 def metrics(usage, provider):
@@ -18,7 +23,7 @@ def metrics(usage, provider):
     if 'totalTokens' in usage:
         usage['total_tokens'] = usage['totalTokens']
     result = normalize(usage, MAPPING, True)
-    if provider not in ('builtin:bigmodel-coding-plan', 'builtin:bigmodel-start-plan'):
+    if provider not in VERIFIED_PROVIDERS:
         # No inference from arithmetical equality alone for unverified providers.
         for name in result:
             result[name] = cell(result[name]['value'], 'unknown', '供应商字段包含关系尚未验证', result[name]['field'])
@@ -65,7 +70,7 @@ def apply_turn_event(sessions, event):
 def classify(query):
     if query == 'main_turn':
         return 'main'
-    if query == 'subagent':
+    if query in ('subagent', 'workflow_child'):
         return 'child'
     return 'internal' if query in ('compact', 'session_title', 'web_fetch_processing', 'web_search_tool') else 'unknown'
 
@@ -110,6 +115,12 @@ def read(roots):
         base = {'key': key, 'call_id': f'{rid}:{attempt}', 'session': sid, 'agent': sid, 'turn': obj.get('turnId'),
                 'root_turn': None, 'time': at, 'start': obj.get('startedAt'), 'sources': [loc],
                 'duration_ms': obj.get('durationMs'), 'group': classify(ctx.get('querySource')), 'call_count': 1}
+        if ctx.get('querySource') == 'compact':
+            base['internal_kind'] = 'compaction'
+        elif ctx.get('querySource') == 'session_title':
+            base['internal_kind'] = 'session_aux'
+        elif ctx.get('querySource') == 'workflow_child':
+            base['origin_kind'] = 'workflow_child'
         if ctx.get('querySource') == 'session_title':
             base['turn'] = None
         if base['turn']:
@@ -193,9 +204,11 @@ def read_database(path):
             sessions, requests = {}, []
             for row in db.execute('SELECT id,version,parent_id,time_created,task_type FROM session'):
                 sid = row['id']
+                # task_type records the relation kind: child types are descendants, not forks.
+                child = row['task_type'] in ('subagent_child', 'workflow_child')
                 sessions[sid] = dict(session(sid, iso_ms(row['time_created'])), version=row['version'],
-                                     parent=row['parent_id'] if row['task_type'] == 'subagent_child' else None,
-                                     forked_from=row['parent_id'] if row['task_type'] != 'subagent_child' else None,
+                                     parent=row['parent_id'] if child else None,
+                                     forked_from=row['parent_id'] if row['parent_id'] and not child else None,
                                      paths=[str(source)])
             records, issues = [], []
             fields = 'id,logical_request_id,attempt_index,session_id,turn_id,query_source,provider_id,model_id,status,started_at,completed_at,duration_ms,retry_count,raw_usage_json'
@@ -214,7 +227,10 @@ def read_database(path):
                                 'start': iso_ms(row['started_at']), 'time': iso_ms(row['completed_at']),
                                 'duration_ms': row['duration_ms'], 'sources': [loc],
                                 'metrics': metrics(usage, row['provider_id']),
-                                'call_count': 1 if usage and not row['retry_count'] else None})
+                                'call_count': 1 if usage and not row['retry_count'] else None,
+                                **({'internal_kind': 'compaction'} if row['query_source'] == 'compact' else
+                                   {'internal_kind': 'session_aux'} if row['query_source'] == 'session_title' else
+                                   {'origin_kind': 'workflow_child'} if row['query_source'] == 'workflow_child' else {})})
                 if row['retry_count']:
                     issues.append({'reason': '数据库仅保留逻辑请求结果，重试调用总数及失败用量可能缺失', 'source': loc,
                                    'session': row['session_id'], 'turn': row['turn_id']})
@@ -278,6 +294,21 @@ def read_database(path):
     log_data = read([relation_logs]) if relation_logs.is_dir() else {'events': [], 'source_files': []}
     for event in log_data['events']:
         apply_turn_event(sessions, event)
+    rollout_root = source.parent.parent / 'rollout' if source.parent.name == 'db' else source.parent / 'rollout'
+    alternates = []
+    if rollout_root.is_dir():
+        # Filename gives a session-level association only; rollout requestIds live in another
+        # identity space than database logical_request_id, so no call-level bridge exists and
+        # readable values stay out of the metered subtotal.
+        for path in sorted(rollout_root.glob('model-io-*.jsonl')):
+            sid = path.name[len('model-io-'):-len('.jsonl')]
+            if sid not in sessions:
+                continue
+            rollout_records = [r for r in read([path])['records'] if r['session'] == sid]
+            alternates.append(dict({'kind': 'rollout', 'path': str(path), 'session': sid,
+                                    'records': len(rollout_records),
+                                    'note': '跨源重叠未知，未并入小计；为该会话全量可读值，未按报告范围筛选'}, **aggregate(rollout_records)))
     return {'harness': 'zcode', 'sessions': sessions, 'records': records, 'issues': issues,
             'source_files': [str(source)] + [str(p) for p in (paths[1],Path(str(source)+'-shm')) if p.exists()] + log_data['source_files'], 'events': log_data['events'],
-            'ledger': 'model_usage；不叠加身份无法对应的 rollout 或消息副本', 'requests':requests}
+            'alternate_sources': alternates,
+            'ledger': 'model_usage 为计量来源；rollout 无调用级身份桥接，可读值独立展示不并入小计', 'requests':requests}

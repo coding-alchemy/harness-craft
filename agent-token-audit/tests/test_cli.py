@@ -535,11 +535,49 @@ class CLI(unittest.TestCase):
         with patch.dict(os.environ,{'CODEX_THREAD_ID':'s'}):
             items=json.loads(self.run_cli('requests','--source',str(self.log),'--current').stdout)
             self.assertEqual(items[0]['id'],'request-2')
+            self.assertEqual(items[0]['classification'],'unknown')
             result=json.loads(self.run_cli('report','--source',str(self.log),'--current','--request-id','request-2','--format','json').stdout)
             self.assertEqual(result['summary']['metrics']['input']['value'],100)
             self.assertEqual(result['scope']['to'],'2026-09-01T00:01:00.500000+00:00')
         with patch.dict(os.environ,{'CODEX_THREAD_ID':'unrelated'}):
             self.run_cli('report','--source',str(self.log),'--current',codes=(4,))
+        env = {k: v for k, v in os.environ.items() if k != 'CODEX_THREAD_ID'}
+        proc = subprocess.run([sys.executable, '-B', str(ENTRY), 'report', '--source', str(self.log), '--current'],
+                              capture_output=True, text=True, cwd=self.root, env=env)
+        self.assertEqual(proc.returncode, 4)
+        self.assertIn('CODEX_THREAD_ID 缺失', proc.stderr)
+
+    def test_codex_system_injected_messages_are_not_request_cutoffs(self):
+        def message(mid, kinds, text):
+            meta = {'turn_id': 't1', 'create_time': 1788220860.5}
+            if kinds is not None:
+                meta['content_item_kinds'] = kinds
+            return {'type': 'response_item', 'timestamp': T1, 'payload': {
+                'type': 'message', 'role': 'user', 'id': mid, 'content': [{'type': 'input_text', 'text': text}],
+                'internal_chat_message_metadata_passthrough': meta}}
+        system = message('msg-env', ['agents_md.instructions', 'environments.environment_context'], '<environment_context>')
+        skill = message('msg-skill', ['skills.selected_skill_instructions'], '<skill>')
+        apps = message('msg-apps', ['additional_content.codex_apps_open_page'], '<external_codex_apps_open_page>')
+        real = message('msg-real', ['user.text'], '统计这个任务')
+        reply = message('msg-reply', ['user.text'], '<send_user_message_question_reply>[{"answer":"同意"}]')
+        legacy = {'type': 'response_item', 'timestamp': T1, 'payload': {
+            'type': 'message', 'role': 'user', 'id': 'msg-legacy', 'content': [{'type': 'input_text', 'text': '旧格式消息'}]}}
+        self.write([meta(), usage(), system, skill, apps, real, reply, legacy, usage('r2', time='2026-09-01T00:02:00Z')])
+        args = ['--source', str(self.log), '--session', 's']
+        items = json.loads(self.run_cli('requests', *args).stdout)
+        listed = {item['id']: item for item in items}
+        self.assertNotIn('msg-env', listed)
+        self.assertNotIn('msg-skill', listed)
+        self.assertNotIn('msg-apps', listed)
+        self.assertEqual(listed['msg-real']['classification'], 'user_message')
+        self.assertEqual(listed['msg-reply']['classification'], 'user_message')
+        self.assertEqual(listed['msg-legacy']['classification'], 'unknown')
+        for rejected in ('msg-env', 'msg-skill', 'msg-apps'):
+            proc = self.run_cli('report', *args, '--request-id', rejected, codes=(4,))
+            self.assertIn('系统注入', proc.stderr)
+        result = json.loads(self.run_cli('report', *args, '--request-id', 'msg-real', '--format', 'json').stdout)
+        self.assertEqual(result['summary']['metrics']['input']['value'], 100)
+        self.assertEqual(result['scope']['to'], '2026-09-01T00:01:00.500000+00:00')
 
     def test_codex_duplicate_request_log_is_one_request_candidate(self):
         request = {'type': 'response_item', 'timestamp': T1, 'payload': {
@@ -571,6 +609,266 @@ class CLI(unittest.TestCase):
         self.assertTrue(result['issues'])
         self.assertNotIn('PRIVATE-VALUE', json.dumps(result))
 
+    def test_v2_report_roundtrip_views_and_projection(self):
+        def started(turn):
+            return {'type': 'event_msg', 'timestamp': T0, 'payload': {'type': 'task_started', 'turn_id': turn}}
+        def count(total, time):
+            return {'type': 'event_msg', 'timestamp': time, 'payload': {'type': 'token_count', 'info': {'total_token_usage': {
+                'input_tokens': total, 'output_tokens': 0, 'cached_input_tokens': 0, 'total_tokens': total}}}}
+        child = meta('child')
+        child['payload']['source'] = {'subagent': {'thread_spawn': {'parent_thread_id': 's'}}}
+        child_usage = usage('cr', sid='child', turn='ct', inp=50, cache=0, output=0)
+        child_usage['payload']['root_turn_id'] = 't1'
+        parent_log = self.root / 'parent.jsonl'
+        parent_log.write_text(''.join(json.dumps(x) + '\n' for x in [
+            meta(), started('t1'), count(0, T0), usage(), count(100, T1),
+            started('t2'), started('t3'), count(1300, '2026-09-01T00:03:00Z')]))
+        self.write([child, child_usage])
+        turns = ['--turn', 't1', '--turn', 't2', '--turn', 't3']
+        result = self.report('--source', str(parent_log), *turns, '--detail', 'turn')
+        self.assertEqual(result['format_version'], 2)
+        self.assertEqual(result['localization']['session']['confirmed_by'], 'explicit')
+        self.assertEqual(result['localization']['cutoff']['source'], 'explicit')
+        turn_rows = {row['label']: row for row in result['views']['turn']['rows']}
+        self.assertEqual(set(turn_rows), {'t1', '多轮区间，无法拆分'})
+        self.assertEqual(turn_rows['t1']['metrics']['input']['value'], 150)
+        self.assertEqual(turn_rows['多轮区间，无法拆分']['metrics']['input']['value'], 1200)
+        agent_rows = {row['label']: row for row in result['views']['agent']['rows']}
+        self.assertEqual(agent_rows['s']['metrics']['input']['value'], 1300)
+        self.assertEqual(agent_rows['child']['metrics']['input']['value'], 50)
+        model_total = sum(row['metrics']['input']['value'] for row in result['views']['model']['rows'])
+        self.assertEqual(model_total, result['summary']['metrics']['input']['value'])
+        self.assertEqual([d['name'] for d in result['details']],
+                         [row['label'] for row in result['views']['turn']['rows']])
+        self.assertEqual(result['details'][-1]['metrics'], turn_rows['t1']['metrics'])
+        self.assertIn('定位证据', self.run_cli('report', '--source', str(parent_log), '--session', 's', *turns).stdout)
+        saved = self.root / 'v2.json'
+        self.report('--source', str(parent_log), *turns, '--export', 'json', '--output', str(saved))
+        shown = json.loads(self.run_cli('show', '--saved', str(saved), '--format', 'json').stdout)
+        self.assertEqual(shown, json.loads(saved.read_text()))
+        self.run_cli('show', '--saved', str(saved), '--export', 'json', '--output', str(saved), codes=(4,))
+
+    def test_v1_report_reads_without_new_dimensions_and_recompute_makes_v2(self):
+        self.write([meta(), usage(), usage('r2', inp=300, cache=None)])
+        saved = self.root / 'v2.json'
+        self.report('--detail', 'model', '--export', 'json', '--output', str(saved))
+        old = {k: v for k, v in json.loads(saved.read_text()).items()
+               if k not in ('localization', 'internal_support', 'views')}
+        old['format_version'] = 1
+        v1 = self.root / 'v1.json'
+        v1.write_text(json.dumps(old))
+        shown = json.loads(self.run_cli('show', '--saved', str(v1), '--format', 'json').stdout)
+        self.assertEqual(shown['format_version'], 1)
+        self.assertEqual(shown['summary'], old['summary'])
+        self.assertEqual(shown['details'], old['details'])
+        self.assertNotIn('views', shown)
+        table = self.run_cli('show', '--saved', str(v1))
+        self.assertIn('旧报告未保存', table.stdout)
+        self.assertIn('明细（model', table.stdout)
+        plain = {k: v for k, v in old.items() if k != 'details'}
+        plain_path = self.root / 'v1-plain.json'
+        plain_path.write_text(json.dumps(plain))
+        plain_shown = json.loads(self.run_cli('show', '--saved', str(plain_path), '--format', 'json').stdout)
+        self.assertEqual(plain_shown['summary'], plain['summary'])
+        self.assertNotIn('details', plain_shown)
+        recompute = json.loads(self.run_cli('recompute', '--saved', str(v1), '--format', 'json').stdout)
+        self.assertEqual(recompute['format_version'], 2)
+        self.assertEqual(recompute['scope'], old['scope'])
+        self.assertEqual(recompute['summary']['metrics']['input']['value'], 400)
+
+    def test_invalid_v2_reports_rejected(self):
+        self.write([meta(), usage()])
+        saved = self.root / 'v2.json'
+        self.report('--detail', 'model', '--export', 'json', '--output', str(saved))
+        base = json.loads(saved.read_text())
+        def reject(mutate):
+            data = json.loads(json.dumps(base))
+            mutate(data)
+            path = self.root / 'bad.json'
+            path.write_text(json.dumps(data))
+            self.run_cli('show', '--saved', str(path), codes=(4,))
+        reject(lambda d: d['localization']['session'].__setitem__('id', 'other'))
+        reject(lambda d: d['localization']['cutoff'].__setitem__('time', 'not-a-time'))
+        reject(lambda d: d['views'].pop('agent'))
+        reject(lambda d: d['views']['model']['rows'][0]['metrics']['input'].__setitem__('value', -5))
+        reject(lambda d: d['views']['model']['rows'][0]['metrics']['input'].__setitem__('value', 1.5))
+        reject(lambda d: d['details'][0]['metrics']['input'].__setitem__('value', 1))
+        reject(lambda d: d['internal_support'].pop('retry_failure'))
+        reject(lambda d: d['views']['model']['rows'][0].pop('id'))
+
+    def test_large_integers_survive_roundtrip_exactly(self):
+        big = 2 ** 53 + 3
+        self.write([meta(), usage(inp=big, cache=0)])
+        result = self.report()
+        self.assertEqual(result['summary']['metrics']['input']['value'], big)
+        self.assertEqual(result['views']['model']['rows'][0]['metrics']['input']['value'], big)
+        saved = self.root / 'big.json'
+        self.report('--export', 'json', '--output', str(saved))
+        self.assertIn(str(big), saved.read_text())
+        shown = json.loads(self.run_cli('show', '--saved', str(saved), '--format', 'json').stdout)
+        self.assertEqual(shown['summary']['metrics']['input']['value'], big)
+        self.assertEqual(shown['views']['model']['rows'][0]['metrics']['input']['value'], big)
+
+    def test_legal_full_cache_rate_and_all_status_reports_roundtrip(self):
+        self.write([meta(), usage(inp=100, cache=100, output=0)])
+        result = self.report()
+        self.assertEqual(result['summary']['cache_hit_rate']['value'], 1.0)
+        self.assertEqual(result['coverage_state'], 'unknown')
+        saved = self.root / 'rate.json'
+        self.report('--export', 'json', '--output', str(saved))
+        self.assertEqual(json.loads(self.run_cli('show', '--saved', str(saved), '--format', 'json').stdout)['summary']['cache_hit_rate']['value'], 1.0)
+        self.write([{'event': 'model.sdk.stream.completed', 'sessionId': 's', 'timestamp': T1,
+                     'context': {'requestId': 'r', 'attempt': 1, 'querySource': 'main_turn', 'usage': {'inputTokens': '[Redacted]'}}}])
+        count_only = self.root / 'count.json'
+        self.report('--harness', 'zcode', '--export', 'json', '--output', str(count_only))
+        self.assertEqual(json.loads(self.run_cli('show', '--saved', str(count_only), '--format', 'json').stdout)['status'], 'count_only')
+        self.write([{'event': 'subagent.completed', 'sessionId': 's', 'turnId': 't1', 'timestamp': T1, 'context': {'agentId': 'a1', 'totalTokens': 200000}}])
+        tool_only = self.root / 'tool.json'
+        self.report('--harness', 'zcode', '--export', 'json', '--output', str(tool_only))
+        self.assertEqual(json.loads(self.run_cli('show', '--saved', str(tool_only), '--format', 'json').stdout)['status'], 'tool_only')
+        self.write([meta()])
+        unstatisticable = self.root / 'none.json'
+        self.report('--export', 'json', '--output', str(unstatisticable))
+        self.assertEqual(json.loads(self.run_cli('show', '--saved', str(unstatisticable), '--format', 'json').stdout)['status'], 'unstatisticable')
+        path = self.make_database()
+        zero = self.root / 'zero.json'
+        self.run_cli('report', '--harness', 'zcode', '--database', str(path), '--session', 's', '--turn', 't0',
+                     '--to', END, '--format', 'json', '--export', 'json', '--output', str(zero))
+        self.assertEqual(json.loads(self.run_cli('show', '--saved', str(zero), '--format', 'json').stdout)['status'], 'confirmed_zero')
+
+    def test_account_plan_provider_usage_metered_and_unverified_stays_unknown(self):
+        rows = []
+        for rid, provider in (('a', 'account:bigmodel-individual-coding-plan'), ('b', 'account:bigmodel-start-plan'), ('c', 'bigmodel')):
+            rows.append({'sessionId': 's', 'requestId': rid, 'attempt': 1, 'turnId': 't1', 'querySource': 'main_turn',
+                         'completedAt': T1, 'model': {'providerId': provider, 'modelId': 'GLM-5.3'},
+                         'response': {'usage': {'inputTokens': 100, 'outputTokens': 10, 'cacheReadTokens': 90, 'totalTokens': 110}}})
+        self.write(rows)
+        result = self.report('--harness', 'zcode')
+        self.assertEqual(result['summary']['metrics']['input']['value'], 200)
+        self.assertEqual(result['summary']['metrics']['input']['known_records'], 2)
+        self.assertEqual(result['summary']['metrics']['input']['records'], 3)
+        self.assertTrue(any('尚未验证' in r['metrics']['input']['reason'] for r in result['records'] if r['call_id'] == 'c:1'))
+
+    def test_database_alternate_rollout_shown_not_merged(self):
+        root = self.root / 'layout'
+        dbdir = root / 'db'
+        dbdir.mkdir(parents=True)
+        path = dbdir / 'db.sqlite'
+        db = sqlite3.connect(path)
+        db.executescript('''CREATE TABLE session (id TEXT, version TEXT, parent_id TEXT, time_created INTEGER, task_type TEXT);
+        CREATE TABLE model_usage (id TEXT,logical_request_id TEXT,attempt_index INTEGER,session_id TEXT,turn_id TEXT,
+        query_source TEXT,provider_id TEXT,model_id TEXT,status TEXT,started_at INTEGER,completed_at INTEGER,
+        duration_ms INTEGER,retry_count INTEGER,raw_usage_json TEXT);
+        CREATE TABLE turn_usage (session_id TEXT,turn_id TEXT,started_at INTEGER,completed_at INTEGER,status TEXT,model_request_count INTEGER);''')
+        db.execute('INSERT INTO session VALUES (?,?,?,?,?)', ('s', '0.16.5', None, 1788220800000, 'interactive'))
+        db.execute('INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   ('r1', 'msg1', 0, 's', 't1', 'main_turn', 'builtin:bigmodel-coding-plan', 'GLM-5.3',
+                    'completed', 1788220800000, 1788220860000, 60000, 0,
+                    json.dumps({'inputTokens': 100, 'outputTokens': 0, 'cacheReadTokens': 0, 'totalTokens': 100})))
+        db.commit(); db.close()
+        rollout = root / 'rollout'
+        rollout.mkdir()
+        (rollout / 'model-io-s.jsonl').write_text(json.dumps({
+            'requestId': 'uuid-1', 'attempt': 1, 'sessionId': 's', 'turnId': 't1', 'querySource': 'main_turn',
+            'completedAt': T1, 'model': {'providerId': 'account:bigmodel-individual-coding-plan', 'modelId': 'GLM-5.3'},
+            'response': {'usage': {'inputTokens': 400, 'outputTokens': 40, 'cacheReadTokens': 10, 'totalTokens': 440}}}) + '\n')
+        args = ['--harness', 'zcode', '--database', str(path), '--session', 's']
+        result = json.loads(self.run_cli('report', *args, '--to', END, '--format', 'json').stdout)
+        self.assertEqual(result['summary']['metrics']['input']['value'], 100)
+        self.assertEqual(len(result['records']), 1)
+        alt = result['alternate_sources'][0]
+        self.assertEqual(alt['kind'], 'rollout')
+        self.assertEqual(alt['session'], 's')
+        self.assertEqual(alt['records'], 1)
+        self.assertEqual(alt['metrics']['input']['value'], 400)
+        self.assertIn('未并入小计', alt['note'])
+        self.assertIn('未按报告范围筛选', alt['note'])
+        self.assertIn('补充来源（rollout', self.run_cli('report', *args, '--to', END).stdout)
+        saved = self.root / 'alt.json'
+        self.run_cli('report', *args, '--to', END, '--format', 'json', '--export', 'json', '--output', str(saved))
+        shown = json.loads(self.run_cli('show', '--saved', str(saved), '--format', 'json').stdout)
+        self.assertEqual(shown['alternate_sources'][0]['metrics']['input']['value'], 400)
+        csv_path = self.root / 'alt.csv'
+        self.run_cli('report', *args, '--to', END, '--export', 'csv', '--output', str(csv_path))
+        alt_row = next(r for r in csv.DictReader(io.StringIO(csv_path.read_text())) if r['category'] == 'alternate_source')
+        self.assertEqual(alt_row['input'], '400')
+        data = json.loads(saved.read_text())
+        data['alternate_sources'][0]['metrics']['input']['value'] = -1
+        saved.write_text(json.dumps(data))
+        self.run_cli('show', '--saved', str(saved), codes=(4,))
+
+    def test_codex_compaction_marker_reclassifies_referenced_call(self):
+        started = {'type': 'event_msg', 'timestamp': T0, 'payload': {'type': 'task_started', 'turn_id': 't1'}}
+        compaction = usage('resp-compact', inp=5000, cache=0, output=200)
+        marker = {'type': 'compacted', 'timestamp': '2026-09-01T00:01:30Z', 'payload': {
+            'compaction_response_id': 'resp-compact', 'message': 'summary',
+            'latest_token_usage_record': {'response_id': 'resp-compact', 'thread_id': 's',
+                                          'usage': dict(compaction['payload']['usage'])}}}
+        unresolved = {'type': 'compacted', 'timestamp': '2026-09-01T00:03:00Z', 'payload': {}}
+        self.write([meta(), started, usage(), compaction, marker, usage('r2', time='2026-09-01T00:02:00Z'), unresolved])
+        result = self.report()
+        groups = {row['group']: row['metrics']['input']['value'] for row in result['rows']}
+        self.assertEqual(groups.get('main'), 200)
+        self.assertEqual(groups.get('internal'), 5000)
+        self.assertEqual(result['summary']['metrics']['input']['value'], 5200)
+        compaction_records = [r for r in result['records'] if r.get('internal_kind') == 'compaction']
+        self.assertEqual(len(compaction_records), 1)
+        self.assertTrue(any('压缩调用' in i['reason'] and ('未找到' in i['reason'] or '未提供' in i['reason']) for i in result['issues']))
+        self.assertEqual(result['internal_support']['compaction_summary']['status'], 'checked_available')
+        self.assertEqual(result['internal_support']['title_session_aux']['status'], 'checked_absent')
+        only = self.report('--main-only')
+        self.assertEqual(only['summary']['metrics']['input']['value'], 200)
+
+    def test_workflow_child_is_descendant_and_session_aux_is_separate(self):
+        path = self.root / 'wf.sqlite'
+        db = sqlite3.connect(path)
+        db.executescript('''CREATE TABLE session (id TEXT, version TEXT, parent_id TEXT, time_created INTEGER, task_type TEXT);
+        CREATE TABLE model_usage (id TEXT,logical_request_id TEXT,attempt_index INTEGER,session_id TEXT,turn_id TEXT,
+        query_source TEXT,provider_id TEXT,model_id TEXT,status TEXT,started_at INTEGER,completed_at INTEGER,
+        duration_ms INTEGER,retry_count INTEGER,raw_usage_json TEXT);
+        CREATE TABLE turn_usage (session_id TEXT,turn_id TEXT,started_at INTEGER,completed_at INTEGER,status TEXT,model_request_count INTEGER);''')
+        db.execute('INSERT INTO session VALUES (?,?,?,?,?)', ('s', '0.16.9', None, 1788220800000, 'interactive'))
+        db.execute('INSERT INTO session VALUES (?,?,?,?,?)', ('wf', '0.16.9', 's', 1788220801000, 'workflow_child'))
+        def usage_row(rid, sid, turn, source, inp, completed):
+            db.execute('INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                       (rid, rid, 0, sid, turn, source, 'builtin:bigmodel-coding-plan', 'GLM-5.3', 'completed',
+                        completed - 60000, completed, 60000, 0,
+                        json.dumps({'inputTokens': inp, 'outputTokens': 1, 'cacheReadTokens': 0, 'totalTokens': inp + 1})))
+        usage_row('main1', 's', 't1', 'main_turn', 1000, 1788220860000)
+        usage_row('wfc1', 'wf', None, 'workflow_child', 5000, 1788220920000)
+        usage_row('wfc2', 'wf', 'wfturn', 'workflow_child', 7000, 1788220980000)
+        usage_row('title1', 's', 't1', 'session_title', 238, 1788220870000)
+        db.commit(); db.close()
+        args = ['--harness', 'zcode', '--database', str(path), '--session', 's']
+        full = json.loads(self.run_cli('report', *args, '--to', END, '--format', 'json').stdout)
+        groups = {row['group']: row['metrics']['input']['value'] for row in full['rows']}
+        self.assertEqual(groups.get('main'), 1000)
+        self.assertEqual(groups.get('child'), 12000)
+        self.assertEqual(groups.get('internal'), 238)
+        self.assertEqual(full['summary']['metrics']['input']['value'], 13238)
+        self.assertEqual([r['origin_kind'] for r in full['records'] if r.get('origin_kind')], ['workflow_child'] * 2)
+        self.assertEqual(full['internal_support']['background_other']['status'], 'checked_available')
+        self.assertEqual(full['internal_support']['title_session_aux']['status'], 'checked_available')
+        task = json.loads(self.run_cli('report', *args, '--turn', 't1', '--to', END, '--format', 'json').stdout)
+        self.assertEqual(task['summary']['metrics']['input']['value'], 1000)
+        unassigned = [r['call_id'] for r in task['unassigned_records']]
+        self.assertIn('title1:0', unassigned)
+        main_only = json.loads(self.run_cli('report', *args, '--to', END, '--main-only', '--format', 'json').stdout)
+        self.assertEqual(main_only['summary']['metrics']['input']['value'], 1000)
+
+    def test_descendant_cycle_keeps_records_with_reason(self):
+        first = meta('a')
+        first['payload']['source'] = {'subagent': {'thread_spawn': {'parent_thread_id': 'b'}}}
+        second = meta('b')
+        second['payload']['source'] = {'subagent': {'thread_spawn': {'parent_thread_id': 'a'}}}
+        log_b = self.root / 'b.jsonl'
+        log_b.write_text(json.dumps(second) + '\n')
+        self.write([first, usage(sid='a', turn='t1')])
+        result = json.loads(self.run_cli('report', '--source', str(self.log), '--source', str(log_b),
+                                         '--session', 'a', '--to', END, '--format', 'json').stdout)
+        self.assertEqual(result['summary']['metrics']['input']['value'], 100)
+        self.assertTrue(any('循环' in i['reason'] for i in result['issues']))
+
     def test_installation_standalone_and_existing_target_protected(self):
         installer=ENTRY.parents[3]/'install_skill.py'
         target=self.root/'installed'
@@ -580,6 +878,8 @@ class CLI(unittest.TestCase):
         self.write([meta(),usage()])
         proc=subprocess.run([sys.executable,'-B',str(standalone),'report','--source',str(self.log),'--session','s','--to',END,'--format','json'],capture_output=True,text=True,cwd=self.root)
         self.assertEqual(json.loads(proc.stdout)['summary']['metrics']['input']['value'],100)
+        for viewer_file in ('viewer/index.html','viewer/lossless-json.umd.js','viewer/lossless-json.LICENSE.md'):
+            self.assertTrue((target/viewer_file).is_file(), viewer_file)
         skill=target/'SKILL.md';skill.write_text('existing personal changes')
         proc=subprocess.run([sys.executable,'-B',str(installer),'--target',str(target)],capture_output=True,text=True)
         self.assertEqual(proc.returncode,1)

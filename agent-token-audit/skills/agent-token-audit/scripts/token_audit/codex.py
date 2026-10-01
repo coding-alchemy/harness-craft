@@ -21,7 +21,7 @@ def discover(roots):
 
 def read(roots):
     paths = discover(roots)
-    sessions, records, issues, contexts, requests = {}, [], [], {}, []
+    sessions, records, issues, contexts, requests, compactions = {}, [], [], {}, [], []
     for path, line, obj, error in source_lines(paths):
         loc = {'path': path, 'line': line}
         if error:
@@ -70,11 +70,21 @@ def read(roots):
             if metadata.get('turn_id') is not None and not isinstance(metadata['turn_id'], str):
                 metadata = dict(metadata, turn_id=None)
                 issues.append({'reason': '请求轮次字段格式未知', 'source': loc, 'session': ctx['session']})
+            kinds = metadata.get('content_item_kinds')
+            if isinstance(kinds, list) and all(isinstance(k, str) for k in kinds):
+                # The harness tags each content item; only user.text is a user-originated request.
+                classification = 'user_message' if 'user.text' in kinds else 'non_user_input'
+            else:
+                classification = 'unknown'
             created=metadata.get('create_time')
             at=dt.datetime.fromtimestamp(created,dt.timezone.utc).isoformat() if isinstance(created,(int,float)) else obj.get('timestamp')
-            requests.append({'id':payload.get('id'),'session':ctx['session'],'turn':metadata.get('turn_id') or ctx['turn'],
-                             'time':at,'source':loc,'sources':[loc],
-                             'time_source':'message_create_time' if isinstance(created,(int,float)) else 'message_log_time'})
+            item={'id':payload.get('id'),'session':ctx['session'],'turn':metadata.get('turn_id') or ctx['turn'],
+                  'time':at,'source':loc,'sources':[loc],
+                  'time_source':'message_create_time' if isinstance(created,(int,float)) else 'message_log_time',
+                  'classification':classification,'eligible':classification != 'non_user_input'}
+            if not item['eligible']:
+                item['rejection_reason'] = '该消息由系统注入（非用户输入），不能作为用户请求截止点'
+            requests.append(item)
         elif typ == 'response_item':
             if payload.get('type') == 'message' and payload.get('role') == 'assistant':
                 ctx['outputs'].append(payload.get('id'))
@@ -82,8 +92,10 @@ def read(roots):
                 # Tool calls or unknown model outputs make a message-only association ambiguous.
                 ctx['outputs'].append(None)
         elif typ == 'compacted':
-            issues.append({'reason': '发生上下文压缩，源未提供可独立关联的压缩 usage', 'source': loc,
-                           'session': ctx['session'], 'turn': ctx['turn']})
+            # The marker names the compaction call's own response; its usage record (if any)
+            # is the metered evidence. latest_token_usage_record is a copy of the same call,
+            # never an additional one.
+            compactions.append((payload.get('compaction_response_id'), loc, ctx['session']))
         elif typ == 'event_msg' and payload.get('type') in ('task_started','task_complete','turn_aborted'):
             sid = ctx['session']; turn = payload.get('turn_id') or ctx['turn']
             if sid not in sessions or not turn:
@@ -177,6 +189,20 @@ def read(roots):
         else:
             kept.append(record)
     records = kept
+    # A compaction marker reclassifies its referenced call as internal auxiliary; it never adds usage.
+    for crid, loc, sid in compactions:
+        if not isinstance(crid, str):
+            issues.append({'reason': '发生上下文压缩，未提供可关联的压缩调用身份；用量可能已计或缺失',
+                           'source': loc, 'session': sid})
+            continue
+        matched = [r for r in records if r.get('call_id') == crid]
+        if matched:
+            for record in matched:
+                record['group'] = 'internal'
+                record['internal_kind'] = 'compaction'
+        else:
+            issues.append({'reason': '发生上下文压缩，未找到可关联的压缩调用 usage；可能已计或缺失',
+                           'source': loc, 'session': sid})
     unique_requests, unkeyed_requests = {}, []
     for request in requests:
         request_id = request['id']

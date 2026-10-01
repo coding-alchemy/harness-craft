@@ -5,13 +5,51 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from .core import METRICS, aggregate, markdown, timestamp
+from .core import INTERNAL_CATEGORIES, METRICS, aggregate, markdown, timestamp
+
+
+def check_aggregate_row(row):
+    """Validate one aggregate payload (metrics, cache subset, call count) shared by all report rows."""
+    for name in METRICS:
+        metric = row['metrics'][name]
+        if metric['value'] is not None and (type(metric['value']) is not int or metric['value'] < 0):
+            raise ValueError('报告中的 token 必须为非负整数或 null')
+        if metric['state'] not in ('known','partial','unknown'):
+            raise ValueError('未知的指标状态')
+        if not isinstance(metric['reasons'],list) or not all(isinstance(r, str) for r in metric['reasons']):
+            raise ValueError('缺失指标原因')
+    rate = row['cache_hit_rate']
+    if not isinstance(rate, dict):
+        raise ValueError('缺失缓存覆盖状态')
+    if rate['value'] is not None and (type(rate['value']) not in (int, float) or not 0 <= rate['value'] <= 1):
+        raise ValueError('缓存命中率必须为 0 到 1 的数值或 null')
+    if rate['state'] not in ('known', 'partial', 'unknown', 'not_applicable'):
+        raise ValueError('未知的缓存覆盖状态')
+    if any(type(rate[k]) is not int or rate[k] < 0 for k in ('paired_records', 'input', 'cache_read')):
+        raise ValueError('无效的缓存覆盖量')
+    if row['call_count'] is not None and (type(row['call_count']) is not int or row['call_count'] < 0):
+        raise ValueError('无效的调用数')
+
+
+def check_localization(localization, scope):
+    session = localization['session']
+    if (not isinstance(session, dict) or not isinstance(session.get('id'), str) or session['id'] != scope['session']
+            or not isinstance(session.get('confirmed_by'), str) or not isinstance(session.get('evidence'), str)):
+        raise ValueError('定位证据缺少会话身份或与会话不一致')
+    cutoff = localization['cutoff']
+    if (not isinstance(cutoff, dict) or not isinstance(cutoff.get('source'), str)
+            or cutoff.get('source') != scope['cutoff_source'] or cutoff.get('time') != scope['to']
+            or not isinstance(cutoff.get('evidence'), str)):
+        raise ValueError('定位证据缺少截止点或与截止点不一致')
+    if not isinstance(localization.get('limits'), list) or not all(isinstance(x, str) for x in localization['limits']):
+        raise ValueError('无效的定位限制')
 
 
 def load_report(path):
     try:
         obj = json.loads(Path(path).read_text())
-        if not isinstance(obj,dict) or type(obj.get('format_version')) is not int or obj['format_version'] != 1:
+        version = obj.get('format_version') if isinstance(obj, dict) else None
+        if type(version) is not int or version not in (1, 2):
             raise ValueError('不支持的报告格式版本')
         scope = obj['scope']
         if obj['harness'] not in ('codex','zcode') or not isinstance(scope['session'],str):
@@ -24,25 +62,37 @@ def load_report(path):
         if type(scope['main_only']) is not bool or type(scope['include_children']) is not bool or scope['main_only'] == scope['include_children']:
             raise ValueError('不一致的子代理策略')
         for row in obj['rows'] + [obj['summary']] + obj.get('details', []):
-            for name in METRICS:
-                metric = row['metrics'][name]
-                if metric['value'] is not None and (type(metric['value']) is not int or metric['value'] < 0):
-                    raise ValueError('报告中的 token 必须为非负整数或 null')
-                if metric['state'] not in ('known','partial','unknown'):
-                    raise ValueError('未知的指标状态')
-                if not isinstance(metric['reasons'],list) or not all(isinstance(r, str) for r in metric['reasons']):
-                    raise ValueError('缺失指标原因')
-            rate = row['cache_hit_rate']
-            if not isinstance(rate, dict):
-                raise ValueError('缺失缓存覆盖状态')
-            if rate['value'] is not None and (type(rate['value']) not in (int, float) or not 0 <= rate['value'] <= 1):
-                raise ValueError('缓存命中率必须为 0 到 1 的数值或 null')
-            if rate['state'] not in ('known', 'partial', 'unknown', 'not_applicable'):
-                raise ValueError('未知的缓存覆盖状态')
-            if any(type(rate[k]) is not int or rate[k] < 0 for k in ('paired_records', 'input', 'cache_read')):
-                raise ValueError('无效的缓存覆盖量')
-            if row['call_count'] is not None and (type(row['call_count']) is not int or row['call_count'] < 0):
-                raise ValueError('无效的调用数')
+            check_aggregate_row(row)
+        if version == 2:
+            check_localization(obj['localization'], scope)
+            support = obj['internal_support']
+            if not isinstance(support, dict) or set(support) != set(INTERNAL_CATEGORIES):
+                raise ValueError('缺失或多余的内部来源支持类别')
+            for value in support.values():
+                if (not isinstance(value, dict) or not isinstance(value.get('status'), str)
+                        or not isinstance(value.get('summary'), str) or not isinstance(value.get('evidence'), list)):
+                    raise ValueError('无效的内部来源支持说明')
+            views = obj['views']
+            if not isinstance(views, dict) or set(views) != {'model','agent','turn'}:
+                raise ValueError('缺失报告展示视图')
+            for dimension, view in views.items():
+                if (not isinstance(view, dict) or type(view.get('available')) is not bool
+                        or not isinstance(view.get('reason'), str) or not isinstance(view['rows'], list)):
+                    raise ValueError('无效的展示视图：' + dimension)
+                for row in view['rows']:
+                    if not isinstance(row.get('id'), str) or not isinstance(row.get('label'), str):
+                        raise ValueError('无效的视图行身份')
+                    check_aggregate_row(row)
+            for detail in obj.get('details', []):
+                matches = [row for row in views[detail['dimension']]['rows'] if row['label'] == detail['name']]
+                if len(matches) != 1 or any(matches[0][key] != detail[key] for key in ('metrics','cache_hit_rate','call_count')):
+                    raise ValueError('明细与保存视图投影不一致')
+            for alt in obj.get('alternate_sources', []):
+                if (not isinstance(alt, dict) or not isinstance(alt.get('kind'), str) or not isinstance(alt.get('path'), str)
+                        or not isinstance(alt.get('session'), str) or not isinstance(alt.get('note'), str)
+                        or type(alt.get('records')) is not int or alt['records'] < 0):
+                    raise ValueError('无效的补充来源说明')
+                check_aggregate_row(alt)
         for key in ('records','source_files','issues','tool_reports'):
             if not isinstance(obj[key],list):
                 raise ValueError('缺失报告结构：' + key)
@@ -67,6 +117,8 @@ def load_report(path):
         # Ignore unrelated top-level additions: only the report contract is exported.
         allowed = {'format_version','harness','scope','input','read_at','status','scope_note','rows','summary','records',
                    'unassigned_records','inherited_records','issues','source_files','coverage','coverage_state','tool_reports','activity','details'}
+        if version == 2:
+            allowed |= {'localization','internal_support','views','alternate_sources'}
         return {k:v for k,v in obj.items() if k in allowed}
     except (KeyError,TypeError,json.JSONDecodeError) as exc:
         raise ValueError('报告缺少必需结构或 JSON 无效') from exc
@@ -78,6 +130,8 @@ def csv_text(result):
     rows += [dict(category='detail',label=r['name'],**r) for r in result.get('details',[])]
     if result.get('unassigned_records'):
         rows.append(dict(category='unassigned',label='会话辅助/未归属',**aggregate(result['unassigned_records'])))
+    rows += [dict(category='alternate_source',label=f"{alt['kind']}:{alt['session']}",**alt)
+             for alt in result.get('alternate_sources', [])]
     columns = ['category','label','scope','status','read_at','sources','issues','call_count',
                'cache_hit_rate','cache_rate_state','paired_records','paired_input','paired_cache_read','tool_report_total']
     for m in METRICS:

@@ -122,7 +122,77 @@ def aggregate(records):
             'known_call_count': sum(r.get('call_count') or 0 for r in records)}
 
 
-def report(data, session_id, cutoff, main_only=False, turns=None, since=None, cutoff_source='cli_start'):
+def build_views(selected, session_id):
+    """Three independent views over the same selected records; the only such computation."""
+    def turn_identity(record):
+        members = record.get('interval_turns')
+        if members and len(set(members)) > 1:
+            return '__multi_turn_interval__', '多轮区间，无法拆分'
+        if members:
+            return members[0], members[0]
+        owner = record['turn'] if record['session'] == session_id else record.get('owner_turn')
+        return (owner, owner) if owner else ('__unknown__', '未知')
+
+    views = {}
+    for dimension, identity_of in (
+            ('model', lambda r: (r.get('model') or '模型未知', r.get('model') or '模型未知')),
+            ('agent', lambda r: (r.get('agent') or '未知', r.get('agent') or '未知')),
+            ('turn', turn_identity)):
+        groups = {}
+        for record in selected:
+            identity, label = identity_of(record)
+            groups.setdefault(identity, (label, []))[1].append(record)
+        views[dimension] = {'available': True, 'reason': '', 'rows': [
+            dict(id=identity, label=groups[identity][0], **aggregate(groups[identity][1]))
+            for identity in sorted(groups)]}
+    return views
+
+
+INTERNAL_CATEGORIES = ('retry_failure', 'compaction_summary', 'title_session_aux', 'subagent_descendants', 'background_other')
+INTERNAL_LABELS = {'retry_failure': '重试/失败', 'compaction_summary': '压缩/摘要', 'title_session_aux': '标题/会话辅助',
+                   'subagent_descendants': '子代理/后代', 'background_other': '后台/其他'}
+INTERNAL_STATES = {'not_checked': '尚未核查', 'checked_available': '已核查：有可靠记录', 'checked_absent': '已核查：来源未提供', 'checked_gap': '已核查：存在缺口'}
+
+
+def internal_support(selected, issues, harness):
+    """Record verified facts only; unchecked must stay distinguishable from source gaps."""
+    def evidence(part):
+        return [issue for issue in issues if part in issue.get('reason', '')]
+
+    support = {}
+    retry = evidence('重试')
+    support['retry_failure'] = {'status': 'checked_gap' if retry else 'not_checked',
+                                'summary': '数据库仅保留逻辑请求结果，独立重试调用总数及失败用量可能缺失' if retry
+                                else '重试与失败调用尚未在本范围核查', 'evidence': retry}
+    compact_marks = evidence('压缩')
+    metered_compactions = [r for r in selected if r.get('internal_kind') == 'compaction']
+    support['compaction_summary'] = {'status': 'checked_available' if metered_compactions else 'checked_gap' if compact_marks else 'not_checked',
+                                     'summary': f'本范围包含 {len(metered_compactions)} 条经明确关联计量的压缩/摘要调用' if metered_compactions
+                                     else '源存在压缩标记但无可关联 usage，可能已计或缺失' if compact_marks
+                                     else '压缩与摘要调用尚未在本范围核查', 'evidence': compact_marks}
+    aux = [r for r in selected if r.get('internal_kind') == 'session_aux']
+    if aux:
+        support['title_session_aux'] = {'status': 'checked_available',
+                                        'summary': f'本范围包含 {len(aux)} 条会话辅助调用（标题等，不摊入任务轮次）', 'evidence': []}
+    elif harness == 'codex':
+        support['title_session_aux'] = {'status': 'checked_absent',
+                                        'summary': '已核查近期真实样例记录类型，源未记录标题/会话辅助类模型调用', 'evidence': []}
+    else:
+        support['title_session_aux'] = {'status': 'not_checked',
+                                        'summary': '标题与会话辅助尚未核查；无法归属记录在会话辅助/未归属单列', 'evidence': []}
+    children = [r for r in selected if r['group'] == 'child']
+    background = [r for r in selected if r.get('origin_kind') == 'workflow_child']
+    support['subagent_descendants'] = {'status': 'checked_available' if children else 'not_checked',
+                                       'summary': f'本范围包含 {len(children)} 条经明确关系归属的后代调用'
+                                       + (f'（其中后台工作流 {len(background)} 条）' if background else '') if children
+                                       else '后代与派生关系尚未在本范围核查', 'evidence': []}
+    support['background_other'] = {'status': 'checked_available' if background else 'not_checked',
+                                   'summary': f'本范围包含 {len(background)} 条后台工作流调用，按明确父子关系归入后代并遵守截止点' if background
+                                   else '后台及其他内部工作尚未在本范围核查', 'evidence': []}
+    return support
+
+
+def report(data, session_id, cutoff, main_only=False, turns=None, since=None, cutoff_source='cli_start', localization=None):
     if session_id not in data['sessions']:
         raise ValueError('找不到指定会话；请先列出候选')
     available = data['sessions'][session_id]['turns']
@@ -184,6 +254,8 @@ def report(data, session_id, cutoff, main_only=False, turns=None, since=None, cu
     wall = (max(map(timestamp, ends)) - min(map(timestamp, begins))).total_seconds() if ended and len(begins) == len(chosen_turns) else None
     duration = sum(r['duration_ms'] for r in selected) if selected and all(isinstance(r.get('duration_ms'), (float,int)) for r in selected) else None
     rows = [dict(group=g, **aggregate([r for r in selected if r['group'] == g])) for g in GROUPS if any(r['group'] == g for r in selected)]
+    views = build_views(selected, session_id)
+    view_rows = [row for view in views.values() for row in view['rows']]
     any_usage = any(known(r['metrics'][m]) for r in selected for m in ('input','output','cache_read'))
     any_count = any(r.get('call_count') is not None for r in selected)
     tools = []
@@ -204,15 +276,22 @@ def report(data, session_id, cutoff, main_only=False, turns=None, since=None, cu
         summary['call_count'] = 0
         summary['cache_hit_rate']['state'] = 'not_applicable'
     else:
-        for row in rows + [summary]:
+        for row in rows + view_rows + [summary]:
             for metric in row['metrics'].values():
                 if metric['value'] is not None:
                     metric['state']='partial'
             if row['cache_hit_rate']['state']=='known':
                 row['cache_hit_rate']['state']='partial'
-    return {'format_version': 1, 'harness': data['harness'],
+    result = {'format_version': 2, 'harness': data['harness'],
             'scope': {'session': session_id, 'turns': turns, 'from': since, 'to': cutoff,
                       'cutoff_source': cutoff_source, 'include_children': not main_only, 'main_only': main_only},
+            'localization': localization or {'session': {'id': session_id, 'confirmed_by': 'explicit',
+                                                         'evidence': '显式指定的会话标识'},
+                                             'cutoff': {'time': cutoff, 'source': cutoff_source,
+                                                        'evidence': '显式或默认截止点'},
+                                             'limits': []},
+            'internal_support': internal_support(selected, issues, data['harness']),
+            'views': views,
             'read_at': now(), 'status': 'confirmed_zero' if zero_proven else 'partial' if any_usage else 'count_only' if any_count else 'tool_only' if tools else 'unstatisticable',
             'scope_note': '筛选：主代理常规调用' if main_only else '默认纳入有证据归属的后代与内部调用；重叠任务选集不能直接相加',
             'rows': rows, 'summary': summary, 'records': selected, 'unassigned_records': unassigned,
@@ -223,6 +302,10 @@ def report(data, session_id, cutoff, main_only=False, turns=None, since=None, cu
             'activity': {'status': 'ended' if ended else 'active' if any(t.get('status') == 'running' for t in chosen_turns) else 'unknown',
                          'wall_seconds': wall, 'call_duration_ms': duration, 'note': '墙钟跨度不扣除插入任务；调用耗时之和不等于墙钟跨度'},
             'tool_reports': tools}
+    alternates = [alt for alt in data.get('alternate_sources', []) if alt['session'] in family]
+    if alternates:
+        result['alternate_sources'] = alternates
+    return result
 
 
 def display_value(metric):
@@ -249,6 +332,25 @@ def markdown(result):
         lines.append('| ' + ' | '.join([safe(name), display_value(metrics['input']), display_value(metrics['output']), display_value(metrics['cache_read']), hit, display_value(metrics['total'])]) + ' |')
     lines += ['', '输入包含缓存读取；缓存与已包含的推理输出不再相加。',
               f"实际读取：{result['read_at']}；状态：{STATES.get(result['status'], result['status'])}"]
+    localization = result.get('localization')
+    if localization is None:
+        lines.append('定位证据：旧报告未保存')
+    else:
+        session = localization['session']; cutoff = localization['cutoff']
+        lines.append(f"定位证据：会话经{session['confirmed_by']}确认（{safe(session['evidence'])}）；"
+                     f"截止点来源 {safe(cutoff['source'])}（{safe(cutoff['evidence'])}）")
+        lines += [f"定位限制：{safe(limit)}" for limit in localization.get('limits', [])]
+    support = result.get('internal_support')
+    if support is None:
+        lines.append('内部来源支持：旧报告未保存')
+    else:
+        lines.append('内部来源支持：' + '；'.join(
+            f"{INTERNAL_LABELS.get(key, key)}={INTERNAL_STATES.get(value['status'], value['status'])}"
+            for key, value in support.items()))
+        lines += [f"内部支持说明（{INTERNAL_LABELS.get(key, key)}）：{safe(value['summary'])}"
+                  for key, value in support.items() if value['status'] != 'not_checked']
+    if result.get('views') is None:
+        lines.append('明细视图（模型/代理/轮次）：旧报告未保存，不可用')
     lines.append(f"调用数：{result['summary']['call_count'] if result['summary']['call_count'] is not None else '未知'}；其中已识别 {result['summary'].get('known_call_count', 0)} 次")
     activity = result.get('activity', {})
     lines.append(f"活跃状态：{STATES.get(activity.get('status'), '未知')}；墙钟秒：{activity.get('wall_seconds') if activity.get('wall_seconds') is not None else '未知'}；调用耗时毫秒之和：{activity.get('call_duration_ms') if activity.get('call_duration_ms') is not None else '未知'}")
@@ -263,6 +365,11 @@ def markdown(result):
     for reason,sources in issue_groups.items():
         lines.append(f"缺口：{safe(reason)}（{len(sources)} 处）；来源示例：{safe(sources[:3])}")
     lines += [f"仅工具报告：{safe(i['agent'])}，累计 {i['total']:,}；独立展示，不与 usage 相加；来源 {safe(i['source'])}" for i in result.get('tool_reports', [])]
+    for alt in result.get('alternate_sources', []):
+        metrics = alt['metrics']
+        lines.append(f"补充来源（{safe(alt['kind'])}，会话 {safe(alt['session'])}）：{alt['records']} 条，"
+                     f"输入 {display_value(metrics['input'])}、总量 {display_value(metrics['total'])}；"
+                     f"{safe(alt['note'])}；来源 {safe(alt['path'])}")
     if result.get('unassigned_records'):
         separate = aggregate(result['unassigned_records'])
         lines.append(f"会话辅助/未归属（未摊入所选任务）：{len(result['unassigned_records'])} 条，已记录总量 {display_value(separate['metrics']['total'])}")

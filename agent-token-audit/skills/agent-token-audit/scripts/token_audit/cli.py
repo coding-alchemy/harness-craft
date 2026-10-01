@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 from . import codex, zcode
-from .core import aggregate, known, now, report, timestamp
+from .core import known, now, report, timestamp
 from .relations import bind
 from .formats import export, load_report, render
 
@@ -14,6 +14,36 @@ def read_input(harness, descriptor):
     if descriptor['kind'] == 'zcode_database':
         return bind(zcode.read_database(descriptor['paths'][0]))
     return bind((codex if harness == 'codex' else zcode).read(descriptor['paths']))
+
+
+def cutoff_evidence(source):
+    if source == 'explicit':
+        return '用户显式指定的 --to 截止时间'
+    if source == 'request_start':
+        return '调用方提供的可信请求起点；时间字符串本身未验证请求身份'
+    if source == 'cli_start':
+        return '独立 CLI 命令开始时间（默认截止点）'
+    return '本次统计请求（--request-id）自身的创建/入队起点'
+
+
+def localization_of(session, used_current, saved, harness, cutoff, cutoff_source):
+    if saved:
+        confirmed, evidence = 'saved_scope', '沿用已保存报告确定的会话范围'
+    elif used_current:
+        variable = 'CODEX_THREAD_ID' if harness == 'codex' else 'ZCODE_SESSION_ID'
+        confirmed, evidence = 'current_env', '环境变量 ' + variable + ' 与记录会话唯一匹配'
+    else:
+        confirmed, evidence = 'explicit', '显式指定的 --session 会话标识'
+    limits = []
+    if cutoff_source == 'request_start':
+        limits.append('截止时间为调用方提供；工具未验证请求身份')
+    if cutoff_source == 'cli_start':
+        limits.append('独立 CLI 不读取运行环境身份；截止点为命令开始时间')
+    if saved:
+        limits.append('定位证据沿用已保存报告；本次重算未重新定位')
+    return {'session': {'id': session, 'confirmed_by': confirmed, 'evidence': evidence},
+            'cutoff': {'time': cutoff, 'source': cutoff_source, 'evidence': cutoff_evidence(cutoff_source)},
+            'limits': limits}
 
 
 def main(argv=None):
@@ -98,9 +128,12 @@ def main(argv=None):
         if args.current:
             if saved or args.session:
                 raise ValueError('--current 不与保存范围或显式会话混用')
-            candidate=os.environ.get('CODEX_THREAD_ID') if harness == 'codex' else os.environ.get('ZCODE_SESSION_ID')
-            if not candidate or candidate not in data['sessions']:
-                raise ValueError('无法可靠匹配当前会话；请列出 sessions 候选，不能按最新文件猜选')
+            variable='CODEX_THREAD_ID' if harness == 'codex' else 'ZCODE_SESSION_ID'
+            candidate=os.environ.get(variable)
+            if not candidate:
+                raise ValueError('当前环境未提供可信会话身份（' + variable + ' 缺失）；请运行 sessions 查看候选并明确选择，不能按最新文件猜选')
+            if candidate not in data['sessions']:
+                raise ValueError('环境提供的会话身份与记录不匹配；请运行 sessions 核对候选并明确选择')
             args.session=candidate
         if saved and args.session not in data['sessions']:
             data['sessions'][args.session]={'paths':descriptor['paths'],'turns':{t:{'id':t,'start':None,'end':None,'status':'unknown'} for t in (args.turn or [])}}
@@ -141,15 +174,15 @@ def main(argv=None):
                 raise ValueError('统计请求身份缺失或时间冲突；请明确可用截止点')
             cutoff=times.pop();timestamp(cutoff);cutoff_source=matches[0]['time_source']
         result = report(data, args.session, cutoff, main_only=bool(args.main_only), turns=args.turn, since=args.since,
-                        cutoff_source=cutoff_source)
+                        cutoff_source=cutoff_source,
+                        localization=localization_of(args.session, args.current, saved, harness, cutoff, cutoff_source))
         result['input']=descriptor
         result['scope']['label']=args.label
         if args.detail:
-            def detail_name(record):
-                value=record.get('owner_turn') if args.detail=='turn' and record['session']!=args.session else record.get(args.detail)
-                return value or '未知'
-            names = sorted({detail_name(r) for r in result['records']})
-            result['details'] = [dict(dimension=args.detail, name=name, **aggregate([r for r in result['records'] if detail_name(r) == name])) for name in names]
+            result['details'] = [dict(dimension=args.detail, name=row['label'], metrics=row['metrics'],
+                                      cache_hit_rate=row['cache_hit_rate'], call_count=row['call_count'],
+                                      known_call_count=row['known_call_count'])
+                                 for row in result['views'][args.detail]['rows']]
         if args.export:
             export(result,args.export,args.output,[args.saved] if args.saved else [])
         print(render(result,args.format),end='')
