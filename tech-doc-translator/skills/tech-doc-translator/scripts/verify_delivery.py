@@ -13,6 +13,9 @@
       "inputs": ["00_目录.md", "01_章.md"],          // 相对交付根
       "outputs": [{"path": "book.pdf", "sha256": "…"}],
       "images_display": "export/images_display.json", // 有图时必须
+      "view_declaration": "export/view_declaration.json", // 可选：PDF 视图声明
+                                                          // （授权排除区间与中文题名；声明时
+                                                          // 核验参数必须一致，摘要入交付身份）
       "sources": [                              // 翻译模式必须；pdf 模式不强加
         {"family": "single", "source_version": "13.4",
          "parsed_markdown": "docs/source_en.md",       // 解析 Markdown（检查实际英文输入）
@@ -1344,6 +1347,9 @@ def compute_delivery_identity(root, record, source_entries=None):
     if record.get("images_display"):
         identity["images_display"] = _digest_or_none(
             rooted(record["images_display"]))
+    if record.get("view_declaration"):
+        identity["view_declaration"] = _digest_or_none(
+            rooted(record["view_declaration"]))
     for entry in source_entries or []:
         identity["sources"].append(_source_identity(entry, rooted))
         # 源资源身份按每份原始快照的实际家族选区枚举（§9.3）：PDF 家族
@@ -1460,6 +1466,8 @@ def _check_facts(root_abs, tool, args, order, problems=None):
                                             for p in parsed.images_display]
         if parsed.provenance:
             facts["files"]["provenance"] = dep(parsed.provenance)
+        if getattr(parsed, "view_declaration", None):
+            facts["files"]["view_declaration"] = dep(parsed.view_declaration)
         facts["files"]["unlink_target"] = [dep(p)
                                            for p in parsed.unlink_target]
         report_path = os.path.realpath(os.path.join(
@@ -1480,6 +1488,9 @@ def _check_facts(root_abs, tool, args, order, problems=None):
                                 for p in parsed.unlink_target]
         if parsed.provenance:
             parsed.provenance = _rooted(root_abs, parsed.provenance)
+        if getattr(parsed, "view_declaration", None):
+            parsed.view_declaration = _rooted(
+                root_abs, parsed.view_declaration)
     elif tool == "verify_pdf_source":
         # 受约束 PDF 核验入口（§4.6）：真实参数解析的语义事实；golden、
         # 图片身份与强 token 口径经清单数据进入源链身份，这里登记
@@ -1886,12 +1897,20 @@ def expected_review_binding(kind, target, root, record, source_entries,
         map_digest = identity.get("images_display")
         if map_declared and map_digest is None:
             return None  # 已声明交付映射但摘要不可得：绑定不完整
+        decl_declared = record.get("view_declaration")
+        decl_digest = identity.get("view_declaration")
+        if decl_declared and decl_digest is None:
+            return None  # 已声明视图声明但摘要不可得：绑定不完整
         return {
             "target_sha256": target_digest,
             "ordered_inputs": ordered_inputs,
             "images_display": {
                 "path": record.get("images_display"),
                 "sha256": identity.get("images_display"),
+            },
+            "view_declaration": {
+                "path": record.get("view_declaration"),
+                "sha256": identity.get("view_declaration"),
             },
             "resources": [[src, digest] for src, digest in resources],
             "checks": [{
@@ -2104,6 +2123,8 @@ def _identity_missing_digests(identity):
             missing.append("输出 %s" % rel)
     if "images_display" in identity and identity["images_display"] is None:
         missing.append("交付级映射")
+    if "view_declaration" in identity and identity["view_declaration"] is None:
+        missing.append("视图声明")
     for entry in identity.get("sources") or []:
         label = entry.get("parsed_markdown")
         if entry.get("parsed_sha256") is None:

@@ -15,7 +15,7 @@ import re
 import sys
 import unicodedata
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import pypdf
 from collections import Counter
@@ -40,6 +40,13 @@ PDF_PAGE_MARGIN_HORIZONTAL_PT = 16 * MM_TO_PT
 PDF_PRE_PADDING_VERTICAL_PT = 7.0
 PDF_PRE_PADDING_HORIZONTAL_PT = 9.0
 PDF_PRE_LINE_HEIGHT = 1.45
+# 页脚页码带（R4/A5）：页脚必须渲染在底部边距区内，与 @page 垂直边距同值
+# （同一样式契约锁定）；页脚带内的非页脚文字视为正文/脚注遮挡。
+PDF_PAGE_FOOTER_BAND_PT = PDF_PAGE_MARGIN_VERTICAL_PT
+PDF_PAGE_FOOTER_CENTER_TOLERANCE_PT = 20.0
+PDF_PAGE_FOOTER_FONT_MIN_PT = 7.0
+PDF_PAGE_FOOTER_FONT_MAX_PT = 10.0
+_FOOTER_TEXT_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")
 
 
 def normalize(text):
@@ -204,7 +211,7 @@ def collect_visual_aid(pdf_path, dpi=VISUAL_AID_DEFAULT_DPI,
 
 
 # ---------------------------------------------------------------------------
-# 独立原始扫描：不经过 Markdown 解析器，直接在原文上统计
+# 独立原文核对：结构计数直接扫描，译注按 CommonMark 块边界扫描
 # ---------------------------------------------------------------------------
 
 FENCE_OPEN_RE = re.compile(r"^(`{3,}|~{3,})")
@@ -260,6 +267,58 @@ def code_span_intervals(chunk_lines):
         intervals.append((position, closer_end))
         position = closer_end
     return intervals
+
+
+def scan_translator_notes(text):
+    """独立扫描正文中已标识译注，保留代码和原文引用中的同形文字。
+
+    返回 [(原始行号, 片段)]；用核验侧 CommonMark 实例重建代码块与引用
+    块源行范围（含缩进代码、懒惰续行），不读取导出报告的排除结论。
+    其余原文仍由独立行内代码扫描器与译注模式核对。
+    """
+    found = []
+    lines = text.split("\n")
+    protected_lines = {
+        line
+        for token in _AUTHORIZED_STRUCTURE.parse(text)
+        if token.type in {"fence", "code_block", "blockquote_open"} and token.map
+        for line in range(token.map[0] + 1, token.map[1] + 1)
+    }
+    chunk = []  # (行号, 行内容)：当前段落候选行
+
+    def flush_chunk():
+        nonlocal chunk
+        if not chunk:
+            return
+        intervals = code_span_intervals([line for _, line in chunk])
+        starts = []
+        offset = 0
+        for _number, line in chunk:
+            starts.append(offset)
+            offset += len(line) + 1
+        joined = "\n".join(line for _, line in chunk)
+        for match in exporter.TRANSLATOR_NOTE_RE.finditer(joined):
+            if any(s <= match.start() < e for s, e in intervals):
+                continue  # 行内代码中的同形文字保留
+            line_no = next(
+                number
+                for index, (number, _line) in enumerate(chunk)
+                if starts[index] <= match.start() < starts[index] + len(_line) + 1
+            )
+            found.append((line_no, match.group(0)))
+        chunk = []
+
+    for number, line in enumerate(lines, start=1):
+        stripped = line.lstrip()
+        if number in protected_lines:
+            flush_chunk()
+            continue
+        if not stripped:
+            flush_chunk()
+            continue
+        chunk.append((number, line))
+    flush_chunk()
+    return found
 
 
 def raw_scan(text):
@@ -521,12 +580,12 @@ def check_image_coverage(chapters, bindings, undetermined_map,
             )
 
 
-def check_provenance(chapters, report, pdf, args_provenance, failures,
-                     heading_pages=None):
-    """独立重建出处预期并核对前置位置（R6/D6）。
+def check_provenance(chapters, report, pdf, args_provenance, failures):
+    """独立重建出处预期并核对证据与 PDF 可见性（R6/D6，R2/C2 新政策）。
 
     预期从原始输入重建（共享字段提取实现，不读导出器结论）；与导出证据
-    核对政策、模式与逐章分类，再从最终 PDF 文本核对前置说明先于首章。
+    核对政策、模式与逐章分类，再核对导出视图不包含被采用的前置出处：
+    来源门禁仍必须独立通过，但“PDF 中可见”不再是来源已核验的证据。
     章首四类管理字段的移除区间由既有投影核验独立对账。
     """
     exported = report.get("provenance")
@@ -545,6 +604,14 @@ def check_provenance(chapters, report, pdf, args_provenance, failures,
                 "code": "provenance-policy-mismatch",
                 "message": "出处字段政策与当前版本不一致：%r vs %r"
                 % (policy, list(exporter.MANAGEMENT_FIELD_LABELS)),
+            }
+        )
+    if exported.get("pdf_visibility") != "excluded":
+        failures.append(
+            {
+                "code": "provenance-policy-mismatch",
+                "message": "导出证据的出处可见性政策与当前版本不一致：%r"
+                % exported.get("pdf_visibility"),
             }
         )
     if (exported.get("mapping") or None) != (args_provenance or None):
@@ -592,59 +659,53 @@ def check_provenance(chapters, report, pdf, args_provenance, failures,
             )
     if pdf is None:
         return
-    # 无渲染前置区时，被采用的集中出处段（生成前置、目录“译自…”段或
-    # 映射区间段，由 collect_provenance 以实际可见文字给出）同样必须先于
-    # 首章标题：位置保证不能只靠装载规则或文件名顺序，须在成品中实测。
+    # 新政策：被采用的前置出处（生成前置组合、目录“译自…”段或映射区间
+    # 段的实际可见文字）与目录出处段不得出现在最终 PDF。同一来源文字可
+    # 能作为正文合法内容出现，因此不按全文关键词零命中判定，而按导出视
+    # 图重建允许的出现集合核对（PDF 出现次数不得多于导出视图保留次数）。
+    view_text = export_view_visible_text(chapters)
+    needles = []
     adopted = (facts.get("adopted_front") or "").strip()
-    if not adopted:
-        return
-    # 前置说明先于首章：前置文本所在页不晚于首章标题目的地页；同页时
-    # 文本位置必须先于章首标题。首章页取自大纲目的地（heading_pages），
-    # 不被目录页中的同名条目干扰。
-    compact_pages = [re.sub(r"\s+", "", page) for page in pdf.pages]
-    first_content = next((c for c in chapters if not c.is_toc), None)
-    if first_content is None or not first_content.headings:
-        return
-    heading = first_content.headings[0]
-    heading_page = (heading_pages or {}).get(heading["id"])
-    first_line = next(
-        (line for line in adopted.split("\n") if line.strip()),
-        None)
-    if first_line is None:
-        return
-    token = re.sub(r"\s+", "", first_line)
-    token = token[: max(12, min(len(token), 30))]
-    front_page = next(
-        (i for i, text in enumerate(compact_pages) if token in text), None)
-    if front_page is None:
-        failures.append(
-            {
-                "code": "provenance-front-missing",
-                "message": "前置出处说明未出现在最终 PDF：%r" % first_line[:40],
-            }
-        )
-        return
-    if heading_page is None:
-        return
-    if front_page > heading_page:
-        failures.append(
-            {
-                "code": "provenance-position",
-                "message": "前置出处说明（第 %d 页）晚于首章标题"
-                "（第 %d 页）" % (front_page + 1, heading_page + 1),
-            }
-        )
-    elif front_page == heading_page:
-        heading_token = re.sub(r"\s+", "", heading["text"])
-        heading_token = heading_token[: max(12, min(len(heading_token), 30))]
-        if compact_pages[front_page].find(token) > \
-                compact_pages[front_page].find(heading_token):
+    needles.extend(line for line in adopted.split("\n") if line.strip())
+    toc_chapter = next((c for c in chapters if c.is_toc), None)
+    toc_text = exporter.find_toc_provenance(toc_chapter)
+    if toc_text:
+        # 目录出处（自动段与声明片段）按可见文字逐行核对缺席；声明接管
+        # 的片段同时受 check_view_declaration 的逐处核对。
+        needles.extend(
+            line for line in
+            exporter.visible_provenance_text(toc_text).split("\n")
+            if line.strip())
+    seen = set()
+    for needle in needles:
+        token = normalize(needle)
+        if len(token) < 4 or token in seen:
+            continue
+        seen.add(token)
+        allowed = view_text.count(token)
+        found = pdf.norm_text.count(token)
+        if found > allowed:
             failures.append(
                 {
-                    "code": "provenance-position",
-                    "message": "同页时前置出处说明未先于首章标题",
+                    "code": "provenance-front-present",
+                    "message": "前置出处说明不应出现在最终 PDF"
+                    "（PDF %d 次 > 允许 %d 次）：%r"
+                    % (found, allowed, needle[:40]),
                 }
             )
+
+
+def export_view_visible_text(chapters):
+    """导出视图的归一化可见文字：各章渲染 soup 文本按章拼接。
+
+    目录出处段、章首管理字段、译注片段与视图声明排除已不在视图中；
+    同一文字的合法出现（正文、代码、原文引用块）保留计数，作为
+    PDF 缺席检查允许出现集合的单源重建。
+    """
+    return "".join(
+        normalize(chapter.soup.get_text(" ", strip=True))
+        for chapter in chapters
+    )
 
 
 def check_image_widths(chapters, pdf, bounds, bindings, report, failures):
@@ -1171,15 +1232,35 @@ def apply_authorized_spans(text, spans):
     )
 
 
-def check_projection(chapters, report, pdf, failures):
+def check_projection(chapters, report, pdf, failures,
+                     view_declaration=None):
     """排除区间必须与独立扫描一致，且被排除内容确实不在 PDF 中。"""
     recorded_chapters = {
         item.get("path"): item
         for item in report.get("chapters", [])
     }
+    declared_exclusions = (
+        view_declaration["exclusions"] if view_declaration else []
+    )
     for chapter in chapters:
         authorized = authorized_head_exclusions(chapter.text)
-        expected_text = apply_authorized_spans(chapter.text, authorized)
+        own = [
+            ex for ex in declared_exclusions if ex["chapter"] is chapter
+        ]
+        spans = [(start + 1, end) for start, end, _label in authorized]
+        if chapter.toc_provenance_exclusion is not None:
+            spans.append(
+                (
+                    chapter.toc_provenance_exclusion["start_line"],
+                    chapter.toc_provenance_exclusion["end_line"],
+                )
+            )
+        spans.extend(
+            tuple(ex["lines"]) for ex in own if ex["type"] == "block"
+        )
+        inline = [ex for ex in own if ex["type"] == "inline"]
+        expected_text = exporter.project_view_declared(
+            chapter.text, spans, inline)
         context = {"input": str(chapter.path)}
         if expected_text != chapter.projected_text:
             failures.append(
@@ -1232,6 +1313,185 @@ def check_projection(chapters, report, pdf, failures):
                     )
 
 
+def _visible_remainder(line_text, fragment):
+    """行内删除片段后的可见文字（导出渲染口径）：代码标记、链接标记不
+    进入 PDF 可见文本，直接比较原始 Markdown 行会误报连带删除。"""
+    remainder = line_text.replace(fragment, "")
+    if len(normalize(remainder)) < 4:
+        return ""
+    html = exporter._HEAD_STRUCTURE_MD.render(remainder)
+    soup = exporter.BeautifulSoup(html, "html.parser")
+    return normalize(soup.get_text(" ", strip=True))
+
+
+def check_translator_notes(chapters, report, pdf, failures):
+    """独立从原始输入定位每处 【译注：…】，核对导出报告与 PDF 视图。
+
+    不信任导出报告的排除结论：清单与独立重建必须一致；译注片段在 PDF
+    中的出现次数不得多于导出视图仍保留的出现次数（同形文字在代码/
+    原文引用中合法出现不误报）；译注所在行的其余文字仍在，防连带删除。
+    """
+    expected = [
+        {"input": str(chapter.path), "line": line, "fragment": fragment}
+        for chapter in chapters
+        for line, fragment in scan_translator_notes(chapter.text)
+    ]
+    exported = report.get("translator_note_exclusions")
+    if exported != expected:
+        failures.append(
+            {
+                "code": "translator-note-evidence-mismatch",
+                "message": "译注排除清单与独立重建不一致"
+                "（核验 %d 处 / 导出 %r 处）"
+                % (len(expected),
+                   len(exported) if isinstance(exported, list) else exported),
+            }
+        )
+    if pdf is None:
+        return
+    view_text = export_view_visible_text(chapters)
+    for item in expected:
+        context = {"input": item["input"], "line": item["line"]}
+        token = normalize(item["fragment"])
+        if len(token) >= 4:
+            allowed = view_text.count(token)
+            found = pdf.norm_text.count(token)
+            if found > allowed:
+                failures.append(
+                    {
+                        "code": "translator-note-present",
+                        "message": "译注片段仍出现在最终 PDF"
+                        "（%d 次 > 允许 %d 次）：%r"
+                        % (found, allowed, item["fragment"][:40]),
+                        **context,
+                    }
+                )
+        source_lines = next(
+            c.text.split("\n") for c in chapters
+            if str(c.path) == item["input"]
+        )
+        remainder = _visible_remainder(
+            source_lines[item["line"] - 1], item["fragment"])
+        if remainder and remainder not in pdf.norm_text:
+            failures.append(
+                {
+                    "code": "translator-note-collateral",
+                    "message": "译注所在行其余文字未出现在 PDF（防连带删除）：%r"
+                    % source_lines[item["line"] - 1][:60],
+                    **context,
+                }
+            )
+
+
+def check_view_declaration(chapters, report, pdf, args_view_declaration,
+                           failures):
+    """独立重建视图声明的授权排除，核对导出报告与 PDF 视图。
+
+    不信任导出报告的排除结论：从原始输入与同一声明文件重建允许排除
+    范围，与导出证据逐处一致；block 整块与 inline 片段在 PDF 中的出现
+    次数不得多于导出视图保留次数；inline 区间各行删除片段后的其余
+    文字仍在（相邻内容完整）。无声明时行为与现状一致。
+    """
+    exported = report.get("view_declaration")
+    exported_path = exported.get("path") if isinstance(exported, dict) else None
+    if (exported_path or None) != (args_view_declaration or None):
+        failures.append(
+            {
+                "code": "view-declaration-mismatch",
+                "message": "视图声明参数与导出不一致（导出 %r / 核验 %r）"
+                % (exported_path, args_view_declaration),
+            }
+        )
+        return
+    if args_view_declaration is None:
+        return
+    try:
+        declaration = exporter.load_view_declaration(
+            args_view_declaration, chapters)
+    except exporter.ExportError as exc:
+        failures.append({"code": "view-declaration-invalid",
+                         "message": str(exc)})
+        return
+    expected_records = [
+        {
+            "input": ex["input"],
+            "lines": ex["lines"],
+            "type": ex["type"],
+            "kind": ex["kind"],
+            "fragment": ex["fragment"],
+            "reason": ex["reason"],
+        }
+        for ex in declaration["exclusions"]
+    ]
+    if (not isinstance(exported, dict)
+            or exported.get("sha256") != declaration["sha256"]
+            or exported.get("exclusions") != expected_records
+            or exported.get("document_title")
+            != declaration["document_title"]):
+        failures.append(
+            {
+                "code": "view-declaration-evidence-mismatch",
+                "message": "导出证据中的视图声明记录与声明文件不一致",
+            }
+        )
+    if pdf is None:
+        return
+    view_text = export_view_visible_text(chapters)
+    for ex in declaration["exclusions"]:
+        context = {"input": ex["input"]}
+        source_lines = ex["chapter"].text.split("\n")
+        ranged_lines = source_lines[ex["lines"][0] - 1:ex["lines"][1]]
+        if ex["type"] == "block":
+            for line in ranged_lines:
+                needle = normalize(line)
+                if len(needle) < 4:
+                    continue
+                allowed = view_text.count(needle)
+                found = pdf.norm_text.count(needle)
+                if found > allowed:
+                    failures.append(
+                        {
+                            "code": "declared-block-present",
+                            "message": "声明排除块仍出现在最终 PDF"
+                            "（%d 次 > 允许 %d 次）：%r"
+                            % (found, allowed, line[:40]),
+                            **context,
+                        }
+                    )
+        else:
+            token = normalize(ex["fragment"])
+            if len(token) >= 4:
+                allowed = view_text.count(token)
+                found = pdf.norm_text.count(token)
+                if found > allowed:
+                    failures.append(
+                        {
+                            "code": "declared-fragment-present",
+                            "message": "声明排除片段仍出现在最终 PDF"
+                            "（%d 次 > 允许 %d 次）：%r"
+                            % (found, allowed, ex["fragment"][:40]),
+                            **context,
+                        }
+                    )
+            exclusion = ex["chapter"].toc_provenance_exclusion
+            for offset, line in enumerate(ranged_lines):
+                line_no = ex["lines"][0] + offset
+                if exclusion is not None and (
+                        exclusion["start_line"] <= line_no
+                        <= exclusion["end_line"]):
+                    continue  # 该行由自动出处排除负责，其缺席另行核对
+                remainder = _visible_remainder(line, ex["fragment"])
+                if remainder and remainder not in pdf.norm_text:
+                    failures.append(
+                        {
+                            "code": "declared-inline-collateral",
+                            "message": "声明 inline 排除所在行其余文字未出现在"
+                            " PDF（相邻内容完整）：%r" % line[:60],
+                            **context,
+                        }
+                    )
+
+
 # ---------------------------------------------------------------------------
 # PDF 读取
 # ---------------------------------------------------------------------------
@@ -1253,8 +1513,16 @@ class PdfFacts:
             for index, page in enumerate(self.reader.pages)
         }
         self.uri_links = set()
-        self.internal_annots = []  # {page, dest_page, top}
+        self.internal_annots = []  # {page, dest_page, top, rect, ref}
         self.broken_named_dests = []
+        # PDF /Title 元数据（R3/A4）：与可见中文总标题一致性的核对输入。
+        self.metadata_title = None
+        try:
+            metadata = self.reader.metadata
+            if metadata is not None:
+                self.metadata_title = metadata.title
+        except Exception:  # noqa: BLE001  元数据不可读按缺失处理，由题名检查判 FAIL
+            self.metadata_title = None
         self.collect_annotations()
         self.outline = []
         self.collect_outline()
@@ -1264,9 +1532,13 @@ class PdfFacts:
         # 结构容器候选也在此关联；不再有第二套 run 采集。
         self.drawn_events = _collect_text_run_geometry(self)
         self.line_buckets = build_line_buckets(self.drawn_events)
-        self.mcid_marks = _walk_content_stream_positions(self.reader)
+        painted_marks = set()
+        self.mcid_marks = _walk_content_stream_positions(
+            self.reader, painted_marks)
+        self.structure_links = []
         self.structure_containers = (
-            _walk_structure_containers(self.reader)
+            _walk_structure_containers(
+                self.reader, self.structure_links, painted_marks)
             if self.mcid_marks is not None else None)
 
     def page_of_offset(self, offset):
@@ -1315,11 +1587,15 @@ class PdfFacts:
                     name_key = dest.decode("utf-8", "replace").lstrip("/")
                 rect = obj.get("/Rect")
                 top = float(rect[3]) if rect is not None else 0.0
+                bounds_rect = (
+                    [float(rect[i]) for i in range(4)]
+                    if rect is not None else None)
                 if name_key is not None:
                     if name_key in named:
                         self.internal_annots.append(
                             {"page": page_index,
-                             "dest_page": named[name_key], "top": top}
+                             "dest_page": named[name_key], "top": top,
+                             "rect": bounds_rect, "ref": ref}
                         )
                     else:
                         self.broken_named_dests.append(str(name_key))
@@ -1330,12 +1606,10 @@ class PdfFacts:
                         index = self.page_id_to_index.get(
                             getattr(target_ref, "idnum", None)
                         )
-                        rect = obj.get("/Rect")
-                        top = float(rect[3]) if rect is not None else 0.0
                         if index is not None:
                             self.internal_annots.append(
                                 {"page": page_index, "dest_page": index,
-                                 "top": top}
+                                 "top": top, "rect": bounds_rect, "ref": ref}
                             )
                     except (KeyError, TypeError, IndexError):
                         continue
@@ -1385,38 +1659,10 @@ def consume_toc_navigation(toc_chapter, chapters, failures, include_sections):
         return target if target in included_paths else None
 
     def _nav_only(element, extra_identity=()):
-        # 非链接文本只剩章编号/标题/文件名等导航元数据即视为纯导航；
-        # 其他可见内容（说明、注记、图片）表示混合容器。extra_identity
-        # 仅供范围外目标的行使用，不改变已纳入容器的判定。
-        identity = set(extra_identity)
-        for chapter in chapters:
-            if chapter is toc_chapter:
-                continue
-            if chapter.headings:
-                identity.add(chapter.headings[0]["text"])
-            identity.add(chapter.path.stem)
-            identity.add(chapter.path.name)
-        numeric = re.compile(r"^[\s\d.、,，;；()（）#\-]*$")
-
-        def scan(node):
-            for child in node.children:
-                if isinstance(child, exporter.NavigableString):
-                    text = str(child).strip()
-                    if not text or numeric.match(text):
-                        continue
-                    if any(text in name or name in text for name in identity):
-                        continue
-                    return False
-                elif isinstance(child, exporter.Tag):
-                    if child.name == "a" and child.get("href"):
-                        continue
-                    if child.name == "img":
-                        return False
-                    if not scan(child):
-                        return False
-            return True
-
-        return scan(element)
+        # 与导出器独立同构的纯导航容器判定（模块级共享实现，
+        # 供目录导航独立核验复用）。
+        return _toc_nav_only_container(
+            element, chapters, toc_chapter, extra_identity)
 
     consumed_containers = []
     seen_containers = set()
@@ -1553,14 +1799,372 @@ def consume_toc_navigation(toc_chapter, chapters, failures, include_sections):
     return found_nav
 
 
-def reparse_inputs(paths, failures, unlink_targets=(), toc_sections=False):
+def _toc_nav_only_container(element, chapters, toc_chapter,
+                            extra_identity=()):
+    """容器去掉导航链接后是否只剩导航元数据（无说明/图片）。
+
+    章编号、目标章标题、文件名与纯数字单元是导航自身的组成部分；
+    除此之外的可见内容（技术说明、注记、图片）说明容器是混合的。
+    extra_identity 仅供范围外目标的行使用（分篇时未纳入章的链接
+    文本与文件名同样是导航元数据），不改变已纳入容器的判定。
+    """
+    identity = set(extra_identity)
+    for chapter in chapters:
+        if chapter is toc_chapter:
+            continue
+        if chapter.headings:
+            identity.add(chapter.headings[0]["text"])
+        identity.add(chapter.path.stem)
+        identity.add(chapter.path.name)
+    numeric = re.compile(r"^[\s\d.、,，;；()（）#\-]*$")
+
+    def scan(node):
+        for child in node.children:
+            if isinstance(child, exporter.NavigableString):
+                text = str(child).strip()
+                if not text or numeric.match(text):
+                    continue
+                if any(text in name or name in text for name in identity):
+                    continue
+                return False
+            elif isinstance(child, exporter.Tag):
+                if child.name == "a" and child.get("href"):
+                    continue
+                if child.name == "img":
+                    return False
+                if not scan(child):
+                    return False
+        return True
+
+    return scan(element)
+
+
+def _toc_raw_chapter_links(toc_chapter, chapters):
+    """从未投影的目录原文枚举指向纳入章节的链接（不含目录自身）。
+
+    返回 [{line, end_line, label, href, fragment, target, container}]，
+    container 为 list/table/None（链接所在的最近导航容器类型）。
+    该项保护从原始输入独立枚举，不从导出器报告的“已排除内容”反推
+    （设计 §8.4）。
+    """
+    included = {c.path: c for c in chapters if c is not toc_chapter}
+    tokens = exporter._DECL_STRUCTURE_MD.parse(toc_chapter.text)
+    links = []
+    stack = []  # 容器栈：list / table
+    for token in tokens:
+        if token.type in ("bullet_list_open", "ordered_list_open"):
+            stack.append("list")
+            continue
+        if token.type == "table_open":
+            stack.append("table")
+            continue
+        if token.type in ("bullet_list_close", "ordered_list_close",
+                          "table_close"):
+            if stack:
+                stack.pop()
+            continue
+        if token.type != "inline" or not token.children:
+            continue
+        container = stack[-1] if stack else None
+        children = token.children
+        for index, child in enumerate(children):
+            if child.type != "link_open":
+                continue
+            href = dict(child.attrs or []).get("href") or ""
+            if not href or urlsplit(href).scheme:
+                continue
+            path_part, _, raw_fragment = href.partition("#")
+            path_part = unquote(path_part)
+            target = ((toc_chapter.dir / path_part).resolve()
+                      if path_part else toc_chapter.path)
+            included_chapter = included.get(target)
+            if included_chapter is None:
+                continue
+            label = []
+            for sibling in children[index + 1:]:
+                if sibling.type == "link_close":
+                    break
+                if sibling.type in ("text", "code_inline"):
+                    label.append(sibling.content)
+            links.append({
+                "line": (token.map[0] + 1) if token.map else None,
+                "end_line": token.map[1] if token.map else None,
+                "label": "".join(label),
+                "href": href,
+                "fragment": unquote(raw_fragment) if raw_fragment else None,
+                "target": included_chapter,
+                "container": container,
+            })
+    return links
+
+
+def _toc_link_instances(pdf, page_start, page_end, printed_labels):
+    """以完整 /Link 自有的绘制事件定位导航实例，不借用全页文字。
+
+    折行只是同一实例的多个绘制段；同行其他文字属于其他 MCID。
+    /OBJR 只提供归属，注解是否仍在页面上由实际 /Annots 事实确认。
+    结构树可能引用从不含文本绘制操作的空 MCID（如行内代码的包装
+    节点）：这类标记不产生文字与跨度，容忍其缺席；含文本绘制操作
+    但提取不到事件的标记仍按归属证据缺失处理。
+    """
+    events_by_mark = {}
+    for page_index in range(page_start, min(page_end, len(pdf.drawn_events))):
+        for event in pdf.drawn_events[page_index]:
+            if event["mcid"] is not None:
+                events_by_mark.setdefault(
+                    (page_index, event["mcid"]), []).append(event)
+    text_marks = {
+        (page, mcid)
+        for page, ops in (pdf.mcid_marks or {}).items()
+        for mcid in ops
+    }
+    owners = Counter(mark for link in pdf.structure_links
+                     for mark in set(link["mcids"]))
+    pool = {}
+    for link in pdf.structure_links:
+        marks = list(dict.fromkeys(link["mcids"]))
+        if not marks or any(not (page_start <= page < page_end)
+                            for page, _mcid in marks):
+            continue
+        runs = [(page, event) for page, mcid in marks
+                for event in events_by_mark.get((page, mcid), [])]
+        label = normalize("".join(event["text"] for _page, event in runs))
+        if not label or label in printed_labels:
+            continue
+        spans = []
+        # 每个事件保持自己的物理几何，逐段检查；不聚合成整行吸收旁邻文字。
+        for page, event in runs:
+            if event["text"].strip():
+                spans.append((page, event["start_pt"], event["right_pt"],
+                              event["baseline_y_pt"], event["font_size_pt"]))
+        objects = set(link["objects"])
+        annots = [annot for annot in pdf.internal_annots
+                  if (annot["page"], annot["ref"]) in objects]
+        usable = (all(owners[mark] == 1 for mark in marks)
+                  and all(mark not in text_marks or events_by_mark.get(mark)
+                          for mark in marks)
+                  and objects and len(annots) == len(objects))
+        pool.setdefault(label, []).append(
+            {"spans": spans, "annots": annots, "usable": bool(usable)})
+    return pool
+
+
+def _toc_annot_covers(annots, span, expected):
+    """存在页内注解：目的地等于期望页且矩形与标签绘制段相交。"""
+    sp_page, x0, x1, baseline, font_size = span
+    for annot in annots:
+        if annot["page"] != sp_page or annot["dest_page"] != expected:
+            continue
+        rect = annot.get("rect")
+        if rect is None:
+            continue
+        ax0, ay0, ax1, ay1 = rect
+        if ax0 > ax1:
+            ax0, ax1 = ax1, ax0
+        if ay0 > ay1:
+            ay0, ay1 = ay1, ay0
+        if (ax0 - 3.0 <= x1 and ax1 + 3.0 >= x0
+                and ay0 - 3.0 <= baseline + font_size
+                and ay1 + 3.0 >= baseline - 0.3 * font_size):
+            return True
+    return False
+
+
+def check_toc_nav_links(chapters, pdf, bounds, heading_pages,
+                        view_declaration, failures, toc_sections=False):
+    """目录章节导航独立核验（设计 §8.4）：从未投影目录原文枚举指向纳入
+    章节的链接，逐项核对最终 PDF。
+
+    自动出处排除区间或 toc-provenance 声明内容覆盖这类链接即失败（出处
+    排除不得吞掉章节导航）；纯导航容器（list/table 行）按既有印刷目录
+    折叠规则消费，交 check_print_toc 对账；混合容器中的链接被解除为纯
+    文字，链接文字须保留在目录页文本；容器外（段落等）链接保留为可点击
+    链接，其文字须在目录页，且该文字每个绘制段（折行时多段）都须有
+    矩形相交、目的地等于该链接目标页的页内注解（逐链接几何绑定，
+    不接受页级存在性，也不接受只用一段正确注解替代其余段）。
+    """
+    toc_chapter = next((c for c in chapters if c.is_toc), None)
+    if toc_chapter is None:
+        return
+    toc_bound = next((b for b in bounds if b[0] is toc_chapter), None)
+    if toc_bound is None:
+        return  # 章区间缺失已由 chapter-structure 失败覆盖
+    _chapter, page_start, page_end = toc_bound
+    toc_page_text = normalize("".join(pdf.pages[page_start:page_end]))
+    exclusion = toc_chapter.toc_provenance_exclusion
+    declared = [
+        ex for ex in (view_declaration or {}).get("exclusions") or []
+        if ex["chapter"] is toc_chapter
+        and ex["kind"] == exporter.TOC_PROVENANCE_DECLARATION_KIND
+    ]
+    raw_links = _toc_raw_chapter_links(toc_chapter, chapters)
+    if not raw_links:
+        return
+    # 从同一独立目录期望与成品章/标题页重建标题+实际页码；不采用
+    # 导出报告的页码或布局决定。印刷目录的完整性仍由 check_print_toc 核对。
+    printed_labels = set()
+    for entry in derive_toc_expectations(chapters, toc_sections) or []:
+        included = next(c for c in chapters
+                        if c.index == entry["chapter_index"])
+        if entry["level"] == 1:
+            page = next((s for c, s, _e in bounds if c is included), None)
+        else:
+            heading = next((h for h in included.headings
+                            if h["text"] == entry["title"]), None)
+            page = heading_pages.get(heading["id"]) if heading else None
+        if page is not None:
+            printed_labels.add(normalize(entry["title"]) + str(page + 1))
+    # 折叠判定用未投影原文渲染的 soup；token 枚举与 soup 遍历同为文档序，
+    # 同名 href 按出现顺序一一配对。
+    raw_soup = exporter.BeautifulSoup(
+        exporter._DECL_STRUCTURE_MD.render(toc_chapter.text), "html.parser")
+    anchor_pool = {}
+    for anchor in raw_soup.find_all("a", href=True):
+        anchor_pool.setdefault(anchor.get("href"), []).append(anchor)
+    instance_pool = _toc_link_instances(
+        pdf, page_start, page_end, printed_labels)
+    for link in raw_links:
+        start, end = link["line"], link["end_line"]
+        swallowed = False
+        if exclusion is not None and start is not None and not (
+                end < exclusion["start_line"]
+                or start > exclusion["end_line"]):
+            failures.append(
+                {
+                    "code": "toc-nav-in-exclusion",
+                    "message": "指向纳入章节的链接被目录出处自动排除区间吞掉："
+                    "%s L%d-L%d（%s）"
+                    % (toc_chapter.path.name, start, end, link["href"]),
+                    "input": str(toc_chapter.path),
+                }
+            )
+            swallowed = True
+        for ex in declared:
+            ex_start, ex_end = ex["lines"]
+            if start is None or ex_end < start or ex_start > end:
+                continue
+            if ex["type"] == "inline":
+                hit = link["href"] in ex["fragment"]
+            else:
+                ranged = "\n".join(
+                    toc_chapter.text.split("\n")[ex_start - 1:ex_end])
+                hit = link["href"] in ranged
+            if hit:
+                failures.append(
+                    {
+                        "code": "toc-nav-in-exclusion",
+                        "message": "指向纳入章节的链接被 toc-provenance 声明"
+                        "内容吞掉：%s L%d-L%d（%s）"
+                        % (toc_chapter.path.name, start, end, link["href"]),
+                        "input": str(toc_chapter.path),
+                    }
+                )
+                swallowed = True
+        if swallowed:
+            continue
+        if link["container"] in ("list", "table"):
+            pool = anchor_pool.get(link["href"]) or []
+            anchor = pool.pop(0) if pool else None
+            nav_only = False
+            if anchor is not None:
+                parent = anchor.find_parent(
+                    "li" if link["container"] == "list" else "tr")
+                if parent is not None:
+                    nav_only = _toc_nav_only_container(
+                        parent, chapters, toc_chapter)
+            if nav_only:
+                continue  # 折叠条目由 check_print_toc 对账
+            # 混合容器：导航链接被解除为纯文字，说明内容原样保留。
+            if normalize(link["label"]) not in toc_page_text:
+                failures.append(
+                    {
+                        "code": "toc-nav-text-missing",
+                        "message": "目录混合容器中的章节链接文字未在目录页"
+                        "保留：%s（%s）" % (link["label"][:40], link["href"]),
+                        "input": str(toc_chapter.path),
+                    }
+                )
+            continue
+        # 容器外（段落等）链接保留为可点击链接：文字与页内跳转注解都须在。
+        if normalize(link["label"]) not in toc_page_text:
+            failures.append(
+                {
+                    "code": "toc-nav-text-missing",
+                    "message": "目录中的章节链接文字未在目录页保留：%s（%s）"
+                    % (link["label"][:40], link["href"]),
+                    "input": str(toc_chapter.path),
+                }
+            )
+            continue
+        target = link["target"]
+        if link["fragment"]:
+            expected = heading_pages.get(target.prefix + link["fragment"])
+            if expected is None:
+                # 普通锚点片段：页码只能由 PDF 命名目的地确定（该片段的
+                # 可消解性已由 toc-fragment-unresolved 独立把关）。
+                expected = pdf.named_dest_pages.get(
+                    target.prefix + link["fragment"])
+        else:
+            target_bound = next(
+                (b for b in bounds if b[0] is target), None)
+            expected = target_bound[1] if target_bound is not None else None
+        if expected is None:
+            continue  # 目标页缺失由 heading-missing 等检查覆盖
+        # 相同完整标签按源序/结构序消费各自的真实实例；印刷长标题的
+        # 前缀不能成为另一条导览，残留 OBJR 也不能替代页面上的注解。
+        pool = instance_pool.get(normalize(link["label"])) or []
+        instance = pool.pop(0) if pool else None
+        hit = instance is not None and instance["usable"] and all(
+            _toc_annot_covers(instance["annots"], span, expected)
+            for span in instance["spans"]
+        ) and all(a["dest_page"] == expected for a in instance["annots"])
+        if not hit:
+            failures.append(
+                {
+                    "code": "toc-nav-link-missing",
+                    "message": "目录中的章节链接没有覆盖其文字且指向目标页的"
+                    "页内注解：%s（%s → 第 %d 页）"
+                    % (link["label"][:40], link["href"], expected + 1),
+                    "input": str(toc_chapter.path),
+                }
+            )
+
+
+def reparse_inputs(paths, failures, unlink_targets=(), toc_sections=False,
+                   view_declaration_path=None):
     """用同一解析层重读输入，重建预期（与原始扫描交叉核对）。
 
     目录章的导航消费用核验器自有的 consume_toc_navigation，不复用
-    导出器的删除决定；坏目标由核验器自己的定位阻断。
+    导出器的删除决定；坏目标由核验器自己的定位阻断。视图声明在解析前
+    加载并叠加到导出视图（与导出同一校验与投影实现）；声明无效记
+    view-declaration-invalid 后继续（该失败已使核验不通过）。
+    目录出处决定在声明加载之后、解析之前（设计 §8.4 顺序，与导出入口
+    一致）：toc-provenance 声明接管对应候选，其余候选进入自动判断；
+    边界无法确定或声明/自动区间重叠时记 input-projection-invalid 并
+    停止重建。
     """
-    chapters = exporter.load_inputs(paths)
+    try:
+        chapters = exporter.load_inputs(paths)
+    except exporter.ExportError as exc:
+        failures.append({"code": "input-projection-invalid",
+                         "message": str(exc)})
+        return []
+    view_declaration = None
+    if view_declaration_path:
+        try:
+            view_declaration = exporter.load_view_declaration(
+                view_declaration_path, chapters)
+        except exporter.ExportError as exc:
+            failures.append(
+                {"code": "view-declaration-invalid", "message": str(exc)})
+    try:
+        exporter.decide_toc_provenance(chapters, view_declaration)
+    except exporter.ExportError as exc:
+        failures.append({"code": "input-projection-invalid",
+                         "message": str(exc)})
+        return []
     for chapter in chapters:
+        exporter.apply_view_declaration(chapter, view_declaration)
         exporter.parse_chapter(chapter)
     toc_chapter = next((c for c in chapters if c.is_toc), None)
     if toc_chapter is not None:
@@ -1574,6 +2178,17 @@ def reparse_inputs(paths, failures, unlink_targets=(), toc_sections=False):
                     "input": str(toc_chapter.path),
                 }
             )
+    for chapter in chapters:
+        exporter.strip_translator_notes(chapter, [])
+    # 中文总标题决定与投影：与导出同一实现，在收集正文事实前完成，
+    # 使正文/标题预期基于同一导出视图；依据不足记失败（核验不通过）。
+    try:
+        title_decision = exporter.decide_document_title(
+            chapters, view_declaration)
+        exporter.project_document_title(chapters, title_decision)
+    except exporter.ExportError as exc:
+        failures.append(
+            {"code": "document-title-invalid", "message": str(exc)})
     for chapter in chapters:
         exporter.collect_chapter_facts(chapter)
     resolve_diagnostics = []
@@ -1947,12 +2562,13 @@ def logical_lines_of(code):
 # ---------------------------------------------------------------------------
 
 
-def _walk_content_stream_positions(reader):
+def _walk_content_stream_positions(reader, painted_marks=None):
     """逐页解析内容流，返回 {page: {mcid: [(seq, x, y), ...]}}。
 
     只跟踪文本行矩阵的 y（Tm.f）与 x（Tm.e）：Chromium 为每个绘制串显式
     设置绝对 Tm，y 不受字形宽度影响；Td/TD/T* 按 PDF 规范推进行矩阵。
     解析失败返回 None；缺少归属证据的源代码块由调用方列为待复核。
+    painted_marks 给定时，同次扫描记录实际填充/描边操作所属的 (page, MCID)。
     """
     from pypdf.generic import ContentStream
 
@@ -1973,6 +2589,7 @@ def _walk_content_stream_positions(reader):
         tm = [row[:] for row in tlm]
         leading = 0.0
         current_mcid = None
+        mcid_stack = []
         seq = 0
         ops = {}
         for operands, operator in contents.operations:
@@ -1989,7 +2606,9 @@ def _walk_content_stream_positions(reader):
             elif operator == b"T*":
                 tlm = matmul(tlm, [[1, 0, 0], [0, 1, 0], [0, -leading, 1]])
                 tm = [row[:] for row in tlm]
-            elif operator == b"BDC":
+            elif operator in (b"BDC", b"BMC"):
+                mcid_stack.append(current_mcid)
+                current_mcid = None
                 props = operands[1] if len(operands) > 1 else {}
                 if isinstance(props, dict) and "/MCID" in props:
                     try:
@@ -1997,7 +2616,11 @@ def _walk_content_stream_positions(reader):
                     except (TypeError, ValueError):
                         current_mcid = None
             elif operator == b"EMC":
-                current_mcid = None
+                current_mcid = mcid_stack.pop() if mcid_stack else None
+            elif operator in (b"S", b"s", b"f", b"F", b"f*",
+                              b"B", b"B*", b"b", b"b*"):
+                if current_mcid is not None and painted_marks is not None:
+                    painted_marks.add((page_index, current_mcid))
             elif operator in (b"Tj", b"'", b'"', b"TJ"):
                 if current_mcid is not None:
                     ops.setdefault(current_mcid, []).append(
@@ -2007,11 +2630,17 @@ def _walk_content_stream_positions(reader):
     return result
 
 
-def _walk_structure_containers(reader):
+def _walk_structure_containers(reader, links=None, painted_marks=None):
     """前序遍历结构树，返回 [(order, subtype, [(page, mcid), ...])]。
 
     每个含 MCID 后代的元素都是候选容器（文档顺序 = 前序序号）；消费时
     按 MCID 去重，嵌套容器在子容器被消费后自然跳过。无法解析返回 None。
+    links 给定时，在同一次遍历中收集完整 /Link 的 MCID 与 /OBJR 归属。
+    Chromium 153 把 pre 的 /Div 改为 /NonStruct；仅将自身填充/描边、含
+    独立后代绘制标记且后代全为 /NonStruct 或 /Code 包装的块容器
+    规范化为 /Div 候选。/Code 标签本身不足以确定整块归属。
+    章包装没有自身绘制，逐行包装没有独立后代；段落/标题/链接的
+    后代属于行内内容，不充当代码块（跨页 pre 的边框可能改用填充）。
     """
     from pypdf.generic import IndirectObject, DictionaryObject
 
@@ -2053,24 +2682,50 @@ def _walk_structure_containers(reader):
             return k
         return [k]
 
-    def walk(node, order_box, inherited_page):
+    def walk(node, order_box, inherited_page, inline_context=False):
         node = resolve(node)
         if isinstance(node, int):
             if inherited_page is not None:
-                return [(inherited_page, int(node))]
-            return []
+                return [(inherited_page, int(node))], [], True
+            return [], [], True
         if not isinstance(node, DictionaryObject):
-            return []
+            return [], [], False
         subtype = str(node.get("/S") or "")
+        inline_context = inline_context or subtype in (
+            "/P", "/Link", "/H1", "/H2", "/H3", "/H4", "/H5", "/H6")
         own_page = page_index_of(node.get("/Pg"))
         page = own_page if own_page is not None else inherited_page
+        if node.get("/Type") == "/OBJR":
+            return [], [(page, node.raw_get("/Obj"))], False
+        if node.get("/Type") == "/MCR" and node.get("/MCID") is not None:
+            return [(page, int(node["/MCID"]))], [], True
         mcids = []
+        objects = []
+        own_mcids = []
+        code_wrappers = subtype in ("/NonStruct", "/Code")
         for child in kids_of(node):
-            mcids.extend(walk(child, order_box, page))
+            child_mcids, child_objects, child_code_wrappers = walk(
+                child, order_box, page, inline_context)
+            mcids.extend(child_mcids)
+            objects.extend(child_objects)
+            code_wrappers = code_wrappers and child_code_wrappers
+            resolved_child = resolve(child)
+            if isinstance(resolved_child, int) or (
+                    isinstance(resolved_child, DictionaryObject)
+                    and resolved_child.get("/Type") == "/MCR"):
+                own_mcids.extend(child_mcids)
+        if subtype == "/Link" and links is not None:
+            links.append({"mcids": mcids, "objects": objects})
         if subtype and mcids:
-            containers.append((order_box[0], subtype, mcids))
+            container_type = subtype
+            if (subtype == "/NonStruct" and code_wrappers
+                    and not inline_context and painted_marks
+                    and any(mark in painted_marks for mark in own_mcids)
+                    and set(mcids) - set(own_mcids)):
+                container_type = "/Div"
+            containers.append((order_box[0], container_type, mcids))
             order_box[0] += 1
-        return mcids
+        return mcids, objects, code_wrappers
 
     try:
         root_ref = reader.trailer["/Root"].get("/StructTreeRoot")
@@ -2084,6 +2739,8 @@ def _walk_structure_containers(reader):
             walk(child, order_box, None)
         return containers
     except Exception:  # noqa: BLE001  结构树不可用时，由调用方记录缺失的归属证据
+        if links is not None:
+            links.clear()
         return None
 
 
@@ -2897,9 +3554,8 @@ def check_code_blocks_per_line(chapters, pdf, bounds, failures, relaxed):
     marks = pdf.mcid_marks
     containers = pdf.structure_containers
     if containers is not None:
-        # 代码块的渲染容器在结构树中稳定呈现为 /Div（正文为 /P、标题
-        # /H1-H6、逐 MCID 包装为 /NonStruct）；只把 /Div 作为代码候选，
-        # 避免行级包装让块绕过父容器对账，也避免整章包装参与匹配。
+        # /Div 包括提取层规范化的 Chromium 153 匿名块容器；正文、
+        # 行内代码、逐行包装与整章包装均不参与代码块匹配。
         containers = [item for item in containers if item[1] == "/Div"]
     buckets_by_page = [(b["page"], b["y"], b) for b in buckets]
     infos = {}
@@ -3036,6 +3692,15 @@ def _collect_text_run_geometry(pdf):
     result = []
     for page in pdf.reader.pages:
         events = []
+        marked_content = []
+
+        def operand(operator, operands, _cm, _tm):
+            if operator in (b"BDC", b"BMC"):
+                props = operands[1] if len(operands) > 1 else {}
+                mcid = props.get("/MCID") if isinstance(props, dict) else None
+                marked_content.append(int(mcid) if mcid is not None else None)
+            elif operator == b"EMC" and marked_content:
+                marked_content.pop()
         try:
             page_left = float(page.mediabox.left)
             page_bottom = float(page.mediabox.bottom)
@@ -3089,6 +3754,8 @@ def _collect_text_run_geometry(pdf):
                 * scale_x
             _events.append(
                 {"y": float(tm[5]), "x": float(tm[4]),
+                 "mcid": next((m for m in reversed(marked_content)
+                               if m is not None), None),
                  "font": font.lstrip("/"), "text": text,
                  "start_pt": start_x, "right_pt": end_x,
                  "code_left_pt": code_left, "code_right_pt": code_right,
@@ -3101,7 +3768,8 @@ def _collect_text_run_geometry(pdf):
                  "page_top_pt": page_top})
 
         try:
-            page.extract_text(visitor_text=visitor)
+            page.extract_text(visitor_text=visitor,
+                              visitor_operand_before=operand)
         except Exception:  # noqa: BLE001
             events = []
         result.append(events)
@@ -3226,7 +3894,9 @@ def check_code_pagination(chapters, pdf, bounds, failures, reviews,
                      + PDF_PRE_PADDING_VERTICAL_PT)
     occupied_by_page = {}
     for bucket in pdf.line_buckets:
-        if bucket["text"].strip():
+        if bucket["text"].strip() \
+                and bucket["baseline_y_pt"] >= PDF_PAGE_FOOTER_BAND_PT:
+            # 页脚页码渲染在底边距带内，不属于正文占用空间。
             occupied_by_page.setdefault(bucket["page"], []).append(
                 bucket["baseline_y_pt"])
     image_extents_by_page = collect_drawn_images(pdf)
@@ -3466,6 +4136,157 @@ def check_outline(chapters, pdf, heading_pages, failures):
                              "message": "大纲目标页与标题实际页不一致：" + heading["text"]})
 
 
+def check_page_footers(pdf, failures):
+    """逐页页脚页码核验（R4/A5）：每页底部边距带内有且仅有一条 `n / N`。
+
+    页序从 PDF 第 1 页算起（与印刷目录同一口径），n 连续到 N == 实际
+    页数；页脚行水平居中于页宽中点；字号在 7–10pt 可读范围；页脚带内
+    不得出现其他正文/脚注文字（遮挡），正文区域出现的相同数字不误计
+    （只认页脚带内的独立行）。缺页码、错总数、页脚移入正文区即失败。
+    """
+    total = len(pdf.pages)
+    buckets_by_page = {}
+    for bucket in pdf.line_buckets:
+        buckets_by_page.setdefault(bucket.get("page"), []).append(bucket)
+    for page_index in range(total):
+        page_no = page_index + 1
+        buckets = buckets_by_page.get(page_index, [])
+        matches = []
+        for bucket in buckets:
+            text = bucket.get("text") or ""
+            match = _FOOTER_TEXT_RE.match(text)
+            if not match:
+                if bucket["baseline_y_pt"] < PDF_PAGE_FOOTER_BAND_PT:
+                    failures.append(
+                        {
+                            "code": "footer-band-content",
+                            "message": "第 %d 页页脚带（底边距 %.1fpt 内）出现"
+                            "非页脚文字（基线 %.1fpt）：%r"
+                            % (page_no, PDF_PAGE_FOOTER_BAND_PT,
+                               bucket["baseline_y_pt"], text.strip()[:30]),
+                        }
+                    )
+                continue
+            if bucket["baseline_y_pt"] >= PDF_PAGE_FOOTER_BAND_PT:
+                failures.append(
+                    {
+                        "code": "footer-in-body",
+                        "message": "第 %d 页页脚页码落在正文区域（基线 "
+                        "%.1fpt 高于页脚带 %.1fpt）：%r"
+                        % (page_no, bucket["baseline_y_pt"],
+                           PDF_PAGE_FOOTER_BAND_PT, text.strip()[:20]),
+                    }
+                )
+                continue
+            matches.append((bucket, match))
+        if len(matches) != 1:
+            failures.append(
+                {
+                    "code": "footer-missing",
+                    "message": "第 %d 页页脚页码缺失或重复（页脚带内匹配 %d 处）"
+                    % (page_no, len(matches)),
+                }
+            )
+            continue
+        bucket, match = matches[0]
+        current, count = int(match.group(1)), int(match.group(2))
+        if current != page_no or count != total:
+            failures.append(
+                {
+                    "code": "footer-number",
+                    "message": "第 %d 页页脚页码为 %d / %d，期望 %d / %d"
+                    % (page_no, current, count, page_no, total),
+                }
+            )
+        center = (bucket["start_pt"] + bucket["right_pt"]) / 2.0
+        page_center = ((bucket["page_left_pt"] or 0)
+                       + (bucket["page_right_pt"] or 0)) / 2.0
+        if abs(center - page_center) > PDF_PAGE_FOOTER_CENTER_TOLERANCE_PT:
+            failures.append(
+                {
+                    "code": "footer-not-centered",
+                    "message": "第 %d 页页脚未水平居中：行中点 %.1fpt / 页中点 "
+                    "%.1fpt（容差 %.0fpt）"
+                    % (page_no, center, page_center,
+                       PDF_PAGE_FOOTER_CENTER_TOLERANCE_PT),
+                }
+            )
+        sizes = [
+            event["font_size_pt"]
+            for event in pdf.drawn_events[page_index]
+            if event["baseline_y_pt"] < PDF_PAGE_FOOTER_BAND_PT
+            and event["text"].strip()
+        ]
+        if sizes and not all(
+                PDF_PAGE_FOOTER_FONT_MIN_PT <= size
+                <= PDF_PAGE_FOOTER_FONT_MAX_PT for size in sizes):
+            failures.append(
+                {
+                    "code": "footer-font-size",
+                    "message": "第 %d 页页脚字号 %.1f–%.1fpt 超出可读范围 "
+                    "%.0f–%.0fpt"
+                    % (page_no, min(sizes), max(sizes),
+                       PDF_PAGE_FOOTER_FONT_MIN_PT,
+                       PDF_PAGE_FOOTER_FONT_MAX_PT),
+                }
+            )
+
+
+def check_document_title(chapters, report, pdf, bounds, title_decision,
+                         failures):
+    """中文文档总标题的独立重建与成品核对（R3/A4/C5）。
+
+    不信任导出结论：从输入与同一视图声明重建题名决定，与导出证据逐
+    字段一致；可见总标题须出现在首个正文章起始页（合订时即第 1 页），
+    PDF /Title 元数据与决定一致。被改错或缺失即失败。
+    """
+    expected = (
+        {key: title_decision[key]
+         for key in ("title", "original", "basis", "source")}
+        if title_decision is not None else None
+    )
+    if report.get("document_title") != expected:
+        failures.append(
+            {
+                "code": "document-title-evidence-mismatch",
+                "message": "导出证据中的文档总标题与独立重建不一致："
+                "导出 %r / 核验 %r" % (report.get("document_title"), expected),
+            }
+        )
+        return
+    if pdf is None or title_decision is None:
+        return
+    needle = normalize(title_decision["title"])
+    if not needle:
+        return
+    start_page = 0
+    content_starts = [start for chapter, start, _end in bounds or []
+                      if not chapter.is_toc]
+    if len(content_starts) == 1:
+        # 单篇（含带目录单篇）：总标题替换首章 H1，随首章起始页。
+        start_page = content_starts[0]
+    elif bounds:
+        # 合订：非章节性总标题段落渲染在首个章节容器（第 1 页）最前。
+        start_page = bounds[0][1]
+    if start_page >= len(pdf.pages) \
+            or needle not in normalize(pdf.pages[start_page]):
+        failures.append(
+            {
+                "code": "document-title-missing",
+                "message": "中文文档总标题未出现在成品第 %d 页（首个正文章"
+                "起始页）：%r" % (start_page + 1, title_decision["title"][:40]),
+            }
+        )
+    if normalize(pdf.metadata_title or "") != needle:
+        failures.append(
+            {
+                "code": "document-title-metadata",
+                "message": "PDF /Title 元数据与中文总标题不一致：元数据 %r /"
+                " 决定 %r" % (pdf.metadata_title, title_decision["title"][:40]),
+            }
+        )
+
+
 def parse_args(argv=None):
     """解析核验 CLI 参数（交付检查复用同一解释，参数单源）。"""
     parser = argparse.ArgumentParser(
@@ -3502,6 +4323,12 @@ def parse_args(argv=None):
         default=None,
         metavar="PATH",
         help="与导出一致的只读出处区间映射；导出使用时核验必须传入同一文件",
+    )
+    parser.add_argument(
+        "--view-declaration",
+        default=None,
+        metavar="PATH",
+        help="与导出一致的 PDF 视图声明；导出使用时核验必须传入同一文件",
     )
     parser.add_argument(
         "--visual-aid",
@@ -3555,10 +4382,23 @@ def run_verification(args):
                          "message": "导出证据缺失或不可解析: %s" % report_path})
 
     chapters = reparse_inputs(
-        args.inputs, failures, args.unlink_target, args.toc_sections
-    )
+        args.inputs, failures, args.unlink_target, args.toc_sections,
+        getattr(args, "view_declaration", None))
     cross_check(chapters, failures)
     check_inputs_protection(report, failures)
+
+    # 视图声明独立重建（reparse 已按同一声明投影；此处再加载供逐项核对）。
+    view_declaration = None
+    if getattr(args, "view_declaration", None):
+        try:
+            view_declaration = exporter.load_view_declaration(
+                args.view_declaration, chapters)
+        except exporter.ExportError as exc:
+            if not any(f.get("code") == "view-declaration-invalid"
+                       for f in failures):
+                failures.append(
+                    {"code": "view-declaration-invalid",
+                     "message": str(exc)})
 
     # 显示尺寸映射独立重建：绑定失败同样判 FAIL，并核对与导出参数一致。
     display_diagnostics = []
@@ -3614,8 +4454,11 @@ def run_verification(args):
                          display_undetermined_raw, report,
                          bool(args.require_display_map), failures)
 
-    check_projection(chapters, report, pdf, failures)
+    check_projection(chapters, report, pdf, failures, view_declaration)
     check_unlinked_links(chapters, pdf, args.unlink_target, report, failures)
+    check_translator_notes(chapters, report, pdf, failures)
+    check_view_declaration(chapters, report, pdf, args.view_declaration,
+                           failures)
 
     if pdf is not None:
         if report.get("pdf_sha256") != exporter.sha256_file(pdf_path):
@@ -3636,9 +4479,8 @@ def run_verification(args):
             )
         heading_pages = {}
         check_headings(chapters, pdf, failures, heading_pages)
-        # 出处预期独立重建与前置位置核对（首章页依赖大纲目的地）。
-        check_provenance(chapters, report, pdf, args.provenance, failures,
-                         heading_pages)
+        # 出处预期独立重建与可见性核对（新政策：PDF 不显示前置出处）。
+        check_provenance(chapters, report, pdf, args.provenance, failures)
         bounds = chapter_bounds(chapters, pdf, heading_pages, failures)
         check_blocks(chapters, pdf, bounds, failures, relaxed, "text")
         # R8：块内核验（结构归属逐行对账）、短块整块与长块页尾续排检查。
@@ -3652,6 +4494,26 @@ def run_verification(args):
         check_outline(chapters, pdf, heading_pages, failures)
         check_image_widths(chapters, pdf, bounds, bindings, report, failures)
         check_print_toc(chapters, pdf, report, bounds, heading_pages, failures)
+        # 目录章节导航独立核验（设计 §8.4）：从未投影目录原文枚举指向纳入
+        # 章节的链接，核对出处排除未吞导航、文字/跳转在成品中保留。
+        check_toc_nav_links(chapters, pdf, bounds, heading_pages,
+                            view_declaration, failures, args.toc_sections)
+        # 中文总标题：独立重建（reparse 已按同一决定投影）并核对成品。
+        title_decision = None
+        try:
+            title_decision = exporter.decide_document_title(
+                chapters, view_declaration)
+        except exporter.ExportError as exc:
+            if not any(f.get("code") == "document-title-invalid"
+                       for f in failures):
+                failures.append(
+                    {"code": "document-title-invalid",
+                     "message": str(exc)})
+        check_document_title(chapters, report, pdf, bounds, title_decision,
+                             failures)
+        # 逐页页脚页码（R4/A5）：与正文/目录检查相互独立，从最终 PDF
+        # 实测页脚带几何。
+        check_page_footers(pdf, failures)
 
     machine_pass = not failures
     verify_report = {

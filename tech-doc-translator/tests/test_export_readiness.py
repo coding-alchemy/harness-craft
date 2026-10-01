@@ -81,7 +81,7 @@ class ExportReadinessTests(unittest.TestCase):
         payload = json.loads(checklist_path.read_text(encoding='utf-8'))
         payload['blocks'] = [
             {'id': 'b001', 'order': 1, 'type': 'heading', 'page': 1,
-             'rect': [38, 40, 200, 55], 'level': 2, 'text': '1 Intro',
+             'rect': [38, 40, 200, 55], 'level': 1, 'text': '1 Intro',
              'adjudication': {'status': 'accepted', 'basis': '编号+字号'}},
             {'id': 'b002', 'order': 2, 'type': 'paragraph', 'page': 1,
              'rect': [38, 70, 460, 90],
@@ -115,7 +115,7 @@ class ExportReadinessTests(unittest.TestCase):
             capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
 
-        draft = ("## 1 Intro（引言）\n\n"
+        draft = ("# 1 Intro（引言）\n\n"
                  "> **来源**：https://example.com/pv-export-ready\n"
                  "> **抓取日期**：2026-09-27\n\n"
                  "【译文】系统运行耗时 44 ms，增益 9%，工作正常。\n\n"
@@ -295,7 +295,7 @@ class ExportReadinessTests(unittest.TestCase):
         target = self.root / '01_章.md'
         text = target.read_text(encoding='utf-8')
         target.write_text(text.replace(
-            '## 1 Intro（引言）', '## 引言'), encoding='utf-8')
+            '# 1 Intro（引言）', '# 引言'), encoding='utf-8')
         try:
             result = run_export(self.root)
             self.assertNotEqual(result.returncode, 0)
