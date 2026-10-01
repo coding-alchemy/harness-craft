@@ -35,34 +35,79 @@ import verify_pdf as verifier
 
 
 class PdfStyleGeometryContractTest(unittest.TestCase):
-    def test_verifier_geometry_matches_pdf_stylesheet(self):
-        """页界证据必须绑定真实 CSS，不能靠已漂移的裸常量。"""
-        style = (Path(__file__).resolve().parents[1]
-                 / 'skills/tech-doc-translator/assets/pdf/style.css').read_text()
-        page = re.search(r'@page\s*\{([^}]*)\}', style, re.DOTALL).group(1)
-        pre = re.search(r'(?m)^pre\s*\{([^}]*)\}', style, re.DOTALL).group(1)
-        margin = re.search(r'margin:\s*([0-9.]+)mm\s+([0-9.]+)mm', page)
-        padding = re.search(r'padding:\s*([0-9.]+)pt\s+([0-9.]+)pt', pre)
-        line_height = re.search(r'line-height:\s*([0-9.]+)', pre)
-        self.assertIsNotNone(margin)
-        self.assertIsNotNone(padding)
-        self.assertIsNotNone(line_height)
+    """版心几何与规格合同字面量的行为级核对。
+
+    CLI 子进程真实导出，用 pypdf 直接读取绘制几何；期望值取自规格合同
+    字面量（@page 上下 18mm、左右 16mm；pre 8.5pt × 行高 1.45），不引用
+    核验器常量或 PdfFacts 内部结构。
+    """
+
+    def test_rendered_layout_matches_spec_geometry(self):
+        import subprocess
+
+        import pypdf
+
+        root = Path(tempfile.mkdtemp(prefix='pdf-geometry-cli-'))
+        self.addCleanup(__import__('shutil').rmtree, root, True)
+        md = root / 'a.md'
+        md.write_text(
+            '# 几何契约样例\n\n> **来源**：https://example.com/geom\n\n'
+            '正文段落第一行。\n\n```python\nalpha = 1\nbeta = 2\n```\n',
+            encoding='utf-8')
+        output, work = root / 'a.pdf', root / 'work'
+        scripts = Path(__file__).resolve().parents[1] / \
+            'skills/tech-doc-translator/scripts'
+        result = subprocess.run(
+            [sys.executable, str(scripts / 'export_pdf.py'),
+             '--output', str(output), '--work-dir', str(work), str(md)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # 规格合同字面量：@page 边距 18mm/16mm；pre 8.5pt、行高 1.45。
+        mm_to_pt = 72 / 25.4
+        margin_h = 16 * mm_to_pt
+        footer_band = 18 * mm_to_pt
+        pre_padding_h = 9.0
+        pre_line_height = 8.5 * 1.45
+        reader = pypdf.PdfReader(str(output))
+
+        def rows_of(page):
+            rows = []
+
+            def visit(text, cm, tm, font_dict, font_size):
+                if not text or not text.strip():
+                    return
+                scale = (float(cm[0]) ** 2 + float(cm[1]) ** 2) ** 0.5
+                x = (float(cm[0]) * float(tm[4])
+                     + float(cm[2]) * float(tm[5]) + float(cm[4]))
+                y = (float(cm[1]) * float(tm[4])
+                     + float(cm[3]) * float(tm[5]) + float(cm[5]))
+                rows.append((text, x, y, abs(float(font_size)) * scale))
+
+            page.extract_text(visitor_text=visit)
+            return rows
+
+        rows = [row for page in reader.pages for row in rows_of(page)]
+        body = [row for row in rows if row[2] >= footer_band]
+        footers = [row for row in rows if row[2] < footer_band]
+        self.assertTrue(body and footers)
+        # 两端对齐的 CJK 行按字形分段绘制，取行首字形核对左边距。
+        para = next(row for row in body if row[0].strip() == '正')
+        self.assertAlmostEqual(para[1], margin_h, delta=2.0)
+        code = [row for row in body if 'alpha' in row[0]]
+        self.assertTrue(code)
         self.assertAlmostEqual(
-            verifier.PDF_PAGE_MARGIN_VERTICAL_PT,
-            float(margin.group(1)) * verifier.MM_TO_PT)
-        self.assertAlmostEqual(
-            verifier.PDF_PAGE_MARGIN_HORIZONTAL_PT,
-            float(margin.group(2)) * verifier.MM_TO_PT)
-        self.assertEqual(verifier.PDF_PRE_PADDING_VERTICAL_PT,
-                         float(padding.group(1)))
-        self.assertEqual(verifier.PDF_PRE_PADDING_HORIZONTAL_PT,
-                         float(padding.group(2)))
-        self.assertEqual(verifier.PDF_PRE_LINE_HEIGHT,
-                         float(line_height.group(1)))
-        # 短块超页预检的打印版心宽度同样绑定 @page（A4 宽 210mm）。
-        self.assertEqual(
-            exporter.PRINT_CONTENT_WIDTH_PX,
-            round((210 - float(margin.group(2)) * 2) / 25.4 * 96))
+            code[0][1], margin_h + pre_padding_h, delta=2.5)
+        mono_baselines = sorted({round(row[2], 1) for row in body
+                                 if any(ch in row[0] for ch in 'ab')})
+        deltas = [later - earlier
+                  for earlier, later in zip(mono_baselines,
+                                            mono_baselines[1:])]
+        self.assertTrue(
+            any(abs(delta - pre_line_height) < 1.5 for delta in deltas),
+            deltas)
+        footer_text = ''.join(row[0].strip() for row in footers)
+        self.assertRegex(footer_text, r'^1\s*/\s*1$')
+        self.assertGreater(min(row[2] for row in body), footer_band)
 
 
 class PdfIntegrityTests(unittest.TestCase):
@@ -92,15 +137,43 @@ class PdfIntegrityTests(unittest.TestCase):
             path = cls.root / ('chapter%d.md' % index)
             path.write_text(source)
             cls.inputs.append(str(path))
+        # 合订导出缺少书名时由视图声明提供中文题名（ticket 04 口径）；
+        # 各章标题（含英文 H1）保持原样。
+        cls.declaration = cls.write_declaration(cls.inputs)
         with contextlib.redirect_stdout(io.StringIO()):
-            result = exporter.export(cls.inputs, cls.pdf, cls.work)
+            result = exporter.export(
+                cls.inputs, cls.pdf, cls.work,
+                view_declaration_path=str(cls.declaration))
         if result:
             raise AssertionError((cls.work / exporter.REPORT_NAME).read_text())
         cls.evidence = (cls.work / exporter.REPORT_NAME).read_text()
 
+    @classmethod
+    def write_declaration(cls, paths):
+        """为合订样例写视图声明：书名经 document_title 提供并记录依据。"""
+        import hashlib
+        payload = {
+            "version": 1,
+            "inputs": [
+                {"path": str(Path(p).resolve()),
+                 "sha256": hashlib.sha256(Path(p).read_bytes()).hexdigest()}
+                for p in paths
+            ],
+            "exclusions": [],
+            "document_title": {"original": "Integrity Sample",
+                               "chinese": "完整性样例全书",
+                               "basis": "测试夹具书名（合订须由声明提供）"},
+        }
+        path = cls.root / ('decl-%d.json'
+                           % (abs(hash(tuple(paths))) % 9973))
+        path.write_text(json.dumps(payload, ensure_ascii=False),
+                        encoding='utf-8')
+        return path
+
     def verify(self, path, inputs=None):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             result = verifier.main(['--pdf', str(path), '--work-dir', str(self.work),
+                                    '--view-declaration', str(self.declaration),
                                     *(inputs if inputs is not None else self.inputs)])
         report = json.loads((self.work / verifier.VERIFY_NAME).read_text())
         return result, {item['code'] for item in report['failures']}
@@ -112,7 +185,8 @@ class PdfIntegrityTests(unittest.TestCase):
         result, codes = self.verify(self.pdf)
         self.assertEqual((result, codes), (0, set()))
         failures = []
-        chapters = verifier.reparse_inputs(self.inputs, failures)
+        chapters = verifier.reparse_inputs(
+            self.inputs, failures, view_declaration_path=str(self.declaration))
         bounds = verifier.chapter_bounds(chapters, verifier.PdfFacts(self.pdf), {}, failures)
         self.assertEqual(failures, [])
         self.assertEqual([(start, end) for _, start, end in bounds],
@@ -177,17 +251,25 @@ class PdfIntegrityTests(unittest.TestCase):
             paths.append(str(path))
         work = self.root / 'outline-work'
         output = self.root / 'outline.pdf'
+        declaration = self.write_declaration(paths)
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(exporter.export(paths, output, work), 0)
+            self.assertEqual(exporter.export(
+                paths, output, work,
+                view_declaration_path=str(declaration)), 0)
             self.assertEqual(verifier.main(['--pdf', str(output), '--work-dir', str(work),
+                                            '--view-declaration', str(declaration),
                                             *paths]), 0)
 
     def test_titleless_book_needs_no_outline(self):
         work = self.root / 'titleless-work'
         output = self.root / 'titleless.pdf'
+        declaration = self.write_declaration(self.inputs[1:3])
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(exporter.export(self.inputs[1:3], output, work), 0)
+            self.assertEqual(exporter.export(
+                self.inputs[1:3], output, work,
+                view_declaration_path=str(declaration)), 0)
             self.assertEqual(verifier.main(['--pdf', str(output), '--work-dir', str(work),
+                                            '--view-declaration', str(declaration),
                                             *self.inputs[1:3]]), 0)
 
 
@@ -904,9 +986,11 @@ class ImageBottomPaginationTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         make_png(root / 'images/pic.png', 600, 300)
         lines11 = '\n'.join('value%d = %d;' % (i, i) for i in range(1, 12))
-        # 18 段导语把图片推到页界：图片移到下页顶部、代码随后跨页
+        # 24 段导语把图片推到页界：图片移到下页顶部、代码块随图片整块
+        # 起排（出处前置说明自 2026-09 排版优化起不再注入导出视图，导语
+        # 长度按无前置区的版心重新标定；21–39 段均得到同一分页证据）。
         pad = '\n\n'.join('段落 %d：占据版面高度的普通正文内容。' % i
-                          for i in range(1, 19))
+                          for i in range(1, 25))
         md = root / 'a.md'
         md.write_text(
             '# 章\n\n> **来源**：https://example.com/img-code\n\n' + pad

@@ -11,6 +11,7 @@
 """
 import argparse
 import base64
+import datetime
 import hashlib
 import json
 import mimetypes
@@ -22,7 +23,7 @@ from html import escape
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 from mdit_py_plugins.dollarmath import dollarmath_plugin
@@ -376,40 +377,15 @@ def soup_images(chapter):
     return [img for img in chapter.soup.find_all("img") if img.get("src")]
 
 
-def build_provenance_section(facts):
-    """把需要集中保留的来源组合渲染为前置说明（导出视图，非正文章节）。"""
-    lines = [line for line in (facts.get("front_text") or "").split("\n")
-             if line]
-    if not lines:
-        return None
-    items = "".join("<p>%s</p>" % escape(line) for line in lines)
-    return ('<div class="provenance-note">'
-            '<p class="provenance-title">出处</p>%s</div>' % items)
-
-
-def inject_provenance(chapters, facts):
-    """把前置说明插到首个正文章节容器最前（同页先于章首标题）。"""
-    html = build_provenance_section(facts)
-    if html is None:
-        return False
-    target = next((c for c in chapters if not c.is_toc), None)
-    if target is None:
-        return False
-    fragment = BeautifulSoup(html, "html.parser")
-    container = target.soup
-    for node in reversed(list(fragment.children)):
-        container.insert(0, node)
-    return True
-
-
 # ---------------------------------------------------------------------------
-# 出处前置与生成门禁（R6/D6：字段投影单源；来源不足在任何打印前失败）
+# 出处前置与生成门禁（R6/D6：字段投影单源；来源不足在任何打印前失败；
+# 新政策：出处只留证据，PDF 导出视图不显示前置出处）
 # ---------------------------------------------------------------------------
 
 # 可定位原文的标记：URL、机器路径或指向具体页面/文档文件的引用。
 # 仅有文档名称或网站首页文字不构成“可定位具体原文”。
 _PROVENANCE_LOCATOR_RE = re.compile(
-    r"(https?://\S+|/[^\s）)】]，。]*|[^\s）)】]，。]*\.(?:html?|md|pdf))", re.I)
+    r"(https?://\S+|/[^\s）)】，。]*|[^\s）)】，。]*\.(?:html?|md|pdf))", re.I)
 
 
 def head_field_values(text):
@@ -470,26 +446,277 @@ def has_provenance_locator(text):
     return False
 
 
+def _toc_prov_error(line_no, reason):
+    return ExportError(
+        "目录“译自…”出处行（L%d）无法确认整行仅为出处（%s），不猜测"
+        "删除；请改用 --view-declaration 显式声明排除" % (line_no, reason))
+
+
+# 裸定位符（裸 URL/本地路径）须连续无空白；?、=、&、#、_ 与路径斜线是
+# 定位符内部字符，未转义的中英分号、全角分隔符与括号则使整行失败
+# （确需分号的真实 URL 可写成 Markdown 链接或对分号编码）。
+_TOC_BARE_FORBIDDEN_RE = re.compile(r"[\s;；，、。：（）()\[\]<>【】]")
+# 书目尾注完整值：有效公历日期、vN.N(.N) 版本或“单个拉丁会议词 + 年份”。
+_TOC_BIB_TAIL_RE = re.compile(r"^（([^（）]*)）$")
+_TOC_BIB_TAIL_SEARCH_RE = re.compile(r"（[^（）]*）$")
+_TOC_BIB_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_TOC_BIB_VERSION_RE = re.compile(r"^v\d+\.\d+(\.\d+)?$")
+_TOC_BIB_CONF_RE = re.compile(r"^[A-Za-z][A-Za-z0-9.\-]* \d{4}$")
+# 书名只接受非空的汉字、ASCII 字母、数字、空格、点、连字符和下划线，
+# 首尾不能是空格或标点，且不得含另一个定位符或分隔冒号。
+_TOC_TITLE_RE = re.compile(r"^[一-鿿A-Za-z0-9 ._\-]+$")
+_TOC_TITLE_EDGE = " ._-"
+
+
+def _toc_bibliographic_tail_ok(value):
+    """书目尾注完整值校验：YYYY-MM-DD（有效公历日期）、vN.N(.N) 或会议词+年份。"""
+    if _TOC_BIB_VERSION_RE.fullmatch(value) \
+            or _TOC_BIB_CONF_RE.fullmatch(value):
+        return True
+    if not _TOC_BIB_DATE_RE.fullmatch(value):
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _toc_title_separator(text):
+    """书名分隔符：首个不在 :// 中的中英文冒号下标，无则 None。"""
+    for index, char in enumerate(text):
+        if char in ":：" and text[index + 1:index + 3] != "//":
+            return index
+    return None
+
+
+def _toc_check_locator(value, line_no, resolve_nav, bare):
+    """来源定位符验证：可定位具体原文；本地目标不得解析为纳入章节。
+
+    窄语法已保证定位符是整个值，故按完整值校验（设计 §8.3）：含
+    “://”的 URL 形态必须有主机及实际文档路径，查询串和片段不算路径；
+    其余沿用本地来源标准并做导航歧义检查。
+    """
+    if not value:
+        raise _toc_prov_error(line_no, "缺少来源定位符")
+    if bare and _TOC_BARE_FORBIDDEN_RE.search(value):
+        raise _toc_prov_error(
+            line_no, "裸定位符须连续无空白且不含分号/括号等分隔字符：%r"
+            % value[:40])
+    if "://" in value:
+        url = urlsplit(value)
+        if not url.netloc:
+            raise _toc_prov_error(
+                line_no, "URL 定位符缺少主机：%r" % value[:40])
+        if not url.path.rstrip("/"):
+            raise _toc_prov_error(
+                line_no, "URL 定位符缺少主机内文档路径：%r" % value[:40])
+    elif not has_provenance_locator(value):
+        raise _toc_prov_error(
+            line_no, "缺少可定位具体原文的来源：%r" % value[:40])
+    if "://" not in value and resolve_nav is not None:
+        path_part = unquote(value.partition("#")[0])
+        if resolve_nav(path_part):
+            raise _toc_prov_error(
+                line_no, "来源定位符解析为本次纳入的目录/章节文件"
+                "（导航歧义）：%r" % value[:40])
+
+
+def _parse_toc_provenance_line(content, line_no, resolve_nav):
+    """整行出处语法校验（设计 §8.3）：完整消费一条来源语法，否则定位失败。
+
+    content 为去掉引用标记与首尾空白、以“译自”开头的行内容。“译自”后
+    只允许至多一个空格或一个中英文冒号；主表达式只接受单一链接
+    （Markdown 链接或 CommonMark 自动链接，标签为单个非空 text 子节点）、
+    单一裸定位符或“书名：裸定位符”，之后至多再有一对全角书目尾注括号
+    与一个句末“。”。任何未消费文字、第二定位符或第二链接都定位失败。
+    """
+    rest = content[len("译自"):]
+    if rest[:1] in (" ", "：", ":"):
+        rest = rest[1:]
+    if not rest:
+        raise _toc_prov_error(line_no, "“译自”后缺少来源内容")
+    if rest[:1] in (" ", "：", ":"):
+        raise _toc_prov_error(
+            line_no, "“译自”与来源之间只允许一个空格或一个中英文冒号")
+    if rest.endswith("。"):
+        rest = rest[:-1]
+    if not rest or rest.endswith("。"):
+        raise _toc_prov_error(line_no, "只允许至多一个句末“。”")
+    children = list(
+        (_DECL_STRUCTURE_MD.parseInline(rest, {})[0].children or []))
+
+    def _check_tail(value):
+        if not _toc_bibliographic_tail_ok(value):
+            raise _toc_prov_error(
+                line_no, "书目尾注须为有效公历日期、vN.N(.N) 版本或"
+                "“单个拉丁会议词 + 四位年份”：%r" % value)
+
+    # 链接形态后的尾注是独立 text token；裸定位符/书名形态的尾注嵌在
+    # 同一 text token 末尾。
+    if children and children[-1].type == "text":
+        match = _TOC_BIB_TAIL_RE.fullmatch(children[-1].content)
+        if match:
+            _check_tail(match.group(1))
+            children = children[:-1]
+    if not children:
+        raise _toc_prov_error(line_no, "缺少来源定位符")
+    if (len(children) == 3 and children[0].type == "link_open"
+            and children[1].type == "text" and children[1].content.strip()
+            and children[2].type == "link_close"):
+        href = dict(children[0].attrs or []).get("href") or ""
+        _toc_check_locator(href, line_no, resolve_nav, bare=False)
+        return
+    if len(children) == 1 and children[0].type == "text":
+        main = children[0].content
+        match = _TOC_BIB_TAIL_SEARCH_RE.search(main)
+        if match:
+            _check_tail(match.group(0)[1:-1])
+            main = main[:match.start()]
+        separator = _toc_title_separator(main)
+        if separator is not None:
+            title = main[:separator]
+            if (title and _TOC_TITLE_RE.fullmatch(title)
+                    and title[0] not in _TOC_TITLE_EDGE
+                    and title[-1] not in _TOC_TITLE_EDGE
+                    and not has_provenance_locator(title)):
+                _toc_check_locator(
+                    main[separator + 1:], line_no, resolve_nav, bare=True)
+                return
+        _toc_check_locator(main, line_no, resolve_nav, bare=True)
+        return
+    raise _toc_prov_error(
+        line_no, "行内构成超出“一条来源”语法（含未消费文字、第二定位符"
+        "或第二链接）")
+
+
+def toc_provenance_span(text, declared_ranges=(), resolve_nav=None):
+    """目录出处段的块边界投影区间：(起始行, 结束行, 段落文本)。
+
+    窄格式自动语法（设计 §8.3）：候选是目录中未被声明接管、以“译自”
+    开头的行（取 CommonMark inline 内容，围栏/缩进代码不产生候选）。
+    一个目录至多自动采用一个出处块；多个候选定位行号并拒绝，要求用
+    --view-declaration 逐处明确范围。结构条件先于行内条件：候选必须
+    位于顶层独立单行段落，或内容恰为一个单行段落的顶层单行引用块；
+    同段多行、共享块、列表/标题/表格/嵌套块中的候选一律定位失败，
+    不猜测删除。结构通过后整行须完整消费一条来源语法
+    （_parse_toc_provenance_line）。识别口径与 find_toc_provenance
+    单源（同一段落既是门禁证据又是排除对象）。
+    declared_ranges：已被 toc-provenance 声明接管的行区间，其中的
+    “译自”候选不再进入自动判断（设计 §8.4 声明接管顺序）。
+    resolve_nav：本地路径→是否解析为本次纳入的目录/章节文件（导航
+    歧义检查），None 表示不做该检查。
+    """
+    tokens = _DECL_STRUCTURE_MD.parse(text)
+    lines = text.split("\n")
+    candidates = []
+    for token in tokens:
+        if token.type != "inline" or token.map is None:
+            continue
+        for offset, content_line in enumerate(token.content.split("\n")):
+            line_no = token.map[0] + offset + 1
+            if any(start <= line_no <= end for start, end in declared_ranges):
+                continue
+            if content_line.strip().startswith("译自"):
+                candidates.append((line_no, content_line.strip()))
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        raise ExportError(
+            "一个目录至多自动采用一个出处块；发现 %d 个“译自”候选"
+            "（L%s），请用 --view-declaration 逐处明确范围"
+            % (len(candidates),
+               "、L".join(str(line_no) for line_no, _c in candidates)))
+    line_no, content_line = candidates[0]
+    for index, token in enumerate(tokens):
+        if token.type not in ("paragraph_open", "blockquote_open") \
+                or not token.map or token.level != 0:
+            continue  # 非顶层块（列表项内段落、嵌套引用等）不可能是独立出处段
+        start, end = token.map[0] + 1, token.map[1]
+        if not (start <= line_no <= end):
+            continue
+        if token.type == "paragraph_open":
+            if end != start:
+                # 多行顶层段落：无法确认整段均为出处。
+                raise ExportError(
+                    "目录“译自…”出处段跨多行（L%d-L%d），无法确认整段"
+                    "均为出处，不猜测删除；请用空行分隔为单行独立段，"
+                    "或在 --view-declaration 中显式声明排除" % (start, end))
+            _parse_toc_provenance_line(content_line, line_no, resolve_nav)
+            return start, end, _toc_block_paragraph(lines, start, end)
+        # 顶层引用块：内容须恰为单个出处段落（无列表、无多段落、无
+        # 更深嵌套），否则边界无法确定，定位行号并拒绝。
+        close = index + 1
+        while close < len(tokens) and not (
+                tokens[close].type == "blockquote_close"
+                and tokens[close].level == 0):
+            close += 1
+        children = [
+            child for child in tokens[index + 1:close]
+            if child.level == 1 and child.map is not None
+            and (child.type.endswith("_open")
+                 or child.type in ("fence", "code_block", "hr", "html_block"))
+        ]
+        if not (len(children) == 1
+                and children[0].type == "paragraph_open"):
+            raise ExportError(
+                "目录“译自…”出处段与导航等内容共享同一块（L%d-L%d），"
+                "投影边界无法确定，不猜测删除；请用空行把出处段单独成块，"
+                "或在 --view-declaration 中显式声明排除" % (start, end))
+        if end != start:
+            # 单段多行引用块：段落内除译自行外还有其余内容行，
+            # 无法确认整段均为出处。
+            raise ExportError(
+                "目录“译自…”出处段跨多行（L%d-L%d），无法确认整段"
+                "均为出处，不猜测删除；请用空行分隔为单行独立段，"
+                "或在 --view-declaration 中显式声明排除" % (start, end))
+        _parse_toc_provenance_line(content_line, line_no, resolve_nav)
+        return start, end, _toc_block_paragraph(lines, start, end)
+    raise ExportError(
+        "目录“译自…”出处段未形成独立顶层段落块（L%d），投影边界无法"
+        "确定，不猜测删除；请调整目录文件，或在 --view-declaration 中"
+        "显式声明排除" % line_no)
+
+
+def _toc_block_paragraph(lines, start, end):
+    """块区间的段落文本口径：非空行去首尾空白后按行拼接。"""
+    return "\n".join(
+        line.strip() for line in lines[start - 1:end] if line.strip())
+
+
 def find_toc_provenance(toc_chapter):
-    """目录中的完整出处普通段落：以“译自”开头且含可定位来源的块。"""
+    """目录出处原文（自动排除段 + toc-provenance 声明片段），无则 None。
+
+    不重新推导边界：自动段与声明片段在 decide_toc_provenance 时已定位
+    并记录到章对象（声明接管的候选可能不满足自动模板，重新推导会误
+    判）；同一份原文既是来源门禁证据又是核验排除预期。
+    """
     if toc_chapter is None:
         return None
-    paragraphs = []
-    current = []
-    for line in toc_chapter.text.split("\n"):
-        stripped = line.strip()
-        if stripped:
-            current.append(stripped)
-        elif current:
-            paragraphs.append("\n".join(current))
-            current = []
-    if current:
-        paragraphs.append("\n".join(current))
-    for paragraph in paragraphs:
-        body = paragraph.lstrip("> ").strip()
-        if body.startswith("译自") and has_provenance_locator(paragraph):
-            return paragraph
-    return None
+    parts = []
+    exclusion = toc_chapter.toc_provenance_exclusion
+    if exclusion is not None:
+        lines = toc_chapter.text.split("\n")
+        parts.append(_toc_block_paragraph(
+            lines, exclusion["start_line"], exclusion["end_line"]))
+    parts.extend(toc_chapter.toc_provenance_fragments)
+    return "\n".join(part for part in parts if part) or None
+
+
+TOC_PROVENANCE_EXCLUSION_REASON = (
+    "目录前置出处段默认排除（PDF 不显示出处；来源证据与门禁保留，"
+    "Markdown 原样）")
+
+
+def remove_line_spans(text, spans):
+    """按原文行区间集合（1 起含端点）移除行，返回投影文本。"""
+    drop = set()
+    for start, end in spans:
+        drop.update(range(start - 1, end))
+    return "\n".join(
+        line for number, line in enumerate(text.split("\n"))
+        if number not in drop
+    )
 
 
 def visible_provenance_text(markdown_text):
@@ -586,13 +813,439 @@ def load_provenance_map(path, chapters, diagnostics):
             "covered": covered}
 
 
+# ---------------------------------------------------------------------------
+# PDF 视图声明（--view-declaration）：受输入摘要绑定的授权排除范围
+# ---------------------------------------------------------------------------
+
+VIEW_DECLARATION_VERSION = 1
+# block 型排除只允许对齐这类 Markdown 块；标题/代码围栏/表格等是技术正文。
+VIEW_DECLARATION_BLOCK_KINDS = ("paragraph", "blockquote", "list")
+VIEW_DECLARATION_TECH_KINDS = ("heading", "code", "table", "hr", "html")
+
+# 声明块边界校验使用独立 CommonMark 实例（开启表格）：与章首结构分析
+# 的纯 commonmark 实例分开，表格块必须被识别为技术正文。
+_DECL_STRUCTURE_MD = MarkdownIt("commonmark")
+_DECL_STRUCTURE_MD.enable("table")
+
+
+def _decl_block_maps(text):
+    """块级 token 的行区间 [(起始行, 结束行, 种类)]，1 起含端点。"""
+    maps = []
+    for token in _DECL_STRUCTURE_MD.parse(text):
+        if token.map is None:
+            continue
+        kind = {
+            "paragraph_open": "paragraph",
+            "blockquote_open": "blockquote",
+            "bullet_list_open": "list",
+            "ordered_list_open": "list",
+            "heading_open": "heading",
+            "fence": "code",
+            "code_block": "code",
+            "table_open": "table",
+            "hr": "hr",
+            "html_block": "html",
+        }.get(token.type)
+        if kind is not None:
+            maps.append((token.map[0] + 1, token.map[1], kind))
+    return maps
+
+
+def _declared_original_heading(chapters):
+    """单篇首章 H1 原文（用于核对声明 original）；无法确定返回 None。
+
+    多章合订（两个及以上正文章）的书名不是首章标题，返回 None 不作
+    核对；首章无标题或只有深层标题（CommonMark 不识别 H7+）同样返回
+    None。用带表格的 CommonMark 实例解析，标题内行内标记取原文。
+    """
+    content = [c for c in chapters if not c.is_toc]
+    if len(content) != 1:
+        return None
+    tokens = _DECL_STRUCTURE_MD.parse(content[0].text)
+    for index, token in enumerate(tokens):
+        if token.type == "heading_open" and token.tag == "h1" \
+                and index + 1 < len(tokens) \
+                and tokens[index + 1].type == "inline":
+            return tokens[index + 1].content.strip() or None
+    return None
+
+
+TOC_PROVENANCE_DECLARATION_KIND = "toc-provenance"
+
+
+def _strip_block_markers(text):
+    """去除各行引用标记与首尾空白后的文本（声明内容判定用）。"""
+    return "\n".join(
+        line.lstrip("> ").strip() for line in text.split("\n")
+    ).strip()
+
+
+def _declared_chapter_links(text, chapter, chapters):
+    """文本中指向本次纳入目录/章节文件的本地链接目标列表。"""
+    targets = []
+    for token in _DECL_STRUCTURE_MD.parse(text):
+        if token.type != "inline" or not token.children:
+            continue
+        for child in token.children:
+            if child.type != "link_open":
+                continue
+            href = dict(child.attrs or []).get("href") or ""
+            if not href or urlsplit(href).scheme:
+                continue
+            path_part = unquote(href.partition("#")[0])
+            target = ((chapter.dir / path_part).resolve()
+                      if path_part else chapter.path)
+            if any(c.path == target for c in chapters):
+                targets.append(href)
+    return targets
+
+
+def _check_toc_provenance_declaration(entry, chapter, chapters, ex_type,
+                                      fragment, ranged_text):
+    """toc-provenance 声明校验：只接管目录出处，不得吞掉章节导航。
+
+    声明内容须来自原始目录、以“译自”开头且含可定位来源；指向纳入
+    目录/章节文件的链接不能作为出处片段获准删除（设计 §8.4）。
+    """
+    start, end = entry["lines"]
+    if not chapter.is_toc:
+        raise ExportError(
+            "视图声明 kind=toc-provenance 只适用于目录文件（%s）：%s"
+            % (TOC_FILE_NAME, entry.get("input")))
+    content = fragment if ex_type == "inline" else ranged_text
+    stripped = _strip_block_markers(content)
+    if not stripped.startswith("译自"):
+        raise ExportError(
+            "toc-provenance 声明排除的内容必须以“译自”开头（非出处内容"
+            "不得按出处排除）：%s L%d-L%d" % (entry.get("input"), start, end))
+    if not has_provenance_locator(stripped):
+        raise ExportError(
+            "toc-provenance 声明排除的内容须含可定位来源：%s L%d-L%d"
+            % (entry.get("input"), start, end))
+    nav = _declared_chapter_links(content, chapter, chapters)
+    if nav:
+        raise ExportError(
+            "toc-provenance 声明不得吞掉指向纳入章节的导航链接：%s "
+            "L%d-L%d（%s）"
+            % (entry.get("input"), start, end, "、".join(nav)))
+
+
+def load_view_declaration(path, chapters):
+    """读取并校验 PDF 视图声明（--view-declaration）；非法即 ExportError。
+
+    声明格式（version 1）：
+        {"version": 1,
+         "inputs": [{"path": "...", "sha256": "..."}],
+         "exclusions": [{"input": "...", "lines": [起, 止],
+                         "type": "block|inline", "kind": "...",
+                         "fragment": "...", "reason": "..."}],
+         "document_title": {"original": "...", "chinese": "...",
+                            "basis": "..."}}
+    inputs 与实际有序输入一一对应且摘要必须匹配（漂移即拒绝）；行区间在
+    文件内、fragment 与实际文本匹配、范围互不重叠；block 型必须对齐
+    Markdown 块边界（整块引用块/段落/列表），区间覆盖标题、代码围栏、
+    表格等技术正文即失败；inline 型删除文本片段。document_title 本阶段
+    只在加载校验时接受并记录（ticket 04 才消费）。
+    kind=toc-provenance 只适用于目录文件（00_目录.md）：声明内容须以
+    “译自”开头且含可定位来源，且不得含指向纳入目录/章节文件的导航
+    链接；接管的候选不再进入目录出处自动判断（decide_toc_provenance）。
+    其他 kind 不接管目录出处候选，不绕过自动判断。
+    """
+    if path is None:
+        return None
+    try:
+        payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ExportError("视图声明无法解析：%s（%s）" % (path, exc))
+    if not isinstance(payload, dict):
+        raise ExportError("视图声明必须是 JSON 对象：%s" % path)
+    if payload.get("version") != VIEW_DECLARATION_VERSION:
+        raise ExportError(
+            "视图声明版本不受支持：%r（本工具只接受 version %d）"
+            % (payload.get("version"), VIEW_DECLARATION_VERSION))
+    items = payload.get("inputs")
+    if not isinstance(items, list) or len(items) != len(chapters):
+        raise ExportError(
+            "视图声明 inputs 必须与导出命令的有序输入一一对应"
+            "（声明 %d 条 / 实际 %d 条）"
+            % (len(items) if isinstance(items, list) else -1, len(chapters)))
+    for item, chapter in zip(items, chapters):
+        declared = Path(str(item.get("path", ""))).expanduser().resolve()
+        if declared != chapter.path:
+            raise ExportError(
+                "视图声明输入与实际有序输入不符：%r != %s"
+                % (item.get("path"), chapter.path))
+        digest = item.get("sha256")
+        if not digest:
+            raise ExportError(
+                "视图声明缺少输入摘要（sha256 必填）：%s" % item.get("path"))
+        if digest != sha256_file(chapter.path):
+            raise ExportError(
+                "视图声明摘要与输入不符：%s" % item.get("path"))
+    document_title = payload.get("document_title")
+    if document_title is not None and not isinstance(document_title, dict):
+        raise ExportError("视图声明 document_title 必须是对象或缺省")
+    if isinstance(document_title, dict) \
+            and str(document_title.get("chinese") or "").strip():
+        # 采用声明题名时校验可回查性与中文口径（R3/C5）：题名须含 CJK
+        # 字符，依据与原题必填；单篇能从输入确定原题（首章 H1）时核对
+        # 一致，多章合订的书名非首章标题，不作此核对。
+        chinese_title = str(document_title["chinese"]).strip()
+        if not _CJK_CHAR_RE.search(chinese_title):
+            raise ExportError(
+                "视图声明 document_title.chinese 须为含中文（CJK）的题名："
+                "%r" % chinese_title[:40])
+        if not str(document_title.get("basis") or "").strip():
+            raise ExportError(
+                "视图声明 document_title.basis 必填：题名依据须可回查")
+        original_title = str(document_title.get("original") or "").strip()
+        if not original_title:
+            raise ExportError(
+                "视图声明 document_title.original 必填：原题须可回查")
+        heading_text = _declared_original_heading(chapters)
+        if heading_text is not None and original_title != heading_text:
+            raise ExportError(
+                "视图声明 document_title.original 与首章实际题名不符："
+                "%r != %r" % (original_title[:40], heading_text[:40]))
+    by_path = {chapter.path: chapter for chapter in chapters}
+    exclusions = []
+    for entry in payload.get("exclusions") or []:
+        if not isinstance(entry, dict):
+            raise ExportError("视图声明排除条目必须是对象：%r" % (entry,))
+        target = Path(str(entry.get("input", ""))).expanduser().resolve()
+        chapter = by_path.get(target)
+        if chapter is None:
+            raise ExportError(
+                "视图声明排除指向未纳入输入的文件：%r" % entry.get("input"))
+        lines = entry.get("lines")
+        if (not isinstance(lines, list) or len(lines) != 2
+                or not all(isinstance(n, int) for n in lines)):
+            raise ExportError(
+                "视图声明排除行区间非法：%r" % (entry.get("lines"),))
+        start, end = lines
+        source_lines = chapter.text.split("\n")
+        if not (1 <= start <= end <= len(source_lines)):
+            raise ExportError(
+                "视图声明排除区间越界：%s L%d-L%d（文件共 %d 行）"
+                % (entry.get("input"), start, end, len(source_lines)))
+        kind = entry.get("kind")
+        reason = entry.get("reason")
+        if not isinstance(kind, str) or not kind.strip():
+            raise ExportError("视图声明排除缺少 kind（排除类型说明）")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ExportError("视图声明排除缺少 reason（排除理由）")
+        ex_type = entry.get("type")
+        if ex_type not in ("block", "inline"):
+            raise ExportError(
+                "视图声明排除类型必须是 block 或 inline：%r" % ex_type)
+        fragment = entry.get("fragment")
+        if not isinstance(fragment, str) or not fragment:
+            raise ExportError("视图声明排除缺少 fragment（原文定位片段）")
+        ranged_text = "\n".join(source_lines[start - 1:end])
+        occurrences = ranged_text.count(fragment)
+        if occurrences == 0:
+            raise ExportError(
+                "视图声明 fragment 与实际文本不符：%s L%d-L%d %r"
+                % (entry.get("input"), start, end, fragment[:40]))
+        if ex_type == "inline" and occurrences != 1:
+            raise ExportError(
+                "视图声明 inline 排除的 fragment 在区间内必须恰好出现"
+                "一次（避免误删同行其他同文内容）：%s L%d-L%d %r 出现 %d "
+                "次；请改用 block 整块排除或给出更完整的片段"
+                % (entry.get("input"), start, end, fragment[:40],
+                   occurrences))
+        if kind.strip() == TOC_PROVENANCE_DECLARATION_KIND:
+            _check_toc_provenance_declaration(
+                entry, chapter, chapters, ex_type, fragment, ranged_text)
+        exclusions.append(
+            {
+                "input": str(target),
+                "chapter": chapter,
+                "lines": [start, end],
+                "type": ex_type,
+                "kind": kind.strip(),
+                "fragment": fragment,
+                "reason": reason.strip(),
+            })
+    # 范围互不重叠（同一输入内）；边界与技术正文校验按输入分别进行。
+    for chapter in chapters:
+        own = sorted(
+            (ex["lines"][0], ex["lines"][1]) for ex in exclusions
+            if ex["chapter"] is chapter
+        )
+        for prev, current in zip(own, own[1:]):
+            if current[0] <= prev[1]:
+                raise ExportError(
+                    "视图声明排除范围重叠：%s L%d-L%d 与 L%d-L%d"
+                    % (chapter.path.name, prev[0], prev[1],
+                       current[0], current[1]))
+        block_maps = _decl_block_maps(chapter.text)
+        for ex in exclusions:
+            if ex["chapter"] is not chapter:
+                continue
+            start, end = ex["lines"]
+            intersects_tech = any(
+                kind in VIEW_DECLARATION_TECH_KINDS
+                and not (end < first or start > last)
+                for first, last, kind in block_maps
+            )
+            if intersects_tech:
+                raise ExportError(
+                    "视图声明排除区间覆盖技术正文（标题/代码围栏/表格等）："
+                    "%s L%d-L%d" % (chapter.path.name, start, end))
+            if ex["type"] == "block":
+                aligned = any(
+                    kind in VIEW_DECLARATION_BLOCK_KINDS
+                    and (first, last) == (start, end)
+                    for first, last, kind in block_maps
+                )
+                if not aligned:
+                    raise ExportError(
+                        "block 型排除未对齐 Markdown 块边界"
+                        "（整块引用块/段落/列表）：%s L%d-L%d"
+                        % (chapter.path.name, start, end))
+    return {
+        "path": str(Path(path).expanduser()),
+        "sha256": sha256_file(Path(path).expanduser()),
+        "document_title": document_title,
+        "exclusions": exclusions,
+    }
+
+
+def project_view_declared(text, block_spans, inline_exclusions):
+    """按声明区间投影导出视图（原文行号）：block 整块移除，inline 删片段。
+
+    block_spans 为 1 起含端点的行区间集合（可与管理字段/目录出处段区间
+    合并传入）；inline 删除区间内各行中的全部 fragment 出现。找不到
+    fragment 时明确失败（校验已先行，此处为双保险）。
+    """
+    drop = set()
+    for start, end in block_spans:
+        drop.update(range(start - 1, end))
+    kept = [
+        (number, line)
+        for number, line in enumerate(text.split("\n"), start=1)
+        if number - 1 not in drop
+    ]
+    for exclusion in inline_exclusions:
+        start, end = exclusion["lines"]
+        fragment = exclusion["fragment"]
+        hit = False
+        for index, (number, line) in enumerate(kept):
+            if start <= number <= end and fragment in line:
+                kept[index] = (number, line.replace(fragment, ""))
+                hit = True
+        if not hit:
+            raise ExportError(
+                "视图声明行内片段不在排除区间内：%r" % fragment[:40])
+    return "\n".join(line for _number, line in kept)
+
+
+def decide_toc_provenance(chapters, view_declaration=None):
+    """目录出处决定（设计 §8.4 顺序）：声明接管优先，其余候选自动判断。
+
+    在视图声明加载校验之后、章节解析之前调用。kind=toc-provenance 声明
+    覆盖的“译自”候选不再进入自动判断（声明内容已在加载时校验：以
+    “译自”开头、含可定位来源、不含章节导航）；未被覆盖的候选按设计
+    §8.3 窄格式自动语法判定（结构条件 + 整行完整消费一条来源语法）。
+    声明覆盖与自动区间不得重叠；任何边界/语法失败在生成候选前
+    ExportError（旧 PDF 不变）。声明接管的出处原文记入
+    chapter.toc_provenance_fragments，与自动段一起作为来源门禁证据。
+    """
+    toc_chapter = next((c for c in chapters if c.is_toc), None)
+    if toc_chapter is None:
+        return
+    declared, others = [], []
+    for ex in (view_declaration or {}).get("exclusions") or []:
+        if ex["chapter"] is not toc_chapter:
+            continue
+        bucket = declared \
+            if ex["kind"] == TOC_PROVENANCE_DECLARATION_KIND else others
+        bucket.append(ex)
+    lines = toc_chapter.text.split("\n")
+    for ex in declared:
+        if ex["type"] == "inline":
+            toc_chapter.toc_provenance_fragments.append(ex["fragment"])
+        else:
+            toc_chapter.toc_provenance_fragments.append(
+                _toc_block_paragraph(lines, ex["lines"][0], ex["lines"][1]))
+
+    def _resolve_nav(path_part):
+        target = ((toc_chapter.dir / path_part).resolve()
+                  if path_part else toc_chapter.path)
+        return any(c.path == target for c in chapters)
+
+    def _takeover_range(ex):
+        """声明实际接管的行区间：block 为整区间；inline 为 fragment 实际
+        覆盖的行（区间内其余行不是获准内容，仍须进入自动判断）。"""
+        start, end = ex["lines"]
+        if ex["type"] == "block":
+            return (start, end)
+        haystack = "\n".join(lines[start - 1:end])
+        at = haystack.find(ex["fragment"])
+        if at < 0:
+            # 加载校验已保证 fragment 在区间内出现；兜底不扩大接管范围
+            return (start, end)
+        first = start + haystack[:at].count("\n")
+        return (first, first + ex["fragment"].count("\n"))
+
+    takeover = [_takeover_range(ex) for ex in declared]
+    span = toc_provenance_span(
+        toc_chapter.text,
+        declared_ranges=takeover,
+        resolve_nav=_resolve_nav)
+    if span is None:
+        return
+    start, end, _paragraph = span
+    for ex_start, ex_end in takeover + [tuple(ex["lines"]) for ex in others]:
+        if not (ex_end < start or ex_start > end):
+            raise ExportError(
+                "目录出处自动区间与视图声明排除范围重叠：%s L%d-L%d 与声明"
+                " L%d-L%d；同一出处只能由一种机制排除"
+                % (toc_chapter.path.name, start, end, ex_start, ex_end))
+    toc_chapter.toc_provenance_exclusion = {
+        "start_line": start,
+        "end_line": end,
+        "reason": TOC_PROVENANCE_EXCLUSION_REASON,
+    }
+    spans = [(item["start_line"], item["end_line"])
+             for item in toc_chapter.exclusions]
+    spans.append((start, end))
+    toc_chapter.projected_text = remove_line_spans(toc_chapter.text, spans)
+
+
+def apply_view_declaration(chapter, declaration):
+    """把视图声明的授权排除叠加到本章导出视图（在既有投影之上）。"""
+    if declaration is None:
+        return
+    own = [ex for ex in declaration["exclusions"] if ex["chapter"] is chapter]
+    if not own:
+        return
+    spans = [(item["start_line"], item["end_line"])
+             for item in chapter.exclusions]
+    if chapter.toc_provenance_exclusion is not None:
+        spans.append(
+            (
+                chapter.toc_provenance_exclusion["start_line"],
+                chapter.toc_provenance_exclusion["end_line"],
+            )
+        )
+    spans.extend(
+        tuple(ex["lines"]) for ex in own if ex["type"] == "block"
+    )
+    inline = [ex for ex in own if ex["type"] == "inline"]
+    chapter.projected_text = project_view_declared(
+        chapter.text, spans, inline)
+
+
 def collect_provenance(chapters, toc_chapter, provenance_map):
     """收集实际输出范围的出处事实并按最低标准分类，返回事实字典。
 
     最低标准：每章均可定位其具体原文；输入中已知的版本/日期原样保留，
-    源未提供不编造。章首四类管理字段全部从章首移除后，彼此不同的来源
-    信息以组合形式保留在前置说明；与目录出处段/映射文本完全一致的组合
-    不再重复。返回事实字典供门禁、报告与前置区渲染使用。
+    源未提供不编造。章首四类管理字段全部从章首移除；彼此不同的来源
+    信息以组合形式保留在导出报告（front_text）；与目录出处段/映射文本
+    完全一致的组合不再重复。返回事实字典供门禁、报告与核验预期使用
+    （PDF 不显示前置出处，见 TOC_PROVENANCE_EXCLUSION_REASON）。
     """
     chapter_facts = []
     for chapter in chapters:
@@ -1206,8 +1859,8 @@ def extract_toc_pages(pdf_path, entries):
 # 章首管理字段投影（只作用于导出视图；Markdown 原文与输入摘要不变）
 # ---------------------------------------------------------------------------
 
-# PDF 默认排除的章首模板字段（D6/A14）：管理字段全部移出章首，出处信息
-# 集中前置到第一章之前；具体可定位来源缺失时在打印前阻断（见出处门禁）。
+# PDF 默认排除的章首模板字段（D6/A14）：管理字段全部移出章首；出处信息
+# 保留在导出报告与来源门禁中，PDF 导出视图不显示前置出处（R2/C2）。
 MANAGEMENT_FIELD_LABELS = ("原文", "译例说明", "来源", "抓取日期")
 # 章首管理引用块的家族标签：引用块首个块是这些标签的字段段时才属于
 # 章首管理区；注（Note）等其他标签的引用块是技术正文边界。
@@ -1580,7 +2233,13 @@ class Chapter:
         self.is_toc = source_path.name == TOC_FILE_NAME
         self.text = source_path.read_text(encoding="utf-8")
         # 导出视图：章首管理字段已在解析前投影掉；text 始终是完整原件。
+        # 目录出处段在视图声明加载后由 decide_toc_provenance 决定（声明接管
+        # 优先于自动判断，设计 §8.4），此处不先行判定，保证显式声明退路可达。
         self.projected_text, self.exclusions = project_management_fields(self.text)
+        self.toc_provenance_exclusion = None
+        # toc-provenance 声明接管的出处原文片段（block 块文本 / inline
+        # fragment），与自动段一起作为来源门禁证据与核验预期。
+        self.toc_provenance_fragments = []
         self.math = []
         self.headings = []  # {level, text, slug, id}
         self.targets = {}  # 未加前缀片段 -> 描述（用于链接消解）
@@ -1692,6 +2351,155 @@ def walk_text_blocks(soup):
         if text:
             blocks.append({"text": text, "segments": segments})
     return blocks
+
+
+# ---------------------------------------------------------------------------
+# 已标识译注的导出视图排除（R2/C6：【译注：…】 只从 PDF 视图移除片段）
+# ---------------------------------------------------------------------------
+
+# 已标识译注语法（references/translation_conventions.md）：只处理正文文本
+# 节点中的完整片段；代码块、行内 code 与原文引用块不扫描、不删除。
+TRANSLATOR_NOTE_RE = re.compile(r"【译注：[^】]*】")
+TRANSLATOR_NOTE_SKIP_ANCESTORS = ("pre", "code", "blockquote")
+
+
+def strip_translator_notes(chapter, records):
+    """从本章导出视图删除已标识译注片段，逐处记录位置与原文片段。
+
+    只改渲染 soup（导出视图）；chapter.text 与 projected_text 不变。
+    records 追加 {"input", "line", "fragment"}。
+    """
+    last_line = 0
+    for node in list(chapter.soup.find_all(string=True)):
+        if isinstance(node, Comment):
+            continue
+        if node.find_parent(TRANSLATOR_NOTE_SKIP_ANCESTORS):
+            continue  # 代码与原文引用块中的同形文字不是译者标识译注
+        text = str(node)
+        if not TRANSLATOR_NOTE_RE.search(text):
+            continue
+        for match in TRANSLATOR_NOTE_RE.finditer(text):
+            fragment = match.group(0)
+            line = find_source_line(chapter, fragment, start=last_line)
+            if line is not None:
+                last_line = line - 1
+            records.append(
+                {
+                    "input": str(chapter.path),
+                    "line": line,
+                    "fragment": fragment,
+                }
+            )
+        node.replace_with(TRANSLATOR_NOTE_RE.sub("", text))
+
+
+# ---------------------------------------------------------------------------
+# 中文文档总标题（R3/A4/C5，设计 5.2）：题名决定与导出视图投影
+# ---------------------------------------------------------------------------
+
+# 中英双语 H1 形态：外文部分 + 括号内中文题名（全角或半角括号）。
+_BILINGUAL_TITLE_RE = re.compile(
+    r"^(?P<outer>.*[A-Za-z].*)[（(](?P<zh>[^（）()]*[一-鿿][^（）()]*)[)）]$")
+_CJK_CHAR_RE = re.compile(r"[一-鿿]")
+
+
+def decide_document_title(chapters, view_declaration):
+    """决定 PDF 中文文档总标题（R3/A4/C5），返回决定字典。
+
+    单篇（一个正文章，含带 00_目录.md 的单篇）：视图声明
+    document_title.chinese > 首章 H1（纯中文原样采用 / 中英双语取括号内
+    中文）> 仅外文题名或缺少 H1 拒绝生成（ExportError，不回退为外文原题）。
+    多章合订（两个及以上正文章）：书名只能由 Agent 依据有序输入范围与
+    章题拟定并经视图声明记录依据——无声明一律拒绝生成，绝不把目录或
+    第一章标题冒充全书标题。
+    """
+    declared = (view_declaration or {}).get("document_title") or None
+    if declared is not None and str(declared.get("chinese") or "").strip():
+        return {
+            "title": str(declared["chinese"]).strip(),
+            "original": str(declared.get("original") or ""),
+            "basis": str(declared.get("basis") or ""),
+            "source": "declaration",
+        }
+    content = [c for c in chapters if not c.is_toc]
+    if len(content) > 1:
+        raise ExportError(
+            "合订缺书名：多章合订无法从输入确定中文书名，请通过 "
+            "--view-declaration 的 document_title 提供有依据的中文题名"
+            "（original/chinese/basis）；不能把目录或第一章标题冒充全书标题")
+    if not content:
+        raise ExportError(
+            "导出缺少正文章节，无法确定中文文档总标题；请在 "
+            "--view-declaration 的 document_title 中提供有依据的中文题名")
+    chapter = content[0]
+    # 首章第一个 H1 即文章总标题（重审结论，机制二）：题名决定、投影
+    # 与声明 original 核对共用同一 H1 选择，无 H1 定位失败并指向声明。
+    heading = next(
+        (item for item in chapter.headings if item["level"] == 1), None)
+    if heading is None:
+        raise ExportError(
+            "首章缺少 H1 标题，无法确定中文文档总标题：%s；请在 "
+            "--view-declaration 的 document_title 中提供有依据的中文题名"
+            % chapter.path)
+    # 单篇投影后该 H1 已是可见题名；original_text 保留输入原题，供核
+    # 验侧独立重建同一决定（投影幂等，不影响首次决定）。
+    text = (heading.get("original_text") or heading["text"]).strip()
+    match = _BILINGUAL_TITLE_RE.match(text)
+    if match:
+        return {
+            "title": match.group("zh").strip(),
+            "original": text,
+            "basis": "首章 H1 括号内中文题名：%s" % text,
+            "source": "bilingual-h1",
+        }
+    if _CJK_CHAR_RE.search(text):
+        return {
+            "title": text,
+            "original": text,
+            "basis": "首章 H1 为中文题名",
+            "source": "plain-chinese",
+        }
+    raise ExportError(
+        "仅外文题名且无视图声明，无法确定中文文档总标题：%r；请通过 "
+        "--view-declaration 的 document_title 提供有依据的中文译名"
+        % text)
+
+
+def project_document_title(chapters, decision):
+    """把中文总标题投影进导出视图（只改渲染 soup 与标题记录）。
+
+    单篇：替换首章 H1 的可见文字（保留层级、锚点 id 与链接目标）；
+    标题含行内链接/公式等结构时无法保真替换，定位失败。合订：在首个
+    章节容器（目录章或首章）最前加入非章节性的 document-title 段落，
+    不新建封面页、不改各章标题。
+    """
+    content = [c for c in chapters if not c.is_toc]
+    if len(content) == 1:
+        chapter = content[0]
+        heading = next(
+            (item for item in chapter.headings if item["level"] == 1), None)
+        if heading is None:
+            raise ExportError(
+                "首章缺少 H1 标题，总标题投影失败：%s" % chapter.path)
+        tag = chapter.soup.find(id=heading["id"])
+        if tag is None:
+            raise ExportError(
+                "总标题投影失败：首章标题节点缺失（%s）" % heading["text"][:40])
+        if tag.find("a", href=True) is not None \
+                or tag.find(attrs={"data-tex": True}) is not None:
+            raise ExportError(
+                "首章 H1 含行内链接或公式，无法保真替换为中文总标题：%r"
+                % heading["text"][:40])
+        tag.clear()
+        tag.append(NavigableString(decision["title"]))
+        heading["original_text"] = heading["text"]  # 供独立重建同一决定
+        heading["text"] = decision["title"]
+        heading["segments"] = [decision["title"]]
+        return
+    target = chapters[0]
+    paragraph = target.soup.new_tag("p", attrs={"class": "document-title"})
+    paragraph.append(NavigableString(decision["title"]))
+    target.soup.insert(0, paragraph)
 
 
 # ---------------------------------------------------------------------------
@@ -2068,6 +2876,22 @@ def file_uri(path):
     return Path(path).as_uri()
 
 
+# 页眉/页脚模板（R4/A5，设计 5.3）：底部边距内居中显示 当前页 / 总页数
+# （Chromium 模板的 pageNumber/totalPages 类取打印分页事实，含封面/目录/
+# 正文全部页面，与印刷目录同一页序）。样式必须内联；字号 11.3px =
+# 8.5pt，低对比灰 #666。页眉为空：Chromium 对空 header_template 会渲染
+# 默认页眉（日期/标题），用零尺寸 div 显式抑制。实测（Chromium 134）：
+# prefer_css_page_size 下模板正常渲染，页脚基线约 16.9pt（18mm=51.02pt
+# 底边距内），版心宽度不变。
+HEADER_TEMPLATE = '<div style="font-size:0;line-height:0;">&nbsp;</div>'
+FOOTER_TEMPLATE = (
+    '<div style="width:100%;font-size:11.3px;color:#666;'
+    'text-align:center;margin:0;padding:0;">'
+    '<span class="pageNumber"></span> / '
+    '<span class="totalPages"></span></div>'
+)
+
+
 def build_document(chapters, title):
     katex_dir = ASSETS_DIR / "katex"
     for name in ("katex.min.css", "katex.min.js"):
@@ -2083,11 +2907,11 @@ def build_document(chapters, title):
 <head>
 <meta charset="utf-8">
 <title>%s</title>
-<link rel="stylesheet" href="%s">
-<link rel="stylesheet" href="%s">
 <style>
 %s
 </style>
+<link rel="stylesheet" href="%s">
+<link rel="stylesheet" href="%s">
 </head>
 <body>
 %s
@@ -2097,9 +2921,9 @@ def build_document(chapters, title):
 </html>
 """ % (
         escape(title),
+        pygments_css,
         file_uri(katex_dir / "katex.min.css"),
         file_uri(ASSETS_DIR / "style.css"),
-        pygments_css,
         body,
         file_uri(katex_dir / "katex.min.js"),
         CHECK_SCRIPT,
@@ -2163,7 +2987,7 @@ def summarize_inputs(chapters):
 
 
 def candidate_code_check(input_paths, unlink_targets, toc_sections,
-                         candidate_path):
+                         candidate_path, view_declaration_path=None):
     """对候选 PDF 运行与核验器同一实现的代码检查（设计 §4.9）。
 
     候选完成目录页码收敛后、复制到最终目标前调用：独立重读候选内容
@@ -2176,7 +3000,8 @@ def candidate_code_check(input_paths, unlink_targets, toc_sections,
 
     failures = []
     chapters = verifier.reparse_inputs(
-        list(input_paths), failures, list(unlink_targets), toc_sections)
+        list(input_paths), failures, list(unlink_targets), toc_sections,
+        view_declaration_path)
     pdf = verifier.PdfFacts(candidate_path)
     heading_pages = {}
     verifier.check_headings(chapters, pdf, failures, heading_pages)
@@ -2193,7 +3018,8 @@ def candidate_code_check(input_paths, unlink_targets, toc_sections,
 
 def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
            toc_sections=False, require_display_map=False,
-           provenance_map_path=None, translation_record_path=None):
+           provenance_map_path=None, translation_record_path=None,
+           view_declaration_path=None):
     work_dir.mkdir(parents=True, exist_ok=True)
     diagnostics = []
     report = {"diagnostics": diagnostics}
@@ -2229,6 +3055,51 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
         print("FAIL: %s" % exc, file=sys.stderr)
         return 1
 
+    # 视图声明（受输入摘要绑定的授权排除范围）：必须在解析前加载校验，
+    # 任何漂移/越界/重叠/跨技术正文在生成任何候选前失败。
+    try:
+        view_declaration = load_view_declaration(view_declaration_path,
+                                                 chapters)
+    except ExportError as exc:
+        report["status"] = STATUS_MACHINE_FAIL
+        report["error"] = str(exc)
+        (work_dir / REPORT_NAME).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print("FAIL: %s" % exc, file=sys.stderr)
+        return 1
+    # 目录出处决定（设计 §8.4）：声明加载校验之后、解析之前；toc-provenance
+    # 声明接管对应候选，未被覆盖的候选才进入自动判断。
+    try:
+        decide_toc_provenance(chapters, view_declaration)
+    except ExportError as exc:
+        report["status"] = STATUS_MACHINE_FAIL
+        report["error"] = str(exc)
+        (work_dir / REPORT_NAME).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print("FAIL: %s" % exc, file=sys.stderr)
+        return 1
+    for chapter in chapters:
+        apply_view_declaration(chapter, view_declaration)
+    if view_declaration is not None:
+        report["view_declaration"] = {
+            "path": view_declaration["path"],
+            "sha256": view_declaration["sha256"],
+            "document_title": view_declaration["document_title"],
+            "exclusions": [
+                {
+                    "input": ex["input"],
+                    "lines": ex["lines"],
+                    "type": ex["type"],
+                    "kind": ex["kind"],
+                    "fragment": ex["fragment"],
+                    "reason": ex["reason"],
+                }
+                for ex in view_declaration["exclusions"]
+            ],
+        }
+
     resource_registry = {}
     # 显示尺寸映射先于渲染读取：命中条目在图片内联后注入受限宽度。
     bindings, display_undetermined, display_undetermined_raw, \
@@ -2239,6 +3110,26 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     # 所有章节的目标映射就绪。
     for chapter in chapters:
         parse_chapter(chapter)
+
+    # 中文文档总标题决定（R3/A4/C5）：必须在印刷目录合成与正文事实
+    # 收集前投影（印刷目录条目与正文预期使用投影后的可见标题）；
+    # 依据不足时定位失败，不生成候选。
+    try:
+        document_title = decide_document_title(chapters, view_declaration)
+        project_document_title(chapters, document_title)
+    except ExportError as exc:
+        report["status"] = STATUS_MACHINE_FAIL
+        report["error"] = str(exc)
+        (work_dir / REPORT_NAME).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print("FAIL: %s" % exc, file=sys.stderr)
+        return 1
+    report["document_title"] = {
+        key: document_title[key]
+        for key in ("title", "original", "basis", "source")
+    }
+
     # 印刷目录合成：仅需各章标题映射，且必须在 collect_chapter_facts 之前，
     # 使被消费的导航列表不进入目录章的正文预期。
     toc_chapter = next((c for c in chapters if c.is_toc), None)
@@ -2262,6 +3153,13 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
         except TocError as exc:
             print("FAIL: %s" % exc, file=sys.stderr)
             return 1
+
+    # 已标识译注只从导出视图排除（原始 Markdown 与输入摘要不变）：
+    # 在收集正文事实前从渲染 soup 删除正文文本节点中的 【译注：…】 片段。
+    note_records = []
+    for chapter in chapters:
+        strip_translator_notes(chapter, note_records)
+    report["translator_note_exclusions"] = note_records
 
     for chapter in chapters:
         collect_chapter_facts(chapter)
@@ -2312,8 +3210,13 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
         "combos": provenance_facts["combos"],
         "front_generated": bool(provenance_facts["front_text"]),
         "mapping": str(provenance_map_path) if provenance_map_path else None,
+        # 新政策（R2/C2）：PDF 不显示前置出处；出处清单与定位证据留在报告。
+        "pdf_visibility": "excluded",
+        "toc_exclusion": (
+            toc_chapter.toc_provenance_exclusion
+            if toc_chapter is not None else None
+        ),
     }
-    inject_provenance(chapters, provenance_facts)
 
     # 资源预检（内联/解码/打印之前）：只读枚举真实图片出现，逐项核对
     # 尺寸覆盖并估算解码预算。任何 fail（含严格策略）都在此阻断，不新增
@@ -2457,7 +3360,9 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
         if entry.get("embed_resample")
     ]
 
-    title = chapters[0].headings[0]["text"] if chapters[0].headings else chapters[0].path.stem
+    # PDF 元数据 <title> 与可见中文总标题取同一题名决定（Chromium 据此写
+    # /Title）；不再简单取首个输入标题。
+    title = document_title["title"]
     html_path = work_dir / HTML_NAME
     candidate = work_dir / CANDIDATE_NAME
 
@@ -2497,6 +3402,13 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                 print_background=True,
                 outline=True,
                 tagged=True,
+                # 每页页脚页码（R4/A5）：底部边距内居中 当前页 / 总页数；
+                # 模板只接受内联样式，页眉为零尺寸 div（Chromium 对空
+                # header_template 会回落默认页眉，须显式抑制）。页脚渲染
+                # 在 @page 边距区内，不占用正文版心。
+                display_header_footer=True,
+                header_template=HEADER_TEMPLATE,
+                footer_template=FOOTER_TEMPLATE,
             )
             browser.close()
         return checks
@@ -2549,7 +3461,7 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     # 已有成品保持原样。
     code_gate_failures = candidate_code_check(
         [str(c.path) for c in chapters], unlink_targets, toc_sections,
-        candidate)
+        candidate, view_declaration_path)
     hard_failures.extend(code_gate_failures)
     fonts = browser_checks.get("fonts", {}) if browser_checks else {}
     # 正文与代码的 CJK 回退族必须至少一项可用，否则中文会退到不可控字体。
@@ -2791,6 +3703,14 @@ def main(argv=None):
              "用于非标准出处段落；不以映射掩盖来源缺失",
     )
     parser.add_argument(
+        "--view-declaration",
+        default=None,
+        metavar="PATH",
+        help="PDF 视图声明 JSON（version 1）：绑定有序输入摘要与授权排除"
+             "区间（block/inline），用于无法从语法定位的非原文说明；"
+             "摘要漂移、越界、重叠或跨技术正文即在生成候选前失败",
+    )
+    parser.add_argument(
         "--translation-record",
         default=None,
         metavar="PATH",
@@ -2812,6 +3732,7 @@ def main(argv=None):
             require_display_map=args.require_display_map,
             provenance_map_path=args.provenance,
             translation_record_path=args.translation_record,
+            view_declaration_path=args.view_declaration,
         )
     except ExportError as exc:
         print("FAIL: %s" % exc, file=sys.stderr)
