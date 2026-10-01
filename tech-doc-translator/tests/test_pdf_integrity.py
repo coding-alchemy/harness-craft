@@ -821,6 +821,112 @@ class BlockTokenReconciliationTest(unittest.TestCase):
             self.vp._consume_block_tokens(
                 rows, ['printf("alpha beta");']))
 
+    def test_trailing_undrawn_whitespace_consumes(self):
+        # Chromium 不绘制 pre 行尾空白 run（real-sample 02 章 #10/#11
+        # 行尾 \t\t 复现）：视觉行耗尽且剩余全为行尾空白时按行尾消费，
+        # 不要求折行证据。
+        self.assertIsNotNone(self.consume(['a();'], 'a();\t\t\n'))
+        self.assertIsNotNone(self.consume(['a(); '], 'a();  \n'))
+
+    def test_trailing_content_deletion_still_fails(self):
+        # 配对反例：行尾非空白内容缺失仍必须拒绝。
+        self.assertIsNone(self.consume(['a();'], 'a(); tail\n'))
+        # 行中空白删短（后面仍有内容）仍必须拒绝。
+        self.assertIsNone(self.consume(['a();'], 'a();\t\tx = 1\n'))
+
+    @staticmethod
+    def _geo_row(text, start, right, page=0, left=54.75, advance=5.115):
+        return {"text": text, "bucket": {
+            "text": text, "start_pt": start, "right_pt": right,
+            "code_left_pt": left, "code_right_pt": left + 73.9 * advance,
+            "mono_advance_pt": advance, "page": page,
+            "baseline_y_pt": 100.0, "line_height_pt": 10.0,
+            "page_top_pt": 800.0, "page_bottom_pt": 0.0}}
+
+    def test_wrapped_indent_blank_row_consumes(self):
+        # 长不可拆 token 整行折到下一视觉行第 0 列时，行首缩进被绘成
+        # 独立的纯空白视觉行（real-sample 04 章 #239、05 章 #67 复现）：
+        # 空白行宽度恰为缩进列数、token 行起点回到版心左界时消费缩进。
+        left, advance = 54.75, 5.115
+        indent, token = ' ' * 21, 'T' * 78
+        rows = [
+            self._geo_row(indent, left, left + 21 * advance),
+            self._geo_row(token, left, left + 78 * advance),
+        ]
+        self.assertIsNotNone(
+            self.vp._consume_block_tokens(rows, [indent + token]))
+
+    def test_wrapped_indent_blank_row_mismatch_fails(self):
+        # 配对反例：空白行宽度与源缩进列数不符（19 ≠ 21）时不消费，
+        # 缩进核验拒绝；真实删除缩进（无空白行）同样拒绝。
+        left, advance = 54.75, 5.115
+        indent, token = ' ' * 21, 'T' * 78
+        rows = [
+            self._geo_row(' ' * 19, left, left + 19 * advance),
+            self._geo_row(token, left, left + 78 * advance),
+        ]
+        self.assertIsNone(
+            self.vp._consume_block_tokens(rows, [indent + token]))
+        rows = [self._geo_row(token, left, left + 78 * advance)]
+        self.assertIsNone(
+            self.vp._consume_block_tokens(rows, [indent + token]))
+
+
+class PageFooterStripTest(unittest.TestCase):
+    """页脚页码从提取文本剔除：跨页段落连续定位不受页脚插入干扰。
+
+    页脚真实性由 check_page_footers 按页脚带几何独立核验；提取文本
+    剔除恰 1 处匹配才生效，多处匹配（正文同形巧合）保守不动。
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/tech-doc-translator/scripts'))
+        import verify_pdf
+        self.vp = verify_pdf
+
+    def test_footer_stripped_per_page(self):
+        pages = ['第一段文字\n1 / 3', '跨页段续\n2 / 3', '末段\n3 / 3']
+        self.assertEqual(
+            self.vp._strip_page_footers(pages),
+            ['第一段文字\n', '跨页段续\n', '末段\n'])
+
+    def test_ambiguous_match_left_untouched(self):
+        # 正文行内同形巧合不算匹配（整行锚定）：真实页脚仍剔除，正文原样保留。
+        pages = ['正文 1 / 2 比例\n1 / 2', '末段\n2 / 2']
+        self.assertEqual(
+            self.vp._strip_page_footers(pages),
+            ['正文 1 / 2 比例\n', '末段\n'])
+
+    def test_multiple_footer_lines_left_untouched(self):
+        # 同一页两处整行同形匹配（同形巧合）保守不动，不误删正文。
+        pages = ['第一段\n1 / 2\n1 / 2', '末段\n2 / 2']
+        self.assertEqual(
+            self.vp._strip_page_footers(pages),
+            ['第一段\n1 / 2\n1 / 2', '末段\n'])
+
+    def test_missing_footer_left_untouched(self):
+        # 页脚缺失（0 处匹配）不动；缺失由页脚几何核验判 FAIL。
+        pages = ['第一段', '末段\n2 / 2']
+        self.assertEqual(
+            self.vp._strip_page_footers(pages), ['第一段', '末段\n'])
+
+    def test_midline_occurrence_not_stripped(self):
+        # 页脚缺失且正文行内恰有一处同形文本：非整行匹配，不是页脚，不动。
+        pages = ['正文 1 / 2 比例', '末段\n2 / 2']
+        self.assertEqual(
+            self.vp._strip_page_footers(pages), ['正文 1 / 2 比例', '末段\n'])
+
+    def test_longer_number_substring_not_stripped(self):
+        # 「12 / 300」包含「2 / 30」子串：页脚模式须整行锚定。
+        # 第 2 页页脚缺失且正文含子串——旧实现会误剔正文「2 / 30」，
+        # 新实现不动（缺失由页脚几何核验判 FAIL）；第 1 页页脚正常剔除。
+        pages = ['表注 12 / 300 取值\n1 / 30', '续文 12 / 300 同上']
+        pages += ['第 %d 页\n%d / 30' % (i, i) for i in range(3, 31)]
+        stripped = self.vp._strip_page_footers(pages)
+        self.assertEqual(stripped[0], '表注 12 / 300 取值\n')
+        self.assertEqual(stripped[1], '续文 12 / 300 同上')
+        self.assertEqual(stripped[2], '第 3 页\n')
+
 
 class CodePaginationGapTest(unittest.TestCase):
     """A21 + 设计 §4.9：长块被强制整块移页时，候选代码门禁阻止替换成品。

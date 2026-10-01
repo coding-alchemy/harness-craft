@@ -2362,27 +2362,153 @@ def walk_text_blocks(soup):
 TRANSLATOR_NOTE_RE = re.compile(r"【译注：[^】]*】")
 TRANSLATOR_NOTE_SKIP_ANCESTORS = ("pre", "code", "blockquote")
 
+_ASCII_PUNCTUATION = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+
+
+def _note_code_span_intervals(chunk_lines):
+    """段内行内代码的字符区间（CommonMark 反引号串配对）。
+
+    核验侧同规则的独立实现：转义反引号不开启代码串，按原文搜索等长
+    闭合串，未闭合的串按字面文本处理。
+    """
+    text = "\n".join(chunk_lines)
+    total = len(text)
+    intervals = []
+    position = 0
+    while position < total:
+        char = text[position]
+        if (
+            char == "\\"
+            and position + 1 < total
+            and text[position + 1] in _ASCII_PUNCTUATION
+        ):
+            position += 2
+            continue
+        if char != "`":
+            position += 1
+            continue
+        run_end = position
+        while run_end < total and text[run_end] == "`":
+            run_end += 1
+        length = run_end - position
+        closer_end = None
+        search = run_end
+        while search < total:
+            if text[search] == "`":
+                end = search
+                while end < total and text[end] == "`":
+                    end += 1
+                if end - search == length:
+                    closer_end = end
+                    break
+                search = end
+            else:
+                search += 1
+        if closer_end is None:
+            position = run_end
+            continue
+        intervals.append((position, closer_end))
+        position = closer_end
+    return intervals
+
+
+def _flush_note_chunk(chunk, found):
+    """在段落候选行（拼接文本）上登记译注出现，排除行内代码区间。"""
+    if not chunk:
+        return
+    intervals = _note_code_span_intervals([line for _, line in chunk])
+    starts = []
+    offset = 0
+    for _number, line in chunk:
+        starts.append(offset)
+        offset += len(line) + 1
+    joined = "\n".join(line for _, line in chunk)
+    for match in TRANSLATOR_NOTE_RE.finditer(joined):
+        if any(s <= match.start() < e for s, e in intervals):
+            continue  # 行内代码中的同形文字不是译注
+        line_no = next(
+            number
+            for index, (number, line) in enumerate(chunk)
+            if starts[index] <= match.start() < starts[index] + len(line) + 1
+        )
+        found.append((line_no, match.group(0)))
+    del chunk[:]
+
+
+def translator_note_occurrences(text):
+    """按源序列出正文中已标识译注的逐次出现：[(原始行号, 片段)]。
+
+    核验侧 scan_translator_notes 同一语言规则的独立实现（双向独立重建
+    是证据核对的设计属性，不共享实现）：CommonMark 解析给出围栏/缩进
+    代码与引用块的保护行，段内排除行内代码区间，跨软换行的片段归属
+    起始行。
+    """
+    protected_lines = set()
+    for token in _HEAD_STRUCTURE_MD.parse(text):
+        if token.type in {"fence", "code_block", "blockquote_open"} and token.map:
+            protected_lines.update(range(token.map[0] + 1, token.map[1] + 1))
+    found = []
+    chunk = []  # (行号, 行内容)：当前段落候选行
+    for number, line in enumerate(text.split("\n"), start=1):
+        if number in protected_lines or not line.strip():
+            _flush_note_chunk(chunk, found)
+            continue
+        chunk.append((number, line))
+    _flush_note_chunk(chunk, found)
+    return found
+
 
 def strip_translator_notes(chapter, records):
     """从本章导出视图删除已标识译注片段，逐处记录位置与原文片段。
 
     只改渲染 soup（导出视图）；chapter.text 与 projected_text 不变。
     records 追加 {"input", "line", "fragment"}。
+
+    按叶子块元素聚合子孙文本节点后匹配：译注内嵌行内 code/强调等
+    标记时会被拆成多个文本节点，逐节点匹配既漏剥（残留在 PDF）又
+    漏记；聚合匹配保证整段移除。匹配起点落在行内代码区间的同形
+    文字保留（与核验侧口径一致）。行号按源序与
+    translator_note_occurrences 的逐次出现一一配对（渲染视图与
+    源文同序；渲染剥去行内标记字符，故按序配对而不按片段内容
+    配对，登记片段取源文原文）。队列耗尽时登记 line=None，由核验侧
+    计数对账暴露。
     """
-    last_line = 0
-    for node in list(chapter.soup.find_all(string=True)):
-        if isinstance(node, Comment):
+    queue = None  # translator_note_occurrences 的 [(行号, 片段)]，按源序
+    for element in chapter.soup.find_all(
+            ["p", "h1", "h2", "h3", "h4", "h5", "h6",
+             "li", "dt", "dd", "th", "td"]):
+        if element.find(["p", "ul", "ol", "table", "pre"]):
+            continue  # 容器元素，等叶子节点自己出现
+        if element.find_parent(TRANSLATOR_NOTE_SKIP_ANCESTORS):
             continue
-        if node.find_parent(TRANSLATOR_NOTE_SKIP_ANCESTORS):
-            continue  # 代码与原文引用块中的同形文字不是译者标识译注
-        text = str(node)
-        if not TRANSLATOR_NOTE_RE.search(text):
+        nodes = []  # (文本节点, 起点, 终点, 是否保护区)
+        offset = 0
+        for node in element.find_all(string=True):
+            if isinstance(node, Comment):
+                continue
+            text = str(node)
+            if not text:
+                continue
+            nodes.append(
+                (node, offset, offset + len(text),
+                 node.find_parent(TRANSLATOR_NOTE_SKIP_ANCESTORS)
+                 is not None))
+            offset += len(text)
+        joined = "".join(str(node) for node, _s, _e, _p in nodes)
+        if not TRANSLATOR_NOTE_RE.search(joined):
             continue
-        for match in TRANSLATOR_NOTE_RE.finditer(text):
-            fragment = match.group(0)
-            line = find_source_line(chapter, fragment, start=last_line)
-            if line is not None:
-                last_line = line - 1
+        if queue is None:
+            queue = list(translator_note_occurrences(chapter.text))
+        edits = []  # (节点, 局部起点, 局部终点)
+        for match in TRANSLATOR_NOTE_RE.finditer(joined):
+            begin = match.start()
+            if any(protected and s <= begin < e
+                   for _n, s, e, protected in nodes):
+                continue  # 行内代码中的同形文字保留
+            if queue:
+                line, fragment = queue.pop(0)
+            else:
+                line, fragment = None, match.group(0)
             records.append(
                 {
                     "input": str(chapter.path),
@@ -2390,7 +2516,21 @@ def strip_translator_notes(chapter, records):
                     "fragment": fragment,
                 }
             )
-        node.replace_with(TRANSLATOR_NOTE_RE.sub("", text))
+            for node, s, e, _protected in nodes:
+                if s < match.end() and match.start() < e:
+                    edits.append((node, max(match.start(), s) - s,
+                                  min(match.end(), e) - s))
+        # 同一文本节点可能有多处编辑：按节点合并后自后往前一次替换，
+        # 避免第一次 replace_with 使节点脱离文档树。
+        by_node = {}
+        for node, local_start, local_end in edits:
+            by_node.setdefault(id(node), [node, []])[1].append(
+                (local_start, local_end))
+        for node, spans in by_node.values():
+            text = str(node)
+            for local_start, local_end in sorted(spans, reverse=True):
+                text = text[:local_start] + text[local_end:]
+            node.replace_with(text)
 
 
 # ---------------------------------------------------------------------------

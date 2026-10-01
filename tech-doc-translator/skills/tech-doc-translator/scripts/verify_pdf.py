@@ -1313,15 +1313,67 @@ def check_projection(chapters, report, pdf, failures,
                     )
 
 
-def _visible_remainder(line_text, fragment):
+def _visible_remainder(line_text, fragment=None):
     """行内删除片段后的可见文字（导出渲染口径）：代码标记、链接标记不
-    进入 PDF 可见文本，直接比较原始 Markdown 行会误报连带删除。"""
-    remainder = line_text.replace(fragment, "")
-    if len(normalize(remainder)) < 4:
-        return ""
-    html = exporter._HEAD_STRUCTURE_MD.render(remainder)
+    进入 PDF 可见文本，直接比较原始 Markdown 行会误报连带删除。
+    fragment 为 None 时删除该行全部已标识译注片段（译注场景：只删
+    当前一处会把同行其他译注的合法缺席误报为连带删除）；行内 code
+    中的同形文字按合同保留。译注内嵌行内 code/强调等标记时被拆成
+    多个文本节点，须按块聚合子孙文本节点后匹配（与导出侧
+    strip_translator_notes 同口径，否则漏删致误报连带删除）。"""
+    if fragment is not None:
+        remainder = line_text.replace(fragment, "")
+        if len(normalize(remainder)) < 4:
+            return ""
+        html = exporter._HEAD_STRUCTURE_MD.render(remainder)
+        soup = exporter.BeautifulSoup(html, "html.parser")
+        return normalize(soup.get_text(" ", strip=True))
+    html = exporter._HEAD_STRUCTURE_MD.render(line_text)
     soup = exporter.BeautifulSoup(html, "html.parser")
-    return normalize(soup.get_text(" ", strip=True))
+    skip = exporter.TRANSLATOR_NOTE_SKIP_ANCESTORS
+    for element in soup.find_all(
+            ["p", "h1", "h2", "h3", "h4", "h5", "h6",
+             "li", "dt", "dd", "th", "td"]):
+        if element.find(["p", "ul", "ol", "table", "pre"]):
+            continue  # 容器元素，等叶子节点自己出现
+        if element.find_parent(skip):
+            continue
+        nodes = [
+            node for node in element.find_all(string=True)
+            if not isinstance(node, exporter.Comment) and str(node)
+        ]
+        joined = "".join(str(node) for node in nodes)
+        if not exporter.TRANSLATOR_NOTE_RE.search(joined):
+            continue
+        spans = []
+        offset = 0
+        for node in nodes:
+            spans.append((offset, offset + len(str(node))))
+            offset += len(str(node))
+        edits = []
+        for match in exporter.TRANSLATOR_NOTE_RE.finditer(joined):
+            begin = match.start()
+            if any(
+                    node.find_parent(skip) is not None and s <= begin < e
+                    for node, (s, e) in zip(nodes, spans)):
+                continue  # 行内代码中的同形文字保留
+            for node, (s, e) in zip(nodes, spans):
+                if s < match.end() and begin < e:
+                    edits.append(
+                        (node, max(begin, s) - s, min(match.end(), e) - s))
+        by_node = {}
+        for node, local_start, local_end in edits:
+            by_node.setdefault(id(node), [node, []])[1].append(
+                (local_start, local_end))
+        for node, node_edits in by_node.values():
+            text = str(node)
+            for local_start, local_end in sorted(node_edits, reverse=True):
+                text = text[:local_start] + text[local_end:]
+            node.replace_with(text)
+    remainder = normalize(soup.get_text(" ", strip=True))
+    if len(remainder) < 4:
+        return ""
+    return remainder
 
 
 def check_translator_notes(chapters, report, pdf, failures):
@@ -1370,8 +1422,7 @@ def check_translator_notes(chapters, report, pdf, failures):
             c.text.split("\n") for c in chapters
             if str(c.path) == item["input"]
         )
-        remainder = _visible_remainder(
-            source_lines[item["line"] - 1], item["fragment"])
+        remainder = _visible_remainder(source_lines[item["line"] - 1])
         if remainder and remainder not in pdf.norm_text:
             failures.append(
                 {
@@ -1496,10 +1547,35 @@ def check_view_declaration(chapters, report, pdf, args_view_declaration,
 # PDF 读取
 # ---------------------------------------------------------------------------
 
+def _strip_page_footers(pages):
+    """从逐页提取文本剔除页脚页码（n / N），返回新列表。
+
+    页脚由 @page 规则逐页绘制，提取序中可能插在跨页段落中间，干扰
+    正文连续定位（text-missing/连带删除误报）。页脚真实性由
+    check_page_footers 按页脚带几何独立核验，与提取文本无关。恰 1 处
+    匹配才剔除：多处匹配（正文同形巧合）不动，保持保守；缺失（0 处）
+    由页脚核验判 FAIL。与几何合同 _FOOTER_TEXT_RE 同样要求整行匹配：
+    正文行内或作为更长数字子串出现的同形文本（如「12 / 300」含
+    「2 / 30」）不是页脚，不剔除。
+    """
+    total = len(pages)
+    stripped = []
+    for index, text in enumerate(pages):
+        pattern = re.compile(
+            r"^\s*%d\s*/\s*%d\s*$" % (index + 1, total), re.M)
+        matches = list(pattern.finditer(text))
+        if len(matches) == 1:
+            match = matches[0]
+            text = text[:match.start()] + text[match.end():]
+        stripped.append(text)
+    return stripped
+
+
 class PdfFacts:
     def __init__(self, path):
         self.reader = pypdf.PdfReader(str(path))
-        self.pages = [p.extract_text() or "" for p in self.reader.pages]
+        self.pages = _strip_page_footers(
+            [p.extract_text() or "" for p in self.reader.pages])
         self.norm_text = "".join(normalize(p) for p in self.pages)
         offsets = []
         position = 0
@@ -2830,6 +2906,8 @@ def _align_code_fragment(needle, pos, text, phantom=None, tabs=None,
       宽度差异计入 tabs（交视觉复核）；
     - 视觉行在源空白 run 中间折行、行尾空白未被绘制（仅当短fall发生在
       本视觉行末尾时，由调用方以 allow_tail_shortfall 按折行点处理）；
+    - 逻辑行行尾的空白 run 未被绘制（Chromium 不绘制 pre 行尾空白）：
+      视觉行耗尽且剩余 needle 全为空白时按行尾消费，不要求折行证据；
     - text 中 needle 没有的空白按“混合字体边界 phantom 空白”宽容并
       计入 phantom（插入方向与边界空白不可区分，交视觉复核）。
     """
@@ -2854,6 +2932,9 @@ def _align_code_fragment(needle, pos, text, phantom=None, tabs=None,
                     if tabs is not None and t_run != len(n_run):
                         tabs[0] += 1
                 elif t_run < len(n_run):
+                    if j >= len(text) and not needle[i:].strip():
+                        # 行尾空白 run 未绘全：剩余即逻辑行行尾空白。
+                        return len(needle)
                     # 源空白被删短：仅当本视觉行在源空白 run 处结束
                     # （折行点、行尾空白未绘制）时允许按折行处理；行中
                     # 删短（j 之后仍有本行内容）必拒。
@@ -2873,6 +2954,10 @@ def _align_code_fragment(needle, pos, text, phantom=None, tabs=None,
                 return None
             i += 1
             j += 1
+    if i < len(needle) and not needle[i:].strip():
+        # 行尾空白 run 未被绘制（Chromium 不绘制 pre 行尾空白）：视觉行
+        # 已耗尽且剩余全为行尾空白，逻辑行按完整消费，不要求折行证据。
+        return len(needle)
     return i
 
 
@@ -3088,6 +3173,51 @@ def _geometry_backed_indent_skip(needle, visual_item, tabs):
     return indent_end
 
 
+def _is_wrapped_indent_row(visual_lines, index, needle, indent_end):
+    """纯空白视觉行是否为“折行缩进”的独立绘制段（几何核对）。
+
+    Chromium 对 pre-wrap 中放不进剩余宽度的长不可拆 token 整行下移时，
+    会把行首缩进空白绘成独立的纯空白视觉行，token 从下一视觉行第 0
+    列开始（real-sample 04 章 #239、05 章 #67 复现）。以下特征须同时
+    成立：本行空白从代码版心左界起绘制、宽度按等宽 advance 折算恰为
+    needle 前导空白的缩进列数；下一视觉行与本行同页、文本无行首空白
+    且起点回到版心左界（缩进已由上行消费）。缺任一几何事实保守返回
+    False，维持“跳过空白行”的原口径。
+    """
+    if indent_end == 0 or index + 1 >= len(visual_lines):
+        return False
+    blank = visual_lines[index]
+    following = visual_lines[index + 1]
+    if not isinstance(blank, dict) or not isinstance(following, dict):
+        return False
+    following_text = _visual_text(following)
+    if not following_text.strip() or following_text[0].isspace():
+        return False
+    blank_bucket = blank.get("bucket", blank)
+    following_bucket = following.get("bucket", following)
+    values = (
+        blank_bucket.get("start_pt"),
+        blank_bucket.get("right_pt"),
+        blank_bucket.get("code_left_pt"),
+        blank_bucket.get("mono_advance_pt"),
+        following_bucket.get("start_pt"),
+        following_bucket.get("code_left_pt"),
+    )
+    if not all(isinstance(value, (int, float)) for value in values):
+        return False
+    (blank_start, blank_right, blank_left, advance,
+     following_start, following_left) = values
+    if blank_bucket.get("page") != following_bucket.get("page"):
+        return False
+    tolerance = max(0.75, advance * 0.2)
+    if abs(blank_start - blank_left) > tolerance:
+        return False  # 缩进空白须从版心左界起绘制
+    if abs(following_start - following_left) > tolerance:
+        return False  # token 行须回到版心左界（缩进已由空白行消费）
+    columns = (blank_right - blank_start) / advance
+    return abs(columns - _indent_columns(needle[:indent_end])) <= 0.5
+
+
 def _consume_block_tokens(visual_lines, logical_lines):
     """块内完整对账（R8/4.9）：每个视觉行必须被某逻辑行消费，反之亦然。
 
@@ -3110,14 +3240,26 @@ def _consume_block_tokens(visual_lines, logical_lines):
             continue  # 空逻辑行：无可绘制字符，不产生视觉行
         # 纯空白视觉行（缩进空行、Chromium 可能绘制尾随空白 run）不携带
         # token，跳过并对齐到下一行；空白保真由逐块的空白复核项覆盖。
+        # 例外：长不可拆 token 整行折到下一视觉行第 0 列时，行首缩进被
+        # 绘成独立的纯空白视觉行（宽度恰为缩进列数），由该行消费缩进。
+        i = None
         while vi < len(visual_lines) and not _visual_text(visual_lines[vi]).strip():
+            indent_end = 0
+            while indent_end < len(needle) and needle[indent_end].isspace():
+                indent_end += 1
+            if _is_wrapped_indent_row(visual_lines, vi, needle, indent_end):
+                tabs[0] += needle[:indent_end].count("\t")
+                i = indent_end
+                vi += 1
+                break
             vi += 1
         line_starts.append(vi)
         if vi >= len(visual_lines):
             return None
-        i = _geometry_backed_indent_skip(needle, visual_lines[vi], tabs)
         if i is None:
-            return None
+            i = _geometry_backed_indent_skip(needle, visual_lines[vi], tabs)
+            if i is None:
+                return None
         # 每个视觉行起始的源位置：片段内断行的防篡改形态判定需要
         # 知道当前行是否从片段起点开始绘制。
         row_starts = {vi: i}
@@ -3401,12 +3543,23 @@ def _match_chapter_blocks_structural(containers, chapter, failures, relaxed):
             source = logical_nonempty[line_index]
             # 与 _geometry_backed_indent_skip 同一制表位口径：混合
             # tab/空格缩进按制表位列宽比较，不按固定 8 空格折算。
-            indent_width = _indent_columns(
-                source[:len(source) - len(source.lstrip())])
-            line_first.append(
-                (indent_width,
-                 flat[start_vi]["bucket"].get(
-                     "first_char_pt", flat[start_vi]["bucket"]["start_pt"])))
+            indent_end = len(source) - len(source.lstrip())
+            indent_width = _indent_columns(source[:indent_end])
+            if (indent_end and start_vi > 0
+                    and not _visual_text(flat[start_vi - 1]).strip()
+                    and _is_wrapped_indent_row(
+                        flat, start_vi - 1, source, indent_end)):
+                # 折行缩进独立空白行：缩进几何已由前一空白行的宽度逐列
+                # 核对（_is_wrapped_indent_row），token 行起点回到版心
+                # 左界是该形态的定义特征，不参与缩进-x 一致性比对（否则
+                # 误报「不同缩进行首 x 相同」，real-sample 04 #239、
+                # 05 #67 复现）。
+                pass
+            else:
+                line_first.append(
+                    (indent_width,
+                     flat[start_vi]["bucket"].get(
+                         "first_char_pt", flat[start_vi]["bucket"]["start_pt"])))
             relaxed.append(
                 {
                     "segment": "代码块 #%d 第 %d 行归属结构行（第 %d 页，"
