@@ -77,16 +77,18 @@ class ScanCodeFencesTest(unittest.TestCase):
         self.assertEqual(scan.unclosed_line, 2)
 
     def test_indent_rules(self):
-        # 4 空格缩进的 ``` 只是代码正文，不参与围栏边界
-        text = '```\ncode\n    ```\nstill code\n```\n'
-        scan = scan_code_fences(text)
-        self.assertTrue(scan.balanced)
-        self.assertEqual(len(scan.blocks), 1)
-        self.assertIn('still code', scan.blocks[0].body)
-        # 0-3 空格缩进可以开启/闭合围栏
+        # 任意空格缩进的标记行均可开启/闭合围栏：列表项内围栏按项层级
+        # 2×level 缩进（可达 4+ 空格），缩进代码块不是本管线受支持输出
         scan = scan_code_fences('   ```js\nvar x;\n   ```\n')
         self.assertTrue(scan.balanced)
         self.assertEqual(scan.blocks[0].info, 'js')
+        scan = scan_code_fences('    ```\nitem_code()\n    ```\n')
+        self.assertTrue(scan.balanced)
+        self.assertEqual(scan.blocks[0].body, 'item_code()')
+        # 深缩进标记行同样参与闭合（不再是代码正文）
+        scan = scan_code_fences('```\ncode\n    ```\nafter\n')
+        self.assertTrue(scan.balanced)
+        self.assertEqual(scan.blocks[0].body, 'code')
 
     def test_backtick_fence_info_may_not_contain_backtick(self):
         scan = scan_code_fences('``` a ` b \nx\n')
@@ -185,6 +187,57 @@ class CompareCodeFencesTest(unittest.TestCase):
         src = scan_code_fences('```c\nx\n```\n').blocks
         doc = scan_code_fences('  ```c\nx\n  ```  \n').blocks
         self.assertEqual(compare_code_fences(src, doc, 'a.md', 'b.md'), [])
+
+
+class DraftSpliceTest(unittest.TestCase):
+    """草稿占位回填（A28）：复杂围栏逐字节回填，数量错误必须拒绝。"""
+
+    def _write(self, tmp, name, text):
+        path = tmp / name
+        path.write_text(text, encoding='utf-8')
+        return str(path)
+
+    def test_splice_mixed_fence_chars_roundtrip(self):
+        import splice_fences
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            src = self._write(tmp, 'src.md',
+                              '# T\n\n~~~~\ncode_tilde()\n~~~~\n\n'
+                              '````python\ncode_quad()\n````\n\n尾\n')
+            draft = self._write(tmp, 'draft.md',
+                                '# T\n\n⟦CODE⟧\n\n⟦CODE⟧\n\n尾\n')
+            out = tmp / 'cand.md'
+            import contextlib
+            import io
+            argv = sys.argv
+            sys.argv = ['splice_fences.py', str(draft), src, str(out)]
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    splice_fences.main()
+            finally:
+                sys.argv = argv
+            text = out.read_text(encoding='utf-8')
+            bodies = [f.body for f in scan_code_fences(text).blocks]
+            self.assertEqual(bodies, ['code_tilde()', 'code_quad()'])
+
+    def test_splice_placeholder_count_mismatch_rejected(self):
+        import splice_fences
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            src = self._write(tmp, 'src.md', '# T\n\n```a\nx\n```\n\n```b\ny\n```\n')
+            draft = self._write(tmp, 'draft.md', '# T\n\n⟦CODE⟧\n\n尾\n')
+            import contextlib
+            import io
+            argv = sys.argv
+            sys.argv = ['splice_fences.py', draft, src, str(tmp / 'o.md')]
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(AssertionError):
+                        splice_fences.main()
+            finally:
+                sys.argv = argv
 
 
 if __name__ == '__main__':

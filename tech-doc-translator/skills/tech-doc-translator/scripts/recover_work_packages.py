@@ -119,7 +119,8 @@ def _fragment_hard_checks(src_body, trans_body, trans_path, strong_tokens,
 
     math_diffs, math_warns = compare_math_spans(
         scan_math_spans(src_body), scan_math_spans(trans_body),
-        '源片段', '译文', approved_extra_exprs=approved_extra_math)
+        '源片段', '译文', approved_extra_exprs=approved_extra_math,
+        doc_text=trans_body)
     fails.extend('公式逐项核对: %s' % d for d in math_diffs)
     warns.extend(math_warns)
 

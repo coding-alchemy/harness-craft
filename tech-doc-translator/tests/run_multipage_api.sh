@@ -92,19 +92,23 @@ import hashlib, json, sys
 from pathlib import Path
 
 out = Path(sys.argv[1])
-payload = json.loads((out / 'images_display.json').read_text(encoding='utf-8'))
+payload = json.loads((out / 'export' / 'images_display.json')
+                     .read_text(encoding='utf-8'))
 assert payload['markdown'] == 'merged_api.md', payload['markdown']
 entries = {e['occurrence']: e for e in payload['entries']}
 assert set(entries) == {1, 2}, payload['entries']
-assert entries[1]['image'] == 'images/diagram.png', entries[1]
+assert entries[1]['markdown'] == '../merged_api.md', entries[1]
+assert entries[1]['image'] == '../images/diagram.png', entries[1]
 assert entries[1]['width']['value'] == 454, entries[1]
-assert entries[2]['image'] == 'images/light.png', entries[2]
+assert entries[2]['image'] == '../images/light.png', entries[2]
 assert entries[2]['width']['value'] == 300, entries[2]
+map_dir = out / 'export'
 for occurrence in (1, 2):
-    actual = hashlib.sha256(
-        (out / entries[occurrence]['image']).read_bytes()).hexdigest()
+    delivered = map_dir / entries[occurrence]['image']
+    actual = hashlib.sha256(delivered.read_bytes()).hexdigest()
     assert entries[occurrence]['sha256'] == actual, entries[occurrence]
-print('交付级映射：跨页全局出现序号、资源摘要与宽度均正确')
+assert not (out / 'images_display.json').exists(), '根目录不得残留映射副本'
+print('交付级映射：export/ 布局、跨页全局出现序号、资源摘要与宽度均正确')
 PY
 
 echo "==> 检查图片已本地化到最终交付目录"
@@ -356,6 +360,16 @@ site = sys.argv[1]
 data = open(site + '/subdir/images/light.png', 'rb').read()
 open(site + '/subdir/images/light.png', 'wb').write(data[:8] + b'L' + data[9:])
 PY
+# A28：源图在解析后被换字节 → 合并绑定必须拒绝（不采用新图摘要冒充）
+if python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR" \
+    >"$TMP/bind_stale_err.txt" 2>&1; then
+  echo "错误：解析后换源图未被合并绑定拒绝"; exit 1
+fi
+grep -q "源资源身份不符" "$TMP/bind_stale_err.txt" \
+  || { cat "$TMP/bind_stale_err.txt"; echo "错误：缺少源资源身份诊断"; exit 1; }
+echo "解析后换源图被合并绑定拒绝 PASS"
+# 重新解析刷新解析期映射（同版本源已重新解析），合并恢复正常
+python3 "$PARSE" "$SITE/subdir/api_page2.html" "$SRC_DIR/api_page2.md"
 python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR"
 python3 - "$OUT_DIR" <<'PY'
 import sys
@@ -416,3 +430,49 @@ python3 "$VERIFY" "$TMP/delivery2/merged_api.md" "$MANIFEST" "$EXPECTED" "$SITE"
 echo "交付树搬迁至第二目录后按新路径校验 PASS"
 
 echo "==> Ticket 04 多页面 API 回归全部通过"
+
+echo "==> 翻译留痕 01：富容器保真与独立对账（多页 API 家族）"
+python3 "$PARSE" tests/fixtures/rich_single_page.html "$TMP/rich_source.md"
+python3 - "$TMP/rich_source.md" <<'PY'
+import sys
+
+sys.path.insert(0, 'skills/tech-doc-translator/scripts')
+from _source_reconcile import reconcile_html_to_markdown
+from _verification import scan_code_fences
+
+text = open(sys.argv[1], encoding='utf-8').read()
+bodies = [f.body for f in scan_code_fences(text).blocks]
+expected = [
+    'print("wrapped")',
+    '#include <bar.h>\nint main() { return 10; }',
+    'note_code()',
+    'list_code()',
+    'details_code()',
+    'dd_code()',
+    'table_code()',
+]
+assert bodies == expected, '代码块顺序或内容不符: %r' % (bodies,)
+assert '## 1.1. C# Interop' in text and '¶' not in text, 'C# 标题/headerlink 异常'
+assert '[TABLE-CODE r=2 c=2#1]' in text, '含代码表格缺少行列定位'
+raw = open('tests/fixtures/rich_single_page.html', encoding='utf-8').read()
+assert reconcile_html_to_markdown(raw, text, 'api') == [], \
+    '正确解析被对账误判'
+for name, mutate in [
+    ('漏代码', lambda t: t.replace('```\ndetails_code()\n```\n', '')),
+    ('等数换内容', lambda t: t.replace('note_code()', 'note_coded()')),
+    # 项内围栏按层级缩进（列表项内代码），突变使用缩进形式
+    ('重复块', lambda t: t.replace('  ```\ndd_code()\n  ```',
+                                   '  ```\ndd_code()\n  ```\n\n  ```\ndd_code()\n  ```')),
+]:
+    diffs = reconcile_html_to_markdown(raw, mutate(text), 'api')
+    assert diffs, '%s 未被对账检出' % name
+    print('API 家族对账损伤 %s: %s' % (name, diffs[0]))
+print('API 家族富容器保真与独立对账 PASS')
+PY
+
+echo "==> 翻译留痕 02/A1：临时输出告警存在且退出 0"
+python3 "$PARSE" tests/fixtures/rich_single_page.html "$TMP/rich_a1.md" \
+  2>"$TMP/a1.err"
+grep -q '系统临时目录' "$TMP/a1.err" \
+  || { echo "错误：临时目录解析未告警"; cat "$TMP/a1.err"; exit 1; }
+echo "A1 临时路径告警 PASS"
