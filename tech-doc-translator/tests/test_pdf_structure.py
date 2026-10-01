@@ -1,4 +1,7 @@
 """PDF 解析的固定组合验收；所有输入均在工作区外构造。"""
+import hashlib
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -268,6 +271,242 @@ class ManagementFieldProjectionTests(unittest.TestCase):
         )
         self.assertNotIn('example.com', projected)
         self.assertIn('正文。', projected)
+
+
+class PdfCliTestCase(unittest.TestCase):
+    """CLI 行为级基类：真实 export/verify 子进程接缝（设计 5.6 口径）。"""
+
+    SCRIPTS = Path(__file__).resolve().parents[1] / \
+        'skills/tech-doc-translator/scripts'
+
+    def setUp(self):
+        temporary = tempfile.mkdtemp(prefix='pdf-cli-')
+        self.addCleanup(__import__('shutil').rmtree, temporary, True)
+        self.base = Path(temporary)
+
+    def write(self, name, text):
+        path = self.base / name
+        path.write_text(text, encoding='utf-8')
+        return path
+
+    def export(self, inputs, output='book.pdf', declaration=None):
+        output_path = self.base / output
+        work = self.base / ('work_' + output.replace('.', '_'))
+        command = [sys.executable, str(self.SCRIPTS / 'export_pdf.py'),
+                   '--output', str(output_path), '--work-dir', str(work)]
+        if declaration is not None:
+            command += ['--view-declaration', str(declaration)]
+        command += [str(path) for path in inputs]
+        result = subprocess.run(command, capture_output=True, text=True)
+        return result, output_path, work
+
+    def verify(self, pdf_path, work, inputs, declaration=None):
+        command = [sys.executable, str(self.SCRIPTS / 'verify_pdf.py'),
+                   '--pdf', str(pdf_path), '--work-dir', str(work)]
+        if declaration is not None:
+            command += ['--view-declaration', str(declaration)]
+        command += [str(path) for path in inputs]
+        return subprocess.run(command, capture_output=True, text=True)
+
+    def declaration(self, name, inputs, exclusions=(), title=None):
+        path = self.base / name
+        payload = {
+            'version': 1,
+            'inputs': [{'path': str(item.resolve()),
+                        'sha256': hashlib.sha256(
+                            item.read_bytes()).hexdigest()}
+                       for item in inputs],
+            'exclusions': list(exclusions),
+        }
+        if title is not None:
+            payload['document_title'] = title
+        path.write_text(json.dumps(payload, ensure_ascii=False),
+                        encoding='utf-8')
+        return path
+
+    def report(self, work):
+        return json.loads(
+            (work / exporter.REPORT_NAME).read_text(encoding='utf-8'))
+
+
+class ProjectionPolicyCliTests(PdfCliTestCase):
+    """投影政策的 CLI 行为级验收：声明输入绑定与目录出处投影。
+
+    目录出处结构谓词、译注排除、声明加载校验的主要正反例由
+    run_pdf_export.sh 的评审修复回归节覆盖（子进程同接缝）；本类只保留
+    该脚本未覆盖的声明输入绑定用例。
+    """
+
+    def test_declaration_input_order_binding(self):
+        one = self.write('one.md', '# 第 A 章\n\n'
+                         '> **来源**：https://example.com/order-a\n\nA 正文。\n')
+        two = self.write('two.md', '# 第 B 章\n\n'
+                         '> **来源**：https://example.com/order-b\n\nB 正文。\n')
+        # 声明按 [two, one] 绑定，导出按 [one, two]：有序输入必须一致。
+        declaration = self.declaration(
+            'decl.json', [two, one],
+            title={'original': 'A and B', 'chinese': '甲乙合订全书',
+                   'basis': '行为级验收'})
+        result, _pdf, work = self.export(
+            [one, two], declaration=declaration)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('有序输入不符', result.stderr)
+        self.assertFalse((work / exporter.CANDIDATE_NAME).exists())
+
+    def test_declaration_requires_input_digest(self):
+        one = self.write('one.md', '# 第 A 章\n\n'
+                         '> **来源**：https://example.com/digest-a\n\nA 正文。\n')
+        two = self.write('two.md', '# 第 B 章\n\n'
+                         '> **来源**：https://example.com/digest-b\n\nB 正文。\n')
+        declaration = self.declaration(
+            'decl.json', [one, two],
+            title={'original': 'A and B', 'chinese': '甲乙合订全书',
+                   'basis': '行为级验收'})
+        payload = json.loads(declaration.read_text(encoding='utf-8'))
+        del payload['inputs'][0]['sha256']
+        declaration.write_text(json.dumps(payload, ensure_ascii=False),
+                               encoding='utf-8')
+        result, _pdf, work = self.export(
+            [one, two], declaration=declaration)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('sha256 必填', result.stderr)
+        self.assertFalse((work / exporter.CANDIDATE_NAME).exists())
+
+
+class DocumentTitleTests(unittest.TestCase):
+    """ticket 04 / R3/A4/C5：中文总标题与 PDF Title 的行为级验收。
+
+    接缝为真实 CLI（export_pdf.py → verify_pdf.py → 导出报告 JSON 与
+    PDF 文本/元数据），只断言外部可见行为，不锁定内部函数或 DOM。
+    """
+
+    SCRIPTS = Path(__file__).resolve().parents[1] / \
+        'skills/tech-doc-translator/scripts'
+
+    def setUp(self):
+        temporary = tempfile.mkdtemp(prefix='pdf-doc-title-cli-')
+        self.addCleanup(__import__('shutil').rmtree, temporary, True)
+        self.base = Path(temporary)
+
+    def write(self, name, text):
+        path = self.base / name
+        path.write_text(text, encoding='utf-8')
+        return path
+
+    def export(self, inputs, output='book.pdf', declaration=None):
+        output_path = self.base / output
+        work = self.base / ('work_' + output.replace('.', '_'))
+        command = [sys.executable, str(self.SCRIPTS / 'export_pdf.py'),
+                   '--output', str(output_path), '--work-dir', str(work)]
+        if declaration is not None:
+            command += ['--view-declaration', str(declaration)]
+        command += [str(path) for path in inputs]
+        result = subprocess.run(command, capture_output=True, text=True)
+        return result, output_path, work
+
+    def verify(self, pdf_path, work, inputs, declaration=None):
+        command = [sys.executable, str(self.SCRIPTS / 'verify_pdf.py'),
+                   '--pdf', str(pdf_path), '--work-dir', str(work)]
+        if declaration is not None:
+            command += ['--view-declaration', str(declaration)]
+        command += [str(path) for path in inputs]
+        return subprocess.run(command, capture_output=True, text=True)
+
+    def report(self, work):
+        return json.loads(
+            (work / exporter.REPORT_NAME).read_text(encoding='utf-8'))
+
+    def pdf_text_and_title(self, pdf_path):
+        import pypdf
+        reader = pypdf.PdfReader(str(pdf_path))
+        text = '\n'.join(page.extract_text() or '' for page in reader.pages)
+        return text, (reader.metadata.title or '')
+
+    def head(self):
+        return '> **来源**：https://example.com/prov-title\n\n'
+
+    def test_bilingual_h1_uses_chinese_part_everywhere(self):
+        chapter = self.write('c.md', '# Torch.fx: Practical Program '
+                             'Capture（Torch.fx：实用程序捕获）\n\n'
+                             + self.head() + '## 1. Introduction（引言）\n\n正文。\n')
+        result, pdf, work = self.export([chapter])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        verify = self.verify(pdf, work, [chapter])
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+        title = self.report(work)['document_title']
+        self.assertEqual(title['title'], 'Torch.fx：实用程序捕获')
+        self.assertEqual(title['source'], 'bilingual-h1')
+        text, meta = self.pdf_text_and_title(pdf)
+        self.assertEqual(meta, 'Torch.fx：实用程序捕获')
+        self.assertIn('Torch.fx：实用程序捕获', text.split('\n')[0])
+        # 章节标题按输入保留（中英双语不变）。
+        self.assertIn('1. Introduction（引言）', text)
+
+    def test_plain_chinese_h1_kept(self):
+        chapter = self.write('c.md', '# 深度学习全书\n\n' + self.head() + '正文。\n')
+        result, pdf, work = self.export([chapter])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.report(work)['document_title']['source'],
+                         'plain-chinese')
+        _text, meta = self.pdf_text_and_title(pdf)
+        self.assertEqual(meta, '深度学习全书')
+
+    def test_foreign_only_h1_rejected_without_declaration(self):
+        chapter = self.write('c.md', '# Introduction to CUDA\n\n'
+                             + self.head() + '正文。\n')
+        result, pdf, work = self.export([chapter])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('仅外文题名', result.stderr)
+        self.assertFalse((work / exporter.CANDIDATE_NAME).exists())
+        self.assertFalse(pdf.exists())
+
+    def test_multi_chapter_book_requires_declaration(self):
+        one = self.write('one.md', '# 第 A 章\n\n'
+                         '> **来源**：https://example.com/a\n\nA 正文。\n')
+        two = self.write('two.md', '# 第 B 章\n\n'
+                         '> **来源**：https://example.com/b\n\nB 正文。\n')
+        result, _pdf, work = self.export([one, two])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('合订缺书名', result.stderr)
+        self.assertFalse((work / exporter.CANDIDATE_NAME).exists())
+
+    def test_multi_chapter_with_declaration_inserts_book_title(self):
+        one = self.write('one.md', '# 第 A 章\n\n'
+                         '> **来源**：https://example.com/a\n\nA 正文。\n')
+        two = self.write('two.md', '# 第 B 章\n\n'
+                         '> **来源**：https://example.com/b\n\nB 正文。\n')
+        declaration = self.base / 'decl.json'
+        declaration.write_text(json.dumps({
+            'version': 1,
+            'inputs': [{'path': str(one.resolve()),
+                        'sha256': hashlib.sha256(one.read_bytes()).hexdigest()},
+                       {'path': str(two.resolve()),
+                        'sha256': hashlib.sha256(two.read_bytes()).hexdigest()}],
+            'exclusions': [],
+            'document_title': {'original': 'A and B',
+                               'chinese': '甲乙合订全书',
+                               'basis': 'Agent 依据有序输入范围与章题拟定'},
+        }, ensure_ascii=False), encoding='utf-8')
+        result, pdf, work = self.export([one, two], declaration=declaration)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        verify = self.verify(pdf, work, [one, two], declaration=declaration)
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+        title = self.report(work)['document_title']
+        self.assertEqual(title['source'], 'declaration')
+        self.assertEqual(title['title'], '甲乙合订全书')
+        text, meta = self.pdf_text_and_title(pdf)
+        self.assertEqual(meta, '甲乙合订全书')
+        self.assertIn('甲乙合订全书', text)
+        self.assertIn('第 A 章', text)
+        self.assertIn('第 B 章', text)
+
+    def test_h1_with_inline_link_cannot_be_replaced(self):
+        chapter = self.write('c.md', '# [Guide](https://example.com)（指南）\n\n'
+                             + self.head() + '正文。\n')
+        result, _pdf, work = self.export([chapter])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('无法保真', result.stderr)
+        self.assertFalse((work / exporter.CANDIDATE_NAME).exists())
 
 
 A_CHAPTER = (

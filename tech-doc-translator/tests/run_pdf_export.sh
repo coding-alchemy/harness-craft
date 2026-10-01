@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # PDF 导出回归：临时样例覆盖单篇导出、核验、失败定位与输入保护。
 # 所有临时文件都生成在工作区外 mktemp 目录；不依赖真实译文项目。
+# 独立成品几何量测需安装 requirements-pdf-source.txt 中已有的 PyMuPDF 依赖。
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 
@@ -12,6 +13,27 @@ VERIFY="../skills/tech-doc-translator/scripts/verify_pdf.py"
 FIXTURE_IMAGE="fixtures/valid_1x1.png"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+
+# 多章合订缺少书名时由视图声明提供中文题名（R3.3/ticket 04 口径）：
+# 生成与给定有序输入一一绑定的最小视图声明（仅 document_title）。
+make_book_decl() {
+  local out=$1
+  shift
+  python3 - "$out" "$@" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({
+    "version": 1,
+    "inputs": [{"path": str(Path(p).resolve()),
+                "sha256": hashlib.sha256(Path(p).read_bytes()).hexdigest()}
+               for p in sys.argv[2:]],
+    "exclusions": [],
+    "document_title": {"original": "Book Fixture",
+                       "chinese": "合订样例全书",
+                       "basis": "测试夹具书名（合订须由声明提供）"},
+}, ensure_ascii=False), encoding="utf-8")
+PY
+}
 
 mkdir -p "$TMP/images" "$TMP/out"
 cp fixtures/valid_1x1.png "$TMP/images/pattern_a.png"
@@ -284,9 +306,12 @@ cat > "$TMP/comp/a_first.md" <<'MD'
 [^1]: B 章注文。
 MD
 
+make_book_decl "$TMP/comp_decl.json" "$TMP/comp/z_second.md" "$TMP/comp/a_first.md"
 python3 "$EXPORT" --output "$TMP/out/comp.pdf" --work-dir "$TMP/work_comp" \
+  --view-declaration "$TMP/comp_decl.json" \
   "$TMP/comp/z_second.md" "$TMP/comp/a_first.md"
 python3 "$VERIFY" --pdf "$TMP/out/comp.pdf" --work-dir "$TMP/work_comp" \
+  --view-declaration "$TMP/comp_decl.json" \
   "$TMP/comp/z_second.md" "$TMP/comp/a_first.md"
 
 python3 - "$TMP/work_comp" <<'PY'
@@ -352,7 +377,9 @@ text = open(path, encoding="utf-8").read().replace(
     "](a_first.md#同名小节)", "](a_first.md#不存在的片段)")
 open(path, "w", encoding="utf-8").write(text)
 PY
+make_book_decl "$TMP/comp_frag_decl.json" "$TMP/comp/bad_fragment.md" "$TMP/comp/a_first.md"
 if python3 "$EXPORT" --output "$TMP/out/comp_frag.pdf" --work-dir "$TMP/work_comp_frag" \
+    --view-declaration "$TMP/comp_frag_decl.json" \
     "$TMP/comp/bad_fragment.md" "$TMP/comp/a_first.md" 2>"$TMP/err_frag.txt"; then
   echo "错误：跨章片段缺失未被检出"; exit 1
 fi
@@ -367,7 +394,9 @@ path = sys.argv[1]
 text = open(path, encoding="utf-8").read().replace("](#同名小节)", "](#不存在的锚点)")
 open(path, "w", encoding="utf-8").write(text)
 PY
+make_book_decl "$TMP/comp_bad_decl.json" "$TMP/comp/z_second.md" "$TMP/comp/bad_target.md"
 if python3 "$EXPORT" --output "$TMP/out/comp_bad.pdf" --work-dir "$TMP/work_comp_bad" \
+    --view-declaration "$TMP/comp_bad_decl.json" \
     "$TMP/comp/z_second.md" "$TMP/comp/bad_target.md" 2>"$TMP/err_comp.txt"; then
   echo "错误：合订坏目标未被检出"; exit 1
 fi
@@ -404,9 +433,13 @@ text = open(path, encoding="utf-8").read()
 text += "再链接无标题章节：[只有正文的章](c_plain.md)。\n"
 open(path, "w", encoding="utf-8").write(text)
 PY
+make_book_decl "$TMP/with_plain_decl.json" "$TMP/comp/z_with_plain.md" \
+  "$TMP/comp/a_first.md" "$TMP/comp/c_plain.md"
 python3 "$EXPORT" --output "$TMP/out/with_plain.pdf" --work-dir "$TMP/work_plain" \
+  --view-declaration "$TMP/with_plain_decl.json" \
   "$TMP/comp/z_with_plain.md" "$TMP/comp/a_first.md" "$TMP/comp/c_plain.md"
 python3 "$VERIFY" --pdf "$TMP/out/with_plain.pdf" --work-dir "$TMP/work_plain" \
+  --view-declaration "$TMP/with_plain_decl.json" \
   "$TMP/comp/z_with_plain.md" "$TMP/comp/a_first.md" "$TMP/comp/c_plain.md"
 python3 - "$TMP/work_plain" <<'PY'
 import json, sys
@@ -559,9 +592,12 @@ cat > "$TMP/plain_ch/b_min.md" <<'MD'
 
 B 章只有正文段落，没有任何标题，用于验证无标题章节的边界与链接目标。
 MD
+make_book_decl "$TMP/plain_min_decl.json" "$TMP/plain_ch/a_min.md" "$TMP/plain_ch/b_min.md"
 python3 "$EXPORT" --output "$TMP/out/plain_min.pdf" --work-dir "$TMP/work_plain_min" \
+  --view-declaration "$TMP/plain_min_decl.json" \
   "$TMP/plain_ch/a_min.md" "$TMP/plain_ch/b_min.md"
 python3 "$VERIFY" --pdf "$TMP/out/plain_min.pdf" --work-dir "$TMP/work_plain_min" \
+  --view-declaration "$TMP/plain_min_decl.json" \
   "$TMP/plain_ch/a_min.md" "$TMP/plain_ch/b_min.md"
 python3 - "$TMP/work_plain_min" <<'PY'
 import json, sys
@@ -584,6 +620,7 @@ with open(path, "a", encoding="utf-8") as handle:
     handle.write("\n被篡改后新增的段落，PDF 中并不存在。\n")
 PY
 if python3 "$VERIFY" --pdf "$TMP/out/plain_min.pdf" --work-dir "$TMP/work_plain_min" \
+    --view-declaration "$TMP/plain_min_decl.json" \
     "$TMP/plain_ch/a_min.md" "$TMP/plain_ch/b_tampered.md" 2>"$TMP/err_plain.txt"; then
   echo "错误：无标题章节正文核验被跳过"; exit 1
 fi
@@ -646,9 +683,12 @@ Same paragraph.
 
 B 章独有段落。
 MD
+make_book_decl "$TMP/dup_decl.json" "$TMP/dup_ch/a_dup.md" "$TMP/dup_ch/b_dup.md"
 python3 "$EXPORT" --output "$TMP/out/dup.pdf" --work-dir "$TMP/work_dup" \
+  --view-declaration "$TMP/dup_decl.json" \
   "$TMP/dup_ch/a_dup.md" "$TMP/dup_ch/b_dup.md"
 python3 "$VERIFY" --pdf "$TMP/out/dup.pdf" --work-dir "$TMP/work_dup" \
+  --view-declaration "$TMP/dup_decl.json" \
   "$TMP/dup_ch/a_dup.md" "$TMP/dup_ch/b_dup.md"
 python3 - "$TMP/work_dup" <<'PY'
 import json, sys
@@ -742,9 +782,12 @@ cat > "$TMP/same_ch/b_same.md" <<'MD'
 
 Same paragraph.
 MD
+make_book_decl "$TMP/same_decl.json" "$TMP/same_ch/a_same.md" "$TMP/same_ch/b_same.md"
 python3 "$EXPORT" --output "$TMP/out/same.pdf" --work-dir "$TMP/work_same" \
+  --view-declaration "$TMP/same_decl.json" \
   "$TMP/same_ch/a_same.md" "$TMP/same_ch/b_same.md"
 python3 "$VERIFY" --pdf "$TMP/out/same.pdf" --work-dir "$TMP/work_same" \
+  --view-declaration "$TMP/same_decl.json" \
   "$TMP/same_ch/a_same.md" "$TMP/same_ch/b_same.md"
 
 echo "==> 复审修复：无入链章节整页清空后必须报 FAIL（不得复用上一章正文）"
@@ -761,6 +804,7 @@ with open(sys.argv[2], "wb") as handle:
     writer.write(handle)
 PY
 if python3 "$VERIFY" --pdf "$TMP/out/same_blank.pdf" --work-dir "$TMP/work_same" \
+    --view-declaration "$TMP/same_decl.json" \
     "$TMP/same_ch/a_same.md" "$TMP/same_ch/b_same.md" 2>"$TMP/err_same.txt"; then
   echo "错误：整章正文丢失未被检出（复用了上一章正文）"; exit 1
 fi
@@ -844,21 +888,20 @@ for probe in ("原文：CUDAProgrammingGuide，版本v13.3",
               "术语译法遵循本项目",
               "本文档为第1章"):
     assert probe not in text, f"被排除字段内容泄漏进 PDF：{probe}"
-# 默认出处前置（R6/D6）：已知来源/日期集中前置且只出现一次。
+# 新政策（R2/C2）：PDF 不显示前置出处；来源清单与定位证据留在导出报告。
 front = ("来源：https://docs.nvidia.com/cuda/cuda-programming-guide/",
          "抓取日期：2026-08-28")
-for keep in front:
-    assert norm(keep) in text, f"前置出处缺失：{keep}"
-first_heading = text.find("1.IntroductiontoCUDA")  # 首章标题必晚于前置区
-for locator in (norm(front[0]), norm(front[1])):
-    assert text.find(locator) < first_heading, "前置出处未先于正文"
-assert text.count(norm(front[0])) == 1, "来源定位符在成品中重复出现"
+for hidden in front:
+    assert norm(hidden) not in text, f"前置出处不应出现在 PDF：{hidden}"
+prov = report["provenance"]
+assert prov["pdf_visibility"] == "excluded", prov
+assert prov["combos"] and prov["combos"][0]["source"], prov  # 出处证据可回查
 for keep in ("正文提到“原文”与“译例说明”同名文字，必须完整保留",
              ">**原文**：代码围栏中的字面字段行，必须原样保留。",
              "项目术语表",
              "CUDA是并行计算平台"):
     assert norm(keep) in text, f"应保留内容缺失：{keep}"
-print("章首四字段移除、出处前置一次、正文/代码同名文字与术语表链接纯文本均正确")
+print("章首四字段移除、前置出处不可见且证据可回查、正文/代码同名文字与术语表链接纯文本均正确")
 PY
 
 echo "==> V0.2-01：伪造排除证据必须 FAIL（核验器不信任导出清单）"
@@ -960,12 +1003,15 @@ entries = [
     __import__('json').dumps({'version': 1, 'entries': entries},
                              ensure_ascii=False, indent=2), encoding='utf-8')
 PY
+make_book_decl "$TMP/disp_decl.json" "$TMP/disp/a.md" "$TMP/disp/b.md"
 python3 "$EXPORT" --output "$TMP/disp/book.pdf" --work-dir "$TMP/disp_work" \
+  --view-declaration "$TMP/disp_decl.json" \
   "$TMP/disp/a.md" "$TMP/disp/b.md" >"$TMP/disp_out.txt" 2>&1 \
   || { cat "$TMP/disp_out.txt"; echo "错误：显示尺寸导出失败"; exit 1; }
 grep -q "图片显示尺寸：恢复 4 处；1 处无映射命中" "$TMP/disp_out.txt" \
   || { cat "$TMP/disp_out.txt"; echo "错误：显示尺寸恢复统计不符"; exit 1; }
 python3 "$VERIFY" --pdf "$TMP/disp/book.pdf" --work-dir "$TMP/disp_work" \
+  --view-declaration "$TMP/disp_decl.json" \
   "$TMP/disp/a.md" "$TMP/disp/b.md"
 python3 - "$TMP/disp_work" "$TMP/disp/book.pdf" <<'PY'
 import json, sys
@@ -1017,7 +1063,9 @@ elif case == 'width':
 Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
 PY
   CH_A="$RM/a.md"; CH_B="$RM/b.md"
+  make_book_decl "$RM/decl.json" "$CH_A" "$CH_B"
   if python3 "$EXPORT" --output "$RM/fail.pdf" --work-dir "$TMP/work_case_$case" \
+      --view-declaration "$RM/decl.json" \
       "$CH_A" "$CH_B" >"$TMP/case_$case.txt" 2>&1; then
     echo "错误：损坏映射（$case）未被检出"; cat "$TMP/case_$case.txt"; exit 1
   fi
@@ -1032,6 +1080,7 @@ echo "==> V0.2-02：核验侧映射参数与导出侧不一致必须 FAIL"
 # 导出走同目录自动发现；核验显式指向另一个内容等价但路径不同的映射文件，
 # 映射集合不一致本身必须被判 FAIL（不能因为内容相同而放过参数漂移）。
 if python3 "$VERIFY" --pdf "$TMP/disp/book.pdf" --work-dir "$TMP/disp_work" \
+    --view-declaration "$TMP/disp_decl.json" \
     --images-display "$TMP/disp_case_digest/images_display.json" \
     "$TMP/disp/a.md" "$TMP/disp/b.md" 2>"$TMP/err_disp_arg.txt"; then
   echo "错误：显示尺寸映射参数不一致未被检出"; exit 1
@@ -1042,11 +1091,13 @@ grep -q "images-display-maps-mismatch" "$TMP/err_disp_arg.txt" \
 echo "==> V0.2-02：无映射旧译文按自然尺寸导出并在结论说明"
 mv "$TMP/disp/images_display.json" "$TMP/disp/_map.json.bak"
 python3 "$EXPORT" --output "$TMP/disp/natural.pdf" --work-dir "$TMP/disp_work2" \
+  --view-declaration "$TMP/disp_decl.json" \
   "$TMP/disp/a.md" "$TMP/disp/b.md" >"$TMP/natural_out.txt" 2>&1 \
   || { cat "$TMP/natural_out.txt"; exit 1; }
 grep -q "按自然尺寸与版心上限导出" "$TMP/natural_out.txt" \
   || { cat "$TMP/natural_out.txt"; echo "错误：无映射回退未说明"; exit 1; }
 python3 "$VERIFY" --pdf "$TMP/disp/natural.pdf" --work-dir "$TMP/disp_work2" \
+  --view-declaration "$TMP/disp_decl.json" \
   "$TMP/disp/a.md" "$TMP/disp/b.md"
 mv "$TMP/disp/_map.json.bak" "$TMP/disp/images_display.json"
 
@@ -1080,10 +1131,14 @@ for sub, width in (("a", 100), ("b", 200)):
 (root / "base_map.json").write_text(json.dumps({"version": 1, "entries": [
     dict(entries[0], markdown="chapter.md")]}, ensure_ascii=False))
 PY
+make_book_decl "$TMP/same_book_decl.json" "$TMP/same/a/chapter.md" \
+  "$TMP/same/b/chapter.md"
 python3 "$EXPORT" --output "$TMP/same/book.pdf" --work-dir "$TMP/same_work" \
+  --view-declaration "$TMP/same_book_decl.json" \
   --images-display "$TMP/same/full_map.json" \
   "$TMP/same/a/chapter.md" "$TMP/same/b/chapter.md" >/dev/null || exit 1
 python3 "$VERIFY" --pdf "$TMP/same/book.pdf" --work-dir "$TMP/same_work" \
+  --view-declaration "$TMP/same_book_decl.json" \
   --images-display "$TMP/same/full_map.json" \
   "$TMP/same/a/chapter.md" "$TMP/same/b/chapter.md"
 python3 - "$TMP/same_work" <<'PY'
@@ -1100,6 +1155,7 @@ assert applied == {"a": 100.0, "b": 200.0}, "同名章宽度串用：%s" % appli
 print("同名 Markdown 按完整路径分别绑定 100px / 200px")
 PY
 if python3 "$EXPORT" --output "$TMP/same/amb.pdf" --work-dir "$TMP/same_amb" \
+  --view-declaration "$TMP/same_book_decl.json" \
   --images-display "$TMP/same/base_map.json" \
   "$TMP/same/a/chapter.md" "$TMP/same/b/chapter.md" >"$TMP/same_amb.txt" 2>&1; then
   echo "错误：文件名兜底同名歧义未被拒绝"
@@ -1150,18 +1206,47 @@ ${TITLE}章正文段落一。
 MD
 done
 NEG_IN=("$TMP/neg/00_目录.md" "$TMP/neg/01_章.md" "$TMP/neg/02_章.md")
+# 合订导出缺少书名时由视图声明提供中文题名（ticket 04 口径）。
+python3 - "$TMP/neg/decl.json" "${NEG_IN[@]}" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+out = Path(sys.argv[1])
+out.write_text(json.dumps({
+    "version": 1,
+    "inputs": [{"path": str(Path(p).resolve()),
+                "sha256": hashlib.sha256(Path(p).read_bytes()).hexdigest()}
+               for p in sys.argv[2:]],
+    "exclusions": [],
+    "document_title": {"original": "Neg Sample", "chinese": "负向样例全书",
+                       "basis": "N01/N04 合订夹具书名（合订须由声明提供）"},
+}, ensure_ascii=False), encoding="utf-8")
+PY
 python3 "$EXPORT" --output "$TMP/neg/base.pdf" --work-dir "$TMP/neg_work" \
-  "${NEG_IN[@]}" >/dev/null || exit 1
+  --view-declaration "$TMP/neg/decl.json" "${NEG_IN[@]}" >/dev/null || exit 1
 python3 "$VERIFY" --pdf "$TMP/neg/base.pdf" --work-dir "$TMP/neg_work" \
-  "${NEG_IN[@]}" >/dev/null || { echo "错误：基线负向样例未通过"; exit 1; }
+  --view-declaration "$TMP/neg/decl.json" "${NEG_IN[@]}" >/dev/null \
+  || { echo "错误：基线负向样例未通过"; exit 1; }
 
 mkdir -p "$TMP/neg2"
 sed '/此说明必须出现在 PDF 中/d' "$TMP/neg/00_目录.md" > "$TMP/neg2/00_目录.md"
 sed '/# \*\*原文\*\*：代码内的字面量行/d' "$TMP/neg/01_章.md" > "$TMP/neg2/01_章.md"
 cp "$TMP/neg/02_章.md" "$TMP/neg2/02_章.md"
 N2_IN=("$TMP/neg2/00_目录.md" "$TMP/neg2/01_章.md" "$TMP/neg2/02_章.md")
+python3 - "$TMP/neg2/decl.json" "${N2_IN[@]}" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({
+    "version": 1,
+    "inputs": [{"path": str(Path(p).resolve()),
+                "sha256": hashlib.sha256(Path(p).read_bytes()).hexdigest()}
+               for p in sys.argv[2:]],
+    "exclusions": [],
+    "document_title": {"original": "Neg Sample", "chinese": "负向样例全书",
+                       "basis": "N02/N03 合订夹具书名（合订须由声明提供）"},
+}, ensure_ascii=False), encoding="utf-8")
+PY
 python3 "$EXPORT" --output "$TMP/neg/wrong.pdf" --work-dir "$TMP/neg_wrong" \
-  "${N2_IN[@]}" >/dev/null || exit 1
+  --view-declaration "$TMP/neg2/decl.json" "${N2_IN[@]}" >/dev/null || exit 1
 python3 - "$TMP/neg_wrong" "$TMP/neg" <<'PY'
 import hashlib
 import json
@@ -1193,7 +1278,7 @@ for item in report.get("chapters", []):
 print("证据已对齐原始输入")
 PY
 if python3 "$VERIFY" --pdf "$TMP/neg/wrong.pdf" --work-dir "$TMP/neg_wrong" \
-  "${NEG_IN[@]}" >"$TMP/neg_v.txt" 2>&1; then
+  --view-declaration "$TMP/neg/decl.json" "${NEG_IN[@]}" >"$TMP/neg_v.txt" 2>&1; then
   echo "错误：说明/代码缺失未被检出"
   exit 1
 fi
@@ -1237,6 +1322,7 @@ report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
 print("已交换前两条目录链接目的地并重签 PDF 摘要")
 PY
 if python3 "$VERIFY" --pdf "$TMP/neg/swapped.pdf" --work-dir "$TMP/neg_work" \
+  --view-declaration "$TMP/neg/decl.json" \
   "${NEG_IN[@]}" >"$TMP/neg2_v.txt" 2>&1; then
   echo "错误：目的地交换未被检出"
   exit 1
@@ -1266,7 +1352,16 @@ report = json.loads(report_path.read_text(encoding="utf-8"))
 printed = str(report["toc"]["entries"][0]["page"])
 digit = printed[-1]
 reader = PdfReader(str(base / "base.pdf"))
-pages = [(page.extract_text() or "") for page in reader.pages]
+
+
+def strip_footer(text):
+    # 页脚页码（ticket 06）每页都有 n / N，剔除后正文仍保持无数字样例。
+    return "\n".join(
+        line for line in (text or "").split("\n")
+        if not re.match(r"^\s*\d+\s*/\s*\d+\s*$", line))
+
+
+pages = [strip_footer(page.extract_text() or "") for page in reader.pages]
 full = "\n".join(pages)
 occurrences = full.count(digit)
 # 固定样例正文无数字：该数字在全文只应是首条目的可见页码本身。
@@ -1333,7 +1428,8 @@ out = base / "tampered.pdf"
 with open(out, "wb") as handle:
     writer.write(handle)
 check = "\n".join(
-    page.extract_text() or "" for page in PdfReader(str(out)).pages)
+    strip_footer(page.extract_text() or "")
+    for page in PdfReader(str(out)).pages)
 assert check.count(digit) == 0 and check.count(forged) == full.count(forged) + 1
 report["pdf_sha256"] = hashlib.sha256(out.read_bytes()).hexdigest()
 report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
@@ -1341,6 +1437,7 @@ report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
 print("已把首条目可见页码 %s 的字形改为 %s" % (digit, forged))
 PY
 if python3 "$VERIFY" --pdf "$TMP/neg/tampered.pdf" --work-dir "$TMP/neg_work" \
+  --view-declaration "$TMP/neg/decl.json" \
   "${NEG_IN[@]}" >"$TMP/neg3_v.txt" 2>&1; then
   echo "错误：成品可见页码篡改未被检出"
   exit 1
@@ -1410,10 +1507,13 @@ for c in 1 2 3; do
   } > "$TMP/toc_big/0${c}_章.md"
 done
 BIG_IN=("$TMP/toc_big/00_目录.md" "$TMP/toc_big/01_章.md" "$TMP/toc_big/02_章.md" "$TMP/toc_big/03_章.md")
+make_book_decl "$TMP/toc_big_decl.json" "${BIG_IN[@]}"
 python3 "$EXPORT" --output "$TMP/toc_big/book.pdf" --work-dir "$TMP/toc_big_work" \
+  --view-declaration "$TMP/toc_big_decl.json" \
   --toc-sections "${BIG_IN[@]}" >"$TMP/toc_big_out.txt" 2>&1 \
   || { cat "$TMP/toc_big_out.txt"; exit 1; }
 python3 "$VERIFY" --pdf "$TMP/toc_big/book.pdf" --work-dir "$TMP/toc_big_work" \
+  --view-declaration "$TMP/toc_big_decl.json" \
   --toc-sections "${BIG_IN[@]}"
 python3 - "$TMP/toc_big_work" "$TMP/toc_big/book.pdf" <<'PY'
 import json
@@ -1513,12 +1613,17 @@ lines = [
 (book / "00_目录.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
 MIX_IN=("$TMP/mix/00_目录.md" "$TMP/mix/01_章.md" "$TMP/mix/02_章.md")
+make_book_decl "$TMP/mix_decl.json" "${MIX_IN[@]}"
 python3 "$EXPORT" --output "$TMP/mix/plain.pdf" --work-dir "$TMP/mix_work" \
+  --view-declaration "$TMP/mix_decl.json" \
   "${MIX_IN[@]}" >/dev/null || exit 1
-python3 "$VERIFY" --pdf "$TMP/mix/plain.pdf" --work-dir "$TMP/mix_work" "${MIX_IN[@]}"
+python3 "$VERIFY" --pdf "$TMP/mix/plain.pdf" --work-dir "$TMP/mix_work" \
+  --view-declaration "$TMP/mix_decl.json" "${MIX_IN[@]}"
 python3 "$EXPORT" --output "$TMP/mix/sec.pdf" --work-dir "$TMP/mix_work_sec" \
+  --view-declaration "$TMP/mix_decl.json" \
   --toc-sections "${MIX_IN[@]}" >/dev/null || exit 1
 python3 "$VERIFY" --pdf "$TMP/mix/sec.pdf" --work-dir "$TMP/mix_work_sec" \
+  --view-declaration "$TMP/mix_decl.json" \
   --toc-sections "${MIX_IN[@]}"
 python3 - "$TMP/mix_work" "$TMP/mix_work_sec" "$TMP/mix/plain.pdf" <<'PY'
 import json
@@ -1595,11 +1700,14 @@ sed -i '' '1s/.*/# 第 3 章 Same Name（同名章 B）/; s/第 03_同名二 章
 sed -i '' 's/## 节标题/## 1.1. Basics（基础）/' "$TMP/toc/01_引言.md"
 
 TOC_IN=("$TMP/toc/00_目录.md" "$TMP/toc/01_引言.md" "$TMP/toc/02_同名.md" "$TMP/toc/03_同名二.md")
-python3 "$EXPORT" --output "$TMP/toc/book.pdf" --work-dir "$TMP/toc_work" "${TOC_IN[@]}" \
+make_book_decl "$TMP/toc_decl.json" "${TOC_IN[@]}"
+python3 "$EXPORT" --output "$TMP/toc/book.pdf" --work-dir "$TMP/toc_work" \
+  --view-declaration "$TMP/toc_decl.json" "${TOC_IN[@]}" \
   >"$TMP/toc_out.txt" 2>&1 || { cat "$TMP/toc_out.txt"; exit 1; }
 grep -q "印刷目录：3 条（含一级节：否），共打印 2 次" "$TMP/toc_out.txt" \
   || { cat "$TMP/toc_out.txt"; echo "错误：章级目录统计不符"; exit 1; }
-python3 "$VERIFY" --pdf "$TMP/toc/book.pdf" --work-dir "$TMP/toc_work" "${TOC_IN[@]}"
+python3 "$VERIFY" --pdf "$TMP/toc/book.pdf" --work-dir "$TMP/toc_work" \
+  --view-declaration "$TMP/toc_decl.json" "${TOC_IN[@]}"
 
 python3 - "$TMP/toc/book.pdf" <<'PY'
 import sys
@@ -1616,8 +1724,10 @@ print("目录页无脚手架残留（表头壳/引导句已清理），说明列
 PY
 
 python3 "$EXPORT" --output "$TMP/toc/book_sec.pdf" --work-dir "$TMP/toc_work_sec" \
+  --view-declaration "$TMP/toc_decl.json" \
   --toc-sections "${TOC_IN[@]}" >/dev/null || exit 1
 python3 "$VERIFY" --pdf "$TMP/toc/book_sec.pdf" --work-dir "$TMP/toc_work_sec" \
+  --view-declaration "$TMP/toc_decl.json" \
   --toc-sections "${TOC_IN[@]}"
 
 python3 - "$TMP/toc_work" "$TMP/toc_work_sec" <<'PY'
@@ -1646,9 +1756,12 @@ print("章级/一级节目录页码、目录偏移与重复章名消歧均正确
 PY
 
 echo "==> V0.2-03：无目录输入保持无印刷目录"
+make_book_decl "$TMP/no_toc_decl.json" "$TMP/toc/01_引言.md" "$TMP/toc/02_同名.md"
 python3 "$EXPORT" --output "$TMP/toc/no_toc.pdf" --work-dir "$TMP/no_toc_work" \
+  --view-declaration "$TMP/no_toc_decl.json" \
   "$TMP/toc/01_引言.md" "$TMP/toc/02_同名.md" >/dev/null || exit 1
 python3 "$VERIFY" --pdf "$TMP/toc/no_toc.pdf" --work-dir "$TMP/no_toc_work" \
+  --view-declaration "$TMP/no_toc_decl.json" \
   "$TMP/toc/01_引言.md" "$TMP/toc/02_同名.md"
 python3 - "$TMP/no_toc_work" <<'PY'
 import json, sys
@@ -1669,7 +1782,8 @@ report = json.loads(path.read_text(encoding="utf-8"))
 report["toc"]["entries"][0]["page"] = 99  # 伪造页码
 path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
-if python3 "$VERIFY" --pdf "$TMP/toc/book.pdf" --work-dir "$TMP/toc_work" "${TOC_IN[@]}" 2>"$TMP/err_toc_tamper.txt"; then
+if python3 "$VERIFY" --pdf "$TMP/toc/book.pdf" --work-dir "$TMP/toc_work" \
+  --view-declaration "$TMP/toc_decl.json" "${TOC_IN[@]}" 2>"$TMP/err_toc_tamper.txt"; then
   echo "错误：篡改目录页码未被检出"; exit 1
 fi
 grep -q "toc-page-number\|toc-target-page\|toc-link-target" "$TMP/err_toc_tamper.txt" \
@@ -1684,7 +1798,8 @@ report = json.loads(path.read_text(encoding="utf-8"))
 report["toc"]["entries"][0]["page"] = 2
 path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
-python3 "$VERIFY" --pdf "$TMP/toc/book.pdf" --work-dir "$TMP/toc_work" "${TOC_IN[@]}" >/dev/null
+python3 "$VERIFY" --pdf "$TMP/toc/book.pdf" --work-dir "$TMP/toc_work" \
+  --view-declaration "$TMP/toc_decl.json" "${TOC_IN[@]}" >/dev/null
 
 echo "==> Ticket 01 PDF 导出回归全部通过"
 
@@ -1720,8 +1835,10 @@ make_png(base / 'imgsel/big.png', 900, 500)   # 去重后的第二大资源
     '![大图](imgsel/big.png)\n\n'
     '![大图重复](imgsel/big.png)\n', encoding='utf-8')
 PY
+make_book_decl "$STRICT/decl.json" "$STRICT/a.md" "$STRICT/b.md"
 # 普通模式：无映射/未覆盖仅告警继续（含代码内图片语法不计）
 python3 "$EXPORT" --output "$STRICT/plain.pdf" --work-dir "$STRICT/w_plain" \
+  --view-declaration "$STRICT/decl.json" \
   "$STRICT/a.md" "$STRICT/b.md" >"$STRICT/plain.txt" 2>&1
 grep -q "总数 4 = 已恢复 0 + 未恢复 4（无映射条目 4" "$STRICT/plain.txt" \
   || { cat "$STRICT/plain.txt"; echo "错误：覆盖汇总口径不符（代码内示例不得计数）"; exit 1; }
@@ -1743,6 +1860,7 @@ echo "普通模式：未覆盖告警继续、代码内图片语法不计数 PASS
 
 # 严格模式：全部出现须有确定尺寸 → 拒绝且不新增成品
 if python3 "$EXPORT" --output "$STRICT/strict.pdf" --work-dir "$STRICT/w_strict" \
+    --view-declaration "$STRICT/decl.json" \
     --require-display-map "$STRICT/a.md" "$STRICT/b.md" \
     >"$STRICT/strict.txt" 2>&1; then
   echo "错误：严格模式未拒绝部分覆盖"; cat "$STRICT/strict.txt"; exit 1
@@ -1791,10 +1909,12 @@ entries = [
     encoding='utf-8')
 PY
 python3 "$EXPORT" --output "$STRICT/full.pdf" --work-dir "$STRICT/w_full" \
+  --view-declaration "$STRICT/decl.json" \
   --images-display "$STRICT/images_display.json" --require-display-map \
   "$STRICT/a.md" "$STRICT/b.md" >"$STRICT/full.txt" 2>&1 \
   || { cat "$STRICT/full.txt"; echo "错误：全量确定映射严格导出应通过"; exit 1; }
 if python3 "$VERIFY" --pdf "$STRICT/full.pdf" --work-dir "$STRICT/w_full" \
+    --view-declaration "$STRICT/decl.json" \
     --images-display "$STRICT/images_display.json" \
     "$STRICT/a.md" "$STRICT/b.md" >"$STRICT/v_mismatch.txt" 2>&1; then
   echo "错误：核验省略严格参数未被检出"; exit 1
@@ -1802,6 +1922,7 @@ fi
 grep -q "images-display-require-mismatch" "$STRICT/v_mismatch.txt" \
   || { cat "$STRICT/v_mismatch.txt"; echo "错误：严格参数不一致诊断缺失"; exit 1; }
 python3 "$VERIFY" --pdf "$STRICT/full.pdf" --work-dir "$STRICT/w_full" \
+  --view-declaration "$STRICT/decl.json" \
   --images-display "$STRICT/images_display.json" --require-display-map \
   "$STRICT/a.md" "$STRICT/b.md" >"$STRICT/v_full.txt" 2>&1 \
   || { cat "$STRICT/v_full.txt"; echo "错误：严格核验应通过"; exit 1; }
@@ -1811,6 +1932,7 @@ echo "严格导出/严格核验一致通过；核验参数漂移被检出 PASS"
 BEFORE=$(shasum -a 256 "$STRICT/full.pdf" | cut -d' ' -f1)
 mv "$STRICT/images_display.json" "$STRICT/images_display.json.bak"
 if python3 "$EXPORT" --output "$STRICT/full.pdf" --work-dir "$STRICT/w_strict2" \
+    --view-declaration "$STRICT/decl.json" \
     --require-display-map "$STRICT/a.md" "$STRICT/b.md" \
     >"$STRICT/strict2.txt" 2>&1; then
   echo "错误：缺映射严格导出未被拒绝"; exit 1
@@ -1822,6 +1944,7 @@ echo "严格失败保护旧 PDF 摘要不变 PASS"
 
 # 预算：重复资源按出现累加 > 按摘要去重；SVG 列为无法估算
 python3 "$EXPORT" --output "$STRICT/plain2.pdf" --work-dir "$STRICT/w_plain2" \
+  --view-declaration "$STRICT/decl.json" \
   "$STRICT/a.md" "$STRICT/b.md" >"$STRICT/plain2.txt" 2>&1
 grep -q "image-decode-budget\|解码预算估算" "$STRICT/plain2.txt" \
   || { cat "$STRICT/plain2.txt"; echo "错误：预算估算未输出"; exit 1; }
@@ -2159,8 +2282,10 @@ python3 "$EXPORT" --output "$PV/nodate.pdf" --work-dir "$PV/w_nodate" \
 grep -q "prov-nodate\|pv-ok" "$PV/nodate.txt" >/dev/null 2>&1 || true
 echo "来源无版本/日期正例：导出通过（不编造字段） PASS"
 
+make_book_decl "$PV/decl_okweak.json" "$PV/ok.md" "$PV/weak.md"
 # 反例 1：来源只是文档名/官网（无法定位具体原文）→ provenance-incomplete
 if python3 "$EXPORT" --output "$PV/old.pdf" --work-dir "$PV/w_weak" \
+    --view-declaration "$PV/decl_okweak.json" \
     "$PV/ok.md" "$PV/weak.md" >"$PV/weak.txt" 2>&1; then
   echo "错误：不可定位来源未被拒绝"; exit 1
 fi
@@ -2182,7 +2307,7 @@ grep -q "provenance-unavailable" "$PV/none.txt" \
   || { cat "$PV/none.txt"; echo "错误：unavailable 诊断缺失"; exit 1; }
 echo "完全缺来源：unavailable 拒绝 PASS"
 
-# 恢复：补齐来源后可生成（且核验确认前置先于首章）
+# 恢复：补齐来源后可生成（且核验确认前置出处不可见、出处证据可回查）
 python3 - "$PV" <<'PY'
 from pathlib import Path
 base = Path(__import__('sys').argv[1])
@@ -2190,10 +2315,14 @@ base = Path(__import__('sys').argv[1])
     '# 章 WEAK\n\n> **来源**：https://example.com/pv-weak\n\n正文。\n',
     encoding='utf-8')
 PY
+# weak.md 已补齐来源：按新输入身份重建声明绑定。
+make_book_decl "$PV/decl_okweak.json" "$PV/ok.md" "$PV/weak.md"
 python3 "$EXPORT" --output "$PV/fixed.pdf" --work-dir "$PV/w_fixed" \
+  --view-declaration "$PV/decl_okweak.json" \
   "$PV/ok.md" "$PV/weak.md" >"$PV/fixed.txt" 2>&1 \
   || { cat "$PV/fixed.txt"; echo "错误：补齐来源后仍拒绝"; exit 1; }
 python3 "$VERIFY" --pdf "$PV/fixed.pdf" --work-dir "$PV/w_fixed" \
+  --view-declaration "$PV/decl_okweak.json" \
   "$PV/ok.md" "$PV/weak.md" >"$PV/fixed_v.txt" 2>&1 \
   || { cat "$PV/fixed_v.txt"; echo "错误：补齐后核验失败"; exit 1; }
 echo "补齐来源后导出与核验恢复 PASS"
@@ -2207,24 +2336,41 @@ cat > "$PV/00_目录.md" <<'MD'
 - [章 OK](ok.md)
 - [章 WEAK](weak.md)
 MD
+make_book_decl "$PV/decl_book.json" "$PV/00_目录.md" "$PV/ok.md" "$PV/weak.md"
 cat > "$PV/map.json" <<EOF
 {"inputs": [{"path": "$PV/00_目录.md", "sha256": "$(shasum -a 256 "$PV/00_目录.md" | cut -d' ' -f1)",
   "sections": [{"lines": [3, 3], "chapters": [2]}]}]}
 EOF
 python3 "$EXPORT" --output "$PV/mapped.pdf" --work-dir "$PV/w_map" \
+  --view-declaration "$PV/decl_book.json" \
   --provenance "$PV/map.json" "$PV/00_目录.md" "$PV/ok.md" "$PV/weak.md" \
   >"$PV/map.txt" 2>&1 \
   || { cat "$PV/map.txt"; echo "错误：合法映射导出失败"; exit 1; }
-python3 - "$PV/w_map" <<'PY'
-import json, sys
+python3 - "$PV/w_map" "$PV/mapped.pdf" <<'PY'
+import json, re, sys, unicodedata
 from pathlib import Path
+
+import pypdf
+
 report = json.loads((Path(sys.argv[1]) / "export_report.json").read_text(encoding="utf-8"))
 prov = report["provenance"]
 assert prov["mode"] == "mapping", prov
 assert prov["complete"] == [2, 3], prov  # 目录文件豁免；两章可定位
-# 各章与映射段落不同的来源组合仍须前置保留（差异不丢失）
+# 各章与映射段落不同的来源组合仍保留在导出报告（差异不丢失）
 assert prov["front_generated"] is True and len(prov["combos"]) == 2, prov
-print("映射模式：目录段落覆盖全书出处，各章独立来源组合仍前置保留")
+assert prov["pdf_visibility"] == "excluded", prov
+assert prov["toc_exclusion"] is not None, prov  # 目录“译自…”段排除证据
+
+
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+
+
+text = norm("".join(p.extract_text() or "" for p in pypdf.PdfReader(sys.argv[2]).pages))
+assert norm("译自NVIDIACUDAProgrammingGuidev13.4") not in text, \
+    "目录译自出处段不应出现在 PDF"
+print("映射模式：目录段落覆盖全书出处，各章独立来源组合仍留报告；"
+      "目录译自段在 PDF 中缺席且证据可回查")
 PY
 # 篡改映射（换摘要）→ 拒绝
 python3 - "$PV" <<'PY'
@@ -2236,6 +2382,7 @@ data["inputs"][0]["sha256"] = "0" * 64
 (base / 'map_bad.json').write_text(json.dumps(data))
 PY
 if python3 "$EXPORT" --output "$PV/mapped.pdf" --work-dir "$PV/w_map_bad" \
+    --view-declaration "$PV/decl_book.json" \
     --provenance "$PV/map_bad.json" "$PV/00_目录.md" "$PV/ok.md" "$PV/weak.md" \
     >"$PV/map_bad.txt" 2>&1; then
   echo "错误：篡改映射未被拒绝"; exit 1
@@ -2259,6 +2406,7 @@ base = Path(sys.argv[1])
     "sections": [{"lines": [3, 3], "chapters": [2]}]}]}), encoding='utf-8')
 PY
 if python3 "$EXPORT" --output "$PV/bad1.pdf" --work-dir "$PV/w_bad1" \
+    --view-declaration "$PV/decl_okweak.json" \
     --provenance "$PV/content_map.json" "$PV/ok.md" "$PV/weak.md" \
     >"$PV/bad1.txt" 2>&1; then
   echo "错误：正文章节内区间映射未被拒绝"; exit 1
@@ -2266,6 +2414,7 @@ fi
 grep -q "只支持目录文件" "$PV/bad1.txt" \
   || { cat "$PV/bad1.txt"; echo "错误：正文区间诊断缺失"; exit 1; }
 if python3 "$EXPORT" --output "$PV/bad2.pdf" --work-dir "$PV/w_bad2" \
+    --view-declaration "$PV/decl_book.json" \
     --provenance "$PV/nodigest_map.json" "$PV/00_目录.md" "$PV/ok.md" "$PV/weak.md" \
     >"$PV/bad2.txt" 2>&1; then
   echo "错误：缺摘要映射未被拒绝"; exit 1
@@ -2275,7 +2424,9 @@ grep -q "缺少输入摘要" "$PV/bad2.txt" \
 echo "映射负例：正文区间与缺摘要均拒绝 PASS"
 
 # 目录未列输入首位时映射明确拒绝（无法保证被采用出处段先于首章；零生成，不重排输入）
+make_book_decl "$PV/decl_last.json" "$PV/ok.md" "$PV/00_目录.md" "$PV/weak.md"
 if python3 "$EXPORT" --output "$PV/last.pdf" --work-dir "$PV/w_last" \
+    --view-declaration "$PV/decl_last.json" \
     --provenance "$PV/map.json" "$PV/ok.md" "$PV/00_目录.md" "$PV/weak.md" \
     >"$PV/last.txt" 2>&1; then
   echo "错误：目录未列首位的映射未被拒绝"; exit 1
@@ -2287,7 +2438,7 @@ test ! -f "$PV/w_last/candidate.pdf" \
 echo "目录未列首位时映射明确拒绝且零生成 PASS"
 
 # 映射为唯一出处来源（章内无管理字段）：目录首位时导出与核验通过，
-# 核验实测被采用映射段在成品中先于首章
+# 核验独立重建出处证据并按新政策核对 PDF 可见性
 PV3="$TMP/prov_mapsole"; rm -rf "$PV3"; mkdir -p "$PV3"
 cat > "$PV3/00_目录.md" <<'MD'
 # 目录
@@ -2358,11 +2509,14 @@ digest = __import__('hashlib').sha256(
     "path": str(base / '00_目录.md'), "sha256": digest,
     "sections": [{"lines": [3, 3], "chapters": [2, 3]}]}]}), encoding='utf-8')
 PY
+make_book_decl "$PV5/decl.json" "$PV5/00_目录.md" "$PV5/a.md" "$PV5/b.md"
 python3 "$EXPORT" --output "$PV5/out.pdf" --work-dir "$PV5/w" \
+  --view-declaration "$PV5/decl.json" \
   --provenance "$PV5/map.json" "$PV5/00_目录.md" "$PV5/a.md" "$PV5/b.md" \
   >"$PV5/e.txt" 2>&1 \
   || { cat "$PV5/e.txt"; echo "错误：共享出处段覆盖两章导出失败"; exit 1; }
 python3 "$VERIFY" --pdf "$PV5/out.pdf" --work-dir "$PV5/w" \
+  --view-declaration "$PV5/decl.json" \
   --provenance "$PV5/map.json" "$PV5/00_目录.md" "$PV5/a.md" "$PV5/b.md" \
   >"$PV5/v.txt" 2>&1 \
   || { cat "$PV5/v.txt"; echo "错误：共享出处段覆盖两章被核验误拒"; exit 1; }
@@ -2420,9 +2574,10 @@ assert 'Guide v1' in lines[0] and 'Guide v2' in lines[1], facts['adopted_front']
 print('出处段落与覆盖关系分离：同段去重、不同段保留边界与版本日期 PASS')
 PY
 
-# 被采用映射段的成品位置实测（函数级损伤）：正确位置通过，移至章后或缺失拒绝
-python3 - "$PV3" <<'PY'
-import json, sys
+# 被采用出处段的成品可见性实测（函数级）：新政策下出现即拒绝，
+# 正文/目录合法出现同一来源文字按导出视图允许集合不误报
+python3 - "$TMP" <<'PY'
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2430,33 +2585,1127 @@ sys.path.insert(0, str(Path('../skills/tech-doc-translator/scripts').resolve()))
 import export_pdf as e
 import verify_pdf as v
 
-base = Path(sys.argv[1])
-chapters = e.load_inputs([str(base / '00_目录.md'), str(base / 'sole.md')])
+base = Path(sys.argv[1]) / 'prov_absence'
+base.mkdir(exist_ok=True)
+(base / '00_目录.md').write_text(
+    '# 目录\n\n'
+    '译自 Guide：https://example.com/pv-abs/book.html\n\n'
+    '- [章 A](a.md)\n', encoding='utf-8')
+(base / 'a.md').write_text(
+    '# 章 A\n\n> **来源**：https://example.com/pv-abs/a\n\n正文。\n',
+    encoding='utf-8')
+chapters = e.load_inputs([str(base / '00_目录.md'), str(base / 'a.md')])
+e.decide_toc_provenance(chapters)
 for c in chapters:
     e.parse_chapter(c)
-pmap = e.load_provenance_map(base / 'map.json', chapters, [])
-facts = e.collect_provenance(chapters, chapters[0], pmap)
-report = {'provenance': {**facts, 'mapping': str(base / 'map.json'),
-                         'policy': {'fields': list(e.MANAGEMENT_FIELD_LABELS)}}}
-visible = 'Source manual: https://example.com/pv-mapsole/book.html'
-assert facts['adopted_front'] == visible, facts['adopted_front']
-heading_pages = {chapters[1].headings[0]['id']: 1}
+facts = e.collect_provenance(chapters, chapters[0], None)
+front_line = '来源：https://example.com/pv-abs/a（适用：第 2 章）'
+assert facts['adopted_front'] == front_line, facts['adopted_front']
+assert chapters[0].toc_provenance_exclusion is not None
+report = {'provenance': {**facts, 'mapping': None,
+                         'policy': {'fields': list(e.MANAGEMENT_FIELD_LABELS)},
+                         'pdf_visibility': 'excluded'}}
+
+
+def norm(s):
+    import re, unicodedata
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+
+
+toc_visible = '译自Guide：https://example.com/pv-abs/book.html'
 cases = {
-    'correct': ['Contents\n%s' % visible, '章 SOLE\n正文。'],
-    'moved': ['Contents', '章 SOLE\n正文。\n%s' % visible],
-    'missing': ['Contents', '章 SOLE\n正文。'],
+    # 目录译自段被排除且正文无同名文字：出现即拒绝
+    'absent': ('single', ''),
+    'front-present': ('single', norm(front_line)),
+    'toc-present': ('single', norm(toc_visible)),
+    # 正文合法出现同一来源文字：允许集合内不误报
+    'body-dup': ('dup', norm('正文。\n' + toc_visible)),
 }
+# 让导出视图保留一处目录来源文字（正文合法重复）以校验允许集合口径
+(base / 'a.md').write_text(
+    '# 章 A\n\n> **来源**：https://example.com/pv-abs/a\n\n正文。\n\n'
+    '译自 Guide：https://example.com/pv-abs/book.html\n', encoding='utf-8')
+chapters_dup = e.load_inputs([str(base / '00_目录.md'), str(base / 'a.md')])
+e.decide_toc_provenance(chapters_dup)
+for c in chapters_dup:
+    e.parse_chapter(c)
+sets = {'single': chapters, 'dup': chapters_dup}
 out = {}
-for name, pages in cases.items():
+for name, (which, norm_text) in cases.items():
     failures = []
-    v.check_provenance(chapters, report, SimpleNamespace(pages=pages),
-                       str(base / 'map.json'), failures, heading_pages)
+    pdf = SimpleNamespace(norm_text=norm_text)
+    v.check_provenance(sets[which], report, pdf, None, failures)
     out[name] = [f['code'] for f in failures]
-assert out['correct'] == [], out
-assert out['moved'] == ['provenance-position'], out
-assert out['missing'] == ['provenance-front-missing'], out
-print('被采用映射段成品位置实测：正确通过、移位/缺失拒绝 PASS')
+assert out['absent'] == [], out
+assert out['front-present'] == ['provenance-front-present'], out
+assert out['toc-present'] == ['provenance-front-present'], out
+assert out['body-dup'] == [], out  # 正文合法出现：PDF 1 次 ≤ 视图 1 次
+# 旧证据（无 pdf_visibility 字段）必须被新政策拒绝
+failures = []
+v.check_provenance(chapters, {'provenance': {**facts, 'mapping': None,
+                              'policy': {'fields': list(e.MANAGEMENT_FIELD_LABELS)}}},
+                   SimpleNamespace(norm_text=''), None, failures)
+assert any(f['code'] == 'provenance-policy-mismatch' for f in failures), failures
+print('被采用出处段成品可见性实测：缺席通过、残留拒绝、正文合法重复不误报、'
+      '旧口径证据失效 PASS')
 PY
+
+echo "==> R2/C6（译注排除）：已标识译注只从 PDF 排除，代码/原文引用保留"
+TN="$TMP/translator_notes"; rm -rf "$TN"; mkdir -p "$TN"
+cat > "$TN/note.md" <<'MD'
+# 章 注
+
+> **来源**：https://example.com/prov-tn
+
+正文句一。【译注：样例译注】句二继续。
+
+参考文献行：Author, A. Title. https://example.com/ref-a。【译注：URL 还原说明】
+
+```text
+代码中 【译注：代码内不删】 保留。
+```
+
+> 原文引用 【译注：引用内不删】 保留。
+
+`行内 【译注：代码串不删】 也保留。`
+MD
+python3 "$EXPORT" --output "$TN/book.pdf" --work-dir "$TN/work" \
+  "$TN/note.md" >"$TN/export.txt" 2>&1 \
+  || { cat "$TN/export.txt"; echo "错误：译注样例导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$TN/book.pdf" --work-dir "$TN/work" \
+  "$TN/note.md" >"$TN/verify.txt" 2>&1 \
+  || { cat "$TN/verify.txt"; echo "错误：译注样例核验失败"; exit 1; }
+python3 - "$TN/work" "$TN/book.pdf" <<'PY'
+import json, re, sys, unicodedata
+from pathlib import Path
+
+import pypdf
+
+report = json.loads((Path(sys.argv[1]) / "export_report.json").read_text(encoding="utf-8"))
+notes = report["translator_note_exclusions"]
+assert [n["fragment"] for n in notes] == ["【译注：样例译注】",
+                                          "【译注：URL 还原说明】"], notes
+assert all(n["input"].endswith("note.md") and isinstance(n["line"], int) for n in notes), notes
+
+
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+
+
+text = norm("".join(p.extract_text() or "" for p in pypdf.PdfReader(sys.argv[2]).pages))
+for hidden in ("【译注：样例译注】", "【译注：URL还原说明】"):
+    assert norm(hidden) not in text, f"译注不应出现在 PDF：{hidden}"
+for keep in ("正文句一。句二继续。",
+             "参考文献行：Author,A.Title.https://example.com/ref-a。",
+             norm("代码中 【译注：代码内不删】 保留。"),
+             norm("原文引用 【译注：引用内不删】 保留。"),
+             norm("行内 【译注：代码串不删】 也保留。")):
+    assert norm(keep) in text, f"译注旁文或保留区内容缺失：{keep}"
+print("译注清单、PDF 缺席、旁文与代码/引用保留证据齐全")
+PY
+echo "已标识译注：正文移除、参考文献行内只删片段、代码/引用保留 PASS"
+
+echo "==> R2（视图声明）：受输入绑定的授权排除与失败保护"
+VD="$TMP/view_decl"; rm -rf "$VD"; mkdir -p "$VD"
+cat > "$VD/00_目录.md" <<'MD'
+# 目录
+
+- [章 VD](vd.md)
+MD
+cat > "$VD/vd.md" <<'MD'
+# 章 VD
+
+> **来源**：https://example.com/prov-vd
+
+正文段落一。
+
+> 本节为文献引用数据整理说明，非原文内容。
+
+正文段落二。【导览：旧版说明】仍在。
+
+| 列 A | 列 B |
+|---|---|
+| 1 | 2 |
+MD
+python3 - "$VD" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+
+base = Path(sys.argv[1])
+lines = (base / 'vd.md').read_text(encoding='utf-8').split('\n')
+quote_start = next(i for i, l in enumerate(lines, 1) if l.startswith('> 本节'))
+inline_line = next(i for i, l in enumerate(lines, 1) if '【导览' in l)
+inputs = []
+for name in ('00_目录.md', 'vd.md'):
+    inputs.append({'path': str(base / name),
+                   'sha256': hashlib.sha256(
+                       (base / name).read_bytes()).hexdigest()})
+(base / 'decl.json').write_text(json.dumps({
+    'version': 1, 'inputs': inputs,
+    'exclusions': [
+        {'input': str(base / 'vd.md'), 'lines': [quote_start, quote_start],
+         'type': 'block', 'kind': 'translator-guide',
+         'fragment': '本节为文献引用数据整理说明',
+         'reason': '译者添加的导览说明，非原文内容'},
+        {'input': str(base / 'vd.md'), 'lines': [inline_line, inline_line],
+         'type': 'inline', 'kind': 'translator-guide',
+         'fragment': '【导览：旧版说明】',
+         'reason': '译者添加的行内导览片段'},
+    ],
+    'document_title': {'original': '章 VD', 'chinese': 'VD 文档',
+                       'basis': '样例依据'}}, ensure_ascii=False),
+    encoding='utf-8')
+print('声明就绪：block 引用块 + inline 行内片段')
+PY
+python3 "$EXPORT" --output "$VD/book.pdf" --work-dir "$VD/work" \
+  --view-declaration "$VD/decl.json" "$VD/00_目录.md" "$VD/vd.md" \
+  >"$VD/export.txt" 2>&1 \
+  || { cat "$VD/export.txt"; echo "错误：合法视图声明导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$VD/book.pdf" --work-dir "$VD/work" \
+  --view-declaration "$VD/decl.json" "$VD/00_目录.md" "$VD/vd.md" \
+  >"$VD/verify.txt" 2>&1 \
+  || { cat "$VD/verify.txt"; echo "错误：合法视图声明核验失败"; exit 1; }
+python3 - "$VD/work" "$VD/book.pdf" <<'PY'
+import json, re, sys, unicodedata
+from pathlib import Path
+
+import pypdf
+
+report = json.loads((Path(sys.argv[1]) / "export_report.json").read_text(encoding="utf-8"))
+decl = report["view_declaration"]
+assert decl["sha256"] and len(decl["exclusions"]) == 2, decl
+assert decl["document_title"]["chinese"] == "VD 文档", decl
+assert report["translator_note_exclusions"] == [], report["translator_note_exclusions"]
+
+
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+
+
+text = norm("".join(p.extract_text() or "" for p in pypdf.PdfReader(sys.argv[2]).pages))
+for hidden in ("本节为文献引用数据整理说明", "【导览：旧版说明】"):
+    assert norm(hidden) not in text, f"声明排除内容不应出现在 PDF：{hidden}"
+# 带目录单篇按 ticket 04 口径替换首章 H1 可见文字为声明的中文题名；
+# 相邻正文、表格与印刷目录保留。
+for keep in ("正文段落一。", "正文段落二。仍在。", "VD文档", "列A"):
+    assert norm(keep) in text, f"相邻内容缺失：{keep}"
+print("声明记录、PDF 缺席与相邻内容完整证据齐全")
+PY
+# 核验不传入声明 → 参数不一致必须失败
+if python3 "$VERIFY" --pdf "$VD/book.pdf" --work-dir "$VD/work" \
+    "$VD/00_目录.md" "$VD/vd.md" >"$VD/verify_nofdecl.txt" 2>&1; then
+  echo "错误：核验缺声明未被判不一致"; exit 1
+fi
+grep -q "view-declaration-mismatch" "$VD/verify_nofdecl.txt" \
+  || { cat "$VD/verify_nofdecl.txt"; echo "错误：缺声明诊断缺失"; exit 1; }
+# 反例：篡改声明摘要 / 越界区间 / 重叠范围 / fragment 不匹配 / 跨技术正文
+python3 - "$VD" <<'PY'
+import json, sys
+from pathlib import Path
+
+base = Path(sys.argv[1])
+good = json.loads((base / 'decl.json').read_text(encoding='utf-8'))
+
+
+def variant(name, mutate):
+    data = json.loads(json.dumps(good))
+    mutate(data)
+    (base / name).write_text(json.dumps(data, ensure_ascii=False),
+                             encoding='utf-8')
+
+
+variant('decl_baddigest.json',
+        lambda d: d['inputs'][0].__setitem__('sha256', '0' * 64))
+variant('decl_oob.json', lambda d: d['exclusions'][0].__setitem__('lines', [999, 1000]))
+variant('decl_overlap.json', lambda d: d['exclusions'].append({
+    'input': d['exclusions'][0]['input'], 'lines': d['exclusions'][0]['lines'],
+    'type': 'block', 'kind': 'translator-guide', 'fragment': '非原文内容',
+    'reason': '重叠反例'}))
+variant('decl_badfragment.json',
+        lambda d: d['exclusions'][1].__setitem__('fragment', '【导览：不存在】'))
+variant('decl_heading.json', lambda d: d['exclusions'].append({
+    'input': d['exclusions'][0]['input'], 'lines': [1, 1], 'type': 'block',
+    'kind': 'translator-guide', 'fragment': '章 VD', 'reason': '标题反例'}))
+variant('decl_fence.json', lambda d: d['exclusions'].append({
+    'input': d['exclusions'][0]['input'], 'lines': [11, 14], 'type': 'block',
+    'kind': 'translator-guide', 'fragment': '|---|---|', 'reason': '表格反例'}))
+print('声明反例就绪')
+PY
+for bad in decl_baddigest decl_oob decl_overlap decl_badfragment decl_heading decl_fence; do
+  if python3 "$EXPORT" --output "$VD/bad.pdf" --work-dir "$VD/w_$bad" \
+      --view-declaration "$VD/$bad.json" "$VD/00_目录.md" "$VD/vd.md" \
+      >"$VD/$bad.txt" 2>&1; then
+    echo "错误：$bad 未被拒绝"; exit 1
+  fi
+  test ! -f "$VD/w_$bad/candidate.pdf" \
+    || { echo "错误：$bad 仍生成候选"; exit 1; }
+done
+grep -q "摘要与输入不符" "$VD/decl_baddigest.txt" \
+  || { cat "$VD/decl_baddigest.txt"; echo "错误：声明摘要诊断缺失"; exit 1; }
+grep -q "区间越界" "$VD/decl_oob.txt" \
+  || { cat "$VD/decl_oob.txt"; echo "错误：越界诊断缺失"; exit 1; }
+grep -q "范围重叠" "$VD/decl_overlap.txt" \
+  || { cat "$VD/decl_overlap.txt"; echo "错误：重叠诊断缺失"; exit 1; }
+grep -q "fragment 与实际文本不符" "$VD/decl_badfragment.txt" \
+  || { cat "$VD/decl_badfragment.txt"; echo "错误：fragment 诊断缺失"; exit 1; }
+grep -q "技术正文" "$VD/decl_heading.txt" \
+  || { cat "$VD/decl_heading.txt"; echo "错误：标题诊断缺失"; exit 1; }
+grep -q "技术正文" "$VD/decl_fence.txt" \
+  || { cat "$VD/decl_fence.txt"; echo "错误：表格诊断缺失"; exit 1; }
+echo "视图声明：合法通过、缺声明核验不一致、六类反例零生成拒绝 PASS"
+
+echo "==> R3/A4/C5（ticket 04）：中文文档总标题决定、投影与核验"
+DT="$TMP/doc_title"; rm -rf "$DT"; mkdir -p "$DT"
+
+# 正例 1：中英双语 H1 无声明 → 采用括号内中文题名，元数据一致，章节标题不变
+cat > "$DT/bilingual.md" <<'MD'
+# Torch.fx: Practical Program Capture（Torch.fx：实用程序捕获）
+
+> **来源**：https://example.com/prov-dt-bilingual
+
+## 1. Introduction（引言）
+
+正文内容。
+MD
+python3 "$EXPORT" --output "$DT/bilingual.pdf" --work-dir "$DT/w_bi" \
+  "$DT/bilingual.md" >"$DT/bi.txt" 2>&1 \
+  || { cat "$DT/bi.txt"; echo "错误：双语 H1 导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$DT/bilingual.pdf" --work-dir "$DT/w_bi" \
+  "$DT/bilingual.md" >"$DT/bi_v.txt" 2>&1 \
+  || { cat "$DT/bi_v.txt"; echo "错误：双语 H1 核验失败"; exit 1; }
+python3 - "$DT/w_bi" "$DT/bilingual.pdf" <<'PY'
+import json, re, sys, unicodedata
+from pathlib import Path
+
+import pypdf
+
+report = json.loads((Path(sys.argv[1]) / "export_report.json").read_text(encoding="utf-8"))
+title = report["document_title"]
+assert title == {
+    "title": "Torch.fx：实用程序捕获",
+    "original": "Torch.fx: Practical Program Capture（Torch.fx：实用程序捕获）",
+    "basis": "首章 H1 括号内中文题名：Torch.fx: Practical Program Capture"
+             "（Torch.fx：实用程序捕获）",
+    "source": "bilingual-h1",
+}, title
+reader = pypdf.PdfReader(sys.argv[2])
+assert reader.metadata.title == "Torch.fx：实用程序捕获", reader.metadata.title
+
+
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+
+
+text = norm("".join(p.extract_text() or "" for p in reader.pages))
+page1 = norm(reader.pages[0].extract_text() or "")
+assert norm("Torch.fx：实用程序捕获") in page1, "可见总标题不在第 1 页"
+assert "PracticalProgramCapture" not in page1, "英文原题不应作为可见总标题"
+# 章节标题按输入保留（中英双语不变）。
+assert norm("1.Introduction（引言）") in text, "章节标题行为变化"
+print("双语 H1：中文总标题、/Title 一致、章节标题不变 PASS")
+PY
+
+# 反例：纯外文题名无声明 → 拒绝生成（零候选），错误指明缺口
+cat > "$DT/foreign.md" <<'MD'
+# Introduction to CUDA Programming
+
+> **来源**：https://example.com/prov-dt-foreign
+
+正文。
+MD
+if python3 "$EXPORT" --output "$DT/foreign.pdf" --work-dir "$DT/w_fo" \
+    "$DT/foreign.md" >"$DT/fo.txt" 2>&1; then
+  echo "错误：纯外文题名未被拒绝"; exit 1
+fi
+grep -q "仅外文题名" "$DT/fo.txt" \
+  || { cat "$DT/fo.txt"; echo "错误：外文题名诊断缺失"; exit 1; }
+test ! -f "$DT/w_fo/candidate.pdf" \
+  || { echo "错误：纯外文题名仍生成候选"; exit 1; }
+echo "纯外文题名无声明：定位缺口拒绝且零生成 PASS"
+
+# 正例 2：视图声明题名 → 采用并可回查（记录 original/chinese/basis）
+cat > "$DT/declared.md" <<'MD'
+# Introduction to CUDA Programming
+
+> **来源**：https://example.com/prov-dt-declared
+
+正文。
+MD
+python3 - "$DT" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+md = base / "declared.md"
+(base / "decl_title.json").write_text(json.dumps({
+    "version": 1,
+    "inputs": [{"path": str(md.resolve()),
+                "sha256": hashlib.sha256(md.read_bytes()).hexdigest()}],
+    "exclusions": [],
+    "document_title": {"original": "Introduction to CUDA Programming",
+                       "chinese": "CUDA 编程指南全集",
+                       "basis": "Agent 依据有序输入范围与章题拟定（测试）"}},
+    ensure_ascii=False), encoding="utf-8")
+PY
+python3 "$EXPORT" --output "$DT/declared.pdf" --work-dir "$DT/w_de" \
+  --view-declaration "$DT/decl_title.json" "$DT/declared.md" >"$DT/de.txt" 2>&1 \
+  || { cat "$DT/de.txt"; echo "错误：声明题名导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$DT/declared.pdf" --work-dir "$DT/w_de" \
+  --view-declaration "$DT/decl_title.json" "$DT/declared.md" >"$DT/de_v.txt" 2>&1 \
+  || { cat "$DT/de_v.txt"; echo "错误：声明题名核验失败"; exit 1; }
+python3 - "$DT/w_de" "$DT/declared.pdf" <<'PY'
+import json, sys
+from pathlib import Path
+
+import pypdf
+
+report = json.loads((Path(sys.argv[1]) / "export_report.json").read_text(encoding="utf-8"))
+title = report["document_title"]
+assert title["source"] == "declaration" and title["title"] == "CUDA 编程指南全集", title
+assert title["original"] == "Introduction to CUDA Programming", title
+assert title["basis"], title  # 依据可回查
+assert pypdf.PdfReader(sys.argv[2]).metadata.title == "CUDA 编程指南全集"
+print("声明题名：采用且 original/chinese/basis 可回查、/Title 一致 PASS")
+PY
+
+# 合订：无书名（首章外文 H1）拒绝；有声明 → 独立总标题、各章 H1 不变、首章仍首章
+cat > "$DT/00_目录.md" <<'MD'
+# 目录
+
+- [Chapter One](one.md)
+- [Chapter Two](two.md)
+MD
+cat > "$DT/one.md" <<'MD'
+# Chapter One
+
+> **来源**：https://example.com/prov-dt-one
+
+一正文。
+MD
+cat > "$DT/two.md" <<'MD'
+# Chapter Two
+
+> **来源**：https://example.com/prov-dt-two
+
+二正文。
+MD
+if python3 "$EXPORT" --output "$DT/book.pdf" --work-dir "$DT/w_bo" \
+    "$DT/00_目录.md" "$DT/one.md" "$DT/two.md" >"$DT/bo.txt" 2>&1; then
+  echo "错误：无书名合订未被拒绝"; exit 1
+fi
+grep -q "合订缺书名" "$DT/bo.txt" \
+  || { cat "$DT/bo.txt"; echo "错误：合订缺书名诊断缺失"; exit 1; }
+test ! -f "$DT/w_bo/candidate.pdf" \
+  || { echo "错误：无书名合订仍生成候选"; exit 1; }
+python3 - "$DT" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+inputs = [base / "00_目录.md", base / "one.md", base / "two.md"]
+(base / "book_title.json").write_text(json.dumps({
+    "version": 1,
+    "inputs": [{"path": str(p.resolve()),
+                "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+               for p in inputs],
+    "exclusions": [],
+    "document_title": {"original": "Chapters One and Two",
+                       "chinese": "第一、二章合订全集",
+                       "basis": "Agent 依据有序输入范围与章题拟定（测试）"}},
+    ensure_ascii=False), encoding="utf-8")
+PY
+python3 "$EXPORT" --output "$DT/book.pdf" --work-dir "$DT/w_book" \
+  --view-declaration "$DT/book_title.json" \
+  "$DT/00_目录.md" "$DT/one.md" "$DT/two.md" >"$DT/book.txt" 2>&1 \
+  || { cat "$DT/book.txt"; echo "错误：有书名合订导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$DT/book.pdf" --work-dir "$DT/w_book" \
+  --view-declaration "$DT/book_title.json" \
+  "$DT/00_目录.md" "$DT/one.md" "$DT/two.md" >"$DT/book_v.txt" 2>&1 \
+  || { cat "$DT/book_v.txt"; echo "错误：有书名合订核验失败"; exit 1; }
+python3 - "$DT/w_book" "$DT/book.pdf" <<'PY'
+import json, re, sys, unicodedata
+from pathlib import Path
+
+import pypdf
+
+report = json.loads((Path(sys.argv[1]) / "export_report.json").read_text(encoding="utf-8"))
+assert report["document_title"]["title"] == "第一、二章合订全集", report["document_title"]
+reader = pypdf.PdfReader(sys.argv[2])
+assert reader.metadata.title == "第一、二章合订全集", reader.metadata.title
+
+
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+
+
+page1 = norm(reader.pages[0].extract_text() or "")
+assert norm("第一、二章合订全集") in page1, "合订总标题不在第 1 页最前可见区域"
+assert page1.find(norm("第一、二章合订全集")) < page1.find("目录"), \
+    "总标题应先于目录标题"
+text = norm("".join(p.extract_text() or "" for p in reader.pages))
+assert norm("ChapterOne") in text and norm("ChapterTwo") in text, \
+    "各章 H1 应保持不变"
+# 印刷目录条目与各章页序仍正确（首章仍首章）。
+toc = report["toc"]
+assert [e["page"] for e in toc["entries"]] == sorted(
+    e["page"] for e in toc["entries"]), toc["entries"]
+print("合订：声明书名、独立总标题先于目录、各章 H1 不变、目录页码正确 PASS")
+PY
+
+# 反例：篡改 /Title 元数据或可见总标题 → 核验失败
+python3 - "$DT" <<'PY'
+import json, sys
+from pathlib import Path
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import DecodedStreamObject, NameObject
+
+base = Path(sys.argv[1])
+reader = PdfReader(str(base / "bilingual.pdf"))
+writer = PdfWriter(clone_from=reader)
+writer.add_metadata({"/Title": "篡改后的标题"})
+writer.write(str(base / "tampered_meta.pdf"))
+reader = PdfReader(str(base / "bilingual.pdf"))
+writer = PdfWriter(clone_from=reader)
+stream = DecodedStreamObject()
+stream.set_data(b"")
+writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+writer.write(str(base / "tampered_visible.pdf"))
+print("篡改样本就绪")
+PY
+if python3 "$VERIFY" --pdf "$DT/tampered_meta.pdf" --work-dir "$DT/w_bi" \
+    "$DT/bilingual.md" >"$DT/tm.txt" 2>&1; then
+  echo "错误：篡改 /Title 未被检出"; exit 1
+fi
+grep -q "document-title-metadata" "$DT/tm.txt" \
+  || { cat "$DT/tm.txt"; echo "错误：元数据篡改诊断缺失"; exit 1; }
+if python3 "$VERIFY" --pdf "$DT/tampered_visible.pdf" --work-dir "$DT/w_bi" \
+    "$DT/bilingual.md" >"$DT/tv.txt" 2>&1; then
+  echo "错误：可见总标题被清空未被检出"; exit 1
+fi
+grep -q "document-title-missing" "$DT/tv.txt" \
+  || { cat "$DT/tv.txt"; echo "错误：可见标题篡改诊断缺失"; exit 1; }
+echo "篡改 /Title 或可见总标题：独立核验均判 FAIL PASS"
+
+echo "==> 评审修复回归（P1）：目录出处块边界 / inline 唯一出现 / 题名声明校验"
+P1="$TMP/p1_regress"; rm -rf "$P1"; mkdir -p "$P1"
+
+# P1-1 正例：导航列表无空行紧接引用块出处（合法独立块）→ 剔除出处、保留目录
+cat > "$P1/00_目录.md" <<'MD'
+# 目录
+
+- [第 A 章](a.md)
+- [第 B 章](b.md)
+> 译自 Guide：https://example.com/p11/book
+MD
+printf '# 第 A 章\n\n> **来源**：https://example.com/p11-a\n\nA 章正文。\n' > "$P1/a.md"
+printf '# 第 B 章\n\n> **来源**：https://example.com/p11-b\n\nB 章正文。\n' > "$P1/b.md"
+make_book_decl "$P1/decl_book.json" "$P1/00_目录.md" "$P1/a.md" "$P1/b.md"
+python3 "$EXPORT" --output "$P1/book.pdf" --work-dir "$P1/w" \
+  --view-declaration "$P1/decl_book.json" \
+  "$P1/00_目录.md" "$P1/a.md" "$P1/b.md" >"$P1/e.txt" 2>&1 \
+  || { cat "$P1/e.txt"; echo "错误：引用块出处正例导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$P1/book.pdf" --work-dir "$P1/w" \
+  --view-declaration "$P1/decl_book.json" \
+  "$P1/00_目录.md" "$P1/a.md" "$P1/b.md" >"$P1/v.txt" 2>&1 \
+  || { cat "$P1/v.txt"; echo "错误：引用块出处正例核验失败"; exit 1; }
+python3 - "$P1/book.pdf" <<'PY'
+import re, sys, unicodedata
+
+import pypdf
+
+
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+
+
+text = norm("".join(
+    p.extract_text() or "" for p in pypdf.PdfReader(sys.argv[1]).pages))
+assert norm("译自Guide：https://example.com/p11/book") not in text, \
+    "目录出处段未从导出视图剔除"
+assert norm("第A章") in text and norm("第B章") in text, "目录导航条目被误删"
+print("P1-1 正例：独立引用块出处剔除、导航目录保留")
+PY
+
+# P1-1 反例：导航列表无空行紧接直接出处段（懒惰续行共享块）→ 定位失败
+mkdir -p "$P1/badcase"
+cat > "$P1/badcase/00_目录.md" <<'MD'
+# 目录
+
+- [第 A 章](a.md)
+译自 Guide：https://example.com/p11/book
+MD
+if python3 "$EXPORT" --output "$P1/bad.pdf" --work-dir "$P1/w_bad" \
+    "$P1/badcase/00_目录.md" "$P1/a.md" "$P1/b.md" >"$P1/bad.txt" 2>&1; then
+  echo "错误：共享块出处未被拒绝"; exit 1
+fi
+grep -q "未形成独立顶层段落块\|未形成独立段落块\|共享同一块" "$P1/bad.txt" \
+  || { cat "$P1/bad.txt"; echo "错误：共享块诊断缺失"; exit 1; }
+test ! -f "$P1/w_bad/candidate.pdf" \
+  || { echo "错误：共享块出处仍生成候选"; exit 1; }
+echo "P1-1 反例：共享块出处定位失败、零候选 PASS"
+
+# P1-2 反例：inline 片段同行出现两次 → 加载拒绝；正例：唯一出现、同行其余完整
+cat > "$P1/inline.md" <<'MD'
+# 章 行内
+
+> **来源**：https://example.com/p12
+
+说明【导览：重复】与【导览：重复】同行两次。
+
+保留 `keep` 代码与 keep 正文。
+MD
+python3 - "$P1" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+md = base / 'inline.md'
+
+
+def write_decl(name, fragment, lines):
+    base.joinpath(name).write_text(json.dumps({
+        'version': 1,
+        'inputs': [{'path': str(md.resolve()),
+                    'sha256': hashlib.sha256(md.read_bytes()).hexdigest()}],
+        'exclusions': [{'input': str(md.resolve()), 'lines': lines,
+                        'type': 'inline', 'kind': 'translator-guide',
+                        'fragment': fragment, 'reason': '评审回归反例'}],
+        'document_title': {'original': '章 行内', 'chinese': '行内章',
+                           'basis': '评审回归'},
+    }, ensure_ascii=False), encoding='utf-8')
+
+
+write_decl('decl_dup.json', '【导览：重复】', [5, 5])
+print('inline 反例声明就绪')
+PY
+if python3 "$EXPORT" --output "$P1/dup.pdf" --work-dir "$P1/w_dup" \
+    --view-declaration "$P1/decl_dup.json" "$P1/inline.md" \
+    >"$P1/dup.txt" 2>&1; then
+  echo "错误：inline 重复片段未被拒绝"; exit 1
+fi
+grep -q "恰好出现一次" "$P1/dup.txt" \
+  || { cat "$P1/dup.txt"; echo "错误：inline 唯一性诊断缺失"; exit 1; }
+test ! -f "$P1/w_dup/candidate.pdf" \
+  || { echo "错误：inline 重复片段仍生成候选"; exit 1; }
+python3 - "$P1" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+md = base / 'inline.md'
+text = md.read_text(encoding='utf-8')
+md.write_text(text.replace('说明【导览：重复】与【导览：重复】同行两次。',
+                           '说明【导览：旧记】保留 `keep` 代码与 keep 正文。'),
+              encoding='utf-8')
+base.joinpath('decl_ok.json').write_text(json.dumps({
+    'version': 1,
+    'inputs': [{'path': str(md.resolve()),
+                'sha256': hashlib.sha256(md.read_bytes()).hexdigest()}],
+    'exclusions': [{'input': str(md.resolve()), 'lines': [5, 5],
+                    'type': 'inline', 'kind': 'translator-guide',
+                    'fragment': '【导览：旧记】', 'reason': '评审回归正例'}],
+    'document_title': {'original': '章 行内', 'chinese': '行内章',
+                       'basis': '评审回归'},
+}, ensure_ascii=False), encoding='utf-8')
+print('inline 正例声明就绪')
+PY
+python3 "$EXPORT" --output "$P1/inline_ok.pdf" --work-dir "$P1/w_ok" \
+  --view-declaration "$P1/decl_ok.json" "$P1/inline.md" >"$P1/ok_e.txt" 2>&1 \
+  || { cat "$P1/ok_e.txt"; echo "错误：inline 正例导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$P1/inline_ok.pdf" --work-dir "$P1/w_ok" \
+  --view-declaration "$P1/decl_ok.json" "$P1/inline.md" >"$P1/ok_v.txt" 2>&1 \
+  || { cat "$P1/ok_v.txt"; echo "错误：inline 正例核验失败"; exit 1; }
+python3 - "$P1/inline_ok.pdf" <<'PY'
+import re, sys, unicodedata
+
+import pypdf
+
+
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+
+
+text = norm("".join(
+    p.extract_text() or "" for p in pypdf.PdfReader(sys.argv[1]).pages))
+assert norm("【导览：旧记】") not in text, "译注片段未剔除"
+assert norm("保留keep代码与keep正文") in text, "同行代码 span 与正文被连带删除"
+print("P1-2：重复片段拒绝且零候选；唯一片段剔除、同行其余完整 PASS")
+PY
+
+# P1-3 反例：题名声明纯外文 / 空 basis / 空 original / 与首章 H1 不符 → 拒绝
+cat > "$P1/title.md" <<'MD'
+# Title Fixture
+
+> **来源**：https://example.com/p13
+
+正文。
+MD
+python3 - "$P1" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+md = base / 'title.md'
+digest = hashlib.sha256(md.read_bytes()).hexdigest()
+
+
+def write(name, title):
+    base.joinpath(name).write_text(json.dumps({
+        'version': 1,
+        'inputs': [{'path': str(md.resolve()), 'sha256': digest}],
+        'exclusions': [],
+        'document_title': title,
+    }, ensure_ascii=False), encoding='utf-8')
+
+
+write('decl_foreign.json',
+      {'original': 'Title Fixture', 'chinese': 'English Book',
+       'basis': '评审回归'})
+write('decl_nobasis.json',
+      {'original': 'Title Fixture', 'chinese': '题名样例', 'basis': ''})
+write('decl_nooriginal.json',
+      {'original': '', 'chinese': '题名样例', 'basis': '评审回归'})
+write('decl_mismatch.json',
+      {'original': 'Another Title', 'chinese': '题名样例', 'basis': '评审回归'})
+write('decl_good.json',
+      {'original': 'Title Fixture', 'chinese': '题名样例', 'basis': '评审回归'})
+print('题名声明反例就绪')
+PY
+for bad in decl_foreign decl_nobasis decl_nooriginal decl_mismatch; do
+  if python3 "$EXPORT" --output "$P1/$bad.pdf" --work-dir "$P1/w_$bad" \
+      --view-declaration "$P1/$bad.json" "$P1/title.md" \
+      >"$P1/$bad.txt" 2>&1; then
+    echo "错误：$bad 未被拒绝"; exit 1
+  fi
+  test ! -f "$P1/w_$bad/candidate.pdf" \
+    || { echo "错误：$bad 仍生成候选"; exit 1; }
+done
+grep -q "须为含中文" "$P1/decl_foreign.txt" \
+  || { cat "$P1/decl_foreign.txt"; echo "错误：纯外文题名诊断缺失"; exit 1; }
+grep -q "basis 必填" "$P1/decl_nobasis.txt" \
+  || { cat "$P1/decl_nobasis.txt"; echo "错误：空 basis 诊断缺失"; exit 1; }
+grep -q "original 必填" "$P1/decl_nooriginal.txt" \
+  || { cat "$P1/decl_nooriginal.txt"; echo "错误：空 original 诊断缺失"; exit 1; }
+grep -q "与首章实际题名不符" "$P1/decl_mismatch.txt" \
+  || { cat "$P1/decl_mismatch.txt"; echo "错误：original 不符诊断缺失"; exit 1; }
+python3 "$EXPORT" --output "$P1/title_ok.pdf" --work-dir "$P1/w_good" \
+  --view-declaration "$P1/decl_good.json" "$P1/title.md" >"$P1/good.txt" 2>&1 \
+  || { cat "$P1/good.txt"; echo "错误：合法题名声明导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$P1/title_ok.pdf" --work-dir "$P1/w_good" \
+  --view-declaration "$P1/decl_good.json" "$P1/title.md" >"$P1/good_v.txt" 2>&1 \
+  || { cat "$P1/good_v.txt"; echo "错误：合法题名声明核验失败"; exit 1; }
+echo "P1-3：纯外文/空 basis/空 original/原题不符均拒绝且零候选，合法声明通过 PASS"
+
+echo "==> 评审修复回归二（P1）：出处结构谓词 / 题名取首章第一个 H1"
+P2R="$TMP/p1_round2"; rm -rf "$P2R"; mkdir -p "$P2R"
+
+# P1-1 反例：引用块内“译自”与导航列表同块（两种顺序）→ 拒绝且零候选
+printf '# 第 A 章\n\n> **来源**：https://example.com/r2-a\n\nA 正文。\n' > "$P2R/a.md"
+for order in listfirst provfirst; do
+  mkdir -p "$P2R/$order"
+  if [ "$order" = listfirst ]; then
+    cat > "$P2R/$order/00_目录.md" <<'MD'
+# 目录
+
+> - [第 A 章](a.md)
+> 译自 Guide：https://example.com/r2/book
+MD
+  else
+    cat > "$P2R/$order/00_目录.md" <<'MD'
+# 目录
+
+> 译自 Guide：https://example.com/r2/book
+> - [第 A 章](a.md)
+MD
+  fi
+  if python3 "$EXPORT" --output "$P2R/$order.pdf" --work-dir "$P2R/w_$order" \
+      "$P2R/$order/00_目录.md" "$P2R/a.md" >"$P2R/$order.txt" 2>&1; then
+    echo "错误：引用块共享块（$order）未被拒绝"; exit 1
+  fi
+  grep -q "共享同一块" "$P2R/$order.txt" \
+    || { cat "$P2R/$order.txt"; echo "错误：共享块（$order）诊断缺失"; exit 1; }
+  test ! -f "$P2R/w_$order/candidate.pdf" \
+    || { echo "错误：共享块（$order）仍生成候选"; exit 1; }
+done
+echo "P1-1 反例：引用块内出处+导航两种顺序均定位拒绝、零候选 PASS"
+
+# P1-1 正例：顶层引用块仅含出处段 → 剔除出处、目录保留（上一轮 P1-1 正例同口径，复验）
+# （用例见“评审修复回归（P1）”节，此处不重复导出。）
+
+# P1-2 正例：H2 在前、H1 在后 → PDF Title 取 H1 中文题名，H2 不受影响
+cat > "$P2R/h1_back.md" <<'MD'
+> **来源**：https://example.com/r2-h1
+
+## 前言
+
+前言正文。
+
+# 真正总标题（真书题）
+
+正文内容。
+MD
+python3 "$EXPORT" --output "$P2R/h1_back.pdf" --work-dir "$P2R/w_h1" \
+  "$P2R/h1_back.md" >"$P2R/h1_e.txt" 2>&1 \
+  || { cat "$P2R/h1_e.txt"; echo "错误：H2 在前正例导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$P2R/h1_back.pdf" --work-dir "$P2R/w_h1" \
+  "$P2R/h1_back.md" >"$P2R/h1_v.txt" 2>&1 \
+  || { cat "$P2R/h1_v.txt"; echo "错误：H2 在前正例核验失败"; exit 1; }
+python3 - "$P2R/w_h1" "$P2R/h1_back.pdf" <<'PY'
+import json, sys
+from pathlib import Path
+
+import pypdf
+
+report = json.loads((Path(sys.argv[1]) / "export_report.json").read_text(encoding="utf-8"))
+assert report["document_title"]["title"] == "真正总标题（真书题）", report["document_title"]
+reader = pypdf.PdfReader(sys.argv[2])
+assert reader.metadata.title == "真正总标题（真书题）", reader.metadata.title
+text = "".join(page.extract_text() or "" for page in reader.pages)
+assert "前言正文" in text and "真正总标题（真书题）" in text, text[:80]
+print("P1-2 正例：题名取首章第一个 H1，H2 前言不受影响")
+PY
+
+# P1-2 反例：首章无 H1 → 拒绝且零候选
+cat > "$P2R/no_h1.md" <<'MD'
+> **来源**：https://example.com/r2-noh1
+
+## 只有小节
+
+正文。
+MD
+if python3 "$EXPORT" --output "$P2R/no_h1.pdf" --work-dir "$P2R/w_noh1" \
+    "$P2R/no_h1.md" >"$P2R/noh1.txt" 2>&1; then
+  echo "错误：无 H1 首章未被拒绝"; exit 1
+fi
+grep -q "缺少 H1 标题" "$P2R/noh1.txt" \
+  || { cat "$P2R/noh1.txt"; echo "错误：无 H1 诊断缺失"; exit 1; }
+test ! -f "$P2R/w_noh1/candidate.pdf" \
+  || { echo "错误：无 H1 仍生成候选"; exit 1; }
+echo "P1-2 反例：首章无 H1 定位失败、零候选 PASS"
+
+# 第三轮（P1-1 单行谓词）：引用块单段两行 / 顶层段落两行同段 → 拒绝且零候选
+for variant in quote plain; do
+  mkdir -p "$P2R/r3_$variant"
+  printf '# 第 A 章\n\n> **来源**：https://example.com/r3-%s\n\nA 正文。\n' "$variant" \
+    > "$P2R/r3_$variant/a.md"
+  if [ "$variant" = quote ]; then
+    cat > "$P2R/r3_$variant/00_目录.md" <<'MD'
+# 目录
+
+- [第 A 章](a.md)
+
+> 译自 [原文](https://example.com/x)
+> [附加导览](a.md)
+MD
+  else
+    cat > "$P2R/r3_$variant/00_目录.md" <<'MD'
+# 目录
+
+- [第 A 章](a.md)
+
+译自 https://example.com/x
+[附加导览](a.md)
+MD
+  fi
+  if python3 "$EXPORT" --output "$P2R/r3_$variant.pdf" \
+      --work-dir "$P2R/w_r3_$variant" \
+      "$P2R/r3_$variant/00_目录.md" "$P2R/r3_$variant/a.md" \
+      >"$P2R/r3_$variant.txt" 2>&1; then
+    echo "错误：多行出处段（$variant）未被拒绝"; exit 1
+  fi
+  grep -q "跨多行（L[0-9]*-L[0-9]*）" "$P2R/r3_$variant.txt" \
+    || { cat "$P2R/r3_$variant.txt"; echo "错误：多行出处（$variant）诊断缺失"; exit 1; }
+  test ! -f "$P2R/w_r3_$variant/candidate.pdf" \
+    || { echo "错误：多行出处（$variant）仍生成候选"; exit 1; }
+done
+echo "第三轮：多行出处段（引用块/顶层段落）定位拒绝且零候选，单行正例仍通过 PASS"
+
+# 第四轮（P1-1 整行出处模板）：同行混合内容 / 双链接 / 括号散文 → 拒绝；
+# 书目尾巴正例（日期括号、拉丁会议词）→ 通过且出处剔除
+python3 - "$P2R" <<'PY'
+import json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+
+
+def write_case(tag, toc_body):
+    case = base / ('r4_' + tag)
+    case.mkdir(exist_ok=True)
+    (case / 'a.md').write_text(
+        '# 第 A 章\n\n> **来源**：https://example.com/r4-%s\n\nA 正文。\n' % tag,
+        encoding='utf-8')
+    (case / '00_目录.md').write_text(toc_body, encoding='utf-8')
+    return case
+
+
+CASES = {
+    # 反例：同行混合（引用块与顶层段落两变体）
+    'quote_mix': '# 目录\n\n- [第 A 章](a.md)\n\n'
+                 '> 译自 [原文](https://example.com/x)；[附加导览](a.md)\n',
+    'plain_mix': '# 目录\n\n- [第 A 章](a.md)\n\n'
+                 '译自 [原文](https://example.com/x)；[附加导览](a.md)\n',
+    # 反例：双来源链接 / 括号散文尾巴
+    'two_links': '# 目录\n\n- [第 A 章](a.md)\n\n'
+                 '译自 [A](https://example.com/u1) 与 [B](https://example.com/u2)\n',
+    'prose_paren': '# 目录\n\n- [第 A 章](a.md)\n\n'
+                   '译自 [原文](https://example.com/u)（另见导览）\n',
+    # 正例：书目尾巴（日期括号、拉丁会议词、版本号）
+    'bib_date': '# 目录\n\n- [第 A 章](a.md)\n\n'
+                '译自 [Guide](https://example.com/book.html)（2026-09-01）\n',
+    'bib_conf': '# 目录\n\n- [第 A 章](a.md)\n\n'
+                '译自 [Paper](https://example.com/p)（MLsys 2022）\n',
+    'bib_ver': '# 目录\n\n- [第 A 章](a.md)\n\n'
+               '译自 NVIDIA CUDA Guide v13.4：https://example.com/g\n',
+}
+for tag, body in CASES.items():
+    write_case(tag, body)
+print('第四轮用例就绪')
+PY
+for tag in quote_mix plain_mix two_links prose_paren; do
+  if python3 "$EXPORT" --output "$P2R/r4_$tag.pdf" \
+      --work-dir "$P2R/w_r4_$tag" \
+      "$P2R/r4_$tag/00_目录.md" "$P2R/r4_$tag/a.md" \
+      >"$P2R/r4_$tag.txt" 2>&1; then
+    echo "错误：第四轮反例（$tag）未被拒绝"; exit 1
+  fi
+  grep -q "无法确认整行仅为出处" "$P2R/r4_$tag.txt" \
+    || { cat "$P2R/r4_$tag.txt"; echo "错误：第四轮反例（$tag）诊断缺失"; exit 1; }
+  grep -q "L[0-9]*" "$P2R/r4_$tag.txt" \
+    || { echo "错误：第四轮反例（$tag）缺行号定位"; exit 1; }
+  test ! -f "$P2R/w_r4_$tag/candidate.pdf" \
+    || { echo "错误：第四轮反例（$tag）仍生成候选"; exit 1; }
+done
+echo "第四轮反例：同行混合/双链接/括号散文均定位拒绝且零候选 PASS"
+for tag in bib_date bib_conf bib_ver; do
+  python3 "$EXPORT" --output "$P2R/r4_$tag.pdf" \
+    --work-dir "$P2R/w_r4_$tag" \
+    "$P2R/r4_$tag/00_目录.md" "$P2R/r4_$tag/a.md" \
+    >"$P2R/r4_$tag.txt" 2>&1 \
+    || { cat "$P2R/r4_$tag.txt"; echo "错误：第四轮正例（$tag）导出失败"; exit 1; }
+  python3 "$VERIFY" --pdf "$P2R/r4_$tag.pdf" \
+    --work-dir "$P2R/w_r4_$tag" \
+    "$P2R/r4_$tag/00_目录.md" "$P2R/r4_$tag/a.md" \
+    >"$P2R/r4_$tag.v.txt" 2>&1 \
+    || { cat "$P2R/r4_$tag.v.txt"; echo "错误：第四轮正例（$tag）核验失败"; exit 1; }
+done
+python3 - "$P2R" <<'PY'
+import re, sys, unicodedata
+from pathlib import Path
+import pypdf
+
+base = Path(sys.argv[1])
+
+
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+
+
+for tag, hidden in (('bib_date', 'example.com/book.html'),
+                    ('bib_conf', 'example.com/p'),
+                    ('bib_ver', 'example.com/g')):
+    text = norm("".join(
+        p.extract_text() or "" for p in pypdf.PdfReader(
+            str(base / ('r4_%s.pdf' % tag))).pages))
+    assert norm(hidden) not in text, "%s 出处未剔除" % tag
+    assert norm("第A章") in text, "%s 目录条目被误删" % tag
+print("第四轮正例：书目尾巴（日期/会议词/版本号）出处剔除、目录保留")
+PY
+echo "第四轮正例：书目尾巴各形态导出+核验通过 PASS"
+
+echo "==> R1/R4（ticket 05/06）：正文两端对齐与逐页页脚页码"
+FT="$TMP/footer_layout"; rm -rf "$FT"; mkdir -p "$FT"
+python3 - "$FT" <<'PY'
+import sys
+from pathlib import Path
+base = Path(sys.argv[1])
+paras = []
+for i in range(1, 41):
+    paras.append(
+        '对齐段 %02d：这是一段用于两端对齐验收的正文，包含中文标点、'
+        '行内 `code_snippet_%d` 与长链接 https://example.com/align/%d/'
+        'index.html，用于检验右缘对齐、长词折行与末行自然结束。'
+        % (i, i, i))
+(base / 'single.md').write_text(
+    '# 对齐样例（Justify）\n\n'
+    '> **来源**：https://example.com/prov-ft-single\n\n' + '\n\n'.join(paras)
+    + '\n\n| 列 A | 列 B |\n|---|---|\n| 短 | 文本 |\n\n'
+    '脚注引用[^1]。\n\n[^1]: 脚注说明文字保留左对齐与小字号。\n',
+    encoding='utf-8')
+(base / '00_目录.md').write_text(
+    '# 目录\n\n- [带目录样例](with_toc.md)\n', encoding='utf-8')
+(base / 'with_toc.md').write_text(
+    '# 带目录样例（Toc）\n\n> **来源**：https://example.com/prov-ft-toc\n\n'
+    + '\n\n'.join('目录后正文段落 %d。' % i for i in range(1, 40)) + '\n',
+    encoding='utf-8')
+(base / 'b_one.md').write_text(
+    '# 合订甲章\n\n> **来源**：https://example.com/prov-ft-one\n\n'
+    + '\n\n'.join('甲章正文段落 %d。' % i for i in range(1, 30)) + '\n',
+    encoding='utf-8')
+(base / 'b_two.md').write_text(
+    '# 合订乙章\n\n> **来源**：https://example.com/prov-ft-two\n\n乙章正文。\n',
+    encoding='utf-8')
+PY
+make_book_decl "$FT/book_decl.json" "$FT/b_one.md" "$FT/b_two.md"
+
+# 单篇：正文两端对齐抽样 + 逐页页脚
+python3 "$EXPORT" --output "$FT/single.pdf" --work-dir "$FT/w_single" \
+  "$FT/single.md" >"$FT/single_e.txt" 2>&1 \
+  || { cat "$FT/single_e.txt"; echo "错误：对齐样例导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$FT/single.pdf" --work-dir "$FT/w_single" \
+  "$FT/single.md" >"$FT/single_v.txt" 2>&1 \
+  || { cat "$FT/single_v.txt"; echo "错误：对齐样例核验失败"; exit 1; }
+python3 - "$FT/single.pdf" <<'PY'
+import re, sys
+import pymupdf
+
+# 使用项目已有的 PDF 渲染依赖直接量测成品，独立于 verify_pdf 的事实与常量。
+pdf = pymupdf.open(sys.argv[1]); total = len(pdf)
+assert total >= 2, total
+page_rows = []
+for page_no, page in enumerate(pdf, start=1):
+    spans = [span for block in page.get_text('dict')['blocks']
+             for line in block.get('lines', []) for span in line['spans']
+             if span['text'].strip()]
+    rows = []
+    for span in sorted(spans, key=lambda s: (s['origin'][1], s['bbox'][0])):
+        if not rows or abs(rows[-1]['baseline'] - span['origin'][1]) > 3:
+            rows.append(dict(baseline=span['origin'][1], spans=[]))
+        rows[-1]['spans'].append(span)
+    for row in rows:
+        row['spans'].sort(key=lambda s: s['bbox'][0])
+        row.update(text=''.join(s['text'] for s in row['spans']),
+                   left=min(s['bbox'][0] for s in row['spans']),
+                   right=max(s['bbox'][2] for s in row['spans']))
+    page_rows.append(rows)
+    footer = [row for row in rows if re.fullmatch(r'\d+\s*/\s*\d+', row['text'])]
+    assert len(footer) == 1, (page_no, footer)
+    row = footer[0]
+    assert re.fullmatch(r'%d\s*/\s*%d' % (page_no, total), row['text']), (page_no, row)
+    # 18mm 底边距，中心偏差不超过 20pt；保持原验收的 7–10pt 字号范围。
+    band_top = page.rect.y1 - 18 * 72 / 25.4
+    assert row['baseline'] > band_top, (page_no, row)
+    assert abs((row['left'] + row['right']) / 2 - (page.rect.x0 + page.rect.x1) / 2) <= 20, (page_no, row)
+    assert all(7 <= s['size'] <= 10 for s in row['spans']), (page_no, row)
+    assert [r for r in rows if r['baseline'] > band_top] == [row], (page_no, rows)
+# 普通正文的完整行共享右缘；段末行自然结束。
+body = [row for row in page_rows[0] if '用于两端对齐验收的正文' in re.sub(r'\s+', '', row['text'])]
+edges = [round(row['right'], 1) for row in body]
+assert len(edges) >= 8, edges
+assert max(edges) - min(edges) <= 1.5, edges
+modal = max(set(edges), key=edges.count)
+last = [row for row in page_rows[0] if '末行自然结束' in re.sub(r'\s+', '', row['text'])]
+assert last and all(row['right'] < modal - 5 for row in last), (last, modal)
+print('单篇：逐页页脚 1/%d..%d/%d（带内/居中/字号可读/无遮挡），正文右缘对齐 %d 行（散布 ≤1.5pt）、末行自然'
+      % (total, total, total, len(edges)))
+PY
+
+# 带目录单篇与合订：首页、目录页、章首页都含页脚；目录页码与页脚同序
+python3 "$EXPORT" --output "$FT/with_toc.pdf" --work-dir "$FT/w_toc" \
+  "$FT/00_目录.md" "$FT/with_toc.md" >"$FT/toc_e.txt" 2>&1 \
+  || { cat "$FT/toc_e.txt"; echo "错误：带目录样例导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$FT/with_toc.pdf" --work-dir "$FT/w_toc" \
+  "$FT/00_目录.md" "$FT/with_toc.md" >"$FT/toc_v.txt" 2>&1 \
+  || { cat "$FT/toc_v.txt"; echo "错误：带目录样例核验失败"; exit 1; }
+python3 "$EXPORT" --output "$FT/book.pdf" --work-dir "$FT/w_book" \
+  --view-declaration "$FT/book_decl.json" \
+  "$FT/b_one.md" "$FT/b_two.md" >"$FT/book_e.txt" 2>&1 \
+  || { cat "$FT/book_e.txt"; echo "错误：合订样例导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$FT/book.pdf" --work-dir "$FT/w_book" \
+  --view-declaration "$FT/book_decl.json" \
+  "$FT/b_one.md" "$FT/b_two.md" >"$FT/book_v.txt" 2>&1 \
+  || { cat "$FT/book_v.txt"; echo "错误：合订样例核验失败"; exit 1; }
+python3 - "$FT/w_toc" "$FT/with_toc.pdf" "$FT/w_book" "$FT/book.pdf" <<'PY'
+import json, re, sys
+from pathlib import Path
+
+import pypdf
+
+
+def check(pdf_path):
+    reader = pypdf.PdfReader(pdf_path)
+    total = len(reader.pages)
+    for page_no, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        assert re.search(r"(?m)^%d\s*/\s*%d\s*$" % (page_no, total), text), \
+            "%s 第 %d 页缺少页脚 %d / %d" % (pdf_path, page_no, page_no, total)
+    return total
+
+
+total_toc = check(sys.argv[2])
+total_book = check(sys.argv[4])
+toc = json.loads((Path(sys.argv[1]) / "export_report.json").read_text(encoding="utf-8"))["toc"]
+assert toc["entries"] and all(e["page"] for e in toc["entries"]), toc["entries"]
+print("带目录单篇 %d 页（目录页/正文页逐页页脚）与合订 %d 页（跨章首页页脚）"
+      "正确；印刷目录页码与页脚同页序" % (total_toc, total_book))
+PY
+
+# 反例：缺页（清空中间页内容 → 该页页脚缺失）与错总数（重复一页 → 页码错乱）
+python3 - "$FT" <<'PY'
+import json, sys
+from pathlib import Path
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import DecodedStreamObject, NameObject
+
+base = Path(sys.argv[1])
+reader = PdfReader(str(base / "with_toc.pdf"))
+writer = PdfWriter(clone_from=reader)
+stream = DecodedStreamObject()
+stream.set_data(b"")
+writer.pages[1][NameObject("/Contents")] = writer._add_object(stream)
+writer.write(str(base / "no_footer.pdf"))
+reader = PdfReader(str(base / "with_toc.pdf"))
+writer = PdfWriter()
+seen = reader.pages[1]
+for page in (reader.pages[0], seen, seen, reader.pages[-1]):
+    writer.add_page(page)
+writer.write(str(base / "dup_footer.pdf"))
+print("页脚反例样本就绪")
+PY
+python3 - "$FT/w_toc" "$FT/no_footer.pdf" "$FT/with_toc.pdf" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1]) / "export_report.json"
+report = json.loads(path.read_text(encoding="utf-8"))
+report["pdf_sha256"] = __import__("hashlib").sha256(
+    Path(sys.argv[2]).read_bytes()).hexdigest()
+path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+PY
+if python3 "$VERIFY" --pdf "$FT/no_footer.pdf" --work-dir "$FT/w_toc" \
+    "$FT/00_目录.md" "$FT/with_toc.md" >"$FT/nf_v.txt" 2>&1; then
+  echo "错误：缺页脚页未被拒绝"; exit 1
+fi
+python3 - "$FT/w_toc" footer-missing <<'PY'
+import json, sys
+from pathlib import Path
+codes = {f["code"] for f in json.loads(
+    (Path(sys.argv[1]) / "verify_report.json").read_text())["failures"]}
+assert sys.argv[2] in codes, codes
+PY
+python3 - "$FT/w_toc" "$FT/dup_footer.pdf" "$FT/with_toc.pdf" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1]) / "export_report.json"
+report = json.loads(path.read_text(encoding="utf-8"))
+report["pdf_sha256"] = __import__("hashlib").sha256(
+    Path(sys.argv[2]).read_bytes()).hexdigest()
+path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+PY
+if python3 "$VERIFY" --pdf "$FT/dup_footer.pdf" --work-dir "$FT/w_toc" \
+    "$FT/00_目录.md" "$FT/with_toc.md" >"$FT/df_v.txt" 2>&1; then
+  echo "错误：错总页数未被拒绝"; exit 1
+fi
+python3 - "$FT/w_toc" footer-number <<'PY'
+import json, sys
+from pathlib import Path
+codes = {f["code"] for f in json.loads(
+    (Path(sys.argv[1]) / "verify_report.json").read_text())["failures"]}
+assert sys.argv[2] in codes, codes
+PY
+# 恢复证据供后续不重跑本节时保持原状
+python3 - "$FT/w_toc" "$FT/with_toc.pdf" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+path = Path(sys.argv[1]) / "export_report.json"
+report = json.loads(path.read_text(encoding="utf-8"))
+report["pdf_sha256"] = hashlib.sha256(Path(sys.argv[2]).read_bytes()).hexdigest()
+path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+PY
+echo "两端对齐与逐页页脚：单篇/带目录/合订正例、缺页脚与错总数反例均判 FAIL PASS"
 
 echo "==> R8（留痕 05）：A20/A21/A22 短块整块、长块续排、交错可验"
 CP="$TMP/code_pagination"; rm -rf "$CP"; mkdir -p "$CP"
@@ -2488,10 +3737,13 @@ block_with_blanks = "x = 1\n\n\nx += 2\n"
     "长块尾随表格，制造跨页提取交错场景。\n",
     encoding="utf-8")
 PY
+make_book_decl "$CP/decl.json" "$CP/a.md" "$CP/b.md"
 python3 "$EXPORT" --output "$CP/book.pdf" --work-dir "$CP/work" \
+  --view-declaration "$CP/decl.json" \
   "$CP/a.md" "$CP/b.md" >"$CP/export.txt" 2>&1 \
   || { cat "$CP/export.txt"; echo "错误：代码分页样例导出失败"; exit 1; }
 python3 "$VERIFY" --pdf "$CP/book.pdf" --work-dir "$CP/work" \
+  --view-declaration "$CP/decl.json" \
   "$CP/a.md" "$CP/b.md" >"$CP/verify.txt" 2>&1 \
   || { cat "$CP/verify.txt"; echo "错误：代码分页样例核验失败"; exit 1; }
 python3 - "$CP/work" "$CP/book.pdf" <<'PY'
@@ -2593,6 +3845,7 @@ report["pdf_sha256"] = hashlib.sha256(out.read_bytes()).hexdigest()
 print("已把代码行中的数字 1 字形改为 7，并重签摘要")
 PY
 if python3 "$VERIFY" --pdf "$CP/tampered.pdf" --work-dir "$CP/work" \
+    --view-declaration "$CP/decl.json" \
     "$CP/a.md" "$CP/b.md" >"$CP/tamper_v.txt" 2>&1; then
   echo "错误：代码内容篡改未被检出"; exit 1
 fi
@@ -2621,7 +3874,7 @@ grep -q "provenance-incomplete" "$PV2/neg.txt" \
   || { cat "$PV2/neg.txt"; echo "错误：不相关来源诊断缺失"; exit 1; }
 echo "不相关目录出处无法替章节通过门禁 PASS"
 
-# 已知日期不在目录出处中 → 前置区必须保留该日期（不得去重丢失）
+# 已知日期不在目录出处中 → 报告出处组合必须保留该日期（不得去重丢失）
 python3 - "$PV2" <<'PY'
 from pathlib import Path
 base = Path(__import__('sys').argv[1])
@@ -2639,9 +3892,11 @@ from pathlib import Path
 base = Path(sys.argv[1])
 report = json.loads((base / 'w_date' / 'export_report.json').read_text(encoding='utf-8'))
 assert report['provenance']['front_generated'] is True, report['provenance']
+assert any('2026-09-12' in (c.get('fetch_date') or '')
+           for c in report['provenance']['combos']), report['provenance']
 text = ''.join(p.extract_text() or '' for p in pypdf.PdfReader(str(base / 'date.pdf')).pages)
-assert '2026-09-12' in text, '已知抓取日期在前置去重中丢失'
-print('目录出处覆盖时已知日期仍在前置区保留 PASS')
+assert '2026-09-12' not in text, '前置出处不应出现在 PDF（证据留在报告）'
+print('目录出处覆盖时已知日期保留在报告证据且 PDF 不显示 PASS')
 PY
 
 # 字段续行中的版本/日期随出处一并保留：投影删除的每段就是收集的同段
@@ -2661,13 +3916,1320 @@ python3 "$VERIFY" --pdf "$PV2/cont.pdf" --work-dir "$PV2/w_cont" \
   "$PV2/cont.md" >"$PV2/cont_v.txt" 2>&1 \
   || { cat "$PV2/cont_v.txt"; echo "错误：续行来源核验失败"; exit 1; }
 python3 - "$PV2" <<'PY'
-import sys
+import json, sys
 import pypdf
 from pathlib import Path
 base = Path(sys.argv[1])
+report = json.loads((base / 'w_cont' / 'export_report.json').read_text(encoding='utf-8'))
+combos = report['provenance']['combos']
+assert any('版本 v1.9' in (c.get('source') or '') and
+           '2026-09-20' in (c.get('source') or '') for c in combos), combos
 text = ''.join(p.extract_text() or '' for p in
                pypdf.PdfReader(str(base / 'cont.pdf')).pages)
-assert '版本 v1.9' in text and '2026-09-20' in text, '续行中的版本/日期丢失'
-assert text.count('2026-09-20') == 1, '续行日期在成品中重复'
-print('字段续行中的版本/日期随前置保留且只出现一次 PASS')
+assert '版本 v1.9' not in text and '2026-09-20' not in text, \
+    '前置出处不应出现在 PDF（证据留在报告）'
+print('字段续行中的版本/日期保留在报告证据且 PDF 不显示 PASS')
 PY
+
+echo "==> T01（pdf-layout-optimization ticket 01）：显式目录出处声明可用"
+T1="$TMP/t1_decl"; rm -rf "$T1"; mkdir -p "$T1"
+printf '# 第 A 章\n\n> **来源**：https://example.com/t1-decl/a\n\nA 正文。\n' \
+  > "$T1/a.md"
+
+# T01-1 正例（顶层段落同行混合）：有效 inline 声明 → 导出+核验成功；
+# PDF 只隐藏获准出处片段，导览文字与可跳转章节目标保留
+cat > "$T1/00_目录.md" <<'MD'
+# 目录
+
+译自 [原文](https://example.com/t1-decl/x)；[附加导览](a.md)
+
+- [第 A 章](a.md)
+MD
+python3 - "$T1" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+toc = (base / '00_目录.md').resolve()
+a = (base / 'a.md').resolve()
+decl = {
+    "version": 1,
+    "inputs": [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+               for p in (toc, a)],
+    "exclusions": [{
+        "input": str(toc), "lines": [3, 3], "type": "inline",
+        "kind": "toc-provenance",
+        "fragment": "译自 [原文](https://example.com/t1-decl/x)；",
+        "reason": "目录出处与附加导览同行：仅排除出处片段，导览保留",
+    }],
+}
+(base / 'decl_inline.json').write_text(
+    json.dumps(decl, ensure_ascii=False), encoding='utf-8')
+PY
+sha256sum "$T1/00_目录.md" "$T1/a.md" | awk '{print $1}' > "$T1/inputs.sha"
+python3 "$EXPORT" --output "$T1/mix.pdf" --work-dir "$T1/w_mix" \
+  --view-declaration "$T1/decl_inline.json" \
+  "$T1/00_目录.md" "$T1/a.md" >"$T1/mix_e.txt" 2>&1 \
+  || { cat "$T1/mix_e.txt"; echo "错误：T01-1 有效 inline 声明导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$T1/mix.pdf" --work-dir "$T1/w_mix" \
+  --view-declaration "$T1/decl_inline.json" \
+  "$T1/00_目录.md" "$T1/a.md" >"$T1/mix_v.txt" 2>&1 \
+  || { cat "$T1/mix_v.txt"; echo "错误：T01-1 有效 inline 声明核验失败"; exit 1; }
+sha256sum "$T1/00_目录.md" "$T1/a.md" | awk '{print $1}' > "$T1/inputs.after.sha"
+cmp -s "$T1/inputs.sha" "$T1/inputs.after.sha" \
+  || { echo "错误：T01-1 输入 Markdown 摘要发生变化"; exit 1; }
+python3 - "$T1" <<'PY'
+import json, re, sys, unicodedata
+from pathlib import Path
+
+import pypdf
+
+base = Path(sys.argv[1])
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+reader = pypdf.PdfReader(str(base / 'mix.pdf'))
+pages = [page.extract_text() or "" for page in reader.pages]
+norm_text = norm("".join(pages))
+named = {str(n).lstrip("/"): reader.get_destination_page_number(d)
+         for n, d in reader.named_destinations.items()}
+id_to_index = {page.indirect_reference.idnum: i
+               for i, page in enumerate(reader.pages)
+               if page.indirect_reference is not None}
+internal_annots = []
+for i, page in enumerate(reader.pages):
+    for ref in page.get("/Annots") or []:
+        obj = ref.get_object()
+        if obj.get("/Subtype") != "/Link":
+            continue
+        dest = obj.get("/Dest")
+        if dest is None:
+            action = obj.get("/A")
+            if action is not None and action.get_object().get("/S") == "/GoTo":
+                dest = action.get_object().get("/D")
+        if dest is None:
+            continue
+        dest = dest.get_object() if hasattr(dest, "get_object") else dest
+        if isinstance(dest, bytes):
+            dest = dest.decode("utf-8", "replace")
+        if isinstance(dest, str):
+            target = named.get(dest.lstrip("/"))
+        else:
+            try:
+                target = id_to_index.get(getattr(dest[0], "idnum", None))
+            except (TypeError, IndexError):
+                target = None
+        if target is not None:
+            internal_annots.append({"page": i, "dest_page": target})
+# 获准出处片段不可见；导览文字保留
+assert '译自' not in norm_text, "出处片段仍出现在 PDF"
+assert norm('附加导览') in norm_text, "导览文字被误删"
+# 导览链接仍可跳转到第 A 章所在页：目录页上至少两个指向章首页的注解
+# （印刷目录条目 + 附加导览）
+chapter_page = next(
+    i for i, text in enumerate(pages)
+    if 'A 正文' in text)
+nav_annots = [a for a in internal_annots
+              if a['page'] == 0 and a['dest_page'] == chapter_page]
+assert len(nav_annots) >= 2, \
+    "目录页指向第 A 章的链接注解不足（印刷目录条目与附加导览各一）：%r" \
+    % (internal_annots,)
+report = json.loads((base / 'w_mix' / 'export_report.json')
+                    .read_text(encoding='utf-8'))
+decl_record = report['view_declaration']
+assert decl_record['sha256'], decl_record
+ex = decl_record['exclusions'][0]
+assert ex['lines'] == [3, 3] and ex['kind'] == 'toc-provenance' \
+    and ex['reason'], ex
+assert report['provenance']['mode'] == 'toc', report['provenance']['mode']
+assert report['provenance']['toc_exclusion'] is None, \
+    "声明接管时不应有自动排除区间"
+print("T01-1：顶层段落同行混合 inline 声明导出+核验通过；"
+      "PDF 无出处、有导览文字与跳转链接；Markdown 摘要不变 PASS")
+PY
+
+# T01-2 正例（顶层引用块同行混合）：同口径复验引用块变体
+cat > "$T1/00_目录.md" <<'MD'
+# 目录
+
+> 译自 [原文](https://example.com/t1-decl/y)；[附加导览](a.md)
+
+- [第 A 章](a.md)
+MD
+python3 - "$T1" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+toc = (base / '00_目录.md').resolve()
+a = (base / 'a.md').resolve()
+decl = {
+    "version": 1,
+    "inputs": [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+               for p in (toc, a)],
+    "exclusions": [{
+        "input": str(toc), "lines": [3, 3], "type": "inline",
+        "kind": "toc-provenance",
+        "fragment": "译自 [原文](https://example.com/t1-decl/y)；",
+        "reason": "引用块内出处与导览同行：仅排除出处片段",
+    }],
+}
+(base / 'decl_quote.json').write_text(
+    json.dumps(decl, ensure_ascii=False), encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$T1/quote.pdf" --work-dir "$T1/w_quote" \
+  --view-declaration "$T1/decl_quote.json" \
+  "$T1/00_目录.md" "$T1/a.md" >"$T1/quote_e.txt" 2>&1 \
+  || { cat "$T1/quote_e.txt"; echo "错误：T01-2 引用块 inline 声明导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$T1/quote.pdf" --work-dir "$T1/w_quote" \
+  --view-declaration "$T1/decl_quote.json" \
+  "$T1/00_目录.md" "$T1/a.md" >"$T1/quote_v.txt" 2>&1 \
+  || { cat "$T1/quote_v.txt"; echo "错误：T01-2 引用块 inline 声明核验失败"; exit 1; }
+python3 - "$T1" <<'PY'
+import re, sys, unicodedata
+from pathlib import Path
+
+import pypdf
+
+base = Path(sys.argv[1])
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+reader = pypdf.PdfReader(str(base / 'quote.pdf'))
+pages = [page.extract_text() or "" for page in reader.pages]
+norm_text = norm("".join(pages))
+named = {str(n).lstrip("/"): reader.get_destination_page_number(d)
+         for n, d in reader.named_destinations.items()}
+id_to_index = {page.indirect_reference.idnum: i
+               for i, page in enumerate(reader.pages)
+               if page.indirect_reference is not None}
+internal_annots = []
+for i, page in enumerate(reader.pages):
+    for ref in page.get("/Annots") or []:
+        obj = ref.get_object()
+        if obj.get("/Subtype") != "/Link":
+            continue
+        dest = obj.get("/Dest")
+        if dest is None:
+            action = obj.get("/A")
+            if action is not None and action.get_object().get("/S") == "/GoTo":
+                dest = action.get_object().get("/D")
+        if dest is None:
+            continue
+        dest = dest.get_object() if hasattr(dest, "get_object") else dest
+        if isinstance(dest, bytes):
+            dest = dest.decode("utf-8", "replace")
+        if isinstance(dest, str):
+            target = named.get(dest.lstrip("/"))
+        else:
+            try:
+                target = id_to_index.get(getattr(dest[0], "idnum", None))
+            except (TypeError, IndexError):
+                target = None
+        if target is not None:
+            internal_annots.append({"page": i, "dest_page": target})
+assert '译自' not in norm_text, "引用块出处片段仍出现在 PDF"
+assert norm('附加导览') in norm_text, "引用块导览文字被误删"
+chapter_page = next(i for i, t in enumerate(pages) if 'A 正文' in t)
+assert any(a['page'] == 0 and a['dest_page'] == chapter_page
+           for a in internal_annots), "引用块变体导览链接不可跳转"
+print("T01-2：顶层引用块同行混合 inline 声明导出+核验通过 PASS")
+PY
+
+# T01-3 正例（独立纯出处块 block 声明）：整块排除，相邻导航保留，
+# 报告给出输入/声明摘要、排除行号与理由，来源门禁基于原始输入通过
+cat > "$T1/00_目录.md" <<'MD'
+# 目录
+
+译自 [原文](https://example.com/t1-decl/z)
+版本 v2.0，2026-01-01 抓取
+
+- [第 A 章](a.md)
+MD
+python3 - "$T1" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+toc = (base / '00_目录.md').resolve()
+a = (base / 'a.md').resolve()
+decl = {
+    "version": 1,
+    "inputs": [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+               for p in (toc, a)],
+    "exclusions": [{
+        "input": str(toc), "lines": [3, 4], "type": "block",
+        "kind": "toc-provenance",
+        "fragment": "译自 [原文](https://example.com/t1-decl/z)",
+        "reason": "多行纯出处段（含版本/抓取续行）整块排除",
+    }],
+}
+(base / 'decl_block.json').write_text(
+    json.dumps(decl, ensure_ascii=False), encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$T1/block.pdf" --work-dir "$T1/w_block" \
+  --view-declaration "$T1/decl_block.json" \
+  "$T1/00_目录.md" "$T1/a.md" >"$T1/block_e.txt" 2>&1 \
+  || { cat "$T1/block_e.txt"; echo "错误：T01-3 纯出处块 block 声明导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$T1/block.pdf" --work-dir "$T1/w_block" \
+  --view-declaration "$T1/decl_block.json" \
+  "$T1/00_目录.md" "$T1/a.md" >"$T1/block_v.txt" 2>&1 \
+  || { cat "$T1/block_v.txt"; echo "错误：T01-3 纯出处块 block 声明核验失败"; exit 1; }
+python3 - "$T1" <<'PY'
+import hashlib, json, re, sys, unicodedata
+from pathlib import Path
+
+import pypdf
+
+base = Path(sys.argv[1])
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+reader = pypdf.PdfReader(str(base / 'block.pdf'))
+norm_text = norm("".join(page.extract_text() or "" for page in reader.pages))
+assert '译自' not in norm_text and norm('版本v2.0') not in norm_text, \
+    "纯出处块仍出现在 PDF"
+assert norm('第A章') in norm_text, "相邻目录导航被误删"
+report = json.loads((base / 'w_block' / 'export_report.json')
+                    .read_text(encoding='utf-8'))
+decl_record = report['view_declaration']
+decl_file = hashlib.sha256(
+    (base / 'decl_block.json').read_bytes()).hexdigest()
+assert decl_record['sha256'] == decl_file, "声明摘要未进入导出报告"
+assert decl_record['exclusions'][0]['lines'] == [3, 4] \
+    and decl_record['exclusions'][0]['reason'], decl_record['exclusions']
+assert report['provenance']['mode'] == 'toc', report['provenance']
+inputs = report['inputs']
+assert all(item.get('sha256') for item in inputs), "输入摘要未进入导出报告"
+print("T01-3：独立纯出处块 block 声明导出+核验通过；报告含输入/声明摘要、"
+      "行号与理由 PASS")
+PY
+
+# T01-4 反例：声明非法逐项定位失败，零新候选，旧 PDF 字节不变
+cat > "$T1/00_目录.md" <<'MD'
+# 目录
+
+译自 [原文](https://example.com/t1-decl/x)；[附加导览](a.md)
+
+- [第 A 章](a.md)
+MD
+python3 - "$T1" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+toc = (base / '00_目录.md').resolve()
+a = (base / 'a.md').resolve()
+digest_toc = hashlib.sha256(toc.read_bytes()).hexdigest()
+digest_a = hashlib.sha256(a.read_bytes()).hexdigest()
+def inputs(toc_digest=digest_toc):
+    return [{"path": str(toc), "sha256": toc_digest},
+            {"path": str(a), "sha256": digest_a}]
+def write(name, exclusions, toc_digest=digest_toc):
+    decl = {"version": 1, "inputs": inputs(toc_digest), "exclusions": exclusions}
+    (base / ('bad_%s.json' % name)).write_text(
+        json.dumps(decl, ensure_ascii=False), encoding='utf-8')
+def excl(lines, ex_type='inline', kind='toc-provenance',
+         fragment='译自 [原文](https://example.com/t1-decl/x)；',
+         reason='反例'):
+    return {"input": str(toc), "lines": lines, "type": ex_type,
+            "kind": kind, "fragment": fragment, "reason": reason}
+write('drift', [excl([3, 3])], toc_digest='0' * 64)           # 摘要漂移
+write('range', [excl([3, 99])])                                # 越界
+write('overlap', [excl([3, 3]), excl([3, 3])])                 # 重叠范围
+write('wrongkind', [excl([3, 3], kind='note')])                # 错误 kind
+write('nav', [excl([3, 3],
+      fragment='译自 [原文](https://example.com/t1-decl/x)；[附加导览](a.md)')])
+write('notprov', [excl([3, 3], fragment='[附加导览](a.md)')])  # 非出处片段
+# fragment 非唯一：独立目录含两行相同出处，区间内 fragment 出现两次
+dup = ('# 目录\n\n译自 [原文](https://example.com/t1-decl/x)\n\n'
+       '译自 [原文](https://example.com/t1-decl/x)\n\n- [第 A 章](a.md)\n')
+(base / '00_目录_dup.md').write_text(dup, encoding='utf-8')
+dup_path = (base / '00_目录_dup.md').resolve()
+decl = {"version": 1,
+        "inputs": [{"path": str(dup_path),
+                    "sha256": hashlib.sha256(dup_path.read_bytes()).hexdigest()},
+                   {"path": str(a), "sha256": digest_a}],
+        "exclusions": [{"input": str(dup_path), "lines": [1, 7],
+                        "type": "inline", "kind": "toc-provenance",
+                        "fragment": "译自 [原文](https://example.com/t1-decl/x)",
+                        "reason": "反例"}]}
+(base / 'bad_nonunique.json').write_text(
+    json.dumps(decl, ensure_ascii=False), encoding='utf-8')
+print('T01-4 反例声明就绪')
+PY
+printf 'OLD-PDF-BYTES' > "$T1/old.pdf"
+for tag in drift range overlap wrongkind nav notprov; do
+  cp "$T1/old.pdf" "$T1/bad_${tag}.pdf"
+  if python3 "$EXPORT" --output "$T1/bad_${tag}.pdf" --work-dir "$T1/w_bad_${tag}" \
+      --view-declaration "$T1/bad_${tag}.json" \
+      "$T1/00_目录.md" "$T1/a.md" >"$T1/bad_${tag}.txt" 2>&1; then
+    echo "错误：T01-4 反例（${tag}）未被拒绝"; exit 1
+  fi
+  test ! -f "$T1/w_bad_${tag}/candidate.pdf" \
+    || { echo "错误：T01-4 反例（${tag}）仍生成候选"; exit 1; }
+  cmp -s "$T1/old.pdf" "$T1/bad_${tag}.pdf" \
+    || { echo "错误：T01-4 反例（${tag}）旧 PDF 被改写"; exit 1; }
+done
+# fragment 非唯一变体使用含两行相同出处的独立目录输入
+cp "$T1/old.pdf" "$T1/bad_nonunique.pdf"
+if python3 "$EXPORT" --output "$T1/bad_nonunique.pdf" \
+    --work-dir "$T1/w_bad_nonunique" \
+    --view-declaration "$T1/bad_nonunique.json" \
+    "$T1/00_目录_dup.md" "$T1/a.md" >"$T1/bad_nonunique.txt" 2>&1; then
+  echo "错误：T01-4 反例（nonunique）未被拒绝"; exit 1
+fi
+test ! -f "$T1/w_bad_nonunique/candidate.pdf" \
+  || { echo "错误：T01-4 反例（nonunique）仍生成候选"; exit 1; }
+cmp -s "$T1/old.pdf" "$T1/bad_nonunique.pdf" \
+  || { echo "错误：T01-4 反例（nonunique）旧 PDF 被改写"; exit 1; }
+# 除摘要漂移（文件级诊断）外，其余反例均须含行号定位
+for tag in range overlap nonunique wrongkind nav notprov; do
+  grep -q "L[0-9]" "$T1/bad_${tag}.txt" \
+    || { cat "$T1/bad_${tag}.txt"; echo "错误：T01-4 反例（${tag}）缺行号定位"; exit 1; }
+done
+grep -q "摘要与输入不符" "$T1/bad_drift.txt" \
+  || { cat "$T1/bad_drift.txt"; echo "错误：摘要漂移诊断缺失"; exit 1; }
+grep -q "越界" "$T1/bad_range.txt" \
+  || { cat "$T1/bad_range.txt"; echo "错误：越界诊断缺失"; exit 1; }
+grep -q "重叠" "$T1/bad_overlap.txt" \
+  || { cat "$T1/bad_overlap.txt"; echo "错误：重叠诊断缺失"; exit 1; }
+grep -q "恰好出现" "$T1/bad_nonunique.txt" \
+  || { cat "$T1/bad_nonunique.txt"; echo "错误：fragment 非唯一诊断缺失"; exit 1; }
+grep -q "无法确认整行仅为出处" "$T1/bad_wrongkind.txt" \
+  || { cat "$T1/bad_wrongkind.txt"; echo "错误：错误 kind 未回退自动判断"; exit 1; }
+grep -q "导航链接" "$T1/bad_nav.txt" \
+  || { cat "$T1/bad_nav.txt"; echo "错误：误含章节导航诊断缺失"; exit 1; }
+grep -q "必须以“译自”开头" "$T1/bad_notprov.txt" \
+  || { cat "$T1/bad_notprov.txt"; echo "错误：非出处片段诊断缺失"; exit 1; }
+echo "T01-4：摘要漂移/越界/重叠/非唯一/错误 kind/误含导航/非出处均定位失败，零候选、旧 PDF 不变 PASS"
+
+# T01-5 核验反例：成品缺失应保留的目录导航 → 独立核验拒绝
+# （清空目录页内容流并重签摘要：只能靠内容核对发现导览丢失）
+cat > "$T1/00_目录.md" <<'MD'
+# 目录
+
+译自 [原文](https://example.com/t1-decl/x)；[附加导览](a.md)
+
+- [第 A 章](a.md)
+MD
+python3 - "$T1" <<'PY'
+import json, sys
+from pathlib import Path
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import DecodedStreamObject, NameObject
+base = Path(sys.argv[1])
+reader = PdfReader(str(base / 'mix.pdf'))
+writer = PdfWriter(clone_from=reader)
+stream = DecodedStreamObject()
+stream.set_data(b'')
+writer.pages[0][NameObject('/Contents')] = writer._add_object(stream)
+writer.write(str(base / 'mix_nosnav.pdf'))
+report = json.loads((base / 'w_mix' / 'export_report.json')
+                    .read_text(encoding='utf-8'))
+report['pdf_sha256'] = __import__('hashlib').sha256(
+    (base / 'mix_nosnav.pdf').read_bytes()).hexdigest()
+(base / 'w_mix' / 'export_report.json').write_text(
+    json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+print('T01-5 篡改样本就绪')
+PY
+if python3 "$VERIFY" --pdf "$T1/mix_nosnav.pdf" --work-dir "$T1/w_mix" \
+    --view-declaration "$T1/decl_inline.json" \
+    "$T1/00_目录.md" "$T1/a.md" >"$T1/nosnav_v.txt" 2>&1; then
+  echo "错误：T01-5 缺失目录导航的 PDF 未被核验拒绝"; exit 1
+fi
+grep -qE "toc-entry-missing|text-missing|chapter-structure" "$T1/nosnav_v.txt" \
+  || { cat "$T1/nosnav_v.txt"; echo "错误：T01-5 缺导航诊断缺失"; exit 1; }
+# 恢复证据供后续重用
+python3 "$VERIFY" --pdf "$T1/mix.pdf" --work-dir "$T1/w_mix" \
+  --view-declaration "$T1/decl_inline.json" \
+  "$T1/00_目录.md" "$T1/a.md" >/dev/null 2>&1 || true
+python3 - "$T1" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+report = json.loads((base / 'w_mix' / 'export_report.json')
+                    .read_text(encoding='utf-8'))
+report['pdf_sha256'] = hashlib.sha256(
+    (base / 'mix.pdf').read_bytes()).hexdigest()
+(base / 'w_mix' / 'export_report.json').write_text(
+    json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+PY
+echo "T01-5：缺失目录导航的成品被独立核验拒绝（不以双命令退出码代替内容证据） PASS"
+
+echo "==> T02（pdf-layout-optimization ticket 02）：目录出处窄格式自动语法与导航独立核验"
+T2="$TMP/t2_narrow"; rm -rf "$T2"; mkdir -p "$T2"
+
+# T02-1 正例：§8.3 各形式逐项真实导出+独立核验通过；出处隐藏、目录导航
+# 与正文保留（查询参数、片段、下划线与本地原文路径完整可用）
+python3 - "$T2" <<'PY'
+from pathlib import Path
+import sys
+base = Path(sys.argv[1])
+CHAPTER = '# 第 A 章\n\n> **来源**：https://example.com/t2-a\n\nA 正文。\n'
+CASES = {
+    'md_zh': '译自 [原文](https://example.com/t2/md-zh?id=1)',
+    'md_en': '译自 [Guide](https://example.com/t2/md-en)',
+    'md_local': '译自 [原文](../original/paper.pdf)',
+    'auto': '译自 <https://example.com/t2/auto_link>',
+    'bare': '译自 https://example.com/t2/p_v1.pdf?id=1&x=2#frag_v',
+    'local': '译自 ../original/paper.pdf',
+    'book': '译自 NVIDIA CUDA Guide v13.4：https://example.com/t2/book',
+    'tail_date': '译自 [Guide](https://example.com/t2/td)（2026-09-01）',
+    'tail_ver': '译自 指南：https://example.com/t2/tv（v13.4.1）',
+    'tail_conf': '译自 [Paper](https://example.com/t2/tc)（MLSys 2022）',
+    'quote': '> 译自 [原文](https://example.com/t2/quote)',
+}
+for tag, prov in CASES.items():
+    case = base / tag
+    case.mkdir()
+    (case / '00_目录.md').write_text(
+        '# 目录\n\n%s\n\n- [第 A 章](a.md)\n' % prov, encoding='utf-8')
+    (case / 'a.md').write_text(CHAPTER, encoding='utf-8')
+# 围栏代码内的“译自”是代码内容：不构成候选、照常保留在 PDF
+case = base / 'fence_keep'
+case.mkdir()
+(case / '00_目录.md').write_text(
+    '# 目录\n\n```\n译自 https://example.com/t2/code-literal\n```\n\n'
+    '- [第 A 章](a.md)\n', encoding='utf-8')
+(case / 'a.md').write_text(CHAPTER, encoding='utf-8')
+# 混合容器正例：导航链接 + 说明文字 → 链接解除为纯文字，说明保留
+case = base / 'mixed_li'
+case.mkdir()
+(case / '00_目录.md').write_text(
+    '# 目录\n\n译自 https://example.com/t2/mixed\n\n'
+    '- [第 A 章](a.md)（含附录说明）\n', encoding='utf-8')
+(case / 'a.md').write_text(CHAPTER, encoding='utf-8')
+print('T02-1 正例就绪')
+PY
+for tag in md_zh md_en md_local auto bare local book tail_date tail_ver \
+    tail_conf quote fence_keep mixed_li; do
+  python3 "$EXPORT" --output "$T2/${tag}.pdf" --work-dir "$T2/w_${tag}" \
+    "$T2/${tag}/00_目录.md" "$T2/${tag}/a.md" >"$T2/${tag}.txt" 2>&1 \
+    || { cat "$T2/${tag}.txt"; echo "错误：T02-1 正例（${tag}）导出失败"; exit 1; }
+  python3 "$VERIFY" --pdf "$T2/${tag}.pdf" --work-dir "$T2/w_${tag}" \
+    "$T2/${tag}/00_目录.md" "$T2/${tag}/a.md" >"$T2/${tag}.v.txt" 2>&1 \
+    || { cat "$T2/${tag}.v.txt"; echo "错误：T02-1 正例（${tag}）核验失败"; exit 1; }
+done
+python3 - "$T2" <<'PY'
+import re, sys, unicodedata
+from pathlib import Path
+import pypdf
+
+base = Path(sys.argv[1])
+
+
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+
+
+HIDDEN = {
+    'md_zh': 'example.com/t2/md-zh', 'md_en': 'example.com/t2/md-en',
+    'md_local': 'original/paper.pdf', 'auto': 'example.com/t2/auto_link',
+    'bare': 'example.com/t2/p_v1.pdf', 'local': 'original/paper.pdf',
+    'book': 'example.com/t2/book', 'tail_date': 'example.com/t2/td',
+    'tail_ver': 'example.com/t2/tv', 'tail_conf': 'example.com/t2/tc',
+    'quote': 'example.com/t2/quote', 'mixed_li': 'example.com/t2/mixed',
+}
+for tag, hidden in HIDDEN.items():
+    text = norm(''.join(
+        p.extract_text() or ''
+        for p in pypdf.PdfReader(str(base / ('%s.pdf' % tag))).pages))
+    assert norm(hidden) not in text, '%s 出处未隐藏' % tag
+    assert '译自' not in text, '%s 出处标记残留' % tag
+    assert norm('第A章') in text, '%s 目录条目被误删' % tag
+    assert norm('A正文') in text, '%s 正文缺失' % tag
+text = norm(''.join(
+    p.extract_text() or ''
+    for p in pypdf.PdfReader(str(base / 'fence_keep.pdf')).pages))
+assert '译自' in text and norm('example.com/t2/code-literal') in text, \
+    '围栏代码内的“译自”内容必须原样保留'
+assert norm('第A章') in text, 'fence_keep 目录条目被误删'
+text = norm(''.join(
+    p.extract_text() or ''
+    for p in pypdf.PdfReader(str(base / 'mixed_li.pdf')).pages))
+assert norm('含附录说明') in text, '混合容器说明文字未保留'
+print('T02-1：三种形式/中英标签/查询片段下划线/本地路径/尾注逐项通过；'
+      '出处隐藏、目录条目与正文保留；围栏内容不动、混合容器说明保留')
+PY
+echo "T02-1 正例：窄格式各形态导出+核验通过 PASS"
+
+# T02-2 反例：格式外候选逐项定位失败（文件/行号诊断、非零退出、零候选、
+# 旧 PDF 字节不变）；格式外出处须走显式声明（T01 已验正例）
+python3 - "$T2" <<'PY'
+from pathlib import Path
+import sys
+base = Path(sys.argv[1])
+CHAPTER = '# 第 A 章\n\n> **来源**：https://example.com/t2-a\n\nA 正文。\n'
+NEG = {
+    'bare_guide': '译自 https://example.com/t2/x；[Additional Guide](a.md)',
+    'two_links': '译自 [A](https://example.com/t2/u1) 与 [B](https://example.com/t2/u2)',
+    'prose': '译自 https://example.com/t2/x See appendix',
+    'paren_prose': '译自 [原文](https://example.com/t2/u)（另见导览）',
+    'image': '译自 ![img](https://example.com/t2/x.png)',
+    'code_inline': '译自 `https://example.com/t2/x`',
+    'no_locator': '译自 某某博客',
+    'multiline': '译自 https://example.com/t2/x\n续行',
+    'shared_quote': '> 译自 Guide：https://example.com/t2/x\n> - [第 A 章](a.md)',
+    'nested_list': '- 译自 https://example.com/t2/x',
+    'nav_link': '译自 [第 A 章](a.md)',
+    'nav_bare': '译自 a.md',
+    'bad_date': '译自 [P](https://example.com/t2/p)（2026-13-01）',
+    'bad_tail': '译自 [P](https://example.com/t2/p)（v13）',
+}
+for tag, prov in NEG.items():
+    case = base / ('neg_' + tag)
+    case.mkdir()
+    (case / '00_目录.md').write_text(
+        '# 目录\n\n%s\n\n- [第 A 章](a.md)\n' % prov, encoding='utf-8')
+    (case / 'a.md').write_text(CHAPTER, encoding='utf-8')
+case = base / 'neg_multi'
+case.mkdir()
+(case / '00_目录.md').write_text(
+    '# 目录\n\n译自 https://example.com/t2/x\n\n译自 https://example.com/t2/y\n\n'
+    '- [第 A 章](a.md)\n', encoding='utf-8')
+(case / 'a.md').write_text(CHAPTER, encoding='utf-8')
+print('T02-2 反例就绪')
+PY
+printf 'OLD-PDF-BYTES' > "$T2/old.pdf"
+for tag in bare_guide two_links prose paren_prose image code_inline \
+    no_locator multiline shared_quote nested_list nav_link nav_bare \
+    bad_date bad_tail multi; do
+  cp "$T2/old.pdf" "$T2/neg_${tag}.pdf"
+  if python3 "$EXPORT" --output "$T2/neg_${tag}.pdf" \
+      --work-dir "$T2/w_neg_${tag}" \
+      "$T2/neg_${tag}/00_目录.md" "$T2/neg_${tag}/a.md" \
+      >"$T2/neg_${tag}.txt" 2>&1; then
+    echo "错误：T02-2 反例（${tag}）未被拒绝"; exit 1
+  fi
+  grep -q "L[0-9]" "$T2/neg_${tag}.txt" \
+    || { cat "$T2/neg_${tag}.txt"; echo "错误：T02-2 反例（${tag}）缺行号定位"; exit 1; }
+  test ! -f "$T2/w_neg_${tag}/candidate.pdf" \
+    || { echo "错误：T02-2 反例（${tag}）仍生成候选"; exit 1; }
+  cmp -s "$T2/old.pdf" "$T2/neg_${tag}.pdf" \
+    || { echo "错误：T02-2 反例（${tag}）旧 PDF 被改写"; exit 1; }
+  case "$tag" in
+    bare_guide|two_links|prose|image|code_inline)
+      kw="无法确认整行仅为出处" ;;
+    paren_prose|bad_date|bad_tail) kw="书目尾注" ;;
+    no_locator) kw="可定位" ;;
+    multiline) kw="跨多行" ;;
+    shared_quote) kw="共享同一块" ;;
+    nested_list) kw="未形成独立顶层段落块" ;;
+    nav_link|nav_bare) kw="导航歧义" ;;
+    multi) kw="至多自动采用一个" ;;
+  esac
+  grep -q "$kw" "$T2/neg_${tag}.txt" \
+    || { cat "$T2/neg_${tag}.txt"; echo "错误：T02-2 反例（${tag}）诊断缺失：$kw"; exit 1; }
+done
+echo "T02-2 反例：混合内容/第二链接/散文/图片/代码/缺来源/多行/共享块/嵌套/导航定位符/无效尾注/多候选均定位失败，零候选、旧 PDF 不变 PASS"
+
+# T02-3 核验反例：改错目录章节链接目标的成品必须被独立核验依据未投影
+# 输入拒绝（toc-nav-link-missing）；缺失情形由 T01-5 同口径覆盖。
+# 导览链接指向章内片段（目标页与印刷目录条目页不同），篡改才可隔离判定。
+cat > "$T2/00_目录.md" <<'MD'
+# 目录
+
+译自 [原文](https://example.com/t2/nav)；[附加导览](a.md#第二节)
+
+- [第 A 章](a.md)
+MD
+python3 - "$T2" <<'PY'
+from pathlib import Path
+import sys
+filler = '\n'.join('填充段 %02d：第二节须落到目标章第二页。' % i
+                   for i in range(1, 201))
+Path(sys.argv[1], 'a.md').write_text(
+    '# 第 A 章\n\n> **来源**：https://example.com/t2-a\n\nA 正文。\n\n'
+    + filler + '\n\n## 第二节\n\n第二节正文。\n', encoding='utf-8')
+PY
+python3 - "$T2" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+toc = (base / '00_目录.md').resolve()
+a = (base / 'a.md').resolve()
+decl = {
+    "version": 1,
+    "inputs": [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+               for p in (toc, a)],
+    "exclusions": [{
+        "input": str(toc), "lines": [3, 3], "type": "inline",
+        "kind": "toc-provenance",
+        "fragment": "译自 [原文](https://example.com/t2/nav)；",
+        "reason": "出处与导览同行：仅排除出处片段，导览保留",
+    }],
+}
+(base / 'decl_nav.json').write_text(
+    json.dumps(decl, ensure_ascii=False), encoding='utf-8')
+print('T02-3 声明就绪')
+PY
+python3 "$EXPORT" --output "$T2/nav.pdf" --work-dir "$T2/w_nav" \
+  --view-declaration "$T2/decl_nav.json" \
+  "$T2/00_目录.md" "$T2/a.md" >"$T2/nav_e.txt" 2>&1 \
+  || { cat "$T2/nav_e.txt"; echo "错误：T02-3 正例导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$T2/nav.pdf" --work-dir "$T2/w_nav" \
+  --view-declaration "$T2/decl_nav.json" \
+  "$T2/00_目录.md" "$T2/a.md" >"$T2/nav_v.txt" 2>&1 \
+  || { cat "$T2/nav_v.txt"; echo "错误：T02-3 正例核验失败"; exit 1; }
+python3 - "$T2" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+from urllib.parse import unquote
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NameObject
+base = Path(sys.argv[1])
+reader = PdfReader(str(base / 'nav.pdf'))
+# Chromium 将非 ASCII 目的地名按 URL 编码写出：同时登记原始与解码键
+named = {}
+for k, v in reader.named_destinations.items():
+    page = reader.get_destination_page_number(v)
+    raw = str(k).lstrip('/')
+    named[raw] = page
+    named.setdefault(unquote(raw), page)
+# “第二节”片段页与章起始页不同（ filler 使其落在章第二页）
+section_pages = {page for name, page in named.items() if '第二节' in name}
+assert section_pages and section_pages != {1}, named
+section_page = section_pages.pop()
+wrong = [name for name, page in named.items() if page != section_page]
+assert wrong, '缺少可改指的其他页命名目的地'
+writer = PdfWriter(clone_from=reader)
+toc_page = writer.pages[0]
+annots = [ref.get_object() for ref in toc_page['/Annots']]
+assert len(annots) >= 2, '目录页应含印刷目录与导览两条注解'
+
+
+def _dest_page(obj):
+    dest = obj.get('/Dest')
+    if dest is None and obj.get('/A') is not None:
+        dest = obj['/A'].get_object().get('/D')
+    if dest is None:
+        return None
+    dest = dest.get_object() if hasattr(dest, 'get_object') else dest
+    if isinstance(dest, bytes):
+        dest = dest.decode('utf-8', 'replace')
+    if isinstance(dest, str):
+        return named.get(dest.lstrip('/'))
+    return None
+
+
+victims = [a for a in annots if _dest_page(a) == section_page]
+assert len(victims) == 1, '导览片段注解应唯一：%r' % (victims,)
+victim = victims[0]
+if victim.get('/Dest') is not None:
+    victim[NameObject('/Dest')] = NameObject('/' + wrong[0])
+else:
+    victim['/A'].get_object()[NameObject('/D')] = NameObject('/' + wrong[0])
+writer.write(str(base / 'nav_wrongdest.pdf'))
+report = json.loads((base / 'w_nav' / 'export_report.json')
+                    .read_text(encoding='utf-8'))
+report['pdf_sha256'] = hashlib.sha256(
+    (base / 'nav_wrongdest.pdf').read_bytes()).hexdigest()
+(base / 'w_nav' / 'export_report.json').write_text(
+    json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+print('T02-3 篡改样本就绪')
+PY
+if python3 "$VERIFY" --pdf "$T2/nav_wrongdest.pdf" --work-dir "$T2/w_nav" \
+    --view-declaration "$T2/decl_nav.json" \
+    "$T2/00_目录.md" "$T2/a.md" >"$T2/nav_wrongdest_v.txt" 2>&1; then
+  echo "错误：T02-3 改错目录章节链接目标的 PDF 未被核验拒绝"; exit 1
+fi
+grep -q "toc-nav-link-missing" "$T2/nav_wrongdest_v.txt" \
+  || { cat "$T2/nav_wrongdest_v.txt"; echo "错误：T02-3 toc-nav-link-missing 诊断缺失"; exit 1; }
+echo "T02-3：改错目录章节链接目标被独立核验依据未投影输入拒绝 PASS"
+
+echo "==> T03（pdf-layout-optimization ticket 03）：复审修复回归"
+T3="$TMP/t03"; rm -rf "$T3"; mkdir -p "$T3"
+cat > "$T3/a.md" <<'MD'
+# 第 A 章
+
+> **来源**：https://example.com/t3-chapter
+
+A 正文。
+MD
+
+# T03-1：inline 声明只接管 fragment 实际覆盖行，区间内其余“译自”候选
+# 恢复自动判断（复审 P1 复现样例转回归）。本正例同时是重叠误报回归：
+# 自动区间 L5 落在声明区间 [3,5] 内但在 fragment 覆盖行 (3,3) 之外，
+# 若重叠检查仍按整个声明区间判定，本导出会被误报重叠拒绝。
+cat > "$T3/00_目录.md" <<'MD'
+# 目录
+
+译自 [原文](https://example.com/t3/one)；[附加导览](a.md)
+
+译自 [另一原文](https://example.com/t3/two)
+
+- [第 A 章](a.md)
+MD
+python3 - "$T3" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+toc = (base / '00_目录.md').resolve()
+a = (base / 'a.md').resolve()
+decl = {
+    "version": 1,
+    "inputs": [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+               for p in (toc, a)],
+    "exclusions": [{
+        "input": str(toc), "lines": [3, 5], "type": "inline",
+        "kind": "toc-provenance",
+        "fragment": "译自 [原文](https://example.com/t3/one)；",
+        "reason": "复审复现：声明区间 [3,5] 的 fragment 只在 L3",
+    }],
+}
+(base / 'decl.json').write_text(
+    json.dumps(decl, ensure_ascii=False), encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$T3/out.pdf" --work-dir "$T3/w" \
+  --view-declaration "$T3/decl.json" \
+  "$T3/00_目录.md" "$T3/a.md" >"$T3/e.txt" 2>&1 \
+  || { cat "$T3/e.txt"; echo "错误：T03-1 声明+L5 自动出处导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$T3/out.pdf" --work-dir "$T3/w" \
+  --view-declaration "$T3/decl.json" \
+  "$T3/00_目录.md" "$T3/a.md" >"$T3/v.txt" 2>&1 \
+  || { cat "$T3/v.txt"; echo "错误：T03-1 声明+L5 自动出处核验失败"; exit 1; }
+python3 - "$T3" <<'PY'
+import re, sys, unicodedata
+from pathlib import Path
+
+import pypdf
+
+base = Path(sys.argv[1])
+def norm(s):
+    return unicodedata.normalize("NFKC", re.sub(r"\s+", "", s or ""))
+text = norm("".join(page.extract_text() or ""
+                    for page in pypdf.PdfReader(str(base / 'out.pdf')).pages))
+for probe in ("译自", "example.com/t3/one", "example.com/t3/two"):
+    assert probe not in text, "出处仍出现在 PDF：%s" % probe
+assert norm("附加导览") in text, "导览文字被误删"
+assert norm("第A章") in text, "目录导航被误删"
+print("T03-1：声明只接管 fragment 覆盖行；L5 出处自动排除、导览与导航保留 PASS")
+PY
+# T03-1 变体：L5 候选格式外 → 定位失败、零候选、旧 PDF 字节不变
+python3 - "$T3" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+toc = base / '00_目录.md'
+text = toc.read_text(encoding='utf-8').replace(
+    "译自 [另一原文](https://example.com/t3/two)",
+    "译自 [另一原文](https://example.com/t3/two)；另见附录")
+toc.write_text(text, encoding='utf-8')
+decl = json.loads((base / 'decl.json').read_text(encoding='utf-8'))
+decl["inputs"][0]["sha256"] = hashlib.sha256(toc.read_bytes()).hexdigest()
+(base / 'decl_bad.json').write_text(
+    json.dumps(decl, ensure_ascii=False), encoding='utf-8')
+PY
+printf 'OLD-PDF' > "$T3/keep.pdf"
+if python3 "$EXPORT" --output "$T3/keep.pdf" --work-dir "$T3/w_bad" \
+    --view-declaration "$T3/decl_bad.json" \
+    "$T3/00_目录.md" "$T3/a.md" >"$T3/bad_e.txt" 2>&1; then
+  echo "错误：T03-1 变体 L5 格式外候选未被拒绝"; exit 1
+fi
+grep -q "L5" "$T3/bad_e.txt" \
+  || { cat "$T3/bad_e.txt"; echo "错误：T03-1 变体未定位 L5"; exit 1; }
+grep -q "无法确认整行仅为出处" "$T3/bad_e.txt" \
+  || { cat "$T3/bad_e.txt"; echo "错误：T03-1 变体诊断缺失"; exit 1; }
+test ! -f "$T3/w_bad/candidate.pdf" || { echo "错误：T03-1 变体仍生成候选"; exit 1; }
+[ "$(cat "$T3/keep.pdf")" = "OLD-PDF" ] || { echo "错误：T03-1 变体覆盖旧 PDF"; exit 1; }
+echo "T03-1 变体：L5 格式外候选定位失败、零候选、旧 PDF 不变 PASS"
+
+# T03-2：印刷目录正确注解不能掩盖被改错的导览链接（复审 P1 复现样例，
+# 逐链接几何绑定）。导览与印刷目录条目指向同一章首页；篡改导览注解后，
+# 页级存在性检查会被条目注解掩盖，逐链接绑定必须报 toc-nav-link-missing。
+cat > "$T3/00_目录.md" <<'MD'
+# 目录
+
+译自 [原文](https://example.com/t3/nav)；[附加导览](a.md)
+
+- [第 A 章](a.md)
+MD
+python3 - "$T3" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+toc = (base / '00_目录.md').resolve()
+a = (base / 'a.md').resolve()
+decl = {
+    "version": 1,
+    "inputs": [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+               for p in (toc, a)],
+    "exclusions": [{
+        "input": str(toc), "lines": [3, 3], "type": "inline",
+        "kind": "toc-provenance",
+        "fragment": "译自 [原文](https://example.com/t3/nav)；",
+        "reason": "复审复现：导览与条目同目标页掩盖场景",
+    }],
+}
+(base / 'decl_nav.json').write_text(
+    json.dumps(decl, ensure_ascii=False), encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$T3/nav.pdf" --work-dir "$T3/w_nav" \
+  --view-declaration "$T3/decl_nav.json" \
+  "$T3/00_目录.md" "$T3/a.md" >"$T3/nav_e.txt" 2>&1 \
+  || { cat "$T3/nav_e.txt"; echo "错误：T03-2 正确成品导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$T3/nav.pdf" --work-dir "$T3/w_nav" \
+  --view-declaration "$T3/decl_nav.json" \
+  "$T3/00_目录.md" "$T3/a.md" >"$T3/nav_v.txt" 2>&1 \
+  || { cat "$T3/nav_v.txt"; echo "错误：T03-2 正确成品核验失败"; exit 1; }
+python3 - "$T3" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import ArrayObject, NameObject
+
+base = Path(sys.argv[1])
+reader = PdfReader(str(base / 'nav.pdf'))
+named = {}
+for key, value in reader.named_destinations.items():
+    named[str(key).lstrip('/')] = reader.get_destination_page_number(value)
+chapter_pages = {page for page in named.values() if page != 0}
+assert chapter_pages, named
+chapter_page = chapter_pages.pop()
+writer = PdfWriter(clone_from=reader)
+toc_page = writer.pages[0]
+annots = [ref.get_object() for ref in toc_page['/Annots']]
+
+
+def _dest_page(obj):
+    dest = obj.get('/Dest')
+    if dest is None and obj.get('/A') is not None:
+        dest = obj['/A'].get_object().get('/D')
+    if dest is None:
+        return None
+    dest = dest.get_object() if hasattr(dest, 'get_object') else dest
+    if isinstance(dest, bytes):
+        dest = dest.decode('utf-8', 'replace')
+    if isinstance(dest, str):
+        return named.get(dest.lstrip('/'))
+    return None
+
+
+victims = [a for a in annots if _dest_page(a) == chapter_page]
+assert len(victims) >= 2, '目录页应有条目与导览两条同目标注解：%r' % (victims,)
+# 本样例中印刷目录条目注解为整行宽（列表容器链接），导览注解紧贴标签
+# 文字：取宽度最窄者为受害者，避免误改印刷目录条目注解（列表项整行
+# 注解的纵高可能高于段落内导览注解，按纵坐标选取不可靠）。
+def _width(annot):
+    rect = annot.get('/Rect') or [0, 0, 0, 0]
+    return abs(float(rect[2]) - float(rect[0]))
+victim = min(victims, key=_width)
+assert _width(victim) < max(_width(a) for a in victims), \
+    '导览与条目注解宽度须可区分'
+# 本样例不存在指向目录页自身的命名目的地；直接把受害者注解改为指向
+# 目录页自身的数组目的地（[页引用 /Fit]，核验器按 dest[0] 解析目标页）。
+toc_dest = ArrayObject([toc_page.indirect_reference, NameObject('/Fit')])
+if victim.get('/Dest') is not None:
+    victim[NameObject('/Dest')] = toc_dest
+else:
+    victim['/A'].get_object()[NameObject('/D')] = toc_dest
+writer.write(str(base / 'nav_masked.pdf'))
+report = json.loads((base / 'w_nav' / 'export_report.json')
+                    .read_text(encoding='utf-8'))
+report['pdf_sha256'] = hashlib.sha256(
+    (base / 'nav_masked.pdf').read_bytes()).hexdigest()
+(base / 'w_nav' / 'export_report.json').write_text(
+    json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+print('T03-2 掩盖篡改样本就绪')
+PY
+if python3 "$VERIFY" --pdf "$T3/nav_masked.pdf" --work-dir "$T3/w_nav" \
+    --view-declaration "$T3/decl_nav.json" \
+    "$T3/00_目录.md" "$T3/a.md" >"$T3/nav_masked_v.txt" 2>&1; then
+  echo "错误：T03-2 被条目注解掩盖的改错导览链接未被核验拒绝"; exit 1
+fi
+grep -q "toc-nav-link-missing" "$T3/nav_masked_v.txt" \
+  || { cat "$T3/nav_masked_v.txt"; echo "错误：T03-2 toc-nav-link-missing 诊断缺失"; exit 1; }
+grep -q "附加导览" "$T3/nav_masked_v.txt" \
+  || { cat "$T3/nav_masked_v.txt"; echo "错误：T03-2 未定位到被改错的链接"; exit 1; }
+echo "T03-2：条目正确注解掩盖下的改错导览链接被逐链接绑定检出 PASS"
+
+# T03-4：长导览链接折行产生多个注解（ticket 03 验收 2 补充）。正例真实
+# 导出+独立核验通过，并从成品 PDF 直读确认各段均指向目标页；仅篡改
+# 其中一段目的地回目录页、其余段与印刷目录注解保持正确，逐段核对
+# 仍须报 toc-nav-link-missing 并定位到该链接。
+cat > "$T3/00_目录.md" <<'MD'
+# 目录
+
+译自 [原文](https://example.com/t3/fold)；导览：前前前前前前前前前前前前前前前前前前前前前前前前前前前前前前[附加导览文字需要足够长才能跨越目录页版心宽度折成两行显示](a.md)
+
+- [第 A 章](a.md)
+MD
+python3 - "$T3" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+toc = (base / '00_目录.md').resolve()
+a = (base / 'a.md').resolve()
+decl = {
+    "version": 1,
+    "inputs": [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+               for p in (toc, a)],
+    "exclusions": [{
+        "input": str(toc), "lines": [3, 3], "type": "inline",
+        "kind": "toc-provenance",
+        "fragment": "译自 [原文](https://example.com/t3/fold)；",
+        "reason": "折行导览正例",
+    }],
+}
+(base / 'decl_fold.json').write_text(
+    json.dumps(decl, ensure_ascii=False), encoding='utf-8')
+PY
+python3 "$EXPORT" --output "$T3/fold.pdf" --work-dir "$T3/w_fold" \
+  --view-declaration "$T3/decl_fold.json" \
+  "$T3/00_目录.md" "$T3/a.md" >"$T3/fold_e.txt" 2>&1 \
+  || { cat "$T3/fold_e.txt"; echo "错误：T03-4 折行正例导出失败"; exit 1; }
+python3 "$VERIFY" --pdf "$T3/fold.pdf" --work-dir "$T3/w_fold" \
+  --view-declaration "$T3/decl_fold.json" \
+  "$T3/00_目录.md" "$T3/a.md" >"$T3/fold_v.txt" 2>&1 \
+  || { cat "$T3/fold_v.txt"; echo "错误：T03-4 折行正例核验失败"; exit 1; }
+python3 - "$T3" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import ArrayObject, NameObject
+
+base = Path(sys.argv[1])
+reader = PdfReader(str(base / 'fold.pdf'))
+named = {}
+for key, value in reader.named_destinations.items():
+    named[str(key).lstrip('/')] = reader.get_destination_page_number(value)
+chapter_pages = {page for page in named.values() if page != 0}
+assert chapter_pages, named
+chapter_page = chapter_pages.pop()
+writer = PdfWriter(clone_from=reader)
+toc_page = writer.pages[0]
+annots = [ref.get_object() for ref in toc_page['/Annots']]
+
+
+def _dest_page(obj):
+    dest = obj.get('/Dest')
+    if dest is None and obj.get('/A') is not None:
+        dest = obj['/A'].get_object().get('/D')
+    if dest is None:
+        return None
+    dest = dest.get_object() if hasattr(dest, 'get_object') else dest
+    if isinstance(dest, bytes):
+        dest = dest.decode('utf-8', 'replace')
+    if isinstance(dest, str):
+        return named.get(dest.lstrip('/'))
+    return None
+
+
+def _width(annot):
+    rect = annot.get('/Rect') or [0, 0, 0, 0]
+    return abs(float(rect[2]) - float(rect[0]))
+
+
+victims = [a for a in annots if _dest_page(a) == chapter_page]
+assert len(victims) >= 3, '目录页应有条目整行注解与折行多段注解：%r' % (victims,)
+# 条目注解为整行宽；折行导览的各段注解均窄于整行
+widest = max(_width(a) for a in victims)
+segments = [a for a in victims if _width(a) < widest]
+assert len(segments) >= 2, '长标签未折行（应产生两段以上导览注解）'
+# 正例直读确认：各段的目的地都解析到章首页
+for seg in segments:
+    assert _dest_page(seg) == chapter_page, '折行段目的地错误'
+# 仅篡改折行第一段（纵高最高者）的目的地回目录页自身
+victim = max(segments, key=lambda a: float((a.get('/Rect') or [0, 0, 0, 0])[3]))
+toc_dest = ArrayObject([toc_page.indirect_reference, NameObject('/Fit')])
+if victim.get('/Dest') is not None:
+    victim[NameObject('/Dest')] = toc_dest
+else:
+    victim['/A'].get_object()[NameObject('/D')] = toc_dest
+writer.write(str(base / 'fold_masked.pdf'))
+report = json.loads((base / 'w_fold' / 'export_report.json')
+                    .read_text(encoding='utf-8'))
+report['pdf_sha256'] = hashlib.sha256(
+    (base / 'fold_masked.pdf').read_bytes()).hexdigest()
+(base / 'w_fold' / 'export_report.json').write_text(
+    json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+print('T03-4 折行部分篡改样本就绪')
+PY
+if python3 "$VERIFY" --pdf "$T3/fold_masked.pdf" --work-dir "$T3/w_fold" \
+    --view-declaration "$T3/decl_fold.json" \
+    "$T3/00_目录.md" "$T3/a.md" >"$T3/fold_masked_v.txt" 2>&1; then
+  echo "错误：T03-4 仅篡改一段的折行导览链接未被核验拒绝"; exit 1
+fi
+grep -q "toc-nav-link-missing" "$T3/fold_masked_v.txt" \
+  || { cat "$T3/fold_masked_v.txt"; echo "错误：T03-4 toc-nav-link-missing 诊断缺失"; exit 1; }
+grep -q "附加导览文字" "$T3/fold_masked_v.txt" \
+  || { cat "$T3/fold_masked_v.txt"; echo "错误：T03-4 未定位到被改错的折行链接"; exit 1; }
+echo "T03-4：折行导览正例通过、各段跳转正确，仅篡改一段即被逐段核对检出 PASS"
+
+# T03-3：无主机定位符完整校验（复审 P2）：链接与裸两种形态逐项定位拒绝
+for form in link bare; do
+  cat > "$T3/00_目录.md" <<MD
+# 目录
+
+$( [ "$form" = link ] && echo '译自 [原文](https:///paper)' || echo '译自 https:///paper' )
+
+- [第 A 章](a.md)
+MD
+  printf 'OLD-PDF' > "$T3/keep_$form.pdf"
+  if python3 "$EXPORT" --output "$T3/keep_$form.pdf" --work-dir "$T3/w_$form" \
+      "$T3/00_目录.md" "$T3/a.md" >"$T3/${form}_e.txt" 2>&1; then
+    echo "错误：T03-3 无主机定位符（$form）未被拒绝"; exit 1
+  fi
+  grep -q "L3" "$T3/${form}_e.txt" \
+    || { cat "$T3/${form}_e.txt"; echo "错误：T03-3（$form）未定位 L3"; exit 1; }
+  grep -q "URL 定位符缺少主机" "$T3/${form}_e.txt" \
+    || { cat "$T3/${form}_e.txt"; echo "错误：T03-3（$form）缺少主机诊断缺失"; exit 1; }
+  test ! -f "$T3/w_$form/candidate.pdf" || { echo "错误：T03-3（$form）仍生成候选"; exit 1; }
+  [ "$(cat "$T3/keep_$form.pdf")" = "OLD-PDF" ] \
+    || { echo "错误：T03-3（$form）覆盖旧 PDF"; exit 1; }
+done
+echo "T03-3：无主机定位符链接/裸两形态均定位失败、零候选、旧 PDF 不变 PASS"
+
+echo "==> T04（第二轮复审修复）：同名实例与 URL 实际路径"
+T4="$TMP/t04_review"
+mkdir -p "$T4"
+python3 - "$T4" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+for tag, suffix in [('plain', ''), ('digit3', ' 3'), ('query_ok', ''),
+                    ('prefix', ''), ('twins', ''), ('code', '')]:
+    case = base / tag
+    case.mkdir()
+    title = ('第 A 章' + '这是检验折行印刷目录的长标题' * 6
+             if tag == 'prefix' else '第 A 章')
+    chapter = '# %s\n\n> **来源**：https://example.com/chapter\n\nA 正文。\n' % title
+    guide = '[第 A 章](a.md)' + suffix
+    if tag == 'twins':
+        guide += ' 和 [第 A 章](a.md)'
+    if tag == 'code':
+        guide = '[`第 A 章`](a.md)'
+    url = ('https://example.com/paper?id=1' if tag == 'query_ok'
+           else 'https://example.com/paper')
+    (case / 'a.md').write_text(chapter, encoding='utf-8')
+    (case / '00_目录.md').write_text(
+        '# 目录\n\n译自 [原文](%s)\n\n%s\n\n'
+        '- [%s](a.md)\n' % (url, guide, title), encoding='utf-8')
+    (case / 'input_hashes.json').write_text(json.dumps({
+        name: hashlib.sha256((case / name).read_bytes()).hexdigest()
+        for name in ('00_目录.md', 'a.md')}), encoding='utf-8')
+PY
+for tag in plain digit3 query_ok prefix twins code; do
+  case_dir="$T4/$tag"
+  python3 "$EXPORT" --output "$case_dir/out.pdf" --work-dir "$case_dir/work" \
+    "$case_dir/00_目录.md" "$case_dir/a.md" >"$case_dir/export.log" 2>&1 \
+    || { cat "$case_dir/export.log"; echo "错误：T04 $tag 正例导出失败"; exit 1; }
+  python3 "$VERIFY" --pdf "$case_dir/out.pdf" --work-dir "$case_dir/work" \
+    "$case_dir/00_目录.md" "$case_dir/a.md" >"$case_dir/verify.log" 2>&1 \
+    || { cat "$case_dir/verify.log"; echo "错误：T04 $tag 正例核验失败"; exit 1; }
+done
+python3 - "$T4" <<'PY'
+import hashlib, json, re, shutil, sys
+from pathlib import Path
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import ArrayObject, NameObject
+base = Path(sys.argv[1])
+for tag in ('plain', 'digit3', 'query_ok', 'prefix', 'twins',
+            'code'):
+    case = base / tag
+    hashes = json.loads((case / 'input_hashes.json').read_text())
+    assert all(hashlib.sha256((case / name).read_bytes()).hexdigest() == digest
+               for name, digest in hashes.items()), '输入 Markdown 被改动'
+    reader = PdfReader(case / 'out.pdf')
+    text = re.sub(r'\s+', '', ''.join(p.extract_text() or '' for p in reader.pages))
+    assert '译自' not in text and '第A章' in text and 'A正文' in text
+    if tag == 'digit3':
+        assert '第A章3' in text, '标签后其他数字被误删'
+    named = {str(n).lstrip('/'): reader.get_destination_page_number(d)
+             for n, d in reader.named_destinations.items()}
+    annotations = [ref.get_object() for ref in reader.pages[0]['/Annots']]
+    assert len(annotations) == (3 if tag == 'twins' else 2), '链接实例数量不符'
+    for annot in annotations:
+        dest = annot.get('/Dest')
+        if dest is None:
+            dest = annot['/A'].get_object()['/D']
+        assert named.get(str(dest).lstrip('/')) == 1, '正例跳转目标错误'
+    if tag == 'query_ok':
+        continue
+    # 印刷目录在上方；逐个改低处的真实导览，其他实例保持正确。
+    printed_index = max(range(len(annotations)),
+                        key=lambda i: float(annotations[i]['/Rect'][3]))
+    for victim_index in range(len(annotations)):
+        if victim_index == printed_index:
+            continue
+        for fault in ('wrong_target', 'deleted'):
+            out = case / ('%s_%d' % (fault, victim_index))
+            out.mkdir()
+            writer = PdfWriter(clone_from=reader)
+            page = writer.pages[0]
+            if fault == 'deleted':
+                page[NameObject('/Annots')] = ArrayObject([
+                    ref for i, ref in enumerate(page['/Annots']) if i != victim_index])
+            else:
+                victim = page['/Annots'][victim_index].get_object()
+                dest = ArrayObject([page.indirect_reference, NameObject('/Fit')])
+                if victim.get('/Dest') is not None:
+                    victim[NameObject('/Dest')] = dest
+                else:
+                    victim['/A'].get_object()[NameObject('/D')] = dest
+            writer.write(out / 'out.pdf')
+            shutil.copytree(case / 'work', out / 'work')
+            report_path = out / 'work' / 'export_report.json'
+            report = json.loads(report_path.read_text())
+            report['pdf_sha256'] = hashlib.sha256((out / 'out.pdf').read_bytes()).hexdigest()
+            report_path.write_text(json.dumps(report, ensure_ascii=False), encoding='utf-8')
+print('T04 正例成品直读：出处缺席、导航文字/两处跳转及输入摘要正确')
+PY
+for tag in plain digit3 prefix twins code; do
+  for fault_dir in "$T4/$tag"/wrong_target_* "$T4/$tag"/deleted_*; do
+    case_dir="$T4/$tag"
+    if python3 "$VERIFY" --pdf "$fault_dir/out.pdf" --work-dir "$fault_dir/work" \
+        "$case_dir/00_目录.md" "$case_dir/a.md" >"$fault_dir/verify.log" 2>&1; then
+      echo "错误：T04 $fault_dir 被其他正确实例掩盖"; exit 1
+    fi
+    grep -q 'toc-nav-link-missing' "$fault_dir/verify.log" \
+      || { cat "$fault_dir/verify.log"; echo "错误：T04 缺逐链接诊断"; exit 1; }
+    grep -q '第 A 章' "$fault_dir/verify.log" \
+      || { cat "$fault_dir/verify.log"; echo "错误：T04 未定位同名链接"; exit 1; }
+  done
+done
+echo "T04-1：同名/digit3/折行标题前缀/同行双链接/行内代码标签正例通过，逐实例篡改/删除均检出 PASS"
+
+python3 - "$T4" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+base = Path(sys.argv[1])
+for index, url in enumerate(('https://example.com/?next=/paper.pdf',
+                            'https://example.com?next=https://other.test/paper',
+                            'https://example.com/#https://other.test/paper')):
+    for form in ('link', 'bare'):
+        case = base / ('home_%d_%s' % (index, form))
+        case.mkdir()
+        (case / 'a.md').write_bytes((base / 'plain' / 'a.md').read_bytes())
+        locator = '[原文](%s)' % url if form == 'link' else url
+        (case / '00_目录.md').write_text(
+            '# 目录\n\n译自 %s\n\n- [第 A 章](a.md)\n' % locator, encoding='utf-8')
+        (case / 'keep.pdf').write_bytes(b'OLD-PDF')
+        (case / 'input_hashes.json').write_text(json.dumps({
+            name: hashlib.sha256((case / name).read_bytes()).hexdigest()
+            for name in ('00_目录.md', 'a.md')}), encoding='utf-8')
+PY
+for case_dir in "$T4"/home_*; do
+  if python3 "$EXPORT" --output "$case_dir/keep.pdf" --work-dir "$case_dir/work" \
+      "$case_dir/00_目录.md" "$case_dir/a.md" >"$case_dir/export.log" 2>&1; then
+    echo "错误：T04 首页 URL 假路径未被拒绝"; exit 1
+  fi
+  grep -q 'L3' "$case_dir/export.log" \
+    || { cat "$case_dir/export.log"; echo "错误：T04 首页 URL 缺行号"; exit 1; }
+  grep -q '主机内文档路径' "$case_dir/export.log" \
+    || { cat "$case_dir/export.log"; echo "错误：T04 首页 URL 缺路径诊断"; exit 1; }
+  test ! -f "$case_dir/work/candidate.pdf" \
+    || { echo "错误：T04 首页 URL 仍生成候选"; exit 1; }
+  [ "$(cat "$case_dir/keep.pdf")" = 'OLD-PDF' ] \
+    || { echo "错误：T04 首页 URL 覆盖旧 PDF"; exit 1; }
+done
+python3 - "$T4" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+for case in Path(sys.argv[1]).glob('home_*'):
+    hashes = json.loads((case / 'input_hashes.json').read_text())
+    assert all(hashlib.sha256((case / name).read_bytes()).hexdigest() == digest
+               for name, digest in hashes.items()), '拒绝场景改动 Markdown'
+print('T04-2：首页 query/fragment 三变体链接/裸形态逐项定位拒绝，零候选、旧 PDF/Markdown 不变 PASS')
+PY
+
+# Chromium 153 将旧 Div 布局容器标为 NonStruct；使用成品标签变体锁住
+# 兼容行为，不依赖运行环境恰好安装某个 Chromium 版本。
+echo "==> Chromium 匿名布局容器：完整代码通过、损伤拒绝、行内代码不借用"
+python3 - "$TMP/anonymous_layout" "$EXPORT" "$VERIFY" <<'PYCOMPAT'
+import hashlib, json, subprocess, sys
+from pathlib import Path
+from pypdf import PdfReader, PdfWriter
+from pypdf.generic import NameObject
+
+base = Path(sys.argv[1]); base.mkdir()
+export, verify = map(lambda p: str(Path(p).resolve()), sys.argv[2:])
+original = base / 'original.md'
+original.write_text('# 容器兼容样例\n\n> **来源**：https://example.com/paper\n\n'
+                    '正文中的行内代码 `printf("a b");` 保留。\n\n'
+                    '```c\nprintf("a b");\n```\n\n```c\nreturn 1;\n```\n\n'
+                    '未知语言回退：\n\n```unknownlang\nx = 1\ny = 2\n```\n\n'
+                    '缩进代码：\n\n    indented_a = 1\n    indented_b = 2\n', encoding='utf-8')
+digest = hashlib.sha256(original.read_bytes()).hexdigest()
+for tag in ('good', 'bad', 'missing_block'):
+    source = original if tag == 'good' else base / (tag + '.md')
+    if tag != 'good':
+        rendered = original.read_text()
+        if tag == 'bad':
+            rendered = rendered.replace('```c\nprintf("a b");', '```c\nprintf("ab");')
+        else:
+            rendered = rendered.replace('```c\nprintf("a b");\n```\n\n', '')
+        source.write_text(rendered, encoding='utf-8')
+    work = base / ('work_' + tag); pdf = base / (tag + '.pdf')
+    result = subprocess.run([sys.executable, export, '--output', str(pdf),
+                             '--work-dir', str(work), str(source)],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    writer = PdfWriter(clone_from=PdfReader(pdf))
+    def change_tag(node):
+        node = node.get_object() if hasattr(node, 'get_object') else node
+        if isinstance(node, list):
+            for child in node: change_tag(child)
+        elif isinstance(node, dict):
+            if node.get('/S') == '/Div': node[NameObject('/S')] = NameObject('/NonStruct')
+            change_tag(node.get('/K', []))
+    change_tag(writer._root_object['/StructTreeRoot'])
+    with pdf.open('wb') as handle: writer.write(handle)
+    report_path = work / 'export_report.json'
+    report = json.loads(report_path.read_text())
+    for item in report['inputs']:
+        item.update(path=str(original.resolve()), sha256=digest, bytes=original.stat().st_size)
+    for item in report['chapters']:
+        item['path'] = str(original.resolve())
+        if 'sha256' in item: item['sha256'] = digest
+    report['pdf_sha256'] = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding='utf-8')
+    result = subprocess.run([sys.executable, verify, '--pdf', str(pdf),
+                             '--work-dir', str(work), str(original)],
+                            capture_output=True, text=True)
+    evidence = json.loads((work / 'verify_report.json').read_text())
+    if tag == 'good':
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not any('结构不足' in item.get('segment', '')
+                       for item in evidence['relaxed_matches']), evidence
+    else:
+        assert result.returncode != 0, tag + ': 代码损伤被静默放过'
+        codes = {item['code'] for item in evidence['failures']}
+        assert 'code-line-missing' in codes and 'pdf-evidence-mismatch' not in codes, evidence
+assert hashlib.sha256(original.read_bytes()).hexdigest() == digest
+print('匿名布局容器：高亮/未知语言/缩进代码有结构归属、空格删除/整块缺失拒绝、行内代码不借用、原输入不变 PASS')
+PYCOMPAT
+
+# 译注排除只作用于正文：缩进代码和引用块中的同形字符串必须保留。
+echo "==> 译注块边界：缩进代码/引用保留，相邻正文译注排除"
+python3 - "$TMP/note_blocks" "$EXPORT" "$VERIFY" <<'PYNOTES'
+import hashlib, json, re, subprocess, sys
+from pathlib import Path
+from pypdf import PdfReader
+
+base = Path(sys.argv[1]); base.mkdir()
+export, verify = (str(Path(p).resolve()) for p in sys.argv[2:])
+protected = '【译注：代码字符串必须保留】'
+for tag, block in (
+    ('spaces', '    print("%s")' % protected),
+    ('tab', '\tprint("%s")' % protected),
+    ('quote', '> 原文引用开始。\n原文续行%s结束。' % protected),
+):
+    source = base / (tag + '.md')
+    source.write_text('# 译注边界样例\n\n> **来源**：https://example.com/paper\n\n'
+                      '正文前文。\n\n' + block + '\n\n'
+                      '正文后文【译注：正文说明应隐藏】仍须保留。\n', encoding='utf-8')
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    pdf = base / (tag + '.pdf'); work = base / ('work_' + tag)
+    for name, command in (
+        ('export', [sys.executable, export, '--output', str(pdf), '--work-dir', str(work), str(source)]),
+        ('verify', [sys.executable, verify, '--pdf', str(pdf), '--work-dir', str(work), str(source)]),
+    ):
+        result = subprocess.run(command, capture_output=True, text=True)
+        (base / (tag + '_' + name + '.log')).write_text(result.stdout + result.stderr)
+        assert result.returncode == 0, tag + ': ' + result.stdout + result.stderr
+    text = re.sub(r'\s+', '', ''.join(page.extract_text() or '' for page in PdfReader(pdf).pages))
+    assert protected in text, tag + ': 原文代码/引用被误删'
+    assert '【译注：正文说明应隐藏】' not in text, tag + ': 正文译注未排除'
+    assert '正文后文仍须保留。' in text, tag + ': 相邻正文被连带排除'
+    evidence = json.loads((work / 'export_report.json').read_text())
+    assert len(evidence['translator_note_exclusions']) == 1, evidence
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
+print('译注块边界：空格/Tab 缩进代码与引用懒惰续行保留，正文译注独立排除、输入不变 PASS')
+PYNOTES
