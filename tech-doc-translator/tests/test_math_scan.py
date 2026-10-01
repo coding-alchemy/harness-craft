@@ -7,12 +7,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/tech-doc-tr
 from _verification import (
     compare_math_spans,
     extract_approved_extra_math,
+    markdown_table_row_lines,
     scan_math_spans,
 )
 
 
 def kinds(spans):
     return [(s.kind, s.expr) for s in spans]
+
+
+class BaseDependencyDeclarationTest(unittest.TestCase):
+    """基础依赖声明与核验模块导入面一致（普通翻译不安装 PDF 依赖）。"""
+
+    def test_markdown_it_declared_in_base_requirements(self):
+        # S1：_verification（翻译核验共用模块）顶层导入 markdown_it，
+        # markdown-it-py 必须声明在基础 requirements.txt 中，不能只
+        # 留在 PDF 可选依赖里
+        skill_dir = (Path(__file__).resolve().parents[1]
+                     / 'skills/tech-doc-translator')
+        text = (skill_dir / 'requirements.txt').read_text(encoding='utf-8')
+        self.assertIn('markdown-it-py', text)
 
 
 class ScanMathSpansTest(unittest.TestCase):
@@ -126,6 +140,166 @@ class CompareMathSpansTest(unittest.TestCase):
         d2 = self.scan(r'历史 $\(M\)$ 新增\n')
         diffs, _ = compare_math_spans(s, d2, 'a.md', 'b.md')
         self.assertTrue(diffs)
+
+
+class LinkLabelMathScanTest(unittest.TestCase):
+    """链接标签中的公式参与扫描（S09）：标签内改符号必须可检出；标签内
+    转义括号仍不构成公式定界（既有排除目的保持）。"""
+
+    def test_label_math_scanned_and_damage_detected(self):
+        src = scan_math_spans('见 [Equation $x$](https://example.com) 说明\n')
+        self.assertEqual(kinds(src), [('inline', 'x')])
+        doc = scan_math_spans('见 [Equation $y$](https://example.com) 说明\n')
+        diffs, _ = compare_math_spans(src, doc, 'a.md', 'b.md')
+        self.assertTrue(any("'x'" in d and "'y'" in d for d in diffs))
+        # 未变公式正例通过
+        same = scan_math_spans('见 [Equation $x$](https://example.com) 说明\n')
+        self.assertEqual(compare_math_spans(src, same, 'a.md', 'b.md'),
+                         ([], []))
+
+    def test_escaped_brackets_in_label_not_block_math(self):
+        text = r'常量 [Python Constant\[T\]](https://example.com) 说明'
+        self.assertEqual(scan_math_spans(text), [])
+
+
+class TablePipeNormalizationTest(unittest.TestCase):
+    """译文表格行管道转义归一（§8.5）：仅真实表格行归一，普通正文含管道
+    不归一（S10）。"""
+
+    def test_markdown_table_row_lines_detection(self):
+        # GFM 语义：表格块由表头 + 分隔行识别，其后连续含管道行为数据行；
+        # 空行结束表格；单行含管道正文（其后无分隔行）不是表格
+        text = ('| A | B |\n| --- | --- |\n| a | b |\n'
+                '\n'
+                '正文 | 管道\n'
+                '| 只有表头 |\n不是表格\n'
+                '```text\n| 代码 | 块 |\n| --- | --- |\n```\n')
+        self.assertEqual(markdown_table_row_lines(text), {1, 2, 3})
+
+    def test_table_block_ends_at_other_blocks_and_bad_column_count(self):
+        # F5：表格后的列表/引用块开启新块，不再算作表格行（表外公式
+        # 损伤必须可检）；表头列数与分隔行不符不构成表格
+        after_list = ('| A | B |\n| --- | --- |\n| a | b |\n'
+                      '- item | with pipe\n')
+        self.assertEqual(markdown_table_row_lines(after_list), {1, 2, 3})
+        after_quote = ('| A | B |\n| --- | --- |\n| a | b |\n'
+                       '> quote | with pipe\n')
+        self.assertEqual(markdown_table_row_lines(after_quote), {1, 2, 3})
+        bad_columns = '| A | B | C |\n| --- | --- |\n| a | $x$ |\n'
+        self.assertEqual(markdown_table_row_lines(bad_columns), set())
+
+    def test_table_then_list_pipe_escape_damage_detected(self):
+        # F5：表格紧接列表（无空行）时，列表行的公式不是表格行，
+        # 绝对值改范数必须拒绝
+        src = scan_math_spans('[TABLE]\nKind | Formula\n--- | ---\n'
+                              'Abs | $|x|$\n- Formula $|x|$\n')
+        doc_text = ('| Kind | Formula |\n| --- | --- |\n| Abs | $\\|x\\|$ |\n'
+                    '- Formula $\\|x\\|$\n')
+        doc = scan_math_spans(doc_text)
+        diffs, _ = compare_math_spans(src, doc, 'src.md', 'doc.md',
+                                      doc_text=doc_text)
+        self.assertTrue(any("L4" in d or 'L5' in d for d in diffs), diffs)
+        # 列表行未改公式的正例通过
+        doc_same = scan_math_spans(
+            '| Kind | Formula |\n| --- | --- |\n| Abs | $\\|x\\|$ |\n'
+            '- Formula $|x|$\n')
+        diffs, _ = compare_math_spans(
+            src, doc_same, 'src.md', 'doc.md',
+            doc_text='| Kind | Formula |\n| --- | --- |\n'
+                     '| Abs | $\\|x\\|$ |\n- Formula $|x|$\n')
+        self.assertEqual(diffs, [])
+
+    def test_table_inside_blockquote_recognized(self):
+        # F5：引用块内的真实表格按去 ``> `` 后内容判定，合法转义归一
+        quote = ('> | Kind | Formula |\n> | --- | --- |\n'
+                 '> | Abs | $\\|x\\|$ |\n')
+        self.assertEqual(markdown_table_row_lines(quote), {1, 2, 3})
+        src = scan_math_spans('[TABLE]\nKind | Formula\n--- | ---\n'
+                              'Abs | $|x|$\n')
+        doc = scan_math_spans(quote)
+        diffs, _ = compare_math_spans(src, doc, 'src.md', 'doc.md',
+                                      doc_text=quote)
+        self.assertEqual(diffs, [])
+        # 引用表格内的其余公式损伤仍拒绝
+        bad = scan_math_spans(quote.replace('$\\|x\\|$', '$\\|x*y\\|$'))
+        diffs, _ = compare_math_spans(src, bad, 'src.md', 'doc.md',
+                                      doc_text=quote)
+        self.assertTrue(diffs)
+
+    def test_nested_quote_after_quoted_table_not_table_row(self):
+        # F5 第三轮：引用表格后的嵌套引用行开启新块，不算表格行；
+        # 表外公式把 | 转义成 \| 的损伤不得被表格行归一掩盖
+        doc_text = ('> | Kind | Formula |\n> | --- | --- |\n'
+                    '> | Abs | $\\|x\\|$ |\n>> note $\\|x\\|$\n')
+        self.assertEqual(markdown_table_row_lines(doc_text), {1, 2, 3})
+        src = scan_math_spans('[TABLE]\nKind | Formula\n--- | ---\n'
+                              'Abs | $|x|$\nnote $|x|$\n')
+        doc = scan_math_spans(doc_text)
+        diffs, _ = compare_math_spans(src, doc, 'src.md', 'doc.md',
+                                      doc_text=doc_text)
+        self.assertTrue(any('L4' in d for d in diffs), diffs)
+        # 嵌套引用行未改公式的正例通过
+        doc_same = scan_math_spans(doc_text.replace('note $\\|x\\|$',
+                                                    'note $|x|$'))
+        diffs, _ = compare_math_spans(src, doc_same, 'src.md', 'doc.md',
+                                      doc_text=doc_text.replace(
+                                          'note $\\|x\\|$', 'note $|x|$'))
+        self.assertEqual(diffs, [])
+
+    def test_escaped_pipe_in_header_keeps_real_table(self):
+        # F5 第三轮：表头单元格内的 \| 是转义管道，实际列数不变；
+        # 表仍被识别，表内公式的合法 \| 转义照常归一
+        doc_text = '| A\\|X | B |\n| --- | --- |\n| a | $\\|x\\|$ |\n'
+        self.assertEqual(markdown_table_row_lines(doc_text), {1, 2, 3})
+        src = scan_math_spans('[TABLE]\nA | B\n--- | ---\na | $|x|$\n')
+        doc = scan_math_spans(doc_text)
+        diffs, _ = compare_math_spans(src, doc, 'src.md', 'doc.md',
+                                      doc_text=doc_text)
+        self.assertEqual(diffs, [])
+        # 表内其余公式损伤仍拒绝
+        bad = scan_math_spans(doc_text.replace('$\\|x\\|$', '$\\|x*y\\|$'))
+        diffs, _ = compare_math_spans(src, bad, 'src.md', 'doc.md',
+                                      doc_text=doc_text)
+        self.assertTrue(diffs)
+
+    def test_literal_html_line_before_table_matches_export(self):
+        # F5 第四轮：核验解析配置与实际导出一致（html=False）——字面
+        # <div> 行只是普通文字，其后紧邻的合法表格照常识别，表内合法
+        # \| 转义归一通过（html=True 会把整片吞成 HTML 块而误拒）
+        doc_text = '# H\n\n<div>\n| A | B |\n| --- | --- |\n| a | $\\|x\\|$ |\n'
+        self.assertEqual(markdown_table_row_lines(doc_text), {4, 5, 6})
+        src = scan_math_spans('[TABLE]\nA | B\n--- | ---\na | $|x|$\n')
+        doc = scan_math_spans(doc_text)
+        diffs, _ = compare_math_spans(src, doc, 'src.md', 'doc.md',
+                                      doc_text=doc_text)
+        self.assertEqual(diffs, [])
+
+    def test_real_table_row_normalized_and_damage_detected(self):
+        src = scan_math_spans('[TABLE]\nKind | Formula\n--- | ---\n'
+                              'Abs | $|x|$\n')
+        doc_text = '| Kind | Formula |\n| --- | --- |\n| Abs | $\\|x\\|$ |\n'
+        doc = scan_math_spans(doc_text)
+        diffs, _ = compare_math_spans(src, doc, 'src.md', 'doc.md',
+                                      doc_text=doc_text)
+        self.assertEqual(diffs, [])
+        # 表格行内的其余公式损伤仍拒绝
+        doc_bad = scan_math_spans(doc_text.replace('$\\|x\\|$', '$\\|x*y\\|$'))
+        diffs, _ = compare_math_spans(src, doc_bad, 'src.md', 'doc.md',
+                                      doc_text=doc_text)
+        self.assertTrue(diffs)
+
+    def test_pipe_in_plain_prose_not_normalized(self):
+        src = scan_math_spans('A | B value $|x|$\n')
+        doc_text = 'A | B value $\\|x\\|$\n'
+        doc = scan_math_spans(doc_text)
+        diffs, _ = compare_math_spans(src, doc, 'src.md', 'doc.md',
+                                      doc_text=doc_text)
+        self.assertTrue(any("'|x|'" in d for d in diffs), diffs)
+        # 未改公式的正文管道正例照常通过
+        doc_same = scan_math_spans('A | B value $|x|$\n')
+        diffs, _ = compare_math_spans(src, doc_same, 'src.md', 'doc.md',
+                                      doc_text='A | B value $|x|$\n')
+        self.assertEqual(diffs, [])
 
 
 class ExtractApprovedExtraMathTest(unittest.TestCase):

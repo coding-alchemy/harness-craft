@@ -791,3 +791,6 @@ grep -q '\[OK\] wp_001.md' "$TMP/img_rec3.txt" \
 echo "源图恢复原内容后同一证据重新可复用"
 
 echo "==> Ticket 05 工作包、术语与恢复闭环回归全部通过"
+
+echo "==> 翻译留痕 06：交付完成统一检查（目录允许清单/持久证据/复核闭合）"
+PYTHONDONTWRITEBYTECODE=1 python3 test_delivery_evidence.py 2>&1 | tail -1

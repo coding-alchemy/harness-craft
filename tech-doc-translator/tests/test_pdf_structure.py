@@ -68,6 +68,8 @@ NESTED_FENCE_HEAD = (
 # 完全一致（identity），不以其余扫描器一致为成功。
 HEAD_FIXED_CASES = [
     # (ID, 正文行, 期望: identity 或 [(label, start, end_inclusive)])
+    # D6/A14 起默认政策为四字段（原文/译例说明/来源/抓取日期）：章首
+    # “来源：x”行随政策授权排除，KEEP 语义仍只约束非管理内容。
     ('H01', [
         '> ```',
         '> **原文**：KEEP',
@@ -81,7 +83,7 @@ HEAD_FIXED_CASES = [
         '> **原文**：KEEP',
         '> ```',
         '> ````',
-    ], 'identity'),
+    ], [('来源', 3, 3)]),
     ('H03', [
         '> **来源**：x',
         '>',
@@ -89,7 +91,7 @@ HEAD_FIXED_CASES = [
         '> ~~~',
         '> **原文**：KEEP',
         '> ```',
-    ], 'identity'),
+    ], [('来源', 3, 3)]),
     ('H04', [
         '> **来源**：x',
         '>',
@@ -97,7 +99,7 @@ HEAD_FIXED_CASES = [
         '> ``` trailing',
         '> **原文**：KEEP',
         '> ```',
-    ], 'identity'),
+    ], [('来源', 3, 3)]),
     ('H05', [
         '> **来源**：x',
         '>',
@@ -105,7 +107,7 @@ HEAD_FIXED_CASES = [
         '> ~~~ trailing',
         '> **原文**：KEEP',
         '> ~~~',
-    ], 'identity'),
+    ], [('来源', 3, 3)]),
     ('H06', [
         '    code line',
         '    > **原文**：KEEP',
@@ -115,14 +117,14 @@ HEAD_FIXED_CASES = [
         '>',
         '>     code',
         '>     **原文**：KEEP',
-    ], 'identity'),
+    ], [('来源', 3, 3)]),
     ('H08', [
         '> **来源**：x',
         '>',
         '> > ```',
         '> > **原文**：KEEP',
         '> > ```',
-    ], 'identity'),
+    ], [('来源', 3, 3)]),
     ('H09', [
         '正文段落。',
         '',
@@ -148,7 +150,7 @@ HEAD_FIXED_CASES = [
         '> - 第二条说明',
         '',
         '正文开始。',
-    ], [('原文', 3, 3), ('译例说明', 6, 8)]),
+    ], [('原文', 3, 3), ('来源', 4, 4), ('译例说明', 6, 8)]),
 ]
 
 
@@ -161,9 +163,10 @@ class ManagementFieldProjectionTests(unittest.TestCase):
         projected, spans = exporter.project_management_fields(REAL_CHAPTER_HEAD)
         self.assertEqual(
             [(s['label'], s['start_line'], s['end_line']) for s in spans],
-            [('原文', 3, 3), ('译例说明', 6, 8)],
+            [('原文', 3, 3), ('来源', 4, 4), ('译例说明', 6, 8)],
         )
-        self.assertIn('> **来源**', projected)
+        self.assertNotIn('> **来源**', projected)
+        self.assertNotIn('docs.nvidia.com', projected)
         self.assertNotIn('> **原文**', projected)
         self.assertNotIn('术语译法遵循本项目', projected)
         self.assertNotIn('[术语表](术语表.md)', projected)
@@ -207,7 +210,7 @@ class ManagementFieldProjectionTests(unittest.TestCase):
                 self.assertNotIn('example note', projected)
                 self.assertEqual(
                     [(s['label'], s['start_line'], s['end_line']) for s in spans],
-                    [('原文', 5, 5), ('译例说明', 13, 13)],
+                    [('来源', 3, 3), ('原文', 5, 5), ('译例说明', 13, 13)],
                 )
 
     def test_quoted_code_fence_survives_head_projection(self):
@@ -220,7 +223,7 @@ class ManagementFieldProjectionTests(unittest.TestCase):
         self.assertNotIn('example note', projected)
         self.assertEqual(
             [(s['label'], s['start_line'], s['end_line']) for s in spans],
-            [('原文', 5, 6), ('译例说明', 12, 12)],
+            [('来源', 3, 3), ('原文', 5, 6), ('译例说明', 12, 12)],
         )
 
     def test_fields_after_first_body_paragraph_survive(self):
@@ -255,8 +258,16 @@ class ManagementFieldProjectionTests(unittest.TestCase):
                         projected, case_id)
 
     def test_no_target_field_keeps_original_path(self):
+        # 四字段政策下章首来源行随默认授权排除；正文不修改的口径由
+        # 原文件只读保证，投影结果不再包含该行。
         text = '# 标题\n\n> **来源**：https://example.com\n\n正文。\n'
-        self.assertEqual(exporter.project_management_fields(text), (text, []))
+        projected, spans = exporter.project_management_fields(text)
+        self.assertEqual(
+            [(s['label'], s['start_line'], s['end_line']) for s in spans],
+            [('来源', 3, 3)],
+        )
+        self.assertNotIn('example.com', projected)
+        self.assertIn('正文。', projected)
 
 
 A_CHAPTER = (

@@ -42,6 +42,7 @@
 
 - 读取、发布或更新规格与 tickets：读取 [issue-tracker](docs/agents/issue-tracker.md)，使用所属范围的 `specs/` 原生 Markdown 工作流。
 - 涉及分诊或 Agent 执行状态：读取 [triage-labels](docs/agents/triage-labels.md)，使用默认五类标签，与文档人工评审状态分开记录。
+- 规划或执行同一大需求的分批迁移（原始开发分支持续保留成果，各批经迁移分支合入主分支），或将该流程已合入批次的主线 rebase 回原始开发分支：先读取 [分批迁移流水线](docs/agents/batch-migration.md)。
 
 ## 3. 工作区与 Git 边界
 
