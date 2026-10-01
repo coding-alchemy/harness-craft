@@ -70,3 +70,4 @@
 - 交付根目录布局、两份可选用户说明与映射迁移规则见 `<SKILL目录>/references/pdf_export.md`；交付级映射固定写入 `export/images_display.json`（导出与核验两侧命令显式传入 `--images-display export/images_display.json`，回补 `--output` 指向同一位置）。
 - 存量译文恢复图片尺寸：`rebuild_images_display.py --manifest <清单> --output <交付映射>`（清单声明范围与同版本来源；只核对图片出现、尺寸与独立身份，不做全文对账，契约见 `<SKILL目录>/references/images_display.md`）。
 - 宣称交付完成前运行 `verify_delivery.py --record <记录> --evidence-dir <持久目录>`：目录允许清单、身份、核验复跑与证据索引统一核验（记录参数按各工具真实 CLI 解释，机器证据取自本次核验计算，不依赖预存核验 JSON；报告写入独立批次后原子替换索引）；人工视觉复核闭合才允许通过。
+- 交付验收成立后按 `<SKILL目录>/references/cleanup.md` 执行收尾清理：证据归入翻译项目 `evidence/`，已确认无用项直接删除，清理后复验阅读、重新导出、恢复与证据回查。

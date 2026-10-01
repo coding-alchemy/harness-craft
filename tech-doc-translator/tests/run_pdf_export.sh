@@ -2668,6 +2668,14 @@ cat > "$TN/note.md" <<'MD'
 > 原文引用 【译注：引用内不删】 保留。
 
 `行内 【译注：代码串不删】 也保留。`
+
+同片段首现。【译注：重复译注】甲。
+
+同片段二现。【译注：重复译注】乙。
+
+同行两处：【译注：同行注】与【译注：同行注】并列，另随【译注：重复译注】三现。
+
+行内标记译注：前文【译注：含 `code` 与 *强调* 标记】后文。
 MD
 python3 "$EXPORT" --output "$TN/book.pdf" --work-dir "$TN/work" \
   "$TN/note.md" >"$TN/export.txt" 2>&1 \
@@ -2683,9 +2691,20 @@ import pypdf
 
 report = json.loads((Path(sys.argv[1]) / "export_report.json").read_text(encoding="utf-8"))
 notes = report["translator_note_exclusions"]
-assert [n["fragment"] for n in notes] == ["【译注：样例译注】",
-                                          "【译注：URL 还原说明】"], notes
-assert all(n["input"].endswith("note.md") and isinstance(n["line"], int) for n in notes), notes
+# 逐处行号登记：同一翻译注片段的每次出现登记各自实际行号，
+# 同行两处各自记录，不错位、不重复登记首处行号；含行内 code/强调
+# 标记的译注被拆成多个文本节点也须整段剥离，登记片段取源文原文。
+assert [(n["line"], n["fragment"]) for n in notes] == [
+    (5, "【译注：样例译注】"),
+    (7, "【译注：URL 还原说明】"),
+    (17, "【译注：重复译注】"),
+    (19, "【译注：重复译注】"),
+    (21, "【译注：同行注】"),
+    (21, "【译注：同行注】"),
+    (21, "【译注：重复译注】"),
+    (23, "【译注：含 `code` 与 *强调* 标记】"),
+], notes
+assert all(n["input"].endswith("note.md") for n in notes), notes
 
 
 def norm(s):
@@ -2693,15 +2712,21 @@ def norm(s):
 
 
 text = norm("".join(p.extract_text() or "" for p in pypdf.PdfReader(sys.argv[2]).pages))
-for hidden in ("【译注：样例译注】", "【译注：URL还原说明】"):
+for hidden in ("【译注：样例译注】", "【译注：URL还原说明】",
+               "【译注：重复译注】", "【译注：同行注】",
+               "【译注：含code与强调标记】"):
     assert norm(hidden) not in text, f"译注不应出现在 PDF：{hidden}"
 for keep in ("正文句一。句二继续。",
              "参考文献行：Author,A.Title.https://example.com/ref-a。",
              norm("代码中 【译注：代码内不删】 保留。"),
              norm("原文引用 【译注：引用内不删】 保留。"),
-             norm("行内 【译注：代码串不删】 也保留。")):
+             norm("行内 【译注：代码串不删】 也保留。"),
+             "同片段首现。甲。",
+             "同片段二现。乙。",
+             "同行两处：与并列，另随三现。",
+             "行内标记译注：前文后文。"):
     assert norm(keep) in text, f"译注旁文或保留区内容缺失：{keep}"
-print("译注清单、PDF 缺席、旁文与代码/引用保留证据齐全")
+print("译注清单、逐处行号、PDF 缺席、旁文与代码/引用保留证据齐全")
 PY
 echo "已标识译注：正文移除、参考文献行内只删片段、代码/引用保留 PASS"
 
