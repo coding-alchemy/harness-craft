@@ -553,5 +553,70 @@ class MarkdownStructureTests(unittest.TestCase):
                          ['ch01-a%d' % i for i in range(12)])
 
 
+
+
+class LongTokenParagraphLayoutTests(unittest.TestCase):
+    """长不可断 token（参考文献 URL）段落不得触发打印整页缩放。
+
+    回归：段落内长 URL 溢出打印页盒时，Chromium 曾整页缩放
+    （约 0.892），导致映射图片绘制宽度不符、版心错位；打印样式
+    现要求段落词内折行（overflow-wrap: break-word）。"""
+
+    def test_long_url_paragraph_keeps_mapped_image_width(self):
+        import json
+        import struct
+        import zlib
+
+        def chunk(tag, data):
+            body = tag + data
+            return (struct.pack('>I', len(data)) + body
+                    + struct.pack('>I', zlib.crc32(body)))
+
+        def make_png(path, w, h):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+            raw = b''.join(b'\x00' + b'\x01\x02\x03' * w for _ in range(h))
+            Path(path).write_bytes(
+                b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
+                + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+        tmp = Path(tempfile.mkdtemp(prefix='long-url-layout-'))
+        self.addCleanup(__import__('shutil').rmtree, tmp, True)
+        make_png(tmp / 'images/pic.png', 200, 100)
+        long_url = ('https://example.com/' + 'a' * 120 + '/index.html')
+        chapter = tmp / 'a.md'
+        chapter.write_text(
+            '# 第 1 章（Demo）\n\n'
+            '> **来源**：https://example.com/prov-long-url\n'
+            '> **抓取日期**：2026-09-27\n\n'
+            '![图](images/pic.png)\n\n'
+            '参考文献行：Author, A. URL %s.\n' % long_url,
+            encoding='utf-8')
+        (tmp / 'export').mkdir()
+        (tmp / 'export/images_display.json').write_text(json.dumps({
+            'version': 1, 'markdown': 'a.md',
+            'entries': [{
+                'markdown': '../a.md', 'occurrence': 1,
+                'image': '../images/pic.png',
+                'sha256': __import__('hashlib').sha256(
+                    (tmp / 'images/pic.png').read_bytes()).hexdigest(),
+                'width': {'value': 150, 'unit': 'px',
+                          'basis': 'inline-css-width',
+                          'reference': None},
+            }],
+            'undetermined': [],
+        }, ensure_ascii=False), encoding='utf-8')
+        result = exporter.export(
+            [str(chapter)], tmp / 'book.pdf', tmp / 'work',
+            images_display_paths=[str(tmp / 'export/images_display.json')])
+        self.assertEqual(result, 0)
+        args = verifier.parse_args(
+            ['--pdf', str(tmp / 'book.pdf'), '--work-dir', str(tmp / 'work'),
+             '--images-display', str(tmp / 'export/images_display.json'),
+             str(chapter)])
+        ok, report = verifier.run_verification(args)
+        self.assertTrue(ok, report.get('failures'))
+
+
 if __name__ == '__main__':
     unittest.main()
