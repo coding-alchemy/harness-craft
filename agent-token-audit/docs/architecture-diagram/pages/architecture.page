@@ -1,0 +1,1845 @@
+{
+  "pageType": "content",
+  "background": {
+    "type": "solid",
+    "color": "$paper"
+  },
+  "notes": "上下三层泳道、层内左到右流程。来源是外部只读依赖。候选查询不进入计量内核；保存报告展示跳过来源与内核。Python与浏览器校验分别保护各自输入。",
+  "elements": [
+    {
+      "elementId": "access-layer",
+      "elementType": "shape",
+      "bounds": [
+        430,
+        205,
+        1320,
+        290
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$inputLight"
+      },
+      "border": {
+        "style": "solid",
+        "width": 0,
+        "color": "$inputLight"
+      }
+    },
+    {
+      "elementId": "metering-layer",
+      "elementType": "shape",
+      "bounds": [
+        430,
+        570,
+        1320,
+        290
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$light"
+      },
+      "border": {
+        "style": "solid",
+        "width": 0,
+        "color": "$light"
+      }
+    },
+    {
+      "elementId": "presentation-layer",
+      "elementType": "shape",
+      "bounds": [
+        430,
+        935,
+        1320,
+        435
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$savedLight"
+      },
+      "border": {
+        "style": "solid",
+        "width": 0,
+        "color": "$savedLight"
+      }
+    },
+    {
+      "elementId": "cli-box",
+      "elementType": "shape",
+      "bounds": [
+        470,
+        240,
+        300,
+        100
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$input"
+      }
+    },
+    {
+      "elementId": "http-box",
+      "elementType": "shape",
+      "bounds": [
+        470,
+        370,
+        300,
+        100
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$input"
+      }
+    },
+    {
+      "elementId": "query-box",
+      "elementType": "shape",
+      "bounds": [
+        895,
+        300,
+        300,
+        140
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$input"
+      }
+    },
+    {
+      "elementId": "operations-box",
+      "elementType": "shape",
+      "bounds": [
+        1300,
+        300,
+        400,
+        155
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$input"
+      }
+    },
+    {
+      "elementId": "source-box",
+      "elementType": "shape",
+      "bounds": [
+        60,
+        667,
+        310,
+        155
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$edge"
+      }
+    },
+    {
+      "elementId": "adapter-box",
+      "elementType": "shape",
+      "bounds": [
+        470,
+        640,
+        330,
+        150
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$read"
+      }
+    },
+    {
+      "elementId": "relations-box",
+      "elementType": "shape",
+      "bounds": [
+        880,
+        640,
+        330,
+        150
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$read"
+      }
+    },
+    {
+      "elementId": "core-box",
+      "elementType": "shape",
+      "bounds": [
+        1290,
+        640,
+        410,
+        150
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$read"
+      }
+    },
+    {
+      "elementId": "report-box",
+      "elementType": "shape",
+      "bounds": [
+        470,
+        985,
+        330,
+        130
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "formats-box",
+      "elementType": "shape",
+      "bounds": [
+        930,
+        985,
+        330,
+        130
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "terminal-box",
+      "elementType": "shape",
+      "bounds": [
+        1370,
+        985,
+        330,
+        130
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "shared-box",
+      "elementType": "shape",
+      "bounds": [
+        930,
+        1190,
+        330,
+        150
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "service-box",
+      "elementType": "shape",
+      "bounds": [
+        1370,
+        1165,
+        330,
+        95
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "offline-box",
+      "elementType": "shape",
+      "bounds": [
+        1370,
+        1270,
+        330,
+        95
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "saved-box",
+      "elementType": "shape",
+      "bounds": [
+        60,
+        1160,
+        310,
+        160
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "cli-query",
+      "elementType": "line",
+      "bounds": [
+        770,
+        290,
+        60,
+        80
+      ],
+      "viewBox": [
+        60,
+        80
+      ],
+      "points": "0,0 60,0 60,80",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        null
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$input"
+      }
+    },
+    {
+      "elementId": "http-query",
+      "elementType": "line",
+      "bounds": [
+        770,
+        370,
+        125,
+        50
+      ],
+      "viewBox": [
+        125,
+        50
+      ],
+      "points": "0,50 60,50 60,0 125,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$input"
+      }
+    },
+    {
+      "elementId": "query-operations",
+      "elementType": "line",
+      "bounds": [
+        1195,
+        370,
+        105,
+        1
+      ],
+      "viewBox": [
+        105,
+        1
+      ],
+      "points": "0,0 105,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$input"
+      }
+    },
+    {
+      "elementId": "operations-adapter",
+      "elementType": "line",
+      "bounds": [
+        635,
+        455,
+        865,
+        185
+      ],
+      "viewBox": [
+        865,
+        185
+      ],
+      "points": "865,0 865,75 0,75 0,185",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$input"
+      }
+    },
+    {
+      "elementId": "source-adapter",
+      "elementType": "line",
+      "bounds": [
+        370,
+        715,
+        100,
+        1
+      ],
+      "viewBox": [
+        100,
+        1
+      ],
+      "points": "0,0 100,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$edge"
+      }
+    },
+    {
+      "elementId": "adapter-relations",
+      "elementType": "line",
+      "bounds": [
+        800,
+        715,
+        80,
+        1
+      ],
+      "viewBox": [
+        80,
+        1
+      ],
+      "points": "0,0 80,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$read"
+      }
+    },
+    {
+      "elementId": "relations-core",
+      "elementType": "line",
+      "bounds": [
+        1210,
+        715,
+        80,
+        1
+      ],
+      "viewBox": [
+        80,
+        1
+      ],
+      "points": "0,0 80,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$read"
+      }
+    },
+    {
+      "elementId": "core-report",
+      "elementType": "line",
+      "bounds": [
+        635,
+        790,
+        860,
+        195
+      ],
+      "viewBox": [
+        860,
+        195
+      ],
+      "points": "860,0 860,110 0,110 0,195",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$read"
+      }
+    },
+    {
+      "elementId": "report-split",
+      "elementType": "line",
+      "bounds": [
+        800,
+        1050,
+        65,
+        1
+      ],
+      "viewBox": [
+        65,
+        1
+      ],
+      "points": "0,0 65,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        null
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "split-formats",
+      "elementType": "line",
+      "bounds": [
+        865,
+        1050,
+        65,
+        1
+      ],
+      "viewBox": [
+        65,
+        1
+      ],
+      "points": "0,0 65,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "split-shared",
+      "elementType": "line",
+      "bounds": [
+        865,
+        1050,
+        65,
+        212
+      ],
+      "viewBox": [
+        65,
+        212
+      ],
+      "points": "0,0 0,212 65,212",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "formats-terminal",
+      "elementType": "line",
+      "bounds": [
+        1260,
+        1050,
+        110,
+        1
+      ],
+      "viewBox": [
+        110,
+        1
+      ],
+      "points": "0,0 110,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "shared-split",
+      "elementType": "line",
+      "bounds": [
+        1260,
+        1262,
+        50,
+        1
+      ],
+      "viewBox": [
+        50,
+        1
+      ],
+      "points": "0,0 50,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        null
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "split-service",
+      "elementType": "line",
+      "bounds": [
+        1310,
+        1205,
+        60,
+        57
+      ],
+      "viewBox": [
+        60,
+        57
+      ],
+      "points": "0,57 0,0 60,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "split-offline",
+      "elementType": "line",
+      "bounds": [
+        1310,
+        1262,
+        60,
+        48
+      ],
+      "viewBox": [
+        60,
+        48
+      ],
+      "points": "0,0 0,48 60,48",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "saved-report",
+      "elementType": "line",
+      "bounds": [
+        370,
+        1050,
+        100,
+        190
+      ],
+      "viewBox": [
+        100,
+        190
+      ],
+      "points": "0,190 40,190 40,0 100,0",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$saved"
+      }
+    },
+    {
+      "elementId": "title",
+      "elementType": "text",
+      "bounds": [
+        60,
+        36,
+        1680,
+        68
+      ],
+      "content": {
+        "text": "Agent Token Audit · 分层与内部流程",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 44,
+        "color": "$ink",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "subtitle",
+      "elementType": "text",
+      "bounds": [
+        60,
+        113,
+        1680,
+        48
+      ],
+      "content": {
+        "text": "先看层间职责，再顺着框与箭头阅读层内处理环节",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 27,
+        "color": "$muted",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "access-heading",
+      "elementType": "text",
+      "bounds": [
+        60,
+        220,
+        330,
+        52
+      ],
+      "content": {
+        "text": "01  接入与编排层",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 32,
+        "color": "$input",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "access-note",
+      "elementType": "text",
+      "bounds": [
+        60,
+        286,
+        330,
+        91
+      ],
+      "content": {
+        "text": "将入口参数转为统一 Query\n固定范围和截止点\n分派查询、展示与重算",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 24,
+        "color": "$muted",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "metering-heading",
+      "elementType": "text",
+      "bounds": [
+        60,
+        570,
+        330,
+        52
+      ],
+      "content": {
+        "text": "02  计量分析层",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 32,
+        "color": "$read",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "presentation-heading",
+      "elementType": "text",
+      "bounds": [
+        60,
+        935,
+        330,
+        52
+      ],
+      "content": {
+        "text": "03  输出与呈现层",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 32,
+        "color": "$saved",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "presentation-note",
+      "elementType": "text",
+      "bounds": [
+        60,
+        996,
+        330,
+        73
+      ],
+      "content": {
+        "text": "复用同一份结果\n只校验、格式化和呈现",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 24,
+        "color": "$muted",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "cli-title",
+      "elementType": "text",
+      "bounds": [
+        488,
+        251,
+        264,
+        38
+      ],
+      "content": {
+        "text": "Skill / CLI",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 26,
+        "color": "$input",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "cli-body",
+      "elementType": "text",
+      "bounds": [
+        488,
+        295,
+        264,
+        35
+      ],
+      "content": {
+        "text": "audit.py → cli.main",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "http-title",
+      "elementType": "text",
+      "bounds": [
+        488,
+        381,
+        264,
+        38
+      ],
+      "content": {
+        "text": "本地 HTTP",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 26,
+        "color": "$input",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "http-body",
+      "elementType": "text",
+      "bounds": [
+        488,
+        425,
+        264,
+        35
+      ],
+      "content": {
+        "text": "webapp.Handler",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "query-title",
+      "elementType": "text",
+      "bounds": [
+        913,
+        311,
+        264,
+        38
+      ],
+      "content": {
+        "text": "统一 Query 对象",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 26,
+        "color": "$input",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "query-body",
+      "elementType": "text",
+      "bounds": [
+        913,
+        355,
+        264,
+        75
+      ],
+      "content": {
+        "text": "操作 / 范围 / 时间\n入口解析与参数转换",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "operations-title",
+      "elementType": "text",
+      "bounds": [
+        1318,
+        311,
+        364,
+        38
+      ],
+      "content": {
+        "text": "共同操作层",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 27,
+        "color": "$input",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "operations-body",
+      "elementType": "text",
+      "bounds": [
+        1318,
+        355,
+        364,
+        90
+      ],
+      "content": {
+        "text": "operations.run(Query)\n定位候选、固定范围\n展示短路 / 统计 / 明确重算",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "query-to-source-label",
+      "elementType": "text",
+      "bounds": [
+        870,
+        497,
+        430,
+        30
+      ],
+      "content": {
+        "text": "明确读取：统计 / 候选 / 重算",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$input",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "source-title",
+      "elementType": "text",
+      "bounds": [
+        78,
+        678,
+        274,
+        38
+      ],
+      "content": {
+        "text": "外部数据源",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 26,
+        "color": "$edge",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "source-body",
+      "elementType": "text",
+      "bounds": [
+        78,
+        722,
+        274,
+        90
+      ],
+      "content": {
+        "text": "Codex JSONL\nZCode JSONL / SQLite\n有限只读快照",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "adapter-title",
+      "elementType": "text",
+      "bounds": [
+        488,
+        651,
+        294,
+        38
+      ],
+      "content": {
+        "text": "来源适配",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 27,
+        "color": "$read",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "adapter-body",
+      "elementType": "text",
+      "bounds": [
+        488,
+        695,
+        294,
+        85
+      ],
+      "content": {
+        "text": "codex / zcode\n字段解析、去重、缺口",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "relations-title",
+      "elementType": "text",
+      "bounds": [
+        898,
+        651,
+        294,
+        38
+      ],
+      "content": {
+        "text": "关系绑定",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 27,
+        "color": "$read",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "relations-body",
+      "elementType": "text",
+      "bounds": [
+        898,
+        695,
+        294,
+        85
+      ],
+      "content": {
+        "text": "relations.bind\n会话 / 轮次归属、继承排除",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "core-title",
+      "elementType": "text",
+      "bounds": [
+        1308,
+        651,
+        374,
+        38
+      ],
+      "content": {
+        "text": "唯一计量内核",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 27,
+        "color": "$read",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "core-body",
+      "elementType": "text",
+      "bounds": [
+        1308,
+        695,
+        374,
+        85
+      ],
+      "content": {
+        "text": "core.report / overview\n选集 → 汇总 / 日桶 / 排行 / 解释\n生成 v2 单会话或 v3 整体报告",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "metering-only-label",
+      "elementType": "text",
+      "bounds": [
+        1210,
+        595,
+        490,
+        30
+      ],
+      "content": {
+        "text": "仅统计 / 重算进入内核；内核不读源",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$read",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "candidate-note",
+      "elementType": "text",
+      "bounds": [
+        470,
+        806,
+        1000,
+        35
+      ],
+      "content": {
+        "text": "候选查询在读取与绑定后返回候选清单，不隐式生成统计报告。",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 23,
+        "color": "$muted",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "report-transfer-label",
+      "elementType": "text",
+      "bounds": [
+        865,
+        865,
+        470,
+        30
+      ],
+      "content": {
+        "text": "同一份报告：数值、范围、状态、记录键",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$read",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "report-title",
+      "elementType": "text",
+      "bounds": [
+        488,
+        996,
+        294,
+        38
+      ],
+      "content": {
+        "text": "报告对象",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 27,
+        "color": "$saved",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "report-body",
+      "elementType": "text",
+      "bounds": [
+        488,
+        1040,
+        294,
+        65
+      ],
+      "content": {
+        "text": "新生成 v2 / v3\n或加载保存 v1 / v2 / v3",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "formats-title",
+      "elementType": "text",
+      "bounds": [
+        948,
+        996,
+        294,
+        38
+      ],
+      "content": {
+        "text": "Python · formats",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 26,
+        "color": "$saved",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "formats-body",
+      "elementType": "text",
+      "bounds": [
+        948,
+        1040,
+        294,
+        65
+      ],
+      "content": {
+        "text": "validate_report → render\n保存报告先校验，再格式化",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "terminal-title",
+      "elementType": "text",
+      "bounds": [
+        1388,
+        996,
+        294,
+        38
+      ],
+      "content": {
+        "text": "终端与文件",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 26,
+        "color": "$saved",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "terminal-body",
+      "elementType": "text",
+      "bounds": [
+        1388,
+        1040,
+        294,
+        65
+      ],
+      "content": {
+        "text": "表格 / JSON / CSV / MD\nexport：显式导出、文件保护",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "shared-title",
+      "elementType": "text",
+      "bounds": [
+        948,
+        1201,
+        294,
+        38
+      ],
+      "content": {
+        "text": "浏览器校验与渲染",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 26,
+        "color": "$saved",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "shared-body",
+      "elementType": "text",
+      "bounds": [
+        948,
+        1245,
+        294,
+        85
+      ],
+      "content": {
+        "text": "shared.js + lossless-json\n校验 → DOM / SVG\n图表、筛选与记录联动",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "service-title",
+      "elementType": "text",
+      "bounds": [
+        1388,
+        1176,
+        294,
+        38
+      ],
+      "content": {
+        "text": "服务网页",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 25,
+        "color": "$saved",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "service-body",
+      "elementType": "text",
+      "bounds": [
+        1388,
+        1220,
+        294,
+        30
+      ],
+      "content": {
+        "text": "HTTP 结果 / 本地保存文件",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 21,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "offline-title",
+      "elementType": "text",
+      "bounds": [
+        1388,
+        1281,
+        294,
+        38
+      ],
+      "content": {
+        "text": "离线查看器",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 25,
+        "color": "$saved",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "offline-body",
+      "elementType": "text",
+      "bounds": [
+        1388,
+        1325,
+        294,
+        30
+      ],
+      "content": {
+        "text": "index.html：仅本地 JSON",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 21,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "saved-title",
+      "elementType": "text",
+      "bounds": [
+        78,
+        1171,
+        274,
+        38
+      ],
+      "content": {
+        "text": "保存 JSON",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 26,
+        "color": "$saved",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "saved-body",
+      "elementType": "text",
+      "bounds": [
+        78,
+        1215,
+        274,
+        95
+      ],
+      "content": {
+        "text": "用户显式导出的文件\n展示不读来源、不重新计量\n重算经 operations 回源",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "saved-label",
+      "elementType": "text",
+      "bounds": [
+        60,
+        1090,
+        330,
+        36
+      ],
+      "content": {
+        "text": "保存报告直接展示路径",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 24,
+        "color": "$saved",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "legend",
+      "elementType": "text",
+      "bounds": [
+        60,
+        1390,
+        1680,
+        37
+      ],
+      "content": {
+        "text": "逻辑职责分层 · 框表示实际模块或数据 · 箭头表示处理/消费方向 · 离线页不能回源统计",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 23,
+        "color": "$muted",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    }
+  ]
+}

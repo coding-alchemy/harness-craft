@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Token 报告只读查看器</title>
+<link rel="stylesheet" href="shared.css">
+</head>
+<body>
+<main>
+  <h1>Token 报告只读查看器</h1>
+  <div class="card filebar">
+    <label for="report-file">选择已保存的 JSON 报告：</label>
+    <input type="file" id="report-file" accept=".json,application/json">
+    <span class="name" id="file-name"></span>
+    <span id="cap-missing" hidden style="color:#7f1d1d"></span>
+  </div>
+  <section id="report" hidden></section>
+  <div class="empty card" id="empty">
+    <p>未加载报告。选择一个由 token 统计工具导出的 JSON 报告文件。</p>
+    <p class="hint">本页面完全离线：只读取你选择的这一个文件，不访问日志、不联网、不执行统计、不保存任何数据。</p>
+  </div>
+  <footer>只读查看器 · 与 CLI 同一报告合同（v1/v2/v3） · 数值为保存时的精确整数</footer>
+</main>
+<script src="lossless-json.umd.js"></script>
+<script src="shared.js"></script>
+<script>
+'use strict';
+function loadFile(file) {
+  if (!file) return;
+  document.getElementById('file-name').textContent = file.name;
+  const reader = new FileReader();
+  reader.onerror = () => fail('无法读取所选文件');
+  reader.onload = () => {
+    try {
+      const obj = LosslessJSON.parse(String(reader.result), undefined, LosslessJSON.parseNumberAndBigInt);
+      const version = validateReport(obj);
+      const footer = '已加载：' + file.name + '（format_version=' + version + '）。数值为该报告保存值；重新统计请使用 CLI。';
+      if (version === 3) renderOverviewReport(obj, footer, 'report');
+      else renderReport(obj, version, footer);
+    } catch (error) {
+      fail(error && error.message ? error.message : String(error));
+    }
+  };
+  reader.readAsText(file);
+}
+
+const missing = capabilityMissing();
+if (missing.length) {
+  const note = document.getElementById('cap-missing');
+  note.hidden = false;
+  note.textContent = '运行环境不可用：缺少 ' + missing.join('、') + ' 能力，不能加载报告。';
+  document.getElementById('report-file').disabled = true;
+} else {
+  document.getElementById('report-file').addEventListener('change', event => {
+    document.getElementById('empty').classList.remove('error');
+    loadFile(event.target.files[0]);
+    event.target.value = '';
+  });
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+{
+  "version": "v2",
+  "title": "Agent Token Audit：三层职责与层内流程",
+  "size": [
+    1800,
+    1450
+  ],
+  "theme": {
+    "colors": {
+      "ink": "#173238",
+      "muted": "#456168",
+      "paper": "#F4F7F4",
+      "read": "#006C68",
+      "light": "#DCEEE7",
+      "saved": "#9C531B",
+      "savedLight": "#F5E8DA",
+      "edge": "#648582",
+      "input": "#365D7D",
+      "inputLight": "#E8EFF5",
+      "white": "#FFFFFF"
+    }
+  },
+  "pages": [
+    "pages/architecture.page"
+  ]
+}
