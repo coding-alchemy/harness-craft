@@ -8,20 +8,28 @@ MAPPING = {'input': 'input_tokens', 'output': 'output_tokens', 'cache_read': 'ca
            'cache_write': 'cache_write_input_tokens', 'reasoning': 'reasoning_output_tokens'}
 
 
-def discover(roots):
+def discover(roots, guard=None):
+    """Find candidate files; an optional guard rejects resolved paths outside the allowed set."""
     paths = set()
     for root in roots:
         root = Path(root).expanduser()
         if root.is_file():
-            paths.add(root.resolve())
+            candidate = root.resolve()
+            if guard:
+                guard(candidate)
+            paths.add(candidate)
         elif root.is_dir():
-            paths.update(p.resolve() for p in root.rglob('*.jsonl'))
+            for entry in root.rglob('*.jsonl'):
+                candidate = entry.resolve()
+                if guard:
+                    guard(candidate)
+                paths.add(candidate)
     return sorted(paths)
 
 
-def read(roots):
-    paths = discover(roots)
-    sessions, records, issues, contexts, requests = {}, [], [], {}, []
+def read(roots, guard=None):
+    paths = discover(roots, guard)
+    sessions, records, issues, contexts, requests, compactions = {}, [], [], {}, [], []
     for path, line, obj, error in source_lines(paths):
         loc = {'path': path, 'line': line}
         if error:
@@ -70,11 +78,21 @@ def read(roots):
             if metadata.get('turn_id') is not None and not isinstance(metadata['turn_id'], str):
                 metadata = dict(metadata, turn_id=None)
                 issues.append({'reason': '请求轮次字段格式未知', 'source': loc, 'session': ctx['session']})
+            kinds = metadata.get('content_item_kinds')
+            if isinstance(kinds, list) and all(isinstance(k, str) for k in kinds):
+                # The harness tags each content item; only user.text is a user-originated request.
+                classification = 'user_message' if 'user.text' in kinds else 'non_user_input'
+            else:
+                classification = 'unknown'
             created=metadata.get('create_time')
             at=dt.datetime.fromtimestamp(created,dt.timezone.utc).isoformat() if isinstance(created,(int,float)) else obj.get('timestamp')
-            requests.append({'id':payload.get('id'),'session':ctx['session'],'turn':metadata.get('turn_id') or ctx['turn'],
-                             'time':at,'source':loc,'sources':[loc],
-                             'time_source':'message_create_time' if isinstance(created,(int,float)) else 'message_log_time'})
+            item={'id':payload.get('id'),'session':ctx['session'],'turn':metadata.get('turn_id') or ctx['turn'],
+                  'time':at,'source':loc,'sources':[loc],
+                  'time_source':'message_create_time' if isinstance(created,(int,float)) else 'message_log_time',
+                  'classification':classification,'eligible':classification != 'non_user_input'}
+            if not item['eligible']:
+                item['rejection_reason'] = '该消息由系统注入（非用户输入），不能作为用户请求截止点'
+            requests.append(item)
         elif typ == 'response_item':
             if payload.get('type') == 'message' and payload.get('role') == 'assistant':
                 ctx['outputs'].append(payload.get('id'))
@@ -82,8 +100,10 @@ def read(roots):
                 # Tool calls or unknown model outputs make a message-only association ambiguous.
                 ctx['outputs'].append(None)
         elif typ == 'compacted':
-            issues.append({'reason': '发生上下文压缩，源未提供可独立关联的压缩 usage', 'source': loc,
-                           'session': ctx['session'], 'turn': ctx['turn']})
+            # The marker names the compaction call's own response; its usage record (if any)
+            # is the metered evidence. latest_token_usage_record is a copy of the same call,
+            # never an additional one.
+            compactions.append((payload.get('compaction_response_id'), loc, ctx['session']))
         elif typ == 'event_msg' and payload.get('type') in ('task_started','task_complete','turn_aborted'):
             sid = ctx['session']; turn = payload.get('turn_id') or ctx['turn']
             if sid not in sessions or not turn:
@@ -95,6 +115,9 @@ def read(roots):
                 item['status'] = 'running'; ctx['pending_turns'].add(turn)
             else:
                 item['end'] = obj.get('timestamp'); item['status'] = 'completed' if payload['type'] == 'task_complete' else 'cancelled'
+                if payload['type'] == 'task_complete' and payload.get('duration_ms') is not None:
+                    item['native_duration_ms'] = payload.get('duration_ms')
+                    item['native_duration_source'] = 'event_msg.task_complete.duration_ms'
         elif typ == 'token_usage_record':
             sid = payload.get('thread_id') or ctx['session']
             if sid not in sessions:
@@ -111,6 +134,7 @@ def read(roots):
                             'root_turn': payload.get('root_turn_id'), 'agent': sid,
                             'group': 'main', 'model': ctx['model'] or '模型未知',
                             'time': obj.get('timestamp'), 'sources': [loc],
+                            'granularity': 'model_call', 'time_kind': 'usage_record_time', 'source_status': 'unknown',
                             'metrics': normalize(usage, MAPPING, True), 'call_count': 1})
             ctx['direct'].append(usage)
             turn = records[-1]['turn']
@@ -144,6 +168,7 @@ def read(roots):
                                 'session': sid, 'agent': sid, 'turn': ctx['turn'], 'root_turn': None,
                                 'group': 'main', 'model': ctx['model'] or '模型未知',
                                 'time': obj.get('timestamp'), 'sources': [loc],
+                                'granularity': 'reply_usage', 'time_kind': 'reply_usage_time', 'source_status': 'unknown',
                                 'metrics': normalize(last, MAPPING, True), 'call_count': 1,
                                 'usage_source': 'unique_last_usage'})
                 if prev is None and any(valid(totals.get(k)) and totals[k] != last[k] for k in core_fields):
@@ -159,6 +184,8 @@ def read(roots):
                                     'session': sid, 'agent': sid, 'turn': turns[0] if len(turns) == 1 else None,
                                     'interval_turns': turns, 'interval_start': ctx['counter_time'], 'root_turn': None,
                                     'group': 'main', 'model': '模型未知', 'time': obj.get('timestamp'), 'sources': [loc],
+                                    'granularity': 'cumulative_interval', 'time_kind': 'count_interval_time',
+                                    'source_status': 'unknown',
                                     'metrics': normalize(differences, MAPPING, True), 'call_count': None})
             elif not ctx['direct'] and any(valid(v) and v for v in totals.values()):
                 issues.append({'reason': '首个累计快照缺少零基线；不视为增量', 'source': loc, 'session': sid, 'turn': ctx['turn']})
@@ -177,6 +204,20 @@ def read(roots):
         else:
             kept.append(record)
     records = kept
+    # A compaction marker reclassifies its referenced call as internal auxiliary; it never adds usage.
+    for crid, loc, sid in compactions:
+        if not isinstance(crid, str):
+            issues.append({'reason': '发生上下文压缩，未提供可关联的压缩调用身份；用量可能已计或缺失',
+                           'source': loc, 'session': sid})
+            continue
+        matched = [r for r in records if r.get('call_id') == crid]
+        if matched:
+            for record in matched:
+                record['group'] = 'internal'
+                record['internal_kind'] = 'compaction'
+        else:
+            issues.append({'reason': '发生上下文压缩，未找到可关联的压缩调用 usage；可能已计或缺失',
+                           'source': loc, 'session': sid})
     unique_requests, unkeyed_requests = {}, []
     for request in requests:
         request_id = request['id']

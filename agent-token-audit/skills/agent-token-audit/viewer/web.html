@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Token 统计操作入口</title>
+<link rel="stylesheet" href="shared.css">
+<style>
+  .ops-grid { display: grid; grid-template-columns: fit-content(30%) 1fr; gap: .3rem .9rem; font-size: .92rem; align-items: center; }
+  .ops-grid dt { color: #5b6470; }
+  .ops-grid dd { margin: 0; word-break: break-all; }
+  fieldset { border: 1px solid #d8dce1; border-radius: 6px; margin: .4rem 0; }
+  button { padding: .3rem .9rem; font-size: .9rem; }
+  button:disabled { opacity: .45; }
+  .sessions-table td, .turns-table td { cursor: pointer; }
+  .sessions-table tr.selected, .turns-table tr.selected { background: #e8effc; }
+  #status { font-size: .88rem; color: #4b5563; min-height: 1.2rem; margin: .4rem 0; }
+  #status.error { color: #7f1d1d; }
+  .tz-line { font-size: .82rem; color: #6b7280; }
+  .scope-summary { font-size: .86rem; background: #f0f4fa; border: 1px dashed #b9c6dd; border-radius: 6px; padding: .4rem .6rem; margin: .4rem 0; word-break: break-all; }
+  .context-note { font-size: .86rem; color: #33517a; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Token 统计操作入口</h1>
+  <div class="card">
+    <p class="hint-line">本页由你显式启动的本地服务驱动，只在你点击对应按钮时读取来源；没有“当前会话”猜测，统计对象以你的明确选择为准。</p>
+    <fieldset>
+      <legend>Harness 与来源</legend>
+      <dl class="ops-grid" id="source-info"></dl>
+      <label><input type="radio" name="harness" value="codex"> Codex</label>
+      <label><input type="radio" name="harness" value="zcode"> ZCode</label>
+    </fieldset>
+    <button id="browse-sessions">浏览会话</button>
+    <button id="browse-turns" disabled>浏览轮次</button>
+    <button id="browse-requests" disabled>浏览请求候选</button>
+    <div id="status"></div>
+  </div>
+  <section class="card" id="overview-card">
+    <h2>整体用量</h2>
+    <p class="hint-line">跨会话汇总：明确点击“查询整体用量”后才读取来源；默认纳入来源全部会话，实际范围、截止点与来源覆盖在结果中显示。点选日期下钻在后续版本提供。</p>
+    <fieldset>
+      <legend>时间范围（左闭右开；日趋势按显示时区归桶）</legend>
+      <label for="ov-from-local">时间下界 from：</label>
+      <input type="text" id="ov-from-local" size="30" placeholder="2026-09-25T00:00">
+      <label for="ov-from-tz">时区：</label>
+      <input type="text" id="ov-from-tz" size="7">
+      <label for="ov-to-local">截止点 to：</label>
+      <input type="text" id="ov-to-local" size="30" placeholder="2026-10-06T00:00">
+      <label for="ov-to-tz">时区：</label>
+      <input type="text" id="ov-to-tz" size="7">
+      <div class="tz-line">输入本地日期时间并配合时区；下界留空即不限；to 留空为“截至本次网页请求（服务入口固定）”。</div>
+    </fieldset>
+    <fieldset>
+      <legend>显示时区（日界归属）</legend>
+      <label for="ov-tz">时区：</label>
+      <input type="text" id="ov-tz" size="7">
+      <div class="tz-line">日趋势按该时区的本地日归桶；保存进整体报告范围。</div>
+    </fieldset>
+    <fieldset>
+      <legend>代理范围</legend>
+      <label><input type="radio" name="ov-agents" value="default" checked> 默认：纳入有证据归属的后代与内部调用</label><br>
+      <label><input type="radio" name="ov-agents" value="main"> 仅主代理常规调用</label>
+    </fieldset>
+    <div class="scope-summary" id="ov-scope-summary"></div>
+    <button id="run-overview">查询整体用量</button>
+  </section>
+  <section id="overview-result" hidden></section>
+  <div id="overview-actions" hidden><button id="overview-export">导出该整体结果…</button></div>
+  <section class="card" id="context-card" hidden>
+    <h2>本次启动关联会话</h2>
+    <p class="context-note" id="context-note"></p>
+    <button id="context-select">选择该会话</button>
+    <button id="context-request-run" hidden>用转交请求起点统计</button>
+    <p class="hint-line">该关联由启动链提供并经来源唯一匹配验证，不代表追踪 Harness 当前前台会话；转交请求只在你点击对应动作后执行。</p>
+  </section>
+  <section class="card" id="sessions-card" hidden>
+    <h2>会话候选</h2>
+    <p class="hint-line">点击一行选择会话；派生关系与缺口如实显示，缺标题/时间/生命周期的候选保持未知。</p>
+    <div id="sessions-table-host"></div>
+  </section>
+  <section class="card" id="turns-card" hidden>
+    <h2>稳定轮次</h2>
+    <p class="hint-line">点击行切换选中，Shift+点击按列表显示顺序选择连续区段；显示序号不是身份，追加消息不产生新轮次。选择空缺即统计整个会话（turns=null）。</p>
+    <div id="turns-table-host"></div>
+  </section>
+  <section class="card" id="requests-card" hidden>
+    <h2>请求候选（截止点依据）</h2>
+    <p class="hint-line">仅列出可作为用户请求截止点的候选；已确认非用户/合成的请求不出现在此。点击一行用该请求自身起点统计。</p>
+    <div id="requests-table-host"></div>
+  </section>
+  <section class="card" id="run-card" hidden>
+    <h2>统计</h2>
+    <fieldset>
+      <legend>时间范围（左闭右开，带时区）</legend>
+      <label for="from-local">时间下界 from：</label>
+      <input type="text" id="from-local" size="30" placeholder="2026-03-08T12:00:00.400000">
+      <label for="from-tz">时区：</label>
+      <input type="text" id="from-tz" size="7">
+      <label for="cutoff-local">截止点 to：</label>
+      <input type="text" id="cutoff-local" size="30" placeholder="2026-03-08T12:00:00.500001">
+      <label for="cutoff-tz">时区：</label>
+      <input type="text" id="cutoff-tz" size="7">
+      <div class="tz-line">输入本地日期时间并配合时区，完整秒与小数秒按原样提交；无时区文本不会被当作 UTC；from 与 to 都可留空。to 留空且未用请求起点时为“截至本次网页请求”。</div>
+    </fieldset>
+    <fieldset>
+      <legend>代理范围</legend>
+      <label><input type="radio" name="agents" value="default" checked> 默认：纳入有证据归属的后代与内部调用</label><br>
+      <label><input type="radio" name="agents" value="main"> 仅主代理常规调用</label>
+    </fieldset>
+    <div class="scope-summary" id="scope-summary"></div>
+    <button id="run-report">统计</button>
+    <button id="clear-turns" hidden>清除轮次选择</button>
+  </section>
+  <section class="card filebar" id="saved-card">
+    <label for="saved-file">选择已保存的 JSON 报告（只在浏览器内加载，不发送服务）：</label>
+    <input type="file" id="saved-file" accept=".json,application/json">
+    <span class="name" id="saved-name"></span>
+    <span id="saved-cap-missing" hidden style="color:#7f1d1d"></span>
+  </section>
+  <section class="card" id="baseline-card" hidden>
+    <h2>保存结果（基准）</h2>
+    <div id="baseline-scope" class="scope-summary"></div>
+    <button id="recompute-run">按原范围重算</button>
+    <button id="update-toggle">编辑新范围并明确更新</button>
+    <button id="baseline-export">导出该结果…</button>
+    <p class="hint-line">展示旧报告不读取来源；重算按保存的会话、轮次/时间、代理策略与截止点读取当前来源并生成新 v2，不写回原文件。更新前先显示原范围与新范围差异，提交完整集合后才读取。</p>
+    <div id="update-form" hidden>
+      <h2 style="font-size:.95rem">更新表单</h2>
+      <p class="hint-line">保持同一 Harness/会话；轮次集合按完整集合提交（不自动追加），留空即整个会话；表单已预填保存的下界与轮次，留空时间下界即清除保存下界；截止点留空为更新到本次网页请求入口。</p>
+      <label for="update-from">时间下界 from（完整带时区时间，清空移除约束）：</label>
+      <input type="text" id="update-from" size="38" placeholder="2026-09-01T00:00:30.123456Z">
+      <label for="update-to">截止点 to：</label>
+      <input type="datetime-local" id="update-to">
+      <label for="update-to-tz">时区：</label>
+      <input type="text" id="update-to-tz" size="7">
+      <label for="update-turns">轮次稳定 ID（逗号或换行分隔，完整集合）：</label><br>
+      <div id="update-turns-block">
+        <textarea id="update-turns" rows="3" style="width:100%"></textarea>
+      </div>
+      <div id="update-sessions-block" hidden>
+        <label for="update-sessions">整体报告的会话集合（逗号或换行分隔，完整替换，留空沿用保存集合）：</label><br>
+        <textarea id="update-sessions" rows="3" style="width:100%"></textarea>
+      </div>
+      <div id="update-tz-block" hidden>
+        <label for="update-tz">显示时区（留空沿用保存时区）：</label>
+        <input type="text" id="update-tz" size="10">
+      </div>
+      <label><input type="radio" name="update-agents" value="keep" checked> 保持保存的代理策略</label>
+      <label><input type="radio" name="update-agents" value="default"> 默认完整范围</label>
+      <label><input type="radio" name="update-agents" value="main"> 仅主代理常规调用</label>
+      <div class="scope-summary" id="update-diff"></div>
+      <button id="update-run">提交更新</button>
+    </div>
+  </section>
+  <section id="report" hidden></section>
+  <section id="fresh-report" hidden></section>
+  <div id="fresh-actions" hidden><button id="fresh-export">导出该结果…</button></div>
+  <div class="empty card" id="fresh-report-empty" hidden><p>新结果区。</p></div>
+  <div class="empty card" id="empty">
+    <p>未发起统计。选择 Harness、浏览会话并明确点击统计后，这里显示结果。</p>
+    <p class="hint">浏览与编辑不会自动统计；关闭标签页不影响终端服务，停止服务请在终端按 Ctrl+C。</p>
+  </div>
+  <footer>本地网页入口 · 与 CLI 同一统计逻辑和报告合同（v2） · 数值为本次读取来源的精确整数</footer>
+</main>
+<script src="lossless-json.umd.js"></script>
+<script src="shared.js"></script>
+<script src="web.js"></script>
+</body>
+</html>
