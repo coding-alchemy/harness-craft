@@ -54,10 +54,11 @@ from _verification import (
     image_occurrence_fails,
     image_references,
     load_image_digests,
+    math_issue_fails,
     source_occurrence_digests,
     strong_token_report,
     scan_code_fences,
-    scan_math_spans,
+    scan_math,
 )
 
 _FRONTMATTER_RE = re.compile(r'^---\s*\n(.*?)\n---\s*\n', re.S)
@@ -105,13 +106,15 @@ def _read_frontmatter(path):
 def _candidate_check_failures(candidate_text, source_text, out_dir,
                               delivery_root, image_digests, strong_tokens,
                               approved_extra_math, label, source_dir=None):
-    """候选/成品在最终语境下对照当前源的全量硬检查；返回失败诊断列表。
+    """候选/成品在最终语境下对照当前源的全量硬检查；返回 (失败, 告警)。
 
     图片完整通过必须建立每次出现的来源身份对应：优先 --image-map，其次
     由可靠的当前源资源（source_dir 下可解析的引用与 [IMG: 标记）推导；
-    两者都不可用时不得宣布完整通过。
+    两者都不可用时不得宣布完整通过。强 token 的缺席/未配置告警随结果
+    返回，不丢弃、不把空差异打印成所有配置项通过。
     """
     fails = []
+    warns = []
     for diff in compare_headings(heading_entries(source_text),
                                  heading_entries(candidate_text),
                                  '源文', label):
@@ -124,11 +127,15 @@ def _candidate_check_failures(candidate_text, source_text, out_dir,
     for diff in compare_code_fences(src_fences.blocks, doc_fences.blocks,
                                     '源文', label):
         fails.append('代码逐块核对: %s' % diff)
+    src_scan = scan_math(source_text)
+    doc_scan = scan_math(candidate_text)
     math_diffs, _ = compare_math_spans(
-        scan_math_spans(source_text), scan_math_spans(candidate_text),
+        src_scan.spans, doc_scan.spans,
         '源文', label, approved_extra_exprs=approved_extra_math,
         doc_text=candidate_text)
     fails.extend('公式逐项核对: %s' % d for d in math_diffs)
+    fails.extend(math_issue_fails(src_scan.issues, '源文'))
+    fails.extend(math_issue_fails(doc_scan.issues, label))
     fn_diffs, _ = footnote_diffs(source_text, candidate_text, '源文', label)
     fails.extend(fn_diffs)
     src_count = image_occurrence_count(source_text)
@@ -145,11 +152,12 @@ def _candidate_check_failures(candidate_text, source_text, out_dir,
     fails.extend(image_occurrence_fails(
         candidate_text, out_dir, delivery_root, expected_digests=identity,
         label=label))
-    token_diffs, _ = strong_token_report(source_text, candidate_text,
-                                         strong_tokens, '源文', label)
+    token_diffs, token_warns = strong_token_report(
+        source_text, candidate_text, strong_tokens, '源文', label)
     if token_diffs:
         fails.extend(token_diffs)
-    return fails
+    warns.extend(token_warns)
+    return fails, warns
 
 
 def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
@@ -326,14 +334,18 @@ def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
         source_slice = open(source_abs, encoding='utf-8').read()
     out_abs = os.path.abspath(out_path)
     out_dir = os.path.dirname(out_abs)
-    fails = _candidate_check_failures(
+    fails, warns = _candidate_check_failures(
         candidate, source_slice, out_dir, delivery_root, image_digests,
         strong_tokens, approved_extra_math, '候选', source_dir=source_dir)
     if fails:
         print('候选未通过最终目录语境检查，不写出成品：')
         for f in fails:
             print('  FAIL:', f)
+        for w in warns:
+            print('  WARN:', w)
         sys.exit(1)
+    for w in warns:
+        print('WARN:', w)
 
     # 7) 写出后再从实际路径复验；失败恢复原成品，首次失败不留新成品
     previous = None
@@ -342,7 +354,7 @@ def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
     with open(out_abs, 'w', encoding='utf-8') as f:
         f.write(candidate)
     written = open(out_abs, encoding='utf-8').read()
-    fails = _candidate_check_failures(
+    fails, warns = _candidate_check_failures(
         written, source_slice, out_dir, delivery_root, image_digests,
         strong_tokens, approved_extra_math, '实际成品', source_dir=source_dir)
     if fails:
@@ -355,7 +367,11 @@ def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
             print('实际路径复验失败，不留下新成品：')
         for f in fails:
             print('  FAIL:', f)
+        for w in warns:
+            print('  WARN:', w)
         sys.exit(1)
+    for w in warns:
+        print('WARN:', w)
 
     print('已合并 %d 个工作包 -> %s%s' % (
         len(ordered_keys), out_abs,

@@ -13,6 +13,9 @@ strategy:
 结构边界与依赖：
     - 代码围栏（含长反引号/波浪线）、行内/块级公式、表格、段落、列表
       （含嵌套子项）、引用、定义与脚注定义均为原子块，切点只落在块间；
+    - 公式覆盖区间由共享 scan_math 一次扫描确认：块级公式跨行覆盖行
+      并入不可拆范围（公式内形似标题/列表/脚注的原文不参与结构识别），
+      候选切点不得落入公式跨度；未解决数学定界阻断拆包，不产生可分派包；
     - 脚注、普通引用链接与引用式图片的定义按引用依赖扩大连续范围，
       跨节依赖合并相邻范围，引用与定义不会被拆进不同包；
     - 图片与其后的图题段落绑定，不在切点两侧分离；
@@ -36,7 +39,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _verification import fenced_line_numbers
+from _verification import fenced_line_numbers, scan_math
 
 _SKILL_DIR = Path(__file__).resolve().parent.parent
 _RULES_PATH = str(_SKILL_DIR / "references" / "translation_conventions.md")
@@ -77,8 +80,14 @@ class _Unit:
         self.merged_count = merged_count
 
 
-def _parse_blocks(lines, fenced):
-    """把行序列切成原子块，覆盖全部非空行；返回按起点排序的 Block 列表。"""
+def _parse_blocks(lines, fenced, protected=frozenset()):
+    """把行序列切成原子块，覆盖全部非空行；返回按起点排序的 Block 列表。
+
+    protected 为共享公式扫描确认的块级公式覆盖行（1 起）：这些行
+    与围栏同样视为不可拆——整段连续 protected 行合成一个 math_block，
+    段落/脚注定义/块标记/列表不再把它们吸收或跨越，公式内部形似
+    标题/列表/脚注的原文不会被切成切点。
+    """
     blocks = []
     n = len(lines)
     i = 0
@@ -89,6 +98,13 @@ def _parse_blocks(lines, fenced):
             while j < n and (j + 1) in fenced:
                 j += 1
             blocks.append(Block('code_fence', i, j))
+            i = j + 1
+            continue
+        if line_no in protected:
+            j = i
+            while j < n and (j + 1) in protected:
+                j += 1
+            blocks.append(Block('math_block', i, j))
             i = j + 1
             continue
         s = lines[i].strip()
@@ -105,6 +121,7 @@ def _parse_blocks(lines, fenced):
                 nxt = lines[j + 1]
                 if nxt.strip() == '':
                     cont = j + 2 < n and (j + 3) not in fenced and (
+                        (j + 3) not in protected) and (
                         lines[j + 2].startswith('  ')
                         or lines[j + 2].startswith('\t'))
                     if cont:
@@ -122,6 +139,7 @@ def _parse_blocks(lines, fenced):
             j = i
             while (j + 1 < n and lines[j + 1].strip() != ''
                    and (j + 2) not in fenced
+                   and (j + 2) not in protected
                    and not _HEADING_RE.match(lines[j + 1])):
                 j += 1
             blocks.append(Block('block_marker', i, j))
@@ -153,6 +171,8 @@ def _parse_blocks(lines, fenced):
                         j += 2
                         continue
                     break
+                if (j + 2) in protected:
+                    break
                 if _LIST_RE.match(nxt) or nxt.startswith(' ') or nxt.startswith('\t'):
                     j += 1
                     continue
@@ -163,6 +183,7 @@ def _parse_blocks(lines, fenced):
         j = i
         while (j + 1 < n and lines[j + 1].strip() != ''
                and (j + 2) not in fenced
+               and (j + 2) not in protected
                and not _HEADING_RE.match(lines[j + 1])
                and not _LIST_RE.match(lines[j + 1])
                and not _TABLE_RE.match(lines[j + 1].strip())
@@ -282,16 +303,18 @@ def _dependency_units(lines, fenced, seeds):
     return _merge_overlapping(units)
 
 
-def _parse_sections(lines, fenced):
+def _parse_sections(lines, fenced, protected=frozenset()):
     """按真实 H2 小节划分；返回 [(section_id, instance, start, end)]。
 
     start/end 为 0 起含端行号，范围覆盖全部行；导语区仅含 H1 与空白时
     并入第一个 H2 小节，含实质导语时自成 '[top]' 小节；同名小节按
-    instance（1 起）区分。
+    instance（1 起）区分。块级公式覆盖行（protected）内的标题样式
+    行属公式原文，不参与小节切分。
     """
     n = len(lines)
     h2_lines = [p for p in range(n)
-                if (p + 1) not in fenced and _H2_RE.match(lines[p])]
+                if (p + 1) not in fenced and (p + 1) not in protected
+                and _H2_RE.match(lines[p])]
     if not h2_lines:
         title = '[top]'
         for p in range(n):
@@ -333,9 +356,13 @@ def _char_range(lines, start, end):
     return char_start, char_end
 
 
-def _count_units(lines, start, end, fenced):
-    """基于块解析的结构计数（headings/paragraphs/list_items/tables/code_fences）。"""
-    blocks = _parse_blocks(lines, fenced)
+def _count_units(lines, start, end, fenced, protected=frozenset()):
+    """基于块解析的结构计数（headings/paragraphs/list_items/tables/code_fences）。
+
+    块级公式（math_block）属正文内容，计入 paragraphs；围栏计数仍只
+    含真实代码围栏。
+    """
+    blocks = _parse_blocks(lines, fenced, protected)
     counts = {'headings': 0, 'paragraphs': 0, 'list_items': 0,
               'tables': 0, 'code_fences': 0}
     for b in blocks:
@@ -343,7 +370,8 @@ def _count_units(lines, start, end, fenced):
             continue
         if b.kind == 'heading':
             counts['headings'] += 1
-        elif b.kind in ('paragraph', 'figure', 'blockquote', 'block_marker'):
+        elif b.kind in ('paragraph', 'figure', 'blockquote', 'block_marker',
+                        'math_block'):
             counts['paragraphs'] += 1
         elif b.kind == 'table':
             counts['tables'] += 1
@@ -367,15 +395,16 @@ def _count_blocks(lines):
                         fenced_line_numbers(text))
 
 
-def _unit_kind(lines, fenced, unit):
-    blocks = [b for b in _parse_blocks(lines, fenced)
+def _unit_kind(lines, fenced, unit, protected=frozenset()):
+    blocks = [b for b in _parse_blocks(lines, fenced, protected)
               if b.start >= unit.start and b.end <= unit.end]
     if len(blocks) == 1:
         return blocks[0].kind
     return '依赖闭包'
 
 
-def _candidates(lines, fenced, units, strategy, max_chars):
+def _candidates(lines, fenced, units, strategy, max_chars,
+                protected=frozenset()):
     """把每个依赖闭包范围展开为候选包范围 (start, end, fragment_index, over_limit)。"""
     candidates = []
     over_limit_reports = []
@@ -384,7 +413,7 @@ def _candidates(lines, fenced, units, strategy, max_chars):
         if strategy == 'h2' or size <= max_chars:
             candidates.append((unit.start, unit.end, 0, False))
             continue
-        blocks = [b for b in _parse_blocks(lines, fenced)
+        blocks = [b for b in _parse_blocks(lines, fenced, protected)
                   if b.start >= unit.start and b.end <= unit.end]
         groups = _dependency_units(
             lines, fenced, [(b.start, b.end) for b in blocks])
@@ -414,7 +443,8 @@ def _candidates(lines, fenced, units, strategy, max_chars):
                 over_limit_reports.append(
                     '行 %d-%d 因单个不可拆块（%s）超限保留整包: 实际 %d 字符（目标 %d）'
                     % (grp.start + 1, grp.end + 1,
-                       _unit_kind(lines, fenced, grp), grp_size, max_chars))
+                       _unit_kind(lines, fenced, grp, protected),
+                       grp_size, max_chars))
                 if current is not None:
                     candidates.append((current[0], current[1],
                                        fragment_index, False))
@@ -464,11 +494,29 @@ def split(source_path, out_dir, trans_dir, strategy):
     lines = doc.split('\n')
     fenced = fenced_line_numbers(doc)
 
-    sections = _parse_sections(lines, fenced)
+    # 共享公式事实：未解决定界阻断拆包（不产生可分派包）；块级公式覆盖
+    # 行并入不可拆范围，切点不得落入公式跨度（行内公式单行存在，行粒度
+    # 切点天然不切入；块级公式跨行，其覆盖行受保护）
+    math_scan = scan_math(doc)
+    if math_scan.issues:
+        details = '；'.join('L%d %r（%s）' % (issue.start_line, issue.raw,
+                                            issue.reason)
+                           for issue in math_scan.issues[:5])
+        sys.exit('拆分拒绝: 存在未解决数学定界，不产生可分派包: %s'
+                 % details)
+    protected = set()
+    for span in math_scan.spans:
+        if span.kind != 'block':
+            continue
+        end_line = doc.count('\n', 0, span.end - 1) + 1
+        if end_line > span.start_line:
+            protected.update(range(span.start_line, end_line + 1))
+
+    sections = _parse_sections(lines, fenced, protected)
     units = _dependency_units(lines, fenced,
                               [(s, e) for _, _, s, e in sections])
     candidates, over_limit_reports = _candidates(
-        lines, fenced, units, strategy, max_chars)
+        lines, fenced, units, strategy, max_chars, protected)
 
     # chars 策略下把候选范围按目标体量组包；超限范围独立成包且不再吸收后续内容
     packages = []
@@ -521,7 +569,7 @@ def split(source_path, out_dir, trans_dir, strategy):
         fragment_index = pkg['fragments'][0][0]
         digest = hashlib.sha256(body.encode('utf-8')).hexdigest()
         char_start, char_end = _char_range(lines, start, end)
-        counts = _count_units(lines, start, end, fenced)
+        counts = _count_units(lines, start, end, fenced, protected)
         target_abs = os.path.join(trans_abs, 'wp_%03d.md' % index)
         header = _make_header(source_abs, target_abs, index, strategy, sid,
                               instance, fragment_index, start, end,

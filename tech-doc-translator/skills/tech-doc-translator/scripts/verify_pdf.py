@@ -20,10 +20,12 @@ from urllib.parse import unquote, urlsplit
 import pypdf
 from collections import Counter
 from markdown_it import MarkdownIt
+from mdit_py_plugins.footnote import footnote_plugin
 from uniseg.linebreak import line_break_boundaries
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import export_pdf as exporter  # noqa: E402  复用同一解析层，另有独立原始扫描交叉核对
+from _verification import scan_math  # noqa: E402
 
 # 与导出证据共用同一命名与状态口径（单一事实源）。
 REPORT_NAME = exporter.REPORT_NAME
@@ -330,6 +332,7 @@ def raw_scan(text):
         "legacy_inline_math": 0,
         "legacy_display_math": 0,
         "std_block_math": 0,
+        "bracket_block_math": 0,
         "images": [],
         "fragment_links": [],
         "external_links": [],
@@ -339,10 +342,18 @@ def raw_scan(text):
     fence_char = None
     fence_len = 0
     in_dollar_block = False
+    in_bracket_block = False
     chunk = []  # (行号, 行内容)：当前段落候选行
     prefix_in_code = set()  # 行首位置落在行内代码区间内的行号
     deep_candidates = []  # (行号, 级别, 文本)：段落闭合后统一判定
     lines = text.splitlines()
+    # 相邻行内公式之间的 $$ 不是块级开启；块级粗扫与状态推进先
+    # 排除共享扫描已确定的 inline 跨度，原始行仍供其余结构统计。
+    masked_math = list(text)
+    for span in scan_math(text).spans:
+        if span.kind == "inline":
+            masked_math[span.start:span.end] = re.sub(r"[^\r\n]", " ", span.raw)
+    math_lines = "".join(masked_math).splitlines()
 
     def flush_chunk():
         nonlocal chunk
@@ -358,8 +369,58 @@ def raw_scan(text):
                     prefix_in_code.add(number)
             chunk = []
 
+    def bracket_opens(line):
+        """本行新开的 \\[…\\] 块数（与共享扫描同口径的独立近似）。
+
+        先移除同行 $$…$$ 整块与 $\\[…\\]$ 历史包装（其中的 \\[ 属表达式，
+        不是块定界），再掩蔽链接标签内的语法转义（与共享掩蔽同义），
+        剩余 \\[ 计数；末个 \\[ 未同行闭合时跨行推进 in_bracket_block，
+        先遇未闭合 $$ 时跨行推进 in_dollar_block。返回
+        (本行新开块数, 未闭合 bracket, 未闭合 dollar)。
+        """
+        work = re.sub(r"\$\$.+?\$\$", "", line)
+        work = re.sub(r"\$\\\[(.{1,4000}?)\\\]\$", "", work)
+        masked = list(work)
+        for match in re.finditer(r"\[((?:\\.|[^\[\]])*)\]\([^()]*\)", work):
+            for esc in re.finditer(r"\\.", match.group(1)):
+                for i in range(match.start(1) + esc.start(),
+                               match.start(1) + esc.end()):
+                    masked[i] = " "
+        work = "".join(masked)
+        opens = 0
+        pos = 0
+        while True:
+            next_open = work.find("\\[", pos)
+            if next_open == -1:
+                # 无 \[：仍须探测本行未闭合的 $$（非行首开启的多行块，
+                # 与下面先遇 $$ 的分支同一跨行语义）
+                next_dollar = work.find("$$", pos)
+                if next_dollar == -1:
+                    return opens, False, False
+                close = work.find("$$", next_dollar + 2)
+                if close == -1:
+                    return opens, False, True
+                pos = close + 2
+                continue
+            next_dollar = work.find("$$", pos)
+            if next_dollar != -1 and next_dollar < next_open:
+                # 先遇 $$ 开启：同行闭合则跳过该跨段继续；未闭合则其后
+                # 的 \[ 属美元块内容，不再计。
+                close = work.find("$$", next_dollar + 2)
+                if close == -1:
+                    return opens, False, True
+                pos = close + 2
+                continue
+            opens += 1
+            close = work.find("\\]", next_open + 2)
+            if close == -1:
+                return opens, True, False
+            pos = close + 2
+
     for line_number, line in enumerate(lines):
         stripped = line.lstrip()
+        math_line = math_lines[line_number]
+        math_stripped = math_line.lstrip()
         if in_fence:
             # 闭合围栏须与开启围栏同字符且不短于其长度（CommonMark），
             # 因此四反引号围栏内的三反引号行不会提前闭合。
@@ -383,6 +444,11 @@ def raw_scan(text):
             if "$$" in stripped:
                 in_dollar_block = False
                 counts["std_block_math"] += 1
+            continue
+        if in_bracket_block:
+            # 多行 \[…\] 块的内容行同样不属于任何其他结构。
+            if "\\]" in stripped:
+                in_bracket_block = False
             continue
         heading = re.match(r"^(#{1,})\s+(.*)$", stripped)
         indent = len(line) - len(stripped)
@@ -412,9 +478,16 @@ def raw_scan(text):
         counts["legacy_display_math"] += len(
             re.findall(r"\$\\\[.{1,4000}?\\\]\$", line)
         )
-        counts["std_block_math"] += len(re.findall(r"\$\$.+?\$\$", stripped))
-        # 同行未闭合的 $$ 开启多行块（$$、内容行、$$ 的标准三行形式）。
-        if stripped.startswith("$$") and stripped.count("$$") % 2 == 1:
+        counts["std_block_math"] += len(re.findall(r"\$\$.+?\$\$", math_stripped))
+        opens, unclosed, dollar_open = bracket_opens(math_line)
+        counts["bracket_block_math"] += opens
+        if unclosed:
+            in_bracket_block = True
+        # 同行未闭合的 $$ 开启多行块（$$、内容行、$$ 的标准三行形式）；
+        # 行中非行首的未闭合 $$ 由 bracket_opens 探测，同一跨行语义。
+        if dollar_open or (
+            math_stripped.startswith("$$") and math_stripped.count("$$") % 2 == 1
+        ):
             flush_chunk()
             in_dollar_block = True
         counts["images"] += re.findall(r"!\[[^\]]*\]\(([^)\s]+)\)", line)
@@ -2241,7 +2314,15 @@ def reparse_inputs(paths, failures, unlink_targets=(), toc_sections=False,
         return []
     for chapter in chapters:
         exporter.apply_view_declaration(chapter, view_declaration)
-        exporter.parse_chapter(chapter)
+        try:
+            exporter.parse_chapter(chapter)
+        except exporter.ExportError as exc:
+            # 与导出入口同一拒绝：未解决数学定界等解析期阻断带原位置
+            # 失败，不能进入产物核对。
+            failures.append({"code": "input-parse-blocked",
+                             "message": str(exc),
+                             "input": str(chapter.path)})
+            return []
     toc_chapter = next((c for c in chapters if c.is_toc), None)
     if toc_chapter is not None:
         if not consume_toc_navigation(
@@ -2302,23 +2383,42 @@ def cross_check(chapters, failures):
                     **context,
                 }
             )
-        legacy_total = scan["legacy_inline_math"] + scan["legacy_display_math"]
-        legacy_parsed = sum(
+        legacy_paren = sum(
+            1 for m in chapter.math if m["original_form"] == "legacy_paren"
+        )
+        legacy_bracket_dollar = sum(
             1
             for m in chapter.math
-            if m["original_form"] in ("legacy_paren", "legacy_bracket")
+            if m["original_form"] == "legacy_bracket"
+            and m.get("markup") == "$"
+        )
+        bracket_block = sum(
+            1
+            for m in chapter.math
+            if m["original_form"] == "legacy_bracket"
+            and m.get("markup") == "\\["
         )
         std_block = sum(1 for m in chapter.math if m["original_form"] == "dollar_block")
-        if legacy_total != legacy_parsed or scan["std_block_math"] != std_block:
+        if (
+            scan["legacy_inline_math"] != legacy_paren
+            or scan["legacy_display_math"] != legacy_bracket_dollar
+            or scan["bracket_block_math"] != bracket_block
+            or scan["std_block_math"] != std_block
+        ):
             failures.append(
                 {
                     "code": "parse-divergence-math",
-                    "message": "原始扫描公式数（legacy %d / block %d）与解析层"
-                    "（legacy %d / block %d）不一致"
+                    "message": "原始扫描公式数（legacy %d / display %d / "
+                    "bracket %d / block %d）与解析层（legacy %d / "
+                    "display %d / bracket %d / block %d）不一致"
                     % (
-                        legacy_total,
+                        scan["legacy_inline_math"],
+                        scan["legacy_display_math"],
+                        scan["bracket_block_math"],
                         scan["std_block_math"],
-                        legacy_parsed,
+                        legacy_paren,
+                        legacy_bracket_dollar,
+                        bracket_block,
                         std_block,
                     ),
                     **context,
@@ -2342,6 +2442,112 @@ def cross_check(chapters, failures):
                     **context,
                 }
             )
+
+
+def _footnote_render_extents(text):
+    """脚注定义的合法交付投影：实际解析定位与渲染顺序（设计 §7.7）。
+
+    用与导出侧相同的 footnote 插件对导出视图做一次只读结构重读：插件把
+    被引用定义移到章末（tail），tail 中 footnote_open/close 段携带原
+    定义内容的 map（实际解析定位），段顺序即渲染序（首次引用序）。未
+    引用定义不进入 tail（不渲染），其跨度仍属源文本序列，由数量门禁
+    拒绝。声明下限 mdit-py-plugins 0.4.0 的 tail 结构与此相同。
+
+    重读只启用 CommonMark/table/footnote，不识别数学定界：公式内部记法
+    （如 $[^b]$）会被 footnote 插件误当作真实引用，改变首次引用序。重读
+    前复用共享扫描已确定的公式跨度做等长掩蔽——跨度内仅非空白字符替换为
+    占位字母，缩进、空白行、换行与偏移逐位保持（缩进与空白行是决定脚注
+    定义归属的结构事实，擦除会把多行公式后的定义区间提前截断），公式内容
+    不参与脚注结构判定，定义定位与真实引用顺序保持。
+    """
+    masked = list(text)
+    for span in scan_math(text).spans:
+        masked[span.start:span.end] = re.sub(r"\S", "x", span.raw)
+    markdown = MarkdownIt("commonmark", {"html": False})
+    markdown.enable("table")
+    markdown.use(footnote_plugin)
+    tokens = markdown.parse("".join(masked), {})
+    line_starts = [0]
+    for match in re.finditer("\n", text):
+        line_starts.append(match.end())
+    extents = []
+    current = None
+    for token in tokens:
+        if token.type == "footnote_open":
+            current = []
+            extents.append(current)
+        elif token.type == "footnote_close":
+            current = None
+        elif current is not None and token.map:
+            current.append(tuple(token.map))
+    result = []
+    for maps in extents:
+        if not maps:
+            continue
+        start_line = min(item[0] for item in maps)
+        end_line = max(item[1] for item in maps)
+        start = line_starts[start_line]
+        end = (line_starts[end_line] if end_line < len(line_starts)
+               else len(text))
+        result.append((start, end))
+    return result
+
+
+def check_math_consumption(chapters, failures):
+    """共享扫描的合法跨度与解析层公式逐一一致（类型、顺序、内容）。
+
+    从授权投影后的导出视图独立重读 `scan_math` 跨度，与解析层实际渲染
+    的公式序列逐项对照（漏渲染、类型漂移、顺序/内容差异都按具体差异
+    失败）；未解决定界在重解析阶段已被拒绝，不会进入本检查。脚注定义
+    内容被既有插件移到章末按首次引用序渲染，属合法交付投影：期望序列
+    按实际解析定位与脚注身份重排（正文源序 + 被引用定义引用序），
+    源文本全局序不直接等于交付投影序。
+    """
+    for chapter in chapters:
+        spans = scan_math(chapter.projected_text).spans
+        parsed = chapter.math
+        context = {"input": str(chapter.path)}
+        if len(spans) != len(parsed):
+            failures.append(
+                {
+                    "code": "math-consumption-count",
+                    "message": "共享扫描公式跨度 %d 与解析层渲染 %d 不一致"
+                    "（漏渲染或多余渲染）"
+                    % (len(spans), len(parsed)),
+                    **context,
+                }
+            )
+            continue
+        extents = _footnote_render_extents(chapter.projected_text)
+        if extents:
+            body = [span for span in spans
+                    if not any(start <= span.start < end
+                               for start, end in extents)]
+            ordered = list(body)
+            for start, end in extents:
+                ordered.extend(span for span in spans
+                               if start <= span.start < end)
+            spans = ordered
+        for index, (span, entry) in enumerate(zip(spans, parsed)):
+            content, display_mode, _ = exporter._span_token(span)
+            latex, mode, _form = exporter.classify_math(content, display_mode)
+            if mode != entry["mode"] or latex != entry["latex"]:
+                failures.append(
+                    {
+                        "code": "math-consumption-mismatch",
+                        "message": "第 %d 个公式类型/内容与共享跨度不一致"
+                        "（解析 %s/%r，扫描 %s/%r，原文 L%d）"
+                        % (
+                            index + 1,
+                            entry["mode"],
+                            entry["latex"],
+                            mode,
+                            latex,
+                            span.start_line,
+                        ),
+                        **context,
+                    }
+                )
 
 
 def check_unlinked_links(chapters, pdf, unlink_targets, report, failures):
@@ -4158,7 +4364,45 @@ def check_code_pagination(chapters, pdf, bounds, failures, reviews,
                 )
 
 
-def check_math(chapters, report, failures):
+def _katex_evidence_pages(pdf_path):
+    """实际成品逐页数学渲染证据：KaTeX 嵌入字体族实际绘字所在页集合。
+
+    用已声明依赖 pypdf 独立重读成品（不依赖导出器报告）：每个成功
+    渲染的公式节点都会留下 KaTeX 字体字形，visitor 字体字典的
+    /BaseFont 给出实际绘制字体（与既有行几何收集同一事实来源）。
+    只有含非空白字符的文本段才算证据：pypdf 会为布局自动合成换行/
+    空白段并沿用前序字体，字体名称、资源声明及布局空白不能单独证明
+    公式存在。返回 None 表示独立读取不可用（成品无法打开或内容不可
+    解析），由调用方按失败处理，不得以通过代替核验。
+    """
+    try:
+        reader = pypdf.PdfReader(str(pdf_path))
+        pages = set()
+        for page_index, page in enumerate(reader.pages):
+            found = []
+
+            def visitor(text, _cm, _tm, font_dict, _font_size,
+                        _found=found):
+                if _found or not text or not text.strip():
+                    return
+                try:
+                    font = (str(font_dict.get("/BaseFont") or "")
+                            if isinstance(font_dict, dict)
+                            else str(font_dict or ""))
+                except Exception:  # noqa: BLE001
+                    font = ""
+                if "KaTeX" in font:
+                    _found.append(True)
+
+            page.extract_text(visitor_text=visitor)
+            if found:
+                pages.add(page_index)
+    except Exception:  # noqa: BLE001  独立读取不可用不得静默通过
+        return None
+    return pages
+
+
+def check_math(chapters, report, pdf_path, bounds, failures):
     browser = report.get("browser_checks", {})
     katex_errors = browser.get("katex") or []
     for error in katex_errors:
@@ -4179,6 +4423,55 @@ def check_math(chapters, report, failures):
                 % (browser.get("mathTotal"), total),
             }
         )
+    # 导出证据记录的公式（成品 DOM 事实）必须与当前从输入重建的解析
+    # 一致：删式、漏渲染或证据漂移都按具体差异失败，不以渲染器报告自证。
+    for chapter, recorded in zip(chapters, report.get("chapters", [])):
+        fresh = [(m["mode"], m["original_form"], m["latex"])
+                 for m in chapter.math]
+        recorded_math = [
+            (m.get("mode"), m.get("original_form"), m.get("latex"))
+            for m in recorded.get("math", [])
+        ]
+        if fresh != recorded_math:
+            failures.append(
+                {
+                    "code": "math-record-mismatch",
+                    "message": "导出证据公式记录与当前输入重建不一致（%d vs %d 条）"
+                    % (len(recorded_math), len(fresh)),
+                    "input": str(chapter.path),
+                }
+            )
+    # 独立 PDF 成品重读核验（一期设计「独立 PDF 核验仍从实际输入和产物
+    # 重读」）：浏览器计数与导出记录都可被未改证据的漏画/篡改骗过，成品
+    # 必须自带数学渲染证据。KaTeX 字形按页面簇呈现，断言粒度取存在性与
+    # 覆盖（重建出公式的章节页范围内须有 KaTeX 字形），不做逐字符几何。
+    expected = {chapter: len(chapter.math) for chapter in chapters}
+    if any(expected.values()):
+        evidence = _katex_evidence_pages(pdf_path)
+        if evidence is None:
+            failures.append(
+                {
+                    "code": "pdf-math-inspect-unavailable",
+                    "message": "成品数学证据独立重读不可用（成品无法打开或"
+                    "内容不可解析），无法核验实际 PDF 是否渲染公式",
+                    "input": str(chapters[0].path) if chapters else None,
+                }
+            )
+        else:
+            for chapter, start, end in bounds:
+                if not expected.get(chapter):
+                    continue
+                if not any(start <= page < end for page in evidence):
+                    failures.append(
+                        {
+                            "code": "pdf-math-missing",
+                            "message": "成品 PDF 第 %d–%d 页缺少数学渲染证据："
+                            "本章从当前输入重建出 %d 条公式，但成品中没有 "
+                            "KaTeX 数学字形（打印漏画或成品被篡改）"
+                            % (start + 1, end, expected[chapter]),
+                            "input": str(chapter.path),
+                        }
+                    )
 
 
 def check_links(chapters, pdf, bounds, heading_pages, failures, reviews):
@@ -4538,6 +4831,7 @@ def run_verification(args):
         args.inputs, failures, args.unlink_target, args.toc_sections,
         getattr(args, "view_declaration", None))
     cross_check(chapters, failures)
+    check_math_consumption(chapters, failures)
     check_inputs_protection(report, failures)
 
     # 视图声明独立重建（reparse 已按同一声明投影；此处再加载供逐项核对）。
@@ -4642,7 +4936,7 @@ def run_verification(args):
         check_short_block_not_split(bounds, failures, code_block_infos)
         check_code_pagination(chapters, pdf, bounds, failures, reviews,
                               code_block_infos, relaxed)
-        check_math(chapters, report, failures)
+        check_math(chapters, report, pdf_path, bounds, failures)
         check_links(chapters, pdf, bounds, heading_pages, failures, reviews)
         check_outline(chapters, pdf, heading_pages, failures)
         check_image_widths(chapters, pdf, bounds, bindings, report, failures)

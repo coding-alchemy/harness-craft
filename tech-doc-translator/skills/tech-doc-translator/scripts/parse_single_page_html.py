@@ -67,10 +67,11 @@ def _render_children(node, out, fidelity):
             continue
         name = child.name
         if name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
-            out.append('\n' + '#' * int(name[1]) + ' '
-                       + fidelity.clean_heading(fidelity.heading_text(child)))
+            out.append('\n' + fidelity.heading_line(
+                int(name[1]), fidelity.clean_heading(
+                    fidelity.heading_text(child, escape_backslashes=True))))
         elif name == 'p':
-            t = fidelity.render_inline(child)
+            t = fidelity.paragraph_text(child)
             if t:
                 out.append('\n' + t)
         elif name in ('ul', 'ol'):
@@ -118,7 +119,7 @@ def _render_children(node, out, fidelity):
                     child.find(['p', 'pre', 'ul', 'ol', 'table', 'dl', 'div', 'section', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'], recursive=True)):
                 render(child, out, fidelity)
             else:
-                t = fidelity.render_inline(child)
+                t = fidelity.paragraph_text(child)
                 if t:
                     out.append('\n' + t)
         elif name == 'section':
@@ -156,7 +157,7 @@ def _render_children(node, out, fidelity):
                           recursive=True) or _has_protected_pre(child):
                 render(child, out, fidelity)
             else:
-                t = fidelity.render_inline(child)
+                t = fidelity.paragraph_text(child)
                 if t:
                     out.append('\n' + t)
 

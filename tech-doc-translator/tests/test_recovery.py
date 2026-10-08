@@ -287,6 +287,28 @@ class FencedImageExampleTest(unittest.TestCase):
                          '围栏内代码示例被误计为图片: %s' % fails)
 
 
+class UnresolvedMathRecoveryTest(unittest.TestCase):
+    """未解决数学定界阻断恢复复用，不能因剩余公式数量相等而放行。"""
+
+    def test_unresolved_math_in_translation_invalidates(self):
+        src = '## S\n\n公式 $a$ 与 $b$。\n'
+        good = '## S（节）\n\n公式 $a$ 与 $b$。\n'
+        bad = '## S（节）\n\n公式 $a$ 与 $b$ 和 $x。\n'
+        fails, _ = recover._fragment_hard_checks(src, bad, 't.md', [], [])
+        self.assertTrue(any('未解决数学定界' in f for f in fails), fails)
+        fails_good, _ = recover._fragment_hard_checks(src, good, 't.md', [], [])
+        self.assertEqual(fails_good, [])
+
+    def test_equal_remaining_count_does_not_mask_issue(self):
+        # 源两个公式，译文删一个又留一个未闭合定界：剩余数量相等无意义
+        src = '## S\n\n$a$ 和 $b$。\n'
+        bad = '## S（节）\n\n$a$ 和 $c\n'
+        fails, _ = recover._fragment_hard_checks(src, bad, 't.md', [], [])
+        self.assertTrue(any('未解决数学定界' in f for f in fails), fails)
+        self.assertTrue(any('公式' in f and '不一致' in f for f in fails),
+                        fails)
+
+
 class SvgDependencyEvidenceTest(unittest.TestCase):
     """SVG 子资源纳入证据绑定：仅换子资源字节即失效（评审 P1/P3）。"""
 

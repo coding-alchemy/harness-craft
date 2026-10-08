@@ -26,7 +26,6 @@ from urllib.parse import unquote, urlsplit
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
-from mdit_py_plugins.dollarmath import dollarmath_plugin
 from mdit_py_plugins.footnote import footnote_plugin
 from pygments import highlight as pygments_highlight
 from pygments.formatters import HtmlFormatter
@@ -43,6 +42,7 @@ from _image_preflight import (
     decode_budget,
     undetermined_binding_diagnostics,
 )
+from _verification import math_issue_fails, scan_math
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets" / "pdf"
 REPORT_NAME = "export_report.json"
@@ -2039,8 +2039,90 @@ def classify_math(content, display_mode):
     return latex, mode, original_form
 
 
-def build_markdown(math_sink, chapter_prefix):
-    """构造按本章作用域工作的解析器；math_sink 收集公式条目。"""
+def _span_token(span):
+    r"""共享跨度 → (token 内容, display_mode, token 类型)。
+
+    `\[…\]` 块级保留原包装送入 classify_math（与历史 $$\[…\]$$ 的包装
+    剥离同一职责，original_form=legacy_bracket）；`$$` 块级内容不含
+    定界（与历史 dollarmath 块 token 一致，original_form=dollar_block）。
+    """
+    if span.kind == "inline":
+        return span.expr, False, "math_inline"
+    if span.raw.startswith("\\["):
+        return "\\[" + span.expr + "\\]", False, "math_block"
+    return span.expr, True, "math_block"
+
+
+def _standalone_block(text, span):
+    """块级跨度是否会被块级规则消费：行首（允许缩进与排版空白）且
+    独占至行尾。带尾随正文的块级退回行内规则渲染。"""
+    if span.kind != "block":
+        return False
+    line_start = text.rfind("\n", 0, span.start) + 1
+    if text[line_start:span.start].strip():
+        return False
+    line_end = text.find("\n", span.end)
+    if line_end == -1:
+        line_end = len(text)
+    return not text[span.end:line_end].strip()
+
+
+def _aligned_span_length(src, pos, raw):
+    r"""span.raw 在 inline state.src 中可消费的长度（容器剥离感知）。
+
+    先做严格前缀匹配（无容器时 state.src 是原文子串，原样命中）。
+    严格失败且 raw 跨行时按最小对齐重试：首行仍须严格相等；后续行
+    与 src 行一一对应，逐行去掉行首空白后内容必须完全一致——列表/
+    引用等容器的 inline 内容已剥掉 item 内容列缩进，与含原始缩进的
+    span.raw 错位，但行内容不被改写。末行允许其后还有同段正文（去
+    行首空白后为前缀即可）。任何内容差异都返回 None，不放宽比对。
+    """
+    if src.startswith(raw, pos):
+        return len(raw)
+    raw_lines = raw.split("\n")
+    if len(raw_lines) < 2:
+        return None
+    src_pos = pos
+    last = len(raw_lines) - 1
+    for index, raw_line in enumerate(raw_lines):
+        if index:
+            if src_pos >= len(src) or src[src_pos] != "\n":
+                return None
+            src_pos += 1
+            content = raw_line.lstrip(" ")
+            line_end = src.find("\n", src_pos)
+            if line_end == -1:
+                line_end = len(src)
+            line = src[src_pos:line_end]
+            offset = len(line) - len(line.lstrip(" "))
+            src_pos += offset
+            if not line[offset:].startswith(content):
+                return None
+            if index < last and src_pos + len(content) != line_end:
+                # 中间行须整行相等（行一一对应，容器只剥行首缩进）
+                return None
+            src_pos += len(content)
+        else:
+            if not src.startswith(raw_line, src_pos):
+                return None
+            src_pos += len(raw_line)
+    return src_pos - pos
+
+
+def build_markdown(math_sink, chapter_prefix, math_spans, text):
+    """构造按本章作用域工作的解析器；math_sink 收集公式条目。
+
+    数学识别边界直接消费 `_verification.scan_math` 的共享跨度（与四族
+    译文、拆包、对账同一事实）：不再配置独立数字/空白规则，合法数字
+    邻接公式进入渲染，货币与代码/转义排除由共享扫描裁决。块级规则只
+    认领行首且独占至行尾的块级跨度（公式 DOM 与历史一致）；其余跨度
+    由行内规则按文档顺序以原文切片匹配渲染（markdown-it 的 inline
+    src 是各块 token 的内容子串，偏移非全局，故用有序游标 + raw 前缀
+    匹配，不用全局偏移）。容器（列表/引用等）inline 内容剥掉内容列
+    缩进后与含原始缩进的 raw 错位：严格前缀失败时按行做去行首空白的
+    最小对齐重试（`_aligned_span_length`），行内容仍须完全一致，有序、
+    内容一致语义不变。
+    """
     def render_math(content, env):
         latex, mode, original_form = classify_math(
             content, env.get("display_mode", False)
@@ -2054,6 +2136,7 @@ def build_markdown(math_sink, chapter_prefix):
                 "mode": mode,
                 "original_form": original_form,
                 "source": content,
+                "markup": env.get("markup", ""),
             }
         )
         tag = "div" if mode == "display" else "span"
@@ -2067,17 +2150,89 @@ def build_markdown(math_sink, chapter_prefix):
             tag,
         )
 
+    spans = list(math_spans)
+    block_consumed = {span.start for span in spans
+                      if _standalone_block(text, span)}
+    global_by_start = {span.start: span for span in spans
+                       if span.kind == "block"}
+    cursor = {"i": 0}
+
+    def _cursor_span():
+        i = cursor["i"]
+        while i < len(spans) and spans[i].start in block_consumed:
+            i += 1
+        cursor["i"] = i
+        return spans[i] if i < len(spans) else None
+
+    def math_inline_rule(state, silent):
+        if state.env.get("pdf_deep_probe"):
+            # 深层标题探测（split_deep_headings）只关心行内代码：不消费
+            # 公式、不推进游标，避免探测消耗真实解析的跨度序列。
+            return False
+        span = _cursor_span()
+        if span is None:
+            return False
+        consumed = _aligned_span_length(state.src, state.pos, span.raw)
+        if consumed is None:
+            return False
+        if not silent:
+            content, display_mode, token_type = _span_token(span)
+            token = state.push(token_type, "math", 0)
+            token.content = content
+            token.markup = span.raw[:1] if span.kind == "inline" \
+                else span.raw[:2]
+            token.meta = {"display_mode": display_mode}
+            if token_type == "math_block":
+                token.block = True
+            cursor["i"] += 1
+        state.pos += consumed
+        return True
+
+    def math_block_rule(state, startLine, endLine, silent):
+        start_pos = state.bMarks[startLine] + state.tShift[startLine]
+        span = global_by_start.get(start_pos)
+        if span is None or span.start not in block_consumed:
+            return False
+        end_line = startLine + state.src[
+            state.bMarks[startLine]:span.end].count("\n")
+        if not silent:
+            content, display_mode, _ = _span_token(span)
+            token = state.push("math_block", "math", 0)
+            token.block = True
+            token.content = content
+            token.markup = span.raw[:2]
+            token.meta = {"display_mode": display_mode}
+            token.map = [startLine, end_line + 1]
+        state.line = end_line + 1
+        return True
+
     markdown = MarkdownIt("commonmark", {"html": False})
     markdown.enable("table")
     markdown.enable("strikethrough")
-    markdown.use(
-        dollarmath_plugin,
-        allow_labels=False,
-        allow_space=False,
-        allow_digits=False,
-        double_inline=False,
-        renderer=render_math,
-    )
+    markdown.inline.ruler.before("escape", "math_inline", math_inline_rule)
+    # alt=["paragraph"]：列表项等容器内段落从标记行起吸后续行，块级
+    # 规则须能终止段落认领行首块级公式（严格全局偏移比对不变）
+    markdown.block.ruler.before("fence", "math_block", math_block_rule,
+                                {"alt": ["paragraph"]})
+
+    def render_math_inline(self, tokens, idx, options, env):
+        content = render_math(
+            str(tokens[idx].content).strip(),
+            {"display_mode": bool(
+                (tokens[idx].meta or {}).get("display_mode")),
+             "markup": tokens[idx].markup or "$"})
+        return '<span class="math inline">%s</span>' % content
+
+    def render_math_block(self, tokens, idx, options, env):
+        content = render_math(
+            str(tokens[idx].content).strip(),
+            {"display_mode": bool(
+                (tokens[idx].meta or {}).get("display_mode", True)),
+             "markup": tokens[idx].markup or "$$"})
+        return '<div class="math block">\n%s\n</div>\n' % content
+
+    markdown.add_render_rule("math_inline", render_math_inline)
+    markdown.add_render_rule("math_block", render_math_block)
     markdown.use(footnote_plugin)
     markdown.core.ruler.before("inline", "pdf_deep_headings", split_deep_headings)
     markdown.inline.ruler.before("html_inline", "pdf_anchor", parse_anchor)
@@ -2162,7 +2317,9 @@ def split_deep_headings(state):
                 marker += "X"
             probe = lines.copy()
             probe[number] = marker + line[match.end(1):]
-            tokens = state.md.parseInline("\n".join(probe), {})[0].children or []
+            tokens = state.md.parseInline(
+                "\n".join(probe), {"pdf_deep_probe": True}
+            )[0].children or []
             if any(t.type == "code_inline" and marker in t.content for t in tokens):
                 continue
             headings[number] = match
@@ -2260,8 +2417,19 @@ class Chapter:
 
 
 def parse_chapter(chapter):
-    """解析单章（经授权投影后的导出视图）并渲染为带前缀的 HTML 片段。"""
-    markdown, formatter = build_markdown(chapter.math, chapter.prefix)
+    """解析单章（经授权投影后的导出视图）并渲染为带前缀的 HTML 片段。
+
+    数学定界消费 `_verification.scan_math` 的共享结果：未解决定界
+    （issues）带原位置拒绝导出，合法跨度（含相邻行内与数字邻接）全部
+    进入既有渲染，与四族译文/拆包/对账的结论一致。
+    """
+    scan = scan_math(chapter.projected_text)
+    if scan.issues:
+        raise ExportError(
+            "未解决数学定界，拒绝导出：\n%s"
+            % "\n".join(math_issue_fails(scan.issues, str(chapter.path))))
+    markdown, formatter = build_markdown(chapter.math, chapter.prefix,
+                                         scan.spans, chapter.projected_text)
     raw_html = markdown.render(chapter.projected_text)
     soup = BeautifulSoup(raw_html, "html.parser")
     for anchor in soup.find_all("a", id=True, href=False):
@@ -3247,9 +3415,19 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             chapters, list(images_display_paths), diagnostics
         )
     # 先完成全部章节解析，再做链接消解：跨章文件链接与片段链接都依赖
-    # 所有章节的目标映射就绪。
-    for chapter in chapters:
-        parse_chapter(chapter)
+    # 所有章节的目标映射就绪。未解决数学定界（共享扫描 issues）在此
+    # 带原位置失败，不生成候选、不触碰既有成品。
+    try:
+        for chapter in chapters:
+            parse_chapter(chapter)
+    except ExportError as exc:
+        report["status"] = STATUS_MACHINE_FAIL
+        report["error"] = str(exc)
+        (work_dir / REPORT_NAME).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print("FAIL: %s" % exc, file=sys.stderr)
+        return 1
 
     # 中文文档总标题决定（R3/A4/C5）：必须在印刷目录合成与正文事实
     # 收集前投影（印刷目录条目与正文预期使用投影后的可见标题）；

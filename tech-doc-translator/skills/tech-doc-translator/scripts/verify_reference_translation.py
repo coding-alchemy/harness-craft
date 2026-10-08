@@ -3,7 +3,11 @@
 
 用法：
     python3 verify_reference_translation.py <译文.md> <源文.md> [strong_token ...]
+        [--official-headings-file <文件>]
         [--approved-extra-math <表达式>]...
+
+--official-headings-file 提供 UTF-8 官方原题清单文件（每行一项，与
+旧位置强 token 可并存，角色不变）；相对路径按调用 cwd 解释。
 
 --approved-extra-math 按原文表达式逐条豁免获准译注公式（可重复；不掩盖源公式遗漏）。
 
@@ -27,11 +31,15 @@ import re
 import os
 from collections import Counter
 
+from _official_headings import (
+    extract_official_headings_option,
+    load_official_headings,
+    official_titles_diff,
+)
 from _verification import (
     compare_code_fences,
     compare_headings,
     compare_math_spans,
-    count_token,
     extract_approved_extra_math,
     extract_image_options,
     extract_strong_tokens,
@@ -42,9 +50,10 @@ from _verification import (
     link_targets,
     image_occurrence_fails,
     image_references,
+    math_issue_fails,
     residual_markers,
     scan_code_fences,
-    scan_math_spans,
+    scan_math,
     source_occurrence_digests,
     strong_token_report,
 )
@@ -167,12 +176,13 @@ def content_counts(text, is_source=True):
 
 def verify(doc_text, src_text, strong_tokens, approved_extra_math=(),
            delivery_root=None, image_digests=None, doc_dir=None,
-           doc_label='译文', src_label='源文'):
+           doc_label='译文', src_label='源文', official=()):
     """参考手册检查核心：接收候选文本与实际目标目录，返回 (fails, warns)。
 
     doc_text 可来自工作区外临时候选（草稿预检）；doc_dir 必须是最终
     Markdown 目录——图片等资源一律按最终目标路径定位，不按候选临时
     路径定位。doc_label/src_label 沿用调用方路径标签用于诊断定位。
+    official 为加载后的官方原题清单（独立基准，可与旧位置强 token 并存）。
     """
     fails = []
     warns = []
@@ -190,14 +200,22 @@ def verify(doc_text, src_text, strong_tokens, approved_extra_math=(),
     for diff in compare_headings(src_entries, doc_entries,
                                  src_label, doc_label):
         fails.append(diff)
+    if official:
+        # 官方原题清单独立基准：源与译文同时漏标题时仍被检出
+        diff = official_titles_diff(
+            official, [t for _, _, t in doc_entries])
+        if diff is not None:
+            fails.append('标题: 与官方清单不一致（%s）' % diff)
 
-    # 4) 公式逐项核对（类型/顺序/原表达式，含历史包装告警）
-    src_math = scan_math_spans(src)
-    doc_math = scan_math_spans(doc)
+    # 4) 公式逐项核对（类型/顺序/原表达式，含历史包装告警）与未解决定界
+    src_scan = scan_math(src)
+    doc_scan = scan_math(doc)
     math_diffs, math_warns = compare_math_spans(
-        src_math, doc_math, src_label, doc_label,
+        src_scan.spans, doc_scan.spans, src_label, doc_label,
         approved_extra_exprs=approved_extra_math, doc_text=doc)
     fails.extend('公式逐项核对: %s' % d for d in math_diffs)
+    fails.extend(math_issue_fails(src_scan.issues, src_label))
+    fails.extend(math_issue_fails(doc_scan.issues, doc_label))
     warns.extend(math_warns)
 
     missing_links = Counter(link_targets(src)) - Counter(link_targets(doc))
@@ -304,7 +322,11 @@ def verify(doc_text, src_text, strong_tokens, approved_extra_math=(),
 
 
 def parse_args(argv):
-    """解析既有 CLI 参数，返回语义结构（verify_delivery 复用同一解释）。"""
+    """解析既有 CLI 参数，返回语义结构（verify_delivery 复用同一解释）。
+
+    --official-headings-file 与旧位置强 token 角色互不影响，可并存。
+    """
+    argv, official_headings_file = extract_official_headings_option(argv)
     argv, approved_extra_math = extract_approved_extra_math(argv)
     argv, flag_tokens = extract_strong_tokens(argv)
     argv, image_map, delivery_root = extract_image_options(argv)
@@ -314,6 +336,7 @@ def parse_args(argv):
         'translated_path': argv[0],
         'source_path': argv[1],
         'strong_tokens': list(argv[2:]) + flag_tokens,
+        'official_headings_file': official_headings_file,
         'approved_extra_math': approved_extra_math,
         'image_map': image_map,
         'delivery_root': delivery_root,
@@ -329,11 +352,17 @@ def main():
     delivery_root = parsed['delivery_root']
     image_map = parsed['image_map']
     image_digests = load_image_digests(image_map) if image_map else None
+    official = None
+    if parsed['official_headings_file']:
+        # 共享加载器在 CLI 实际调用基点（本进程 cwd）读取
+        _path, official = load_official_headings(
+            parsed['official_headings_file'])
     fails, warns = verify(
         read(translated_path), read(source_path), strong_tokens,
         approved_extra_math, delivery_root, image_digests,
         doc_dir=os.path.dirname(os.path.abspath(translated_path)),
-        doc_label=translated_path, src_label=source_path)
+        doc_label=translated_path, src_label=source_path,
+        official=official or ())
 
     print('%s: %s' % (os.path.basename(translated_path), 'PASS' if not fails else 'FAIL'))
     for f in fails:

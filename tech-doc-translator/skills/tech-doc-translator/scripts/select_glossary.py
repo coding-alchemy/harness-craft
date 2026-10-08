@@ -84,10 +84,23 @@ def write_output(path, terms, notes):
         out.write('| --- | --- | --- | --- | --- |\n')
         for term in terms:
             out.write('| {english} | {chinese} | {method} | {context} | {source} |\n'.format(**term))
+        write_mapping(out, terms)
         if notes:
             out.write('\n## 覆盖说明\n\n')
             for note in notes:
                 out.write('- %s\n' % note)
+
+
+def write_mapping(out, terms):
+    """目标列映射回查（D6）：每个词条的原目标表头、表头行号与列号。"""
+    out.write('\n## 目标列映射\n\n')
+    for term in terms:
+        if term.get('header'):
+            out.write('- {english} ← “{header}”（{file} 表头行 {header_line}，'
+                      '第 {column} 列）\n'.format(**term))
+        else:
+            out.write('- {english} ← （无目标译法列：{file} 表头行 '
+                      '{header_line}）\n'.format(**term))
 
 
 def main():

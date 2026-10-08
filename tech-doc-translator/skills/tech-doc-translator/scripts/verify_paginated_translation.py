@@ -3,6 +3,10 @@
 
 用法：
     python3 verify_paginated_translation.py merged.md src1.md src2.md ...
+        [--official-headings-file <文件>]
+
+--official-headings-file 提供 UTF-8 官方原题清单文件（每行一项，按源页
+顺序；与有序源路径可并存，角色不变）；相对路径按调用 cwd 解释。
 
 检查项：
 1. 标题集合与顺序（按节号前缀匹配，兼容 ASCII 括号中文后缀）
@@ -18,6 +22,11 @@ import sys
 import re
 import os
 
+from _official_headings import (
+    extract_official_headings_option,
+    load_official_headings,
+    official_titles_diff,
+)
 from _verification import (
     compare_code_fences,
     compare_headings,
@@ -31,10 +40,12 @@ from _verification import (
     image_occurrence_fails,
     image_references,
     load_image_digests,
+    math_issue_fails,
     residual_markers,
     scan_code_fences,
-    scan_math_spans,
+    scan_math,
     source_occurrence_digests,
+    strong_token_checked_items,
     strong_token_report,
 )
 
@@ -81,6 +92,26 @@ def check_headings(merged_text, src_texts):
     return fails, msgs
 
 
+def check_official_headings(merged_text, official):
+    """官方原题清单按装配后译文序逐项对照（跳过装配章节头）。
+
+    层级仍由源→译文独立有序检查（含已批准降级映射）证明；官方文件是
+    纯原题基准，不按解析结果删减清单项。
+    """
+    fails = 0
+    msgs = []
+    if not official:
+        return fails, msgs
+    got = [t for _, _, t in heading_entries(merged_text)][1:]
+    diff = official_titles_diff(official, got)
+    if diff is None:
+        msgs.append('标题: 与官方清单一致（含顺序） PASS')
+    else:
+        fails += 1
+        msgs.append('标题: 与官方清单不一致 FAIL（%s）' % diff)
+    return fails, msgs
+
+
 def check_fences(text):
     fails = 0
     msgs = []
@@ -119,20 +150,25 @@ def check_code_blocks(merged_text, src_text, src_label, merged_label):
 
 def check_math(merged_text, src_text, approved_extra_math,
                src_label, merged_label):
-    """合并产物公式与拼接源逐项核对（类型/顺序/原表达式）。"""
+    """合并产物公式与拼接源逐项核对（类型/顺序/原表达式）与未解决定界。"""
     fails = 0
     msgs = []
-    src_math = scan_math_spans(src_text)
-    doc_math = scan_math_spans(merged_text)
+    src_scan = scan_math(src_text)
+    doc_scan = scan_math(merged_text)
     math_diffs, math_warns = compare_math_spans(
-        src_math, doc_math, src_label, merged_label,
+        src_scan.spans, doc_scan.spans, src_label, merged_label,
         approved_extra_exprs=approved_extra_math, doc_text=merged_text)
     for diff in math_diffs:
         fails += 1
         msgs.append('公式逐项核对: %s FAIL' % diff)
+    for issue_fail in math_issue_fails(src_scan.issues, src_label) + \
+            math_issue_fails(doc_scan.issues, merged_label):
+        fails += 1
+        msgs.append('公式逐项核对: %s FAIL' % issue_fail)
     msgs.extend('公式逐项核对: %s WARN' % w for w in math_warns)
-    if not math_diffs and doc_math:
-        msgs.append('公式逐项核对: %d 处与源逐项一致 PASS' % len(doc_math))
+    if not math_diffs and not src_scan.issues and not doc_scan.issues \
+            and doc_scan.spans:
+        msgs.append('公式逐项核对: %d 处与源逐项一致 PASS' % len(doc_scan.spans))
     return fails, msgs
 
 
@@ -201,7 +237,11 @@ def check_images(merged_text, merged_dir, src_texts, src_dirs,
 
 
 def check_syntax(merged_text, src_text, strong_tokens):
-    """项目强 token 多重集差异（未配置时明示未检查）。"""
+    """项目强 token 多重集差异（未配置时明示未检查）。
+
+    汇总只声明源中非零出现的配置项已逐项核对；源中未出现的配置项由
+    未检查告警独立列出，不把空差异打印成所有配置项通过。
+    """
     fails = 0
     msgs = []
     diffs, warns = strong_token_report(src_text, merged_text, strong_tokens,
@@ -214,7 +254,14 @@ def check_syntax(merged_text, src_text, strong_tokens):
         msgs.append('强 token: %s FAIL' % diff)
     msgs.extend('强 token: %s WARN' % w for w in warns)
     if not diffs:
-        msgs.append('强 token: %d 个与源一致或仅增加 PASS' % len(strong_tokens))
+        checked = strong_token_checked_items(src_text, strong_tokens)
+        if checked:
+            msgs.append('强 token: %d 项非零源项已逐项核对（%s） PASS'
+                        % (len(checked), '、'.join(checked)))
+        else:
+            msgs.append('强 token: 配置的 %d 项源中均未出现，'
+                        '无非零源项可核对（见未检查告警）'
+                        % len(strong_tokens))
     return fails, msgs
 
 
@@ -251,18 +298,19 @@ def coverage_warnings(merged_text, src_text):
 def run_checks(merged_text, src_texts, src_dirs, *, merged_dir,
                merged_label, src_label, delivery_root=None,
                image_digests=None, strong_tokens=(),
-               approved_extra_math=()):
+               approved_extra_math=(), official=()):
     """分页路线检查核心：接收候选文本与实际目标目录，返回 (失败数, 输出行)。
 
     merged_text 可来自工作区外临时候选（草稿预检）；merged_dir 必须是
     最终 Markdown 目录，资源按最终目标路径定位。src_label 为既有的
     “源文拼接(文件名+文件名)”标签，由调用方按实际源文件名构造。
+    official 为加载后的官方原题清单（可与有序源路径并存，角色不变）。
     输出行与既有 CLI 一致。
     """
     src_text = ''.join(src_texts)
     total_fail = 0
     all_msgs = []
-    for fn, func, args in [
+    sections = [
         ('标题与顺序', check_headings, (merged_text, src_texts)),
         ('代码围栏', check_fences, (merged_text,)),
         ('代码逐块核对', check_code_blocks,
@@ -276,7 +324,12 @@ def run_checks(merged_text, src_texts, src_dirs, *, merged_dir,
           image_digests)),
         ('强 token', check_syntax, (merged_text, src_text, strong_tokens)),
         ('残留解析标记', check_residual, (merged_text,)),
-    ]:
+    ]
+    if official:
+        # 官方原题清单独立基准（可与有序源路径并存，不替代源对照）
+        sections.insert(1, ('官方标题清单', check_official_headings,
+                            (merged_text, official)))
+    for fn, func, args in sections:
         f, msgs = func(*args)
         total_fail += f
         all_msgs.append('## %s' % fn)
@@ -292,7 +345,11 @@ def run_checks(merged_text, src_texts, src_dirs, *, merged_dir,
 
 
 def parse_args(argv):
-    """解析既有 CLI 参数，返回语义结构（verify_delivery 复用同一解释）。"""
+    """解析既有 CLI 参数，返回语义结构（verify_delivery 复用同一解释）。
+
+    --official-headings-file 与合并译文之后的有序源路径可并存，角色不变。
+    """
+    argv, official_headings_file = extract_official_headings_option(argv)
     argv, approved_extra_math = extract_approved_extra_math(argv)
     argv, strong_tokens = extract_strong_tokens(argv)
     argv, image_map, delivery_root = extract_image_options(argv)
@@ -301,6 +358,7 @@ def parse_args(argv):
     return {
         'merged_path': argv[0],
         'src_paths': list(argv[1:]),
+        'official_headings_file': official_headings_file,
         'strong_tokens': strong_tokens,
         'approved_extra_math': approved_extra_math,
         'image_map': image_map,
@@ -317,6 +375,11 @@ def main():
     delivery_root = parsed['delivery_root']
     image_map = parsed['image_map']
     image_digests = load_image_digests(image_map) if image_map else None
+    official = ()
+    if parsed['official_headings_file']:
+        # 共享加载器在 CLI 实际调用基点（本进程 cwd）读取
+        _path, official = load_official_headings(
+            parsed['official_headings_file'])
 
     merged_text = open(merged_path, encoding='utf-8').read()
     src_texts = [open(p, encoding='utf-8').read() for p in src_paths]
@@ -329,7 +392,7 @@ def main():
             os.path.basename(p) for p in src_paths),
         delivery_root=delivery_root, image_digests=image_digests,
         strong_tokens=strong_tokens,
-        approved_extra_math=approved_extra_math)
+        approved_extra_math=approved_extra_math, official=official)
 
     print('\n'.join(all_msgs))
     sys.exit(0 if total_fail == 0 else 1)

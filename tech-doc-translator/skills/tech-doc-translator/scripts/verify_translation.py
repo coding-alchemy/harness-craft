@@ -3,10 +3,13 @@
 
 用法：
     python3 verify_translation.py <译文.md> <源文.md> "官方标题1" "官方标题2" ...
+        [--official-headings-file <文件>]
         [--approved-extra-math <表达式>]... [--strong-token <token>]...
         [--image-map <map.json>] [--delivery-root <dir>] [--fragment]
 
 官方标题只需编号 + 英文原题（如 "1. Introduction"），顺序传入。
+--official-headings-file 提供 UTF-8 官方原题清单文件（每行一项），与
+逐项官方标题互斥，同时提供时拒绝；相对路径按调用 cwd 解释。
 脚本会兼容中文后缀 `（中文）` 与无后缀标题。
 --approved-extra-math 按原文表达式逐条豁免获准译注公式（可重复；不掩盖源公式遗漏）。
 --image-map 按出现顺序提供来源身份 sha256（原始快照独立建立）；未提供映射时
@@ -20,6 +23,11 @@ import re
 import os
 from collections import Counter
 
+from _official_headings import (
+    extract_official_headings_option,
+    load_official_headings,
+    official_titles_diff,
+)
 from _verification import (
     compare_code_fences,
     compare_headings,
@@ -29,15 +37,15 @@ from _verification import (
     extract_strong_tokens,
     footnote_diffs,
     heading_entries,
-    heading_title_matches,
     image_occurrence_count,
     image_occurrence_fails,
     image_references,
     link_targets,
     load_image_digests,
+    math_issue_fails,
     residual_markers,
     scan_code_fences,
-    scan_math_spans,
+    scan_math,
     source_occurrence_digests,
     strong_token_report,
 )
@@ -87,13 +95,12 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
     if official:
         # 官方标题清单作为独立基准（防源文件标题本身缺漏时盲从源文）
         got = [t for _, _, t in doc_headings]
-        if len(got) == len(official) and all(
-                heading_title_matches(e, g) for e, g in zip(official, got)):
+        diff = official_titles_diff(official, got)
+        if diff is None:
             lines.append('标题: 与官方清单一致（含顺序） PASS')
         else:
             fail += 1
-            lines.append('标题: 与官方清单不一致 FAIL（译文 %d 条 vs 官方 %d 条）'
-                         % (len(got), len(official)))
+            lines.append('标题: 与官方清单不一致 FAIL（%s）' % diff)
 
     # 3) 残留解析标记
     for marker in residual_markers(doc, _RESIDUAL_MARKERS):
@@ -183,21 +190,26 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
                      % len(doc_fences.blocks))
 
     # 8) 公式逐项核对（类型/顺序/原表达式）与链接目标
-    src_math = scan_math_spans(src)
-    doc_math = scan_math_spans(doc)
+    src_scan = scan_math(src)
+    doc_scan = scan_math(doc)
     math_diffs, math_warns = compare_math_spans(
-        src_math, doc_math, src_label, doc_label,
+        src_scan.spans, doc_scan.spans, src_label, doc_label,
         approved_extra_exprs=approved_extra_math, doc_text=doc)
     for diff in math_diffs:
         fail += 1
         lines.append('公式逐项核对: %s FAIL' % diff)
+    for issue_fail in math_issue_fails(src_scan.issues, src_label) + \
+            math_issue_fails(doc_scan.issues, doc_label):
+        fail += 1
+        lines.append('公式逐项核对: %s FAIL' % issue_fail)
     for warn in math_warns:
         lines.append('公式逐项核对: %s WARN' % warn)
-    if not math_diffs and src_math:
+    if not math_diffs and not src_scan.issues and not doc_scan.issues \
+            and src_scan.spans:
         lines.append('公式逐项核对: %d 处（行内 %d/块级 %d）与源逐项一致 PASS'
-                     % (len(doc_math),
-                        sum(1 for s in doc_math if s.kind == 'inline'),
-                        sum(1 for s in doc_math if s.kind == 'block')))
+                     % (len(doc_scan.spans),
+                        sum(1 for s in doc_scan.spans if s.kind == 'inline'),
+                        sum(1 for s in doc_scan.spans if s.kind == 'block')))
     if src:
         missing_links = Counter(link_targets(src)) - Counter(link_targets(doc))
         if missing_links:
@@ -229,7 +241,10 @@ def parse_args(argv):
     doc_path/src_path 为路径；official 为官方标题字面值；--strong-token、
     --approved-extra-math、--image-map、--delivery-root、--fragment 按真实
     语义拆出。路径与字面值不做任何改写，由调用方按自己的基点解释。
+    --official-headings-file 与逐项官方原题互斥（同角色官方输入），
+    同时提供时拒绝；文件路径由调用方在实际调用基点读取。
     """
+    argv, official_headings_file = extract_official_headings_option(argv)
     argv, approved_extra_math = extract_approved_extra_math(argv)
     argv, strong_tokens = extract_strong_tokens(argv)
     argv, image_map, delivery_root = extract_image_options(argv)
@@ -237,10 +252,14 @@ def parse_args(argv):
     argv = [a for a in argv if a != '--fragment']
     if len(argv) < 2:
         sys.exit(__doc__)
+    if official_headings_file and len(argv) > 2:
+        sys.exit('--official-headings-file 与逐项官方原题位置参数互斥，'
+                 '同时提供 FAIL')
     return {
         'doc_path': argv[0],
         'src_path': argv[1],
         'official': list(argv[2:]),
+        'official_headings_file': official_headings_file,
         'strong_tokens': strong_tokens,
         'approved_extra_math': approved_extra_math,
         'image_map': image_map,
@@ -264,6 +283,10 @@ def main():
     if not os.path.isfile(src_path):
         sys.exit('源文缺失或不可读: %s FAIL（输入不足，不得把缺源解释成跳过检查）'
                  % src_path)
+    if parsed['official_headings_file']:
+        # 共享加载器在 CLI 实际调用基点（本进程 cwd）读取
+        _path, official = load_official_headings(
+            parsed['official_headings_file'])
     doc = open(doc_path, encoding='utf-8').read()
     src = open(src_path, encoding='utf-8').read()
     fail, lines = run_checks(

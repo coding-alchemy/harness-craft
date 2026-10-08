@@ -305,23 +305,37 @@ CHECK_SHARED_DEPS = {
                    "_html_fidelity.py", "_source_reconcile.py",
                    "_image_binding.py", "_image_preflight.py"),
     "verify_translation": ("verify_translation.py", "_verification.py",
-                           "_html_fidelity.py", "_source_reconcile.py"),
+                           "_official_headings.py", "_html_fidelity.py",
+                           "_source_reconcile.py"),
     "verify_paginated_translation": ("verify_paginated_translation.py",
-                                     "_verification.py", "_html_fidelity.py",
+                                     "_verification.py",
+                                     "_official_headings.py",
+                                     "_html_fidelity.py",
                                      "_source_reconcile.py"),
     "verify_reference_translation": ("verify_reference_translation.py",
-                                     "_verification.py", "_html_fidelity.py",
+                                     "_verification.py",
+                                     "_official_headings.py",
+                                     "_html_fidelity.py",
                                      "_source_reconcile.py"),
     "verify_api_translation": ("verify_api_translation.py",
-                               "_verification.py", "_html_fidelity.py",
-                               "_source_reconcile.py"),
+                               "_verification.py", "_official_headings.py",
+                               "_html_fidelity.py", "_source_reconcile.py"),
     "verify_pdf_source": ("verify_pdf_source.py", "_pdf_source.py",
                           "_verification.py"),
 }
 
+# 术语读取/选择/整合脚本（D6/D7 有限依赖集合）：它们是项目术语口径的
+# 实际判断者，口径变化使依赖项目术语的复核结论失效。各翻译家族检查器
+# 不调用这些脚本，因此不并入其 shared_deps，单独投影进交付身份。
+# R5 收窄：仅交付记录登记了项目术语表文件（实际使用术语）时投影；
+# 未使用术语的交付身份中 glossary 维度为 None，脚本变化不影响其复核。
+GLOSSARY_SHARED_DEPS = ("glossary_markdown.py", "select_glossary.py",
+                        "consolidate_glossaries.py")
+
 # 运行环境版本按复核目标投影（§9.3）：翻译检查覆盖其实际调用的
 # BeautifulSoup/tinycss2/markdown-it-py、图片资源处理所用 Pillow 与
-# Python；PDF 检查另含 pypdf/uniseg。不混入其他目标独有的依赖。
+# Python；PDF 检查另含 pypdf/uniseg 及脚注插件 mdit-py-plugins（导出
+# 渲染与成品核验的脚注结构实际消费者）。不混入其他目标独有的依赖。
 TRANSLATION_ENV_KEYS = ("python", "beautifulsoup4", "tinycss2",
                         "markdown-it-py", "pillow")
 
@@ -351,6 +365,13 @@ def _environment_identity():
     except ImportError:
         versions["markdown-it-py"] = None
     try:
+        import mdit_py_plugins
+
+        versions["mdit-py-plugins"] = getattr(
+            mdit_py_plugins, "__version__", "unknown")
+    except ImportError:
+        versions["mdit-py-plugins"] = None
+    try:
         import pypdf
 
         versions["pypdf"] = getattr(pypdf, "__version__", "unknown")
@@ -373,6 +394,29 @@ def _environment_identity():
 
 def _digest_or_none(path):
     return sha256_file(path) if os.path.isfile(path) else None
+
+
+def _glossary_identity(root, record):
+    """术语口径身份（D6/D7）：术语读取/选择脚本摘要 + 交付根登记为
+    glossary 角色的项目术语表摘要。显式依赖集合，不扫描整个仓库；
+    修改检查器或项目术语表即改变交付身份，须重新复核。
+
+    按实际使用收窄投影（R5）：交付记录未登记项目术语表文件的，不
+    投影术语维度（返回 None）——术语脚本口径变化不影响未使用术语的
+    交付复核有效性。"""
+    files = {}
+    root_abs = os.path.realpath(root)
+    for rel, role in (record.get("files") or {}).items():
+        if role != "glossary":
+            continue
+        path = rel if os.path.isabs(rel) else os.path.normpath(
+            os.path.join(root_abs, rel))
+        files[rel] = _digest_or_none(path)
+    if not files:
+        return None
+    scripts = {name: _digest_or_none(os.path.join(SCRIPTS_DIR, name))
+               for name in GLOSSARY_SHARED_DEPS}
+    return {"scripts": scripts, "files": files}
 
 
 def _source_identity(entry, rooted):
@@ -1314,7 +1358,7 @@ def run_source_reconcile(root, record, source_entries, problems):
 def compute_delivery_identity(root, record, source_entries=None):
     """完整依赖身份（§4.7/§9.3）：输入/产物、源链（逐快照资源）、两侧
     图片资源、映射、全部实际检查的真实 CLI 语义事实与文件依赖、共享
-    脚本、依赖版本与样式政策的同一计算口径。
+    脚本、术语读取/选择口径、依赖版本与样式政策的同一计算口径。
 
     这是本次运行的值，不是状态库；发布前以同一函数重新枚举计算比对，
     不能只复查预先列出的旧路径。文件摘要缺失记 None；绑定按不完整
@@ -1334,6 +1378,7 @@ def compute_delivery_identity(root, record, source_entries=None):
         "sources": [],
         "checks": [],
         "environment": _environment_identity(),
+        "glossary": _glossary_identity(root, record),
     }
     for rel in record.get("inputs") or []:
         path = rooted(rel)
@@ -1529,6 +1574,22 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             facts["files"]["toc"] = dep(parsed["toc_path"])
             facts["params"]["site_root"] = os.path.realpath(
                 _rooted(root_abs, parsed["site_root"]))
+        if parsed.get("official_headings_file"):
+            # 官方标题文件作为实际依赖（D5）：规范化路径 + 内容摘要 +
+            # 加载后的有效原题与确认范围口径；同路径改内容使相关旧
+            # 复核失效，只记录参数字符串不算数。相对路径按交付根解释。
+            from _official_headings import (SCOPE_BY_TOOL,
+                                            official_headings_identity)
+            oh_path = parsed["official_headings_file"]
+            oh_abs, oh_digest, oh_titles = official_headings_identity(
+                oh_path, base_dir=root_abs)
+            facts["files"]["official_headings"] = [oh_abs, oh_digest]
+            facts["params"]["official_headings"] = {
+                "path": oh_abs,
+                "sha256": oh_digest,
+                "titles": oh_titles,
+                "scope": SCOPE_BY_TOOL[tool],
+            }
     return facts, parsed
 
 
@@ -1834,7 +1895,19 @@ def expected_review_binding(kind, target, root, record, source_entries,
         target_digest = (identity.get("inputs", {}).get(target))
         if target_digest is None:
             return None
-        return {
+        # 术语口径（D6/D7，R5 收窄）：仅交付实际使用术语（记录登记了
+        # 项目术语表文件）时，术语读取/选择脚本与项目术语表才随语义
+        # 复核绑定；未使用术语的交付不投影术语维度，术语脚本变化不影
+        # 响其旧复核有效性。任一摘要缺失或变化使旧结论失效。
+        glossary = identity.get("glossary")
+        if glossary:
+            if any(digest is None
+                   for digest in (glossary.get("scripts") or {}).values()):
+                return None
+            if any(digest is None
+                   for digest in (glossary.get("files") or {}).values()):
+                return None
+        binding = {
             "target_sha256": target_digest,
             "checks": [{
                 "order": item["order"],
@@ -1849,6 +1922,9 @@ def expected_review_binding(kind, target, root, record, source_entries,
                             for key in TRANSLATION_ENV_KEYS},
             "delivery_entry": delivery_entry,
         }
+        if glossary:
+            binding["glossary"] = glossary
+        return binding
     if kind in (REVIEW_VISUAL, REVIEW_LINK):
         covering = (pdf_checks or {}).get(
             os.path.realpath(os.path.join(root_abs, target)), [])
@@ -2176,6 +2252,13 @@ def _identity_missing_digests(identity):
                            % (check.get("order"), check.get("tool")))
     if (identity.get("delivery_entry") or {}).get("script_sha256") is None:
         missing.append("交付入口脚本")
+    glossary = identity.get("glossary") or {}
+    for name, digest in (glossary.get("scripts") or {}).items():
+        if digest is None:
+            missing.append("术语脚本 %s" % name)
+    for rel, digest in (glossary.get("files") or {}).items():
+        if digest is None:
+            missing.append("项目术语表 %s" % rel)
     for key, digest in (identity.get("style_policy") or {}).items():
         if digest is None:
             missing.append("样式政策 %s" % key)
@@ -2326,6 +2409,8 @@ def _binding_drift_summary(declared_binding, expected_binding):
             drift.append("运行环境版本变化")
         elif key == "delivery_entry":
             drift.append("交付入口脚本身份变化")
+        elif key == "glossary":
+            drift.append("术语读取/选择身份变化（脚本或项目术语表）")
         else:
             drift.append("%s 变化" % key)
     return drift

@@ -196,9 +196,10 @@ class CandidateImageIdentityTest(unittest.TestCase):
         return path
 
     def _check(self, candidate_text, source_text=None, digests=None):
-        return merge._candidate_check_failures(
+        fails, _warns = merge._candidate_check_failures(
             candidate_text, source_text or self.source, self.out_dir,
             None, digests, (), (), '候选', source_dir=self.tmp)
+        return fails
 
     def test_same_content_passes_without_map(self):
         candidate = '## S（节）\n\n![图一](images/a.png)\n\n![图二](images/b.png)\n'
@@ -214,11 +215,10 @@ class CandidateImageIdentityTest(unittest.TestCase):
         block = '\n```text\n[IMG: example.png]\n```\n'
         source = '## S\n\n正文\n' + block
         candidate = '## S（节）\n\n正文\n' + block
-        self.assertEqual(
-            merge._candidate_check_failures(
-                candidate, source, self.out_dir, None, None, (), (),
-                '候选', source_dir=self.tmp),
-            [])
+        fails, _warns = merge._candidate_check_failures(
+            candidate, source, self.out_dir, None, None, (), (),
+            '候选', source_dir=self.tmp)
+        self.assertEqual(fails, [])
 
     def test_unverifiable_identity_blocks_full_merge(self):
         # 源 [IMG: 标记无法解析为本地资源且未提供映射：不得宣布完整通过
@@ -230,11 +230,18 @@ class CandidateImageIdentityTest(unittest.TestCase):
     def test_unverifiable_identity_passes_with_map(self):
         source = '## S\n\n[IMG: snapshot/origin.png]\n'
         candidate = '## S（节）\n\n![图](images/a.png)\n'
-        fails = merge._candidate_check_failures(
+        fails, _warns = merge._candidate_check_failures(
             candidate, source, self.out_dir, None,
             [file_sha256(os.path.join(self.tmp, 'images', 'a.png'))],
             (), (), '候选', source_dir=self.tmp)
         self.assertEqual(fails, [])
+
+    def test_unresolved_math_blocks_candidate(self):
+        # 候选含未闭合定界：不得宣布完整通过，即使其余公式与源一致
+        source = '## S\n\n行内 $a$ 公式。\n'
+        candidate = '## S（节）\n\n行内 $a$ 公式与 $x。\n'
+        fails = self._check(candidate, source_text=source)
+        self.assertTrue(any('未解决数学定界' in f for f in fails), fails)
 
 
 class SourceOccurrenceDigestsTest(unittest.TestCase):
@@ -461,9 +468,10 @@ class MergeUnsupportedStructureTest(unittest.TestCase):
             json.dump(evidence, f, ensure_ascii=False)
 
     def _candidate_fails(self):
-        return merge._candidate_check_failures(
+        fails, _warns = merge._candidate_check_failures(
             self.TRANS, self.SOURCE, self.tmp, None, None, (), (),
             '候选', source_dir=os.path.join(self.tmp, 'src'))
+        return fails
 
     def test_pi_svg_candidate_rejected(self):
         self._setup(self.PI_SVG)

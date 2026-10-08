@@ -19,14 +19,16 @@ from _html_fidelity import (
     protect_code_entities,
 )
 from _verification import (
+    _HEADING_FACTS_MD,
     fenced_line_numbers,
     heading_entries,
     image_marker_spans,
     image_reference_spans,
     line_code_spans,
     parse_inline_code_spans,
+    resolve_backslash_escapes,
     scan_code_fences,
-    scan_math_spans,
+    scan_math,
 )
 
 _WS_RE = re.compile(r'\s+')
@@ -36,7 +38,6 @@ _MD_LINK_RE = re.compile(r'\[((?:\\.|[^\[\]])*)\]\(((?:\\.|[^()])*)\)')
 _MD_IMAGE_RE = re.compile(r'!\[[^\]]*\]\([^)]*\)')
 _MD_IMG_MARKER_RE = re.compile(r'\[IMG:\s*[^\]]*\]')
 _MD_FOOTNOTE_RE = re.compile(r'\[\^([^\]]+)\]')
-_MD_BOLD_RE = re.compile(r'\*\*([^*]+)\*\*')
 _MD_MATH_RE = re.compile(r'\$+([^$]*)\$+')
 _MD_CODE_SPAN_RE = re.compile(r'(`+)(.*?)\1', re.S)
 _SRC_MATH_WRAP_RE = re.compile(r'\\\(|\\\)|\\\[|\\\]')
@@ -63,8 +64,10 @@ _ADMONITION_TOKENS = ('admonition', 'note', 'warning', 'important', 'tip')
 _MD_TABLE_SEP_CELL_RE = re.compile(r'^-*$')
 
 
-def _norm_text(text, unwrap_links=True, mark_code=False):
-    """内容归一化：行内代码、链接/强调/脚注/公式记法、空白与标点紧排。
+def _norm_text(text, unwrap_links=True, mark_code=False,
+               decode_heading_escape=False, resolve_escapes=False,
+               strip_bracket_escapes=True):
+    """内容归一化：行内代码、链接/脚注/公式记法、空白与标点紧排。
 
     链接解包只用于输出侧（渲染后的 [标签](URL)）；源侧是纯文本，
     其中形似链接的字面量（如 “__fadd_[rn,rz,ru,rd](x, y)”）须保持
@@ -73,26 +76,65 @@ def _norm_text(text, unwrap_links=True, mark_code=False):
     mark_code 为 True（标题流）：行内代码最先隔离为 \\x00 定界占位、
     内容不参与任何后续归一（图片语法删除、空白折叠都不能改写代码
     字面量），公式保留 ``$`` 定界（去定界的拍平必须可检）；其余步骤
-    与普通口径一致。"""
+    与普通口径一致。
+
+    decode_heading_escape 仅由输出侧普通文本角色开启，且只在编码实际
+    生效的位置（列表项首/续行、提示框引用行文字等行首角色）调用：
+    按 Markdown 阅读语义解码——行首反斜线串偶数对折叠（\\\\→\\），尾余
+    一个的转义反斜线消解（\\#→#），# 裸写，即还原实际阅读文字；源侧、
+    代码与公式流不开启，不做全局反斜线删除。
+
+    resolve_escapes 为 True（表格格位等行内语境）：全文按 Markdown
+    行内阅读语义解析反斜线（\\+ASCII 标点→标点、\\\\→\\），代码跨度与
+    公式内容字面保留（resolve_backslash_escapes），与源格字面文字比较
+    实际阅读（F1）。此路径下链接先行解包，标签内的 \\[ \\] 由同一次
+    阅读解析解释，不再手工二次替换。
+
+    strip_bracket_escapes 为 False（真实标题路径）：标题事实已是
+    按阅读语义解释过的文字（heading_entries），余下的 \\[ \\] 是阅读
+    内容本身，不再当作生成语法剥离（F1：剥离会把阅读文字二次解释，
+    与独立 DOM 预期不符而误拒合法输入）。生成语法侧（如源侧
+    render_inline 序列化）保持默认 True，撤销生成的标签转义。"""
     code_spans = []
     if mark_code:
         def _keep_code(match):
             code_spans.append(_pad_code_content(match.group(2)))
             return '\x00%d\x00' % (len(code_spans) - 1)
         text = _MD_CODE_SPAN_RE.sub(_keep_code, text)
-    text = _MD_IMAGE_RE.sub(' ', text)
-    text = _MD_IMG_MARKER_RE.sub(' ', text)
+    link_labels = []
+    if unwrap_links and resolve_escapes:
+        # 链接解包先于反斜线解析，且标签以哨兵保护到归一化结束：标签内
+        # 的 \[ \] 是链接语法，由 resolve_backslash_escapes 按阅读语义
+        # 一次解释；若解析后再经下方的 \[ \] 剥离，同一反斜线被解释
+        # 两次，双重加写的阅读损伤会被掩盖（R2）。图片语法先移除：
+        # 图片的 [alt](src) 不是链接
+        text = _MD_IMAGE_RE.sub(' ', text)
+        text = _MD_IMG_MARKER_RE.sub(' ', text)
+
+        def _keep_label(match):
+            link_labels.append(match.group(1))
+            return '\x00L%d\x00' % (len(link_labels) - 1)
+        text = _MD_LINK_RE.sub(_keep_label, text)
+    if resolve_escapes:
+        text = resolve_backslash_escapes(text)
+    if decode_heading_escape:
+        text = re.sub(
+            r'^(\\+)(#{1,8})(?=\s|$)',
+            lambda m: '\\' * (len(m.group(1)) // 2) + m.group(2), text)
+    if not resolve_escapes:
+        text = _MD_IMAGE_RE.sub(' ', text)
+        text = _MD_IMG_MARKER_RE.sub(' ', text)
     if not mark_code:
         text = _MD_CODE_SPAN_RE.sub(lambda m: _pad_code_content(m.group(2)),
                                     text)
-    if unwrap_links:
+    if unwrap_links and not resolve_escapes:
         text = _MD_LINK_RE.sub(lambda m: m.group(1).replace(
             '\\[', '[').replace('\\]', ']'), text)
     text = _MD_FOOTNOTE_RE.sub(r'[\1]', text)
-    text = _MD_BOLD_RE.sub(r'\1', text)
     if not mark_code:
         text = _MD_MATH_RE.sub(r'\1', text)
-    text = text.replace('\\]', ']').replace('\\[', '[')
+    if strip_bracket_escapes:
+        text = text.replace('\\]', ']').replace('\\[', '[')
     if not mark_code:
         text = _SRC_MATH_WRAP_RE.sub('', text)
     text = _WS_RE.sub(' ', text).strip()
@@ -100,6 +142,9 @@ def _norm_text(text, unwrap_links=True, mark_code=False):
     text = re.sub(r'([\[(]) ', r'\1', text)
     for index, span in enumerate(code_spans):
         text = text.replace('\x00%d\x00' % index, '\x00%s\x00' % span)
+    for index, label in enumerate(link_labels):
+        text = text.replace('\x00L%d\x00' % index,
+                            _norm_link_label(label, resolve=True))
     return text
 
 
@@ -110,9 +155,115 @@ def _pad_code_content(content):
     return content
 
 
-def _norm_math(expr):
-    """公式表达式比较口径：空白不敏感（LaTeX 排版空白无语义）。"""
-    return _WS_RE.sub('', expr)
+def _norm_link_label(label, resolve):
+    r"""链接标签的文字口径。
+
+    输出侧（resolve=True）标签是 Markdown 源：取 markdown-it 实际行内
+    阅读文字——转义、强调与代码跨度由真实解析一次完成，不再用反斜线
+    解码加语法剥离的组合冒充阅读（F2：解码不是完整阅读，强调吃掉的
+    字面星号会被漏过）。公式段先由代码感知的 scan_math 隔离为原文
+    片段：普通阅读器无数学规则，会把 $a*b*c$ 的 *b* 当强调吃掉
+    （P2-1），隔离后普通阅读只解释其余文字段，公式表达式按共享事实
+    原文还原。只隔离美元定界跨度：链接标签是行内语境，其中的 \[ \]
+    是生成的标签括号转义而非块级公式定界（R2 口径），由普通阅读的
+    转义解析一次还原。源侧（resolve=False）是 DOM 字面文字：不做
+    Markdown 强调剥离，字面标点保留；字面数学复用共享 scan_math
+    边界去定界（与输出侧同一公式事实，相邻公式的闭合/开启美元不被
+    吞并），代码跨度记法归一保持（与既有单元格文字口径一致）。两侧
+    共有：脚注引用与剩余文字的数学记法归一、空白与标点紧排。
+    """
+    if resolve:
+        math_exprs = []
+        parts = []
+        cursor = 0
+        # scan_math 的链接语法转义掩蔽（_math_scan_mask）只在完整
+        # [标签](URL) 形态下生效；抽出后的裸标签中的 \[ \] 会被当作
+        # 块级公式定界，吞掉内部 $…$（P2-1 方括号包公式）。扫描前把
+        # 标签包回合成链接语法还原掩蔽语境（标签由 _MD_LINK_RE 抽出，
+        # 不含未转义 ]，包裹无歧义），跨度偏移回移一个字符；raw 非 $
+        # 开头的过滤保留为 R2 角色防线
+        wrapped = '[%s]()' % label
+        for span in scan_math(wrapped).spans:
+            if not span.raw.startswith('$'):
+                continue  # 标签内 \[ \] 是括号转义，不是公式定界
+            start, end = span.start - 1, span.end - 1
+            parts.append(BeautifulSoup(
+                _HEADING_FACTS_MD.renderInline(label[cursor:start]),
+                'html.parser').get_text())
+            parts.append('\x00M%d\x00' % len(math_exprs))
+            math_exprs.append(span.expr)
+            cursor = end
+        parts.append(BeautifulSoup(
+            _HEADING_FACTS_MD.renderInline(label[cursor:]),
+            'html.parser').get_text())
+        label = ''.join(parts)
+    else:
+        math_exprs = []
+        # 源标签字面数学复用共享 scan_math 边界隔离为原文片段（与输出
+        # 侧同一公式事实）：旧 _MD_MATH_RE 的 \$+ 会吞掉相邻公式的
+        # 闭合/开启美元（$x$$y$ 被误归一为 xy$），与输出侧正确归一不
+        # 一致而误拒。代码跨度由扫描器既有代码感知掩蔽（与输出侧口径
+        # 一致），隔离后代码记法归一与剩余文字的 _MD_MATH_RE 行为不变
+        # （金额等旧口径两侧同型保持）。只隔离美元定界跨度：源标签内
+        # 的 \[ \] 是字面文字而非公式定界（与 _literal_math_exprs
+        # 口径一致）
+        parts = []
+        cursor = 0
+        # 按 _literal_math_exprs 的源字面角色在扫描前消除括号定界影响；
+        # 等长掩蔽仅用于定位，文字及表达式仍从原标签截取。
+        masked = label.replace('\\[', '  ').replace('\\]', '  ')
+        for span in scan_math(masked).spans:
+            if not span.raw.startswith('$'):
+                continue
+            parts.append(label[cursor:span.start])
+            parts.append('\x00M%d\x00' % len(math_exprs))
+            width = 1 if span.kind == 'inline' else 2
+            math_exprs.append(label[span.start + width:span.end - width])
+            cursor = span.end
+        parts.append(label[cursor:])
+        label = ''.join(parts)
+        label = _MD_CODE_SPAN_RE.sub(lambda m: _pad_code_content(m.group(2)),
+                                     label)
+    label = _MD_FOOTNOTE_RE.sub(r'[\1]', label)
+    label = _MD_MATH_RE.sub(r'\1', label)
+    label = _WS_RE.sub(' ', label).strip()
+    label = re.sub(r' ([.,;:!?)\]])', r'\1', label)
+    label = re.sub(r'([\[(]) ', r'\1', label)
+    for index, expr in enumerate(math_exprs):
+        label = label.replace('\x00M%d\x00' % index, expr)
+    return label
+
+
+def _strip_math_wrappers(body):
+    r"""DOM 已确认的数学包装去除：\(…\) 与 \[…\] 整体包裹时剥除。"""
+    if (body.startswith('\\(') and body.endswith('\\)')) \
+            or (body.startswith('\\[') and body.endswith('\\]')):
+        return body[2:-2].strip()
+    return body
+
+
+def _family_math_expectation(node, family):
+    r"""已识别数学节点按现行家族的行内/块级表示生成独立预期。
+
+    源侧继续独立读取原 DOM，不接触渲染器输出；允许转换仅限家族合同
+    已确认的表示：包装去除（\(…\)/\[…\]）、实体解码（DOM get_text）
+    与行内格式空白序列化。序列化口径与各家族渲染器一致：paginated/
+    reference 的 div.math 为块级（$$\n…\n$$，t = get_text(' ', strip=True)），
+    paginated 为单行 $$…$$；api 的 div.math 为行内（$\s*\n\s* 折叠）；
+    其余（single 家族全部节点与各家族 span.math）走 render_inline 的
+    行内序列化（\s+ 折叠 + 包装去除）。块级首尾排版空白在事实提取时
+    归一（strip），内部逐字节保留。
+    """
+    if node.name == 'div' and family in ('paginated', 'reference'):
+        body = _strip_math_wrappers(node.get_text(' ', strip=True))
+        expr = body if family == 'paginated' else '\n' + body + '\n'
+        return 'block', expr.strip()
+    if node.name == 'div' and family == 'api':
+        body = re.sub(r'\s*\n\s*', ' ', node.get_text()).strip()
+        return 'inline', body
+    body = node.get_text().strip()
+    body = _strip_math_wrappers(body)
+    return 'inline', re.sub(r'\s+', ' ', body)
 
 
 def _footnote_label(text):
@@ -121,9 +272,21 @@ def _footnote_label(text):
 
 
 def _literal_math_exprs(text):
-    """文本中的字面公式流；转义括号 `\\[…\\]` 是字面文字而非公式定界。"""
-    stripped = text.replace('\\[', ' ').replace('\\]', ' ')
-    return [_norm_math(span.expr) for span in scan_math_spans(stripped)]
+    """文本节点中的字面公式流 (kind, expr)；转义括号 `\\[…\\]` 是
+    字面文字而非公式定界（与解析侧的剥离口径一致），行内格式空白
+    序列化（\\s+ 折叠为单空格）是家族合同允许的表示转换——两侧都
+    在序列化后的文字上运行同一次共享扫描，类型与原表达式逐字节比较。"""
+    serialized = _WS_RE.sub(' ', text)
+    stripped = serialized.replace('\\[', ' ').replace('\\]', ' ')
+    return [(span.kind, span.expr.strip() if span.kind == 'block'
+             else span.expr) for span in scan_math(stripped).spans]
+
+
+def _literal_math_issues(text):
+    """文本节点字面公式扫描的未解决定界（原偏移在序列化后的文字上）。"""
+    serialized = _WS_RE.sub(' ', text)
+    stripped = serialized.replace('\\[', ' ').replace('\\]', ' ')
+    return list(scan_math(stripped).issues)
 
 
 def _in_pre(node):
@@ -200,6 +363,7 @@ class _SourceFacts:
             self.headings = []
             self.code = []
             self.math = []
+            self.math_issues = []
             self.inline_code = []
             self.images = []
             self.image_facts = []
@@ -212,6 +376,7 @@ class _SourceFacts:
             return
         self.headings = self._headings()
         self.code = self._code()
+        self.math_issues = []
         self.math = self._math()
         self.inline_code = self._inline_code()
         self.images = self._images()
@@ -237,8 +402,11 @@ class _SourceFacts:
         return self._heading_ordinals.get(section, 0)
 
     def _headings(self):
-        """标题事实 (层级, 行内序列化文字)：与渲染端 heading_text 同一
-        序列化，行内代码以 \x00 定界参与比较——拍平或改字即差异。"""
+        r"""标题事实 (层级, 行内序列化文字)：与渲染端 heading_text 同一
+        序列化，行内代码以 \x00 定界参与比较——拍平或改字即差异。
+        render_inline 对链接标签生成的 \[ \] 转义只在标签内撤销一层，
+        恢复 DOM 字面标签（F1：标题路径不再全局剥离，纯文本中的字面
+        \[ 保持；链接目标身份保留）。"""
         entries = []
         for h in self.root.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
             if _in_pre(h):
@@ -247,9 +415,15 @@ class _SourceFacts:
             for link in copied.find_all('a', class_='headerlink'):
                 link.decompose()
             text = self._inline.render_inline(copied)
+            text = _MD_LINK_RE.sub(
+                lambda m: '[%s](%s)' % (
+                    m.group(1).replace('\\[', '[').replace('\\]', ']'),
+                    m.group(2)),
+                text)
             entries.append((int(h.name[1]), _norm_text(
                 text.replace('¶', '').replace('\uf0c1', ''),
-                unwrap_links=False, mark_code=True)))
+                unwrap_links=False, mark_code=True,
+                strip_bracket_escapes=False)))
         return entries
 
     def _code(self):
@@ -261,20 +435,16 @@ class _SourceFacts:
         return blocks
 
     def _math(self):
-        """公式流：class=math 元素与文本节点中的字面 $…$，按文档顺序。
+        """公式流 (kind, expr)：class=math 元素与文本节点中的字面 $…$。
 
-        解析器把 span/div.math 转成 `$…$`，正文中本就存在的 `$…$` 文字
-        原样保留并同样参与公式扫描；源侧流必须同时覆盖两类，才能与
-        解析结果的扫描口径一致。
+        解析器把 span/div.math 转成 `$…$`（或 paginated/reference 的
+        `$$…$$`），正文中本就存在的 `$…$` 文字原样保留并同样参与公式
+        扫描；源侧流必须同时覆盖两类，才能与解析结果的扫描口径一致。
+        已识别节点按 `_family_math_expectation` 生成独立预期（保留
+        行内/块级类型与原表达式，不做任意归一）；字面数学用共享
+        scan_math 的同一次扫描定义。issues 单独登记，由对账入口阻断。
         """
         spans = []
-
-        def strip_wrappers(expr):
-            e = expr.strip()
-            if (e.startswith('\\(') and e.endswith('\\)')) \
-                    or (e.startswith('\\[') and e.endswith('\\]')):
-                return e[2:-2].strip()
-            return e
 
         sub_by_index = {}
         for node in self.root.descendants:
@@ -286,16 +456,18 @@ class _SourceFacts:
                     order = self._index[id(node)]
                     sub = sub_by_index.get(order, 0)
                     sub_by_index[order] = sub + 1
-                    spans.append((self._section_of(node), order, sub, 'math',
-                                  _norm_math(strip_wrappers(node.get_text()))))
+                    kind, expr = _family_math_expectation(node, self.family)
+                    spans.append((self._section_of(node), order, sub, kind,
+                                  expr))
                 continue
             if isinstance(node, str):
                 if node.find_parent(class_='math') is not None:
                     continue
                 order = self._index[id(node)]
                 sub = sub_by_index.get(order, 0)
-                for expr in _literal_math_exprs(str(node)):
-                    spans.append((self._section_of(node), order, sub, 'math',
+                self.math_issues.extend(_literal_math_issues(str(node)))
+                for kind, expr in _literal_math_exprs(str(node)):
+                    spans.append((self._section_of(node), order, sub, kind,
                                   expr))
                     sub += 1
                 sub_by_index[order] = sub
@@ -663,7 +835,26 @@ class _SourceFacts:
         copied = copy.deepcopy(cell)
         for pre in copied.find_all('pre'):
             pre.decompose()
-        return _norm_text(copied.get_text(' '), unwrap_links=False)
+        # 格内公式按家族合同做包装去除（\(…\)/\[…\]），与渲染端
+        # render_inline 同一口径投影为 $…$，使格文字与输出侧归一后的
+        # 阅读文字一致（块级 \[…\] 不再残留字面方括号）
+        for math in copied.find_all(class_='math'):
+            body = _strip_math_wrappers(
+                re.sub(r'\s+', ' ', math.get_text()).strip())
+            math.replace_with('$' + body + '$')
+        # 链接标签是源字面文字：其中的 \[ \] 不是数学包装/语法转义，
+        # 以哨兵保护穿过文本归一化，按标签口径还原（R2：与输出侧
+        # 解包后的阅读文字逐字对应）
+        labels = []
+        for link in copied.find_all('a', href=True):
+            label = link.get_text(' ', strip=True)
+            link.replace_with('\x00L%d\x00' % len(labels))
+            labels.append(label)
+        text = _norm_text(copied.get_text(' '), unwrap_links=False)
+        for index, label in enumerate(labels):
+            text = text.replace('\x00L%d\x00' % index,
+                                _norm_link_label(label, resolve=False))
+        return text
 
     @staticmethod
     def _span_value(cell, attr):
@@ -759,14 +950,17 @@ class _MarkdownFacts:
         # 图片序列化缺失必须阻断）
         self._heading_lines = {entry[0] for entry in self._heading_entries}
         self.headings = [
-            (level, _norm_text(title, unwrap_links=False, mark_code=True))
+            (level, _norm_text(title, unwrap_links=False, mark_code=True,
+                               strip_bracket_escapes=False))
             for _, level, title in self._heading_entries]
         # 章节唯一身份 = 标题在文档中的序号（同名小节不合并）
         self._heading_ordinals = {entry[0]: ordinal + 1
                                   for ordinal, entry in
                                   enumerate(self._heading_entries)}
         self.code = self._tagged_code()
-        # math 流剥离转义括号后再扫描，链接标签中的 `\[字面\]` 不算公式
+        # math 流剥离转义括号后再扫描（家族合同：字面 \[ \] 不是公式
+        # 定界），类型与表达式从同一次共享 scan_math 结果投影，issues
+        # 由对账入口作为阻断项上报
         self.math = self._tagged_math()
         self.inline_code = self._tagged_inline_code()
         self.images = self._tagged_images()
@@ -792,10 +986,13 @@ class _MarkdownFacts:
         for line_no, line in enumerate(stripped.split('\n'), start=1):
             line_starts[line_no] = offset
             offset += len(line) + 1
+        scan = scan_math(stripped)
+        self.math_issues = scan.issues
         return [(self._md_section(span.start_line), span.start_line,
                  max(0, span.start - line_starts.get(span.start_line, 0)),
-                 'math', _norm_math(span.expr))
-                for span in scan_math_spans(stripped)
+                 span.kind,
+                 span.expr.strip() if span.kind == 'block' else span.expr)
+                for span in scan.spans
                 if span.start_line not in self._heading_lines]
 
     def _tagged_inline_code(self):
@@ -847,6 +1044,7 @@ class _MarkdownFacts:
                 continue
             m = re.match(r'^\s+\[+\s*([^\[\]]+?)\s*\]+\s*(.*)$', line)
             if m:
+                # 脚注正文不经行首 # 编码（行首是缩进的 [[标签]]），不解码
                 defs.append((_footnote_label(m.group(1)),
                              _norm_text(m.group(2))))
         return refs, defs
@@ -871,7 +1069,10 @@ class _MarkdownFacts:
                     cur = {'label': None, 'texts': []}
                     records.append(cur)
                     cur_closed = False
-                text = _norm_text(s[1:])
+                # 剥掉引用前缀后的前导空白（引用行空白无语义，归一化后
+                # 与原先一致），使行首转义（\#）的解码锚点能够命中
+                text = _norm_text(s[1:].lstrip(),
+                                  decode_heading_escape=True)
                 if text:
                     cur['texts'].append(text)
             else:
@@ -1017,7 +1218,8 @@ class _MarkdownFacts:
                 for deeper in [k for k in last_ordinal if k > level]:
                     del last_ordinal[deeper]
                 last_ordinal[level] = ordinal
-                text_value = _norm_text(match.group(2) or '')
+                text_value = _norm_text(match.group(2) or '',
+                                        decode_heading_escape=True)
                 stack.append({'level': level, 'ordinal': ordinal,
                               'seq': ([('text', text_value)]
                                       if text_value else []),
@@ -1029,7 +1231,8 @@ class _MarkdownFacts:
                 target = target_at(max(
                     1, (len(line) - len(line.lstrip(' '))) >> 1))
                 if target is not None:
-                    text_value = _norm_text(stripped)
+                    text_value = _norm_text(stripped,
+                                            decode_heading_escape=True)
                     if text_value:
                         target['seq'].append(('text', text_value))
                 continue
@@ -1053,6 +1256,9 @@ class _MarkdownFacts:
         current = None
         for line_no, line in enumerate(self.lines, start=1):
             if line_no in self.fenced:
+                # 围栏结束当前表格区域（其后的 [TABLE-CODE] 归属按标记行
+                # 独立匹配，不依赖 current）；围栏正文永不成为表格行
+                current = None
                 continue
             stripped = line.strip()
             if stripped == '[TABLE]':
@@ -1061,6 +1267,11 @@ class _MarkdownFacts:
                 records.append(current)
                 continue
             if current is None:
+                continue
+            if line_no in self._heading_lines:
+                # 标题行可含 ' | '（含管道真实标题）：属于标题流对账，
+                # 不得被吞作当前表格的输出行
+                current = None
                 continue
             if stripped.startswith('[TABLE-CODE'):
                 match = _TABLE_CODE_MARKER_RE.match(stripped)
@@ -1074,7 +1285,8 @@ class _MarkdownFacts:
                 continue
             if not stripped and line:
                 # 单列全空单元格行（渲染端以单个空格输出，与零长空行区分）
-                current['rows'].append([_norm_text('')])
+                current['rows'].append([_norm_text('',
+                                                   decode_heading_escape=True)])
                 current['row_lines'].add(line_no)
                 continue
             if not stripped:
@@ -1091,13 +1303,19 @@ class _MarkdownFacts:
                    for cell in cells):
                 continue  # 表头分隔行（单列 --- 同样适用）
             if ' | ' in line:
-                current['rows'].append([_norm_text(cell) for cell in cells])
+                # 逐格按实际阅读核对：格位序列化对 \+ASCII 标点按阅读语义
+                # 加写（\\ 阅读为一个反斜线），此处解析回阅读文字，与源
+                # 格字面文字一致（F1：非首格字面反斜线可读可验）
+                current['rows'].append(
+                    [_norm_text(cell, resolve_escapes=True)
+                     for cell in cells])
                 current['row_lines'].add(line_no)
             elif not current.get('single_closed') and (
                     current.get('single_column') or not current['rows']):
                 # 单列表格行（无列界记号）：自首行起进入单列模式，空行结束
                 current['single_column'] = True
-                current['rows'].append([_norm_text(line)])
+                current['rows'].append([_norm_text(line,
+                                                   resolve_escapes=True)])
                 current['row_lines'].add(line_no)
             else:
                 current = None
@@ -1139,8 +1357,10 @@ class _MarkdownFacts:
                 continue
             m = re.match(r'^\*\*(.+?)\*\*\s*(.*)$', s)
             if m:
-                pairs.append((_norm_text(m.group(1)),
-                              _norm_text(m.group(2))))
+                pairs.append((_norm_text(m.group(1),
+                                         decode_heading_escape=True),
+                              _norm_text(m.group(2),
+                                         decode_heading_escape=True)))
         return pairs
 
 
@@ -1456,7 +1676,8 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
                     cell_text = row_cells[col - 1] if row_cells and col <= len(
                         row_cells) else ''
                     note_text = _norm_text(' '.join(
-                        md.lines[lines[0] - 1:lines[1]]))
+                        md.lines[lines[0] - 1:lines[1]]),
+                        decode_heading_escape=True)
                     if cell_text and _norm_text(cell_text) not in note_text:
                         diffs.append('源表 #%d 格 %s 内容未在声明说明区间找到: %r'
                                      % (record['ordinal'], position, cell_text))
@@ -1567,6 +1788,16 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
     if src.root is None:
         return ['%s 未找到 article/main/body 选区' % html_label]
 
+    diffs = []
+    # 未解决数学定界：源与解析两侧都不得忽略；忠实解析含未闭合定界的
+    # 输入同样阻断分派（不能用剩余跨度相等消除未解决项）
+    for issue in src.math_issues:
+        diffs.append('%s 未解决数学定界 %r: %s'
+                     % (html_label, issue.raw, issue.reason))
+    for issue in md.math_issues:
+        diffs.append('%s L%d 未解决数学定界 %r: %s'
+                     % (md_label, issue.start_line, issue.raw, issue.reason))
+
     if table_conversions is None:
         (map_diffs, mapped_src, claimed_md, cell_factors, cell_table_targets,
          note_targets) = [], set(), set(), {}, {}, {}
@@ -1598,7 +1829,6 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
         flush()
         return expanded
 
-    diffs = []
     diffs += _stream_diffs('标题', src.headings, md.headings,
                            html_label, md_label)
     # 内容流含行内代码事实；映射表格的格内代码由格内代码归属比较负责，
@@ -1621,8 +1851,11 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
         if entry[3] == 'code' and src.cell_pre_orders.get(
                 entry[1]) in mapped_src:
             continue
+        # 公式条目标签为 inline/block（_family_math_expectation 与输出侧
+        # scan_math 的 kind），格位分类须覆盖两类；image/inline-code 照旧
         cell = (src.mapped_cell_of(entry[1])
-                if entry[3] in ('math', 'image', 'inline-code') else None)
+                if entry[3] in ('inline', 'block', 'image', 'inline-code')
+                else None)
         if cell is not None and cell[0] in mapped_src:
             src_inside.append(entry)
         else:

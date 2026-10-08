@@ -7,10 +7,11 @@ import json
 import os
 import re
 
-from bs4 import BeautifulSoup, Comment, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+from markdown_it import MarkdownIt
 
-from _verification import file_sha256, parse_inline_code_spans, \
-    resource_identity_digest
+from _verification import _ESCAPABLE_PUNCT, _protected_inline_spans, \
+    file_sha256, parse_inline_code_spans, resource_identity_digest
 
 
 # 内联 CSS width 属性（仅取 width 声明；max-width 等不作为显示宽度依据）。
@@ -39,6 +40,133 @@ _INLINE_TAGS = frozenset({
 
 # 提示框类名（与解析器分支一致的包含匹配）
 _ADMONITION_CLASS_TOKENS = ('admonition', 'note', 'warning', 'important', 'tip')
+
+# 行首 # 编码触发：行首若干原文反斜线后接 1–8 个 #、后随空白或行尾。
+# 编码按 Markdown 阅读语义加写反斜线，与实际阅读（\\ 阅读为一个反斜线）
+# 逐字对齐，而不是简单的「加一个」。
+_HEADING_TRIGGER_RE = re.compile(r'^(\\*)(#{1,8})(?=\s|$)')
+# 复合容器形态（引用/列表前缀后的 #）在已知标题行内定位触发串时，前缀
+# 只允许多层 >、bullet、有序标记与空白——检出本身以 markdown-it 解析
+# 为准，本正则仅用于在已确认标题行上定位待转义的 # 串。
+_HEADING_CONTAINER_PREFIX_RE = re.compile(
+    r'(?:>[ \t]*|[-+*][ \t]+|\d+[.)][ \t]+|[ \t]+)*')
+_HEADING_CTX_MD = MarkdownIt('commonmark', {'html': False}).enable('table')
+# 复合容器转义的省流预检：存在「前随空白/> 的 # 串」才需要 markdown-it
+# 复核（行首触发已在逐行段处理）。
+_HEADING_COMPOUND_HINT_RE = re.compile(
+    r'(?:(?<= )|(?<=\t)|(?<=>))(#{1,8})(?=[ \t]|$)')
+
+
+def _escape_hash_run(line, col, pre_escaped=False):
+    """按 Markdown 阅读语义在 line 的 col 处 # 串前加写反斜线：前面已有
+    k 个原文反斜线时逐倍加写（\\ 阅读为一个反斜线，# 保持裸写，行首
+    反斜线已阻断 ATX 标题）；无反斜线时在 # 前写一个。pre_escaped 为
+    True（表格行，格位序列化已按阅读语义加写过）时已有反斜线不再加写。
+    返回新行。"""
+    back = 0
+    while col - back - 1 >= 0 and line[col - back - 1] == '\\':
+        back += 1
+    if back:
+        if pre_escaped:
+            return line
+        return (line[:col - back]
+                + line[col - back:col].replace('\\', '\\\\')
+                + line[col:])
+    return line[:col] + '\\' + line[col:]
+
+
+def heading_trigger_escape(text, pre_escaped=False):
+    """普通块文字写出前的行首 # 编码（与对账解码、标题事实同一
+    markdown-it 语境）。
+
+    逐行处理行首触发串后，以 markdown-it 实际解析复核复合容器形态
+    （引用/列表前缀后的 #，实测会成为标题），循环补写直至不再是标题。
+    编码保证：产物在真实 Markdown 中不产生 ATX 标题，且实际阅读文字与
+    原文逐字一致。只对普通文本调用；真实标题分支、代码围栏与行内代码
+    不经过本函数。pre_escaped 供表格行调用：格位序列化已按阅读语义
+    加写过反斜线，行首编码只补裸 # 触发（k=0），不重复加写。
+    """
+    if not text or '#' not in text:
+        return text
+    lines = text.split('\n')
+    out = []
+    for line in lines:
+        m = _HEADING_TRIGGER_RE.match(line)
+        out.append(line if not m else _escape_hash_run(
+            line, len(m.group(1)), pre_escaped))
+    text = '\n'.join(out)
+    if not _HEADING_COMPOUND_HINT_RE.search(text):
+        return text
+    while True:
+        lines = text.split('\n')
+        edits = []
+        tokens = _HEADING_CTX_MD.parse(text)
+        for pos, tok in enumerate(tokens):
+            if tok.type != 'heading_open' or not tok.markup.startswith('#'):
+                continue
+            line = lines[tok.map[0]]
+            for m in re.finditer(r'(#{1,8})(?=[ \t]|$)', line):
+                if _HEADING_CONTAINER_PREFIX_RE.fullmatch(line[:m.start()]):
+                    edits.append((tok.map[0], m.start()))
+                    break
+        if not edits:
+            return text
+        for row, col in sorted(set(edits), reverse=True):
+            lines[row] = _escape_hash_run(lines[row], col, pre_escaped)
+        text = '\n'.join(lines)
+
+
+def escape_text_backslashes(text):
+    r"""源文本的行内保真加写（GFM 行内语境）：\+ASCII 标点在实际阅读中
+    会丢反斜线（\# 阅读为 #），按阅读语义逐倍加写（\\ 阅读为一个反斜线）；
+    源字面 `*`/`_` 是强调定界，裸露时会与后续定界成对、阅读丢失字符
+    （A\*B\* 阅读为 A\B\），一律转义为 \*/\_（阅读为字面字符），不论
+    数量与位置，不设例外（F2）；代码跨度与公式内容字面保留。
+
+    只接受源文本（DOM 文本节点），不接受已含生成 Markdown 语法（链接
+    标签的 \[ \] 转义等）的整段序列化字符串——后者会把生成语法当成
+    源字面再次加写（R2）。生成语法在加写之后由 render_inline 产生。
+    """
+    if not re.search(r'[\\*_]', text):
+        return text
+    # 源字面括号不作数学定界；等长掩蔽保持保护区对原文本的偏移。
+    masked = text.replace('\\[', '  ').replace('\\]', '  ')
+    protected = _protected_inline_spans(masked)
+    out = []
+    cursor = 0
+    for start, end in protected:
+        out.append(_escape_segment_backslashes(text[cursor:start]))
+        out.append(text[start:end])
+        cursor = end
+    out.append(_escape_segment_backslashes(text[cursor:]))
+    return ''.join(out)
+
+
+def _escape_segment_backslashes(segment):
+    segment = re.sub(
+        r'\\(?=[%s])' % re.escape(''.join(sorted(_ESCAPABLE_PUNCT))),
+        lambda _m: '\\\\', segment)
+    # 强调定界在反斜线逐倍加写后仍裸露（\\* 中的 * 可成对为强调），
+    # 统一转义使阅读为字面字符；保护区（代码/公式）由调用方隔离。
+    return segment.replace('*', '\\*').replace('_', '\\_')
+
+
+_HEADING_TAIL_HASH_RE = re.compile(r'(^|[ \t\\])(#{1,})([ \t]*)$')
+
+
+def escape_heading_tail_hash(text):
+    r"""真实标题内容序列化：内容性尾部 # 串（markdown-it 会按 ATX 关闭
+    标记吞掉，如 `## Title #` 阅读为 Title）按阅读语义逐字转义（\# 阅读
+    为 #），层级记法与内容文字不变。`C#` 等非空白前导的 # 不是关闭
+    标记，不处理；调用方（heading_text）已把原文字面反斜线按阅读语义
+    加写，本函数只为尾部 # 串补写转义反斜线。
+    """
+    m = _HEADING_TAIL_HASH_RE.search(text)
+    if not m:
+        return text
+    return (text[:m.start(2)]
+            + ''.join('\\#' for _ in m.group(2))
+            + m.group(3))
 
 
 def _is_admonition_div(tag):
@@ -552,23 +680,40 @@ class HtmlFidelity:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
         return path
 
+    def heading_line(self, level, text):
+        """真实标题的 ATX 行：内容性尾部 # 串（markdown-it 按 ATX 关闭
+        标记吞掉，如 `## Title #` 阅读为 Title）经 escape_heading_tail_hash
+        按阅读语义保留（\\# 阅读为 #），层级记法与内容文字不变。标题
+        文字由 heading_text 按阅读语义加写过字面反斜线，两侧同步保持
+        原文字面字符（R3）。"""
+        return '#' * level + ' ' + escape_heading_tail_hash(text)
+
     @staticmethod
     def clean_heading(text):
         """去掉 Sphinx headerlink 带来的 ¶ 与链接图标。"""
         return text.replace('¶', '').replace('\uf0c1', '').strip()
 
-    def heading_text(self, tag):
+    def paragraph_text(self, tag):
+        """普通段落/文字块的行内序列化 + 行首伪标题转义（D4 普通块出口）。
+
+        真实标题分支不调用本方法；行内代码、公式与链接仍由 render_inline
+        序列化，转义只作用于行首第一个 #，不进入代码/公式内容。
+        """
+        return heading_trigger_escape(self.render_inline(tag))
+
+    def heading_text(self, tag, escape_backslashes=False):
         """移除实际 headerlink 链接节点后按行内语义序列化标题文字。
 
         只删除已识别的 `a.headerlink` 节点，不用删除尾部 `#` 或 `¶` 的
         正则代替；标题内容经 render_inline 序列化，行内代码、公式、
         链接与脚注引用保留语义（标题内 `a*b*` 不得拍平成 Markdown
-        强调），`C#` 等内容不受影响。
+        强调），`C#` 等内容不受影响。escape_backslashes=True（真实标题
+        出口）按阅读语义加写原文字面反斜线；图题等非标题调用保持默认。
         """
         copied = copy.deepcopy(tag)
         for link in copied.find_all('a', class_='headerlink'):
             link.decompose()
-        return self.render_inline(copied)
+        return self.render_inline(copied, escape_backslashes=escape_backslashes)
 
     @staticmethod
     def _postprocess_inline(text):
@@ -577,7 +722,7 @@ class HtmlFidelity:
         text = re.sub(r'([\[(]) ', r'\1', text)
         return text
 
-    def render_inline(self, element):
+    def render_inline(self, element, escape_backslashes=False):
         """渲染行内节点，保留公式、链接、脚注引用与行内代码语义。
 
         `<code>` 先转为 Markdown 行内代码并以哨兵占位：外层的空白归一、
@@ -586,8 +731,22 @@ class HtmlFidelity:
         直接 code 子节点）时整体转为代码跨度；元素自身即带 href 的链接
         时，其行内处理结果作为标签整体包装为链接，自身链接语义不因
         “只处理后代”而丢失。
+
+        escape_backslashes=True（表格格位与真实标题出口）：序列化前对
+        源文本节点按阅读语义加写反斜线（escape_text_backslashes，代码
+        与已识别数学元素之外），使实际阅读保持原文字面；随后生成的
+        链接标签 \\[ \\]、代码定界与数学定界是语法而非源字面，不再被
+        二次加写（R2）。
         """
         copied = copy.copy(element)
+        if escape_backslashes:
+            for node in list(copied.find_all(string=True)):
+                if type(node) is not NavigableString:
+                    continue  # Comment/CData 等不是可见源文本
+                if node.find_parent('code') is not None \
+                        or node.find_parent(class_='math') is not None:
+                    continue
+                node.replace_with(escape_text_backslashes(str(node)))
         if copied.name == 'code':
             return markdown_inline_code(copied.get_text())
         self_href = (copied.get('href', '').strip()
@@ -770,9 +929,16 @@ class HtmlFidelity:
                 if not text:
                     continue
                 if bullet and not first_text_done:
-                    out.append(inline_prefix + bullet + text)
+                    # 项首 bullet 后的文字同样是 Markdown 行首（markdown-it
+                    # 实测会成为列表内 ATX 标题），经共享出口转义
+                    out.append(inline_prefix + bullet
+                               + heading_trigger_escape(text))
                     first_text_done = True
                 else:
+                    # 续行带缩进前缀时文字落在列表项内容列，行首 # 在真实
+                    # Markdown 中同样成为项内标题；列 0（顶层 details 内容）
+                    # 同理——统一经普通块出口转义
+                    text = heading_trigger_escape(text)
                     out.append('\n' + inline_prefix + (indent or '') + text)
                 continue
             name = item.name
@@ -781,9 +947,11 @@ class HtmlFidelity:
                 if not t:
                     continue
                 if bullet and not first_text_done:
-                    out.append(inline_prefix + bullet + t)
+                    out.append(inline_prefix + bullet
+                               + heading_trigger_escape(t))
                     first_text_done = True
                 else:
+                    t = heading_trigger_escape(t)
                     out.append('\n' + inline_prefix + (indent or '') + t)
             elif name in ('ul', 'ol'):
                 if bullet and not first_text_done:
@@ -821,8 +989,9 @@ class HtmlFidelity:
                 if bullet and not first_text_done:
                     out.append(bullet.rstrip())
                     first_text_done = True
-                out.append('\n' + '#' * int(name[1]) + ' '
-                           + self.clean_heading(self.heading_text(item)))
+                out.append('\n' + self.heading_line(
+                    int(name[1]), self.clean_heading(
+                        self.heading_text(item, escape_backslashes=True))))
             else:
                 if bullet and not first_text_done:
                     out.append(bullet.rstrip())
@@ -866,12 +1035,14 @@ class HtmlFidelity:
             elif kind == 'inline':
                 text = self._inline_run_text(item)
                 if text:
-                    out.append('> ' + text)
+                    # 引用行行首 # 在真实 Markdown 中会成为引用内 ATX
+                    # 标题（markdown-it 实测），经共享出口转义
+                    out.append('> ' + heading_trigger_escape(text))
                 continue
             elif item.name == 'p':
                 t = self.render_inline(item)
                 if t:
-                    out.append('> ' + t)
+                    out.append('> ' + heading_trigger_escape(t))
             elif item.name in ('ul', 'ol'):
                 self.list_lines(item, out, '  ', render_block, emit_image)
             elif item.name == 'img':
@@ -984,7 +1155,10 @@ class HtmlFidelity:
                 col_no += 1
                 self._span_guard(cell, 'colspan', row_no, col_no)
                 self._span_guard(cell, 'rowspan', row_no, col_no)
-                cells.append(self.render_inline(cell))
+                # 格位是 GFM 行内语境：\+ASCII 标点的实际阅读丢反斜线，
+                # 在源文本节点层按阅读语义加写（\\ 阅读为一个反斜线），
+                # 生成的链接语法不再被二次加写，逐格可读可验（F1/R2）
+                cells.append(self.render_inline(cell, escape_backslashes=True))
                 for order, fenced in enumerate(self.cell_fences(cell),
                                                start=1):
                     code_entries.append((row_no, col_no, order, fenced))
@@ -993,11 +1167,13 @@ class HtmlFidelity:
         lines.append('\n[TABLE]')
         for index, cells in enumerate(rows):
             line = ' | '.join(cells)
-            if line.startswith('#'):
-                # 首格为 #（序号列）时整行会被 Markdown 标题扫描误判；
-                # 前置一个空格保持列界（两侧归一后内容不变）
-                line = ' ' + line
-            elif line == '':
+            if _HEADING_TRIGGER_RE.match(line):
+                # 行首为 #（如 # 序号列）时按 ATX 标题误读：经共享出口
+                # 编码；格位反斜线已在格位序列化（escape_backslashes）按
+                # 阅读语义加写，行首编码只补裸 # 触发，不重复加写
+                # （pre_escaped）
+                line = heading_trigger_escape(line, pre_escaped=True)
+            if line == '':
                 # 单列全空格行输出单个空格，与块间零长空行区分
                 line = ' '
             lines.append(line)

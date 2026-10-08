@@ -199,5 +199,60 @@ class SplitPackagesTest(unittest.TestCase):
         self.assertNotIn('tables', ())
 
 
+class SplitMathProtectionTest(unittest.TestCase):
+    """R2/D2：共享公式覆盖区间并入不可拆范围，未解决数学阻断拆包。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='split_math_test_')
+
+    def split(self, source_text, strategy='chars:30', name='src.md'):
+        src = write(self.tmp, name, source_text)
+        wps = os.path.join(self.tmp, 'wps_' + name.replace('.', '_'))
+        trans = os.path.join(self.tmp, 'trans_' + name.replace('.', '_'))
+        split.split(src, wps, trans, strategy)
+        return read_packages(wps), source_text
+
+    def test_block_math_not_split_and_heading_inside_kept(self):
+        # 公式内的 '## ' 是原文不是标题：小节切分不得落在公式内部
+        src = ('## A\n\n$$\n## not a heading\nx = 1\n$$\n\n## B\n\nB 正文。\n')
+        packages, source = self.split(src)
+        self.assertEqual(len(packages), 2)
+        for package in packages:
+            has_open = '$$\n## not a heading' in package['body']
+            has_close = 'x = 1\n$$' in package['body']
+            if has_open or has_close:
+                self.assertTrue(has_open and has_close,
+                                '块级公式被切点拆开: %s' % package['name'])
+        self.assertEqual('\n'.join(p['body'] for p in packages), source)
+        # 公式覆盖行不参与结构识别：frontmatter 计数只记真实标题
+        self.assertEqual(packages[0]['meta']['headings'], '1')
+        self.assertEqual(packages[1]['meta']['headings'], '1')
+
+    def test_chars_split_keeps_block_math_whole(self):
+        filler = '很长的正文段落用于撑大片段体量，包含许多字符。\n\n'
+        src = ('## S1\n\n' + filler * 3 + '$$\nE = m c^2\n$$\n\n'
+               + filler * 3 + '结束。\n')
+        packages, source = self.split(src, 'chars:120')
+        self.assertEqual('\n'.join(p['body'] for p in packages), source)
+        whole = [p for p in packages if 'E = m c^2' in p['body']]
+        self.assertEqual(len(whole), 1)
+        self.assertIn('$$\nE = m c^2\n$$', whole[0]['body'])
+
+    def test_unresolved_math_blocks_split(self):
+        src = '## A\n\n正文 $x 未闭合。\n\n## B\n\nB 正文。\n'
+        path = write(self.tmp, 'bad.md', src)
+        with self.assertRaises(SystemExit) as ctx:
+            split.split(path, os.path.join(self.tmp, 'wps_bad'),
+                        os.path.join(self.tmp, 'trans_bad'), 'h2')
+        self.assertIn('未解决数学定界', str(ctx.exception))
+        self.assertIn('不产生可分派包', str(ctx.exception))
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, 'wps_bad')))
+
+    def test_adjacent_inline_math_split_reassembles(self):
+        src = ('## S1\n\n序 $x$$\\sim$ 中 $y$$\\le$ 末。\n')
+        packages, source = self.split(src, 'chars:12')
+        self.assertEqual('\n'.join(p['body'] for p in packages), source)
+
+
 if __name__ == '__main__':
     unittest.main()

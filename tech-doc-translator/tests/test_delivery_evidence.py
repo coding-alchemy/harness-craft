@@ -491,6 +491,215 @@ class ReviewBindingUnitTest(unittest.TestCase):
             any('复核摘要与当前输入不符' in p for p in problems), problems)
 
 
+class GlossaryBindingUnitTest(unittest.TestCase):
+    """D6/D7 适用身份（R5 收窄）：仅交付实际使用术语（记录登记了项目
+    术语表文件）时，术语读取/选择脚本与项目术语表才参与交付身份与
+    语义复核绑定。
+
+    修改检查器（glossary_markdown.py 等）或项目术语表（术语表.md）使
+    旧语义复核结论失效；重新按当前身份复核后才恢复交付资格。未使用
+    术语的交付不投影术语维度，术语脚本变化不影响其旧复核有效性。
+    """
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix='glossary-binding-'))
+        self.addCleanup(shutil.rmtree, base, True)
+        self.root = base / 'delivery'
+        self.root.mkdir()
+        (self.root / '01_章.md').write_text('# 第 1 章\n\n正文。\n',
+                                            encoding='utf-8')
+        (self.root / 'docs').mkdir()
+        (self.root / 'docs/source_en.md').write_text(
+            '# Chapter 1\n\nBody.\n', encoding='utf-8')
+        (self.root / '术语表.md').write_text(
+            '# 术语表\n\n| 英文原词 | 中文译法 | 处理方式 |\n'
+            '| --- | --- | --- |\n| kernel | 内核 | 中文 |\n',
+            encoding='utf-8')
+
+    def record(self):
+        return {'mode': 'translation', 'inputs': ['01_章.md'],
+                'outputs': [], 'sources': [],
+                'files': {'01_章.md': 'chapter', '术语表.md': 'glossary'},
+                'reviews': []}
+
+    def record_without_glossary(self):
+        record = self.record()
+        del record['files']['术语表.md']
+        return record
+
+    def input_checks(self):
+        translated = str((self.root / '01_章.md').resolve())
+        src = str((self.root / 'docs/source_en.md').resolve())
+        facts = {
+            'script_sha256': sha(SCRIPTS / 'verify_translation.py'),
+            'shared_deps': {
+                name: sha(SCRIPTS / name)
+                for name in delivery_verifier.CHECK_SHARED_DEPS[
+                    'verify_translation']},
+            'params': {'strong_tokens': [], 'official': [],
+                       'approved_extra_math': [], 'fragment': False},
+            'files': {'translated': [translated, sha(self.root / '01_章.md')],
+                      'sources': [[src, sha(self.root / 'docs/source_en.md')]]},
+        }
+        return {translated: [{
+            'order': 1, 'tool': 'verify_translation',
+            'script_sha256': facts['script_sha256'],
+            'shared_deps': facts['shared_deps'], 'facts': facts}]}
+
+    def semantic_binding(self, identity=None, record=None):
+        record = record if record is not None else self.record()
+        ident = identity or delivery_verifier.compute_delivery_identity(
+            str(self.root), record, [])
+        return delivery_verifier.expected_review_binding(
+            'semantic', '01_章.md', str(self.root), record, [],
+            self.input_checks(), {}, ident)
+
+    def test_glossary_participates_in_identity_and_binding(self):
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), self.record(), [])
+        glossary = identity['glossary']
+        self.assertEqual(glossary['files'],
+                         {'术语表.md': sha(self.root / '术语表.md')})
+        for name in ('glossary_markdown.py', 'select_glossary.py',
+                     'consolidate_glossaries.py'):
+            self.assertEqual(glossary['scripts'][name], sha(SCRIPTS / name),
+                             name)
+        binding = self.semantic_binding(identity)
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding['glossary'], glossary)
+
+    def test_glossary_file_change_invalidates_review(self):
+        # 项目术语表（适用输入）变化：旧语义复核绑定与当前身份不符，
+        # 旧结论失效；当前身份下重新复核后恢复。
+        record = self.record()
+        record['reviews'] = [{
+            'kind': 'semantic', 'target': '01_章.md', 'status': 'closed',
+            'sha256': sha(self.root / '01_章.md'),
+            'binding': self.semantic_binding(), 'note': '语义复核闭合'}]
+        (self.root / '术语表.md').write_text(
+            '# 术语表\n\n| 英文原词 | 中文译法 | 处理方式 |\n'
+            '| --- | --- | --- |\n| kernel | 核函数 | 中文 |\n',
+            encoding='utf-8')
+        problems = []
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), record, [])
+        delivery_verifier.check_reviews(
+            record, problems, None, root=str(self.root),
+            input_checks=self.input_checks(), pdf_checks={},
+            source_entries=[], identity=identity)
+        self.assertTrue(
+            any('binding 与当前完整上下文不符' in p for p in problems),
+            problems)
+        # 按当前身份重新复核：同一函数算出的新绑定闭合，恢复交付资格。
+        record['reviews'] = [
+            {'kind': 'semantic', 'target': '01_章.md', 'status': 'closed',
+             'sha256': sha(self.root / '01_章.md'),
+             'binding': self.semantic_binding(identity), 'note': '语义复核闭合'},
+            {'kind': 'source-reconcile', 'target': '01_章.md',
+             'status': 'closed', 'sha256': sha(self.root / '01_章.md'),
+             'binding': delivery_verifier.expected_review_binding(
+                 'source-reconcile', '01_章.md', str(self.root), record, [],
+                 self.input_checks(), {}, identity),
+             'note': '源全量对账闭合'}]
+        problems = []
+        delivery_verifier.check_reviews(
+            record, problems, None, root=str(self.root),
+            input_checks=self.input_checks(), pdf_checks={},
+            source_entries=[], identity=identity)
+        self.assertEqual(problems, [])
+
+    def test_glossary_checker_change_invalidates_review(self):
+        # 术语读取/选择检查器口径变化：旧绑定中的脚本摘要与当前不符，
+        # 旧复核失效，须重新复核后才恢复交付资格。
+        record = self.record()
+        record['reviews'] = [{
+            'kind': 'semantic', 'target': '01_章.md', 'status': 'closed',
+            'sha256': sha(self.root / '01_章.md'),
+            'binding': self.semantic_binding(), 'note': '语义复核闭合'}]
+        problems = []
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), record, [])
+        identity['glossary']['scripts']['glossary_markdown.py'] = 'f' * 64
+        delivery_verifier.check_reviews(
+            record, problems, None, root=str(self.root),
+            input_checks=self.input_checks(), pdf_checks={},
+            source_entries=[], identity=identity)
+        self.assertTrue(
+            any('binding 与当前完整上下文不符' in p for p in problems),
+            problems)
+
+    def test_glossary_digest_missing_blocks_publish(self):
+        # 术语脚本摘要不可得：发布前完整性检查拒绝（None 不构成身份）。
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), self.record(), [])
+        identity['glossary']['scripts']['select_glossary.py'] = None
+        missing = delivery_verifier._identity_missing_digests(identity)
+        self.assertTrue(
+            any('术语脚本 select_glossary.py' in m for m in missing),
+            missing)
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), self.record(), [])
+        identity['glossary']['files']['术语表.md'] = None
+        missing = delivery_verifier._identity_missing_digests(identity)
+        self.assertTrue(
+            any('项目术语表 术语表.md' in m for m in missing), missing)
+
+    def test_glossary_absent_without_project_glossary(self):
+        # R5 收窄：未登记项目术语表（未实际使用术语）的交付不投影
+        # 术语维度；身份中 glossary 为 None，复核绑定不含 glossary 键。
+        record = self.record_without_glossary()
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), record, [])
+        self.assertIsNone(identity['glossary'])
+        binding = self.semantic_binding(identity, record)
+        self.assertIsNotNone(binding)
+        self.assertNotIn('glossary', binding)
+        self.assertEqual(delivery_verifier._identity_missing_digests(identity),
+                         [])
+
+    def test_glossary_script_change_leaves_unrelated_review_valid(self):
+        # R5：未使用术语的交付，术语脚本摘要不参与其复核绑定。旧口径
+        # binding（含 glossary 节）与当前身份不符，旧复核失效；按当前
+        # 身份重复核后恢复，且术语脚本变化不再影响该交付的复核有效性。
+        record = self.record_without_glossary()
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), record, [])
+        binding = self.semantic_binding(identity, record)
+        old_style = dict(binding)
+        old_style['glossary'] = {
+            'scripts': {name: 'a' * 64
+                        for name in delivery_verifier.GLOSSARY_SHARED_DEPS},
+            'files': {}}
+        record['reviews'] = [{
+            'kind': 'semantic', 'target': '01_章.md', 'status': 'closed',
+            'sha256': sha(self.root / '01_章.md'),
+            'binding': old_style, 'note': '旧口径复核闭合'}]
+        problems = []
+        delivery_verifier.check_reviews(
+            record, problems, None, root=str(self.root),
+            input_checks=self.input_checks(), pdf_checks={},
+            source_entries=[], identity=identity)
+        self.assertTrue(
+            any('binding 与当前完整上下文不符' in p for p in problems),
+            problems)
+        recon = delivery_verifier.expected_review_binding(
+            'source-reconcile', '01_章.md', str(self.root), record, [],
+            self.input_checks(), {}, identity)
+        record['reviews'] = [
+            {'kind': 'semantic', 'target': '01_章.md', 'status': 'closed',
+             'sha256': sha(self.root / '01_章.md'),
+             'binding': binding, 'note': '语义复核闭合'},
+            {'kind': 'source-reconcile', 'target': '01_章.md',
+             'status': 'closed', 'sha256': sha(self.root / '01_章.md'),
+             'binding': recon, 'note': '源全量对账闭合'}]
+        problems = []
+        delivery_verifier.check_reviews(
+            record, problems, None, root=str(self.root),
+            input_checks=self.input_checks(), pdf_checks={},
+            source_entries=[], identity=identity)
+        self.assertEqual(problems, [])
+
+
 class CheckFactsUnitTest(unittest.TestCase):
     """检查身份事实（设计 §9.3 固定回归，无浏览器）。
 
@@ -653,6 +862,32 @@ class CheckFactsUnitTest(unittest.TestCase):
         self.assertNotEqual(binding, self.semantic_binding())
         imgmap.write_text('{"digests": []}', encoding='utf-8')
         self.assertEqual(binding, self.semantic_binding())
+
+    def test_plugin_version_enters_pdf_binding_only(self):
+        # 复评 P2-3（设计 §7.7）：mdit-py-plugins 是 PDF 导出渲染与
+        # 成品核验脚注结构的实际消费依赖，版本登记进环境身份并随完整
+        # 环境投影覆盖 PDF 复核绑定；HTML 翻译检查不调用它，普通绑定
+        # 继续按 TRANSLATION_ENV_KEYS 隔离
+        import mdit_py_plugins
+        from unittest.mock import patch
+        identity = self.identity()
+        self.assertEqual(identity['environment'].get('mdit-py-plugins'),
+                         mdit_py_plugins.__version__)
+        visual = self.visual_binding(identity=identity)
+        semantic = self.semantic_binding(identity=identity)
+        self.assertIsNotNone(visual)
+        self.assertIsNotNone(semantic)
+        self.assertIn('mdit-py-plugins', visual['environment'])
+        self.assertNotIn('mdit-py-plugins', semantic['environment'])
+        # 同环境身份稳定
+        self.assertEqual(identity, self.identity())
+        # 仅插件版本变化：相关 PDF 旧复核失效，无关 HTML 绑定不变
+        with patch.object(mdit_py_plugins, '__version__',
+                          'different-review-probe'):
+            altered = self.identity()
+        self.assertNotEqual(identity, altered)
+        self.assertNotEqual(visual, self.visual_binding(identity=altered))
+        self.assertEqual(semantic, self.semantic_binding(identity=altered))
 
     def test_visual_binding_scopes_to_covering_inputs(self):
         # 多 PDF 交付：a.pdf 的 visual 绑定只投影其覆盖检查的实际输入，

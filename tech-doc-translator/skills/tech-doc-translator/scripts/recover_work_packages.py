@@ -47,8 +47,9 @@ from _verification import (
     image_occurrence_count,
     image_references,
     local_resource_digest,
+    math_issue_fails,
     scan_code_fences,
-    scan_math_spans,
+    scan_math,
     strong_token_report,
 )
 
@@ -117,11 +118,15 @@ def _fragment_hard_checks(src_body, trans_body, trans_path, strong_tokens,
                                     '源片段', '译文'):
         fails.append('代码逐块核对: %s' % diff)
 
+    src_scan = scan_math(src_body)
+    doc_scan = scan_math(trans_body)
     math_diffs, math_warns = compare_math_spans(
-        scan_math_spans(src_body), scan_math_spans(trans_body),
+        src_scan.spans, doc_scan.spans,
         '源片段', '译文', approved_extra_exprs=approved_extra_math,
         doc_text=trans_body)
     fails.extend('公式逐项核对: %s' % d for d in math_diffs)
+    fails.extend(math_issue_fails(src_scan.issues, '源片段'))
+    fails.extend(math_issue_fails(doc_scan.issues, '译文'))
     warns.extend(math_warns)
 
     for diff in compare_headings(heading_entries(src_body),

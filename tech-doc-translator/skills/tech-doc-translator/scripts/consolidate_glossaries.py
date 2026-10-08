@@ -85,6 +85,14 @@ def main():
             out.write('\n## 错误\n\n')
             for error in errors:
                 out.write('- %s:%d：%s\n' % error)
+        out.write('\n## 目标列映射\n\n')
+        for row in draft:
+            if row.get('header'):
+                out.write('- {english} ← “{header}”（{file} 表头行 '
+                          '{header_line}，第 {column} 列）\n'.format(**row))
+            else:
+                out.write('- {english} ← （无目标译法列：{file} 表头行 '
+                          '{header_line}）\n'.format(**row))
     if errors:
         raise SystemExit(1)
 

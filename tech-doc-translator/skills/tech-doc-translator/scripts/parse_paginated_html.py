@@ -68,10 +68,11 @@ def _render_children(node, out, fidelity):
             continue
         name, cls = child.name, ' '.join(child.get('class') or [])
         if name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
-            out.append('\n' + '#' * int(name[1]) + ' '
-                       + fidelity.clean_heading(fidelity.heading_text(child)))
+            out.append('\n' + fidelity.heading_line(
+                int(name[1]), fidelity.clean_heading(
+                    fidelity.heading_text(child, escape_backslashes=True))))
         elif name == 'p':
-            t = fidelity.render_inline(child)
+            t = fidelity.paragraph_text(child)
             if t:
                 out.append('\n' + t)
         elif name in ('ul', 'ol'):
@@ -113,7 +114,7 @@ def _render_children(node, out, fidelity):
                             'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
                 render(child, out, fidelity)
             else:
-                t = fidelity.render_inline(child)
+                t = fidelity.paragraph_text(child)
                 if t:
                     out.append('\n' + t)
         elif name == 'section':

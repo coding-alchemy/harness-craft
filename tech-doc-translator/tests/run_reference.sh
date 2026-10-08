@@ -337,3 +337,112 @@ python3 "$PARSE" fixtures/rich_reference.html "$TMPDIR/a1_probe.md" \
 grep -q '系统临时目录' "$TMPDIR/a1.err" \
   || { echo "错误：临时目录解析未告警"; cat "$TMPDIR/a1.err"; exit 1; }
 echo "A1 临时路径告警 PASS"
+
+echo "==> Ticket 04：普通行首 #、表格首格与代码注释分别保真"
+cat > "$TMPDIR/t04_ref.html" <<'HTML'
+<html><body><article>
+<h1>T04 Page</h1>
+<p># define data table</p>
+<table><tr><th>#</th><th>name</th></tr><tr><td>1</td><td>alpha</td></tr></table>
+<pre><code># fence comment
+w = 4  # inline comment
+</code></pre>
+<h2>Config | Range</h2>
+<p>cfg text</p>
+<h2># config</h2>
+<p>named heading after</p>
+</article></body></html>
+HTML
+python3 "$PARSE" "$TMPDIR/t04_ref.html" "$TMPDIR/t04_ref_src.md"
+python3 - "$TMPDIR/t04_ref.html" "$TMPDIR/t04_ref_src.md" <<'PY'
+import sys
+sys.path.insert(0, '../skills/tech-doc-translator/scripts')
+from _verification import heading_entries
+from _source_reconcile import reconcile_html_to_markdown
+html = open(sys.argv[1], encoding='utf-8').read()
+md = open(sys.argv[2], encoding='utf-8').read()
+assert '\\# define data table' in md, '普通段落行首 # 未转义'
+assert '\\# | name' in md, '表格首格 # 未转义'
+assert '# fence comment\nw = 4  # inline comment' in md, '围栏注释被改写'
+assert [t for _, _, t in heading_entries(md)] == [
+    'T04 Page', 'Config | Range', '# config'], '真实标题层级或顺序异常'
+assert reconcile_html_to_markdown(html, md, 'reference') == [], '独立对账误判'
+print('Ticket 04 参考解析保真与独立对账 PASS')
+PY
+
+echo "==> Ticket 04：参考译文保留转义与真实标题通过核验"
+cat > "$TMPDIR/t04_ref_zh.md" <<'MD'
+# T04 Page
+
+\# define data table
+
+| # | 名称 |
+| --- | --- |
+| 1 | alpha |
+
+```
+# fence comment
+w = 4  # inline comment
+```
+
+## Config | Range
+
+配置文字
+
+## # config
+
+注释同名标题之后
+MD
+python3 "$VERIFY" "$TMPDIR/t04_ref_zh.md" "$TMPDIR/t04_ref_src.md"
+
+echo "==> Ticket 04 失败回归：参考译文删除真实标题必须判 FAIL"
+grep -v '^## Config | Range$' "$TMPDIR/t04_ref_zh.md" > "$TMPDIR/t04_ref_nohead.md"
+if python3 "$VERIFY" "$TMPDIR/t04_ref_nohead.md" "$TMPDIR/t04_ref_src.md"; then
+  echo "错误：参考译文删除真实标题未被检测到"
+  exit 1
+else
+  echo "参考译文删除真实标题已正确判 FAIL"
+fi
+
+
+echo "==> Ticket 05：官方标题文件与旧位置强 token 并存（角色不变）"
+cat > "$TMPDIR/oh_math.txt" <<'EOF'
+1. Math Reference
+
+1.1. Formula Types
+1.1.1. Code Example
+1.1.1.1. Parameters
+1.1.1.1.1. Deep Notes
+1.1.1.1.1.1. Even Deeper
+EOF
+python3 "$VERIFY" "$TMPDIR/math_reference_translated.md" "$TMPDIR/math_source.md" \
+  cuBLAS CUDA nvcc --official-headings-file "$TMPDIR/oh_math.txt"
+echo "官方标题文件与强 token 并存且角色不变 PASS"
+
+echo "==> Ticket 05：源与译文同时删真实标题被独立官方基准发现"
+grep -v '^##### 1.1.1.1.1. Deep Notes' "$TMPDIR/math_reference_translated.md" \
+  > "$TMPDIR/math_del_zh.md"
+grep -v '^##### 1.1.1.1.1. Deep Notes' "$TMPDIR/math_source.md" \
+  > "$TMPDIR/math_del_src.md"
+python3 "$VERIFY" "$TMPDIR/math_del_zh.md" "$TMPDIR/math_del_src.md" \
+  cuBLAS CUDA nvcc \
+  || { echo "错误：源译同时删标题的无基准对照应通过"; exit 1; }
+if python3 "$VERIFY" "$TMPDIR/math_del_zh.md" "$TMPDIR/math_del_src.md" \
+    cuBLAS CUDA nvcc --official-headings-file "$TMPDIR/oh_math.txt" \
+    >"$TMPDIR/oh_ref.err" 2>&1; then
+  echo "错误：独立官方基准未发现源译同时删除的真实标题"
+  exit 1
+fi
+grep -q '与官方清单不一致' "$TMPDIR/oh_ref.err" \
+  || { echo "错误：缺少官方清单差异诊断"; cat "$TMPDIR/oh_ref.err"; exit 1; }
+echo "参考家族独立官方基准检漏 PASS"
+
+echo "==> Ticket 05：官方标题文件缺失明确失败，不降级"
+if python3 "$VERIFY" "$TMPDIR/math_reference_translated.md" "$TMPDIR/math_source.md" \
+    cuBLAS --official-headings-file "$TMPDIR/oh_absent.txt" \
+    >"$TMPDIR/oh_absent.err" 2>&1; then
+  echo "错误：缺文件未失败"; exit 1
+fi
+grep -q '缺失或不可读' "$TMPDIR/oh_absent.err" \
+  || { echo "错误：缺文件诊断缺失"; cat "$TMPDIR/oh_absent.err"; exit 1; }
+echo "参考家族缺文件明确失败"
