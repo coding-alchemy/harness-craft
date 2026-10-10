@@ -464,6 +464,21 @@ function el(tag, className, text) {
   if (text !== undefined) node.textContent = text;
   return node;
 }
+function tableScroll(table) {
+  const wrap = el('div', 'table-scroll');
+  wrap.appendChild(table);
+  return wrap;
+}
+function evidenceCard(title, nodes) {
+  const details = el('details', 'card evidence');
+  const summary = document.createElement('summary');
+  summary.textContent = title;
+  details.appendChild(summary);
+  const body = el('div', 'evidence-body');
+  nodes.forEach(n => body.appendChild(n));
+  details.appendChild(body);
+  return details;
+}
 function metricCell(tableCell, value, state) {
   const info = cellInt(value, state);
   tableCell.textContent = info.text;
@@ -473,7 +488,7 @@ function metricCell(tableCell, value, state) {
 }
 function addRow(tbody, name, aggregate, emphasize) {
   const tr = document.createElement('tr');
-  if (emphasize) tr.style.fontWeight = '600';
+  if (emphasize) tr.classList.add('emphasize');
   tr.appendChild(el('td', null, name));
   for (const key of ['input', 'output', 'cache_read']) {
     metricCell(tr.appendChild(document.createElement('td')), aggregate.metrics[key].value, aggregate.metrics[key].state);
@@ -551,7 +566,7 @@ function buildInternalRelationsCard(obj, locate) {
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
-    frag.appendChild(table);
+    frag.appendChild(tableScroll(table));
   }
   if (exp.relations && exp.relations.length) {
     frag.appendChild(el('h3', null, '会话关系（既有明确关系，不推断新关系）'));
@@ -604,13 +619,18 @@ function buildRecordsDetail(obj) {
         : '收起调用明细';
       if (!host.firstChild) renderRecordsTable();
     });
-    nodes = [el('h2', null, '调用明细'), toggle, host];
+    nodes = [toggle, host];
 
     locateRecordsByKeys = keys => {
       if (!keys.length) return;
       locatedKeys = keys.slice();
       if (host.hidden) { host.hidden = false; toggle.textContent = '收起调用明细'; }
       drawRecordsTable();
+      let ancestor = host.parentElement;
+      while (ancestor) {
+        if (ancestor.tagName === 'DETAILS') ancestor.open = true;
+        ancestor = ancestor.parentElement;
+      }
       host.scrollIntoView({ block: 'nearest' });
     };
 
@@ -696,7 +716,7 @@ function buildRecordsDetail(obj) {
           + (hasExplanation ? '' : '旧报告未保存记录级解释，仅展示已保存字段。');
       }
       host.appendChild(bar);
-      host.appendChild(table);
+      host.appendChild(tableScroll(table));
       host.appendChild(el('p', 'hint-line', '明细只展示报告已保存的白名单元数据（身份、时间、指标状态与来源定位）；不在浏览器重新归属或计量，不读取来源文件。'));
     }
 
@@ -825,7 +845,7 @@ function buildTimelineCard(obj, locate) {
         tbody.appendChild(tr);
       }
       table.appendChild(tbody);
-      frag.appendChild(table);
+      frag.appendChild(tableScroll(table));
       if (!obj.explanation.turns.length) {
         frag.appendChild(el('p', 'unavailable', '本报告未保存轮次时间线行（旧报告或范围内无轮次证据）。'));
       }
@@ -881,15 +901,15 @@ function renderReport(obj, version, footerText, sectionId) {
       + '（输入与缓存读取均已知的记录子集），不是总输入。调用数：'
       + (obj.summary.call_count === null ? '未知' : obj.summary.call_count.toString())
       + '；其中已识别 ' + (obj.summary.known_call_count === null ? '未知' : obj.summary.known_call_count.toString()) + ' 次。');
-    note.style.fontSize = '.85rem';
+    note.className = 'hint-line';
     const wrap = document.createDocumentFragment();
-    wrap.appendChild(table);
+    wrap.appendChild(tableScroll(table));
     wrap.appendChild(note);
     return wrap;
   })());
 
   const localizationCard = (() => {
-    const nodes = [el('h2', null, '定位证据')];
+    const nodes = [];
     if (obj.localization) {
       const dl = document.createElement('dl');
       dl.className = 'meta-grid';
@@ -903,10 +923,10 @@ function renderReport(obj, version, footerText, sectionId) {
     }
     return nodes;
   })();
-  card(...localizationCard);
+  report.appendChild(evidenceCard('定位证据', localizationCard));
 
   const supportCard = (() => {
-    const nodes = [el('h2', null, '内部来源支持')];
+    const nodes = [];
     if (obj.internal_support) {
       const ul = document.createElement('ul');
       ul.className = 'notes';
@@ -920,7 +940,7 @@ function renderReport(obj, version, footerText, sectionId) {
     }
     return nodes;
   })();
-  card(...supportCard);
+  report.appendChild(evidenceCard('内部来源支持', supportCard));
 
   let viewLocateHandler = null;   // set by the records block once it exists
   let viewClearHandler = null;
@@ -1027,7 +1047,6 @@ function renderReport(obj, version, footerText, sectionId) {
           group.setAttribute('tabindex', '0');
           group.setAttribute('role', 'button');
           group.setAttribute('aria-label', '定位 ' + row.label + ' 的明细');
-          group.style.cursor = 'pointer';
           group.addEventListener('click', () => viewLocateHandler(row.aggregate.record_keys));
           group.addEventListener('keydown', event => {
             if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); viewLocateHandler(row.aggregate.record_keys); }
@@ -1128,7 +1147,7 @@ function renderReport(obj, version, footerText, sectionId) {
       tbody.appendChild(tr);
       tbody.appendChild(detailRow);
     }
-    tableHost.appendChild(table);
+    tableHost.appendChild(tableScroll(table));
     if (visible.length !== rows.length) {
       tableHost.appendChild(el('p', 'hint-line', '已按筛选隐藏 ' + (rows.length - visible.length) + ' 行；原范围、截止点、合计与占比分母保持不变。'));
     }
@@ -1158,25 +1177,28 @@ function renderReport(obj, version, footerText, sectionId) {
 
   card(el('h2', null, '来源与缺口'), (() => {
     const frag = document.createDocumentFragment();
-    const sources = document.createElement('ul');
-    sources.className = 'notes';
-    for (const path of obj.source_files) {
-      const li = el('li', null, '来源（仅展示路径，不自动读取）：');
-      li.appendChild(el('span', 'path', path));
-      sources.appendChild(li);
-    }
-    frag.appendChild(sources);
     if (obj.issues && obj.issues.length) {
       const grouped = {};
       for (const issue of obj.issues) grouped[issue.reason] = (grouped[issue.reason] || 0) + 1;
       const ul = document.createElement('ul');
       ul.className = 'notes';
       for (const reason of Object.keys(grouped)) ul.appendChild(el('li', null, '缺口：' + reason + '（' + grouped[reason] + ' 处）'));
-      frag.appendChild(el('p', null, '缺口说明：'));
+      frag.appendChild(el('p', null, '缺口说明（始终可见，不折叠）：'));
       frag.appendChild(ul);
     } else {
       frag.appendChild(el('p', null, '无已记录缺口（不代表证明完整覆盖）。'));
     }
+    const sourcesDetails = el('details', 'evidence-inner');
+    sourcesDetails.appendChild(el('summary', null, '来源文件列表（' + obj.source_files.length + ' 个；仅展示路径，不自动读取）'));
+    const sources = document.createElement('ul');
+    sources.className = 'notes';
+    for (const path of obj.source_files) {
+      const li = el('li');
+      li.appendChild(el('span', 'path', path));
+      sources.appendChild(li);
+    }
+    sourcesDetails.appendChild(sources);
+    frag.appendChild(sourcesDetails);
     return frag;
   })());
 
@@ -1199,29 +1221,27 @@ function renderReport(obj, version, footerText, sectionId) {
     const ul = document.createElement('ul');
     ul.className = 'notes';
     extra.forEach(x => ul.appendChild(el('li', null, x)));
-    card(el('h2', null, '独立证据（不并入小计）'), ul);
+    report.appendChild(evidenceCard('独立证据（不并入小计）', [ul]));
   }
   let locateRecordsByKeys = null;
   const recordsDetail = buildRecordsDetail(obj);
   if (recordsDetail) {
-    card(...recordsDetail.nodes);
+    report.appendChild(evidenceCard('调用明细', recordsDetail.nodes));
     locateRecordsByKeys = recordsDetail.locate;
     viewLocateHandler = recordsDetail.locate;
     viewClearHandler = recordsDetail.clear;
   }
   if (obj.explanation && Array.isArray(obj.explanation.turns)) {
-    card(el('h2', null, '轮次时间线与已有耗时'), buildTimelineCard(obj, locateRecordsByKeys));
+    report.appendChild(evidenceCard('轮次时间线与已有耗时', [buildTimelineCard(obj, locateRecordsByKeys)]));
   }
 
   if (obj.explanation && (Array.isArray(obj.explanation.internal) && obj.explanation.internal.length
       || Array.isArray(obj.explanation.relations) && obj.explanation.relations.length
       || Array.isArray(obj.explanation.excluded) && obj.explanation.excluded.length)) {
-    card(el('h2', null, '内部分布、后代关系与未计量证据'), buildInternalRelationsCard(obj, locateRecordsByKeys));
+    report.appendChild(evidenceCard('内部分布、后代关系与未计量证据', [buildInternalRelationsCard(obj, locateRecordsByKeys)]));
   }
 
-  const loaded = el('p', null, footerText);
-  loaded.style.fontSize = '.82rem';
-  loaded.style.color = '#6b7280';
+  const loaded = el('p', 'hint-line', footerText);
   report.appendChild(loaded);
 }
 
@@ -1241,54 +1261,101 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
   const scope = obj.scope;
   const card = (...nodes) => { const c = el('section', 'card'); nodes.forEach(n => c.appendChild(n)); report.appendChild(c); return c; };
 
-  card(el('h2', null, '整体范围与状态'), el('span', 'status-tag status-' + obj.status, STATES[obj.status] || obj.status), (() => {
-    const dl = document.createElement('dl');
-    dl.className = 'meta-grid';
-    const add = (term, value) => {
-      dl.appendChild(el('dt', null, term));
-      const dd = el('dd');
-      if (value instanceof Node) dd.appendChild(value); else dd.textContent = value === null || value === undefined ? '未指定' : value;
-      dl.appendChild(dd);
-    };
-    add('Harness', obj.harness);
-    add('会话集合', scope.sessions.length + ' 个（' + scope.sessions.slice(0, 5).map(s => short(s, 16)).join('、')
-      + (scope.sessions.length > 5 ? ' …' : '') + '）');
-    add('时间下界', scope.from || '未指定');
-    add('截止点', scope.to + '（来源：' + scope.cutoff_source + '）');
-    add('显示时区', scope.tz);
-    add('代理策略', scope.main_only ? '仅主代理常规调用' : '含可靠归属的后代与内部调用');
-    add('实际读取时间', obj.read_at);
-    add('覆盖说明', obj.coverage);
-    return dl;
-  })());
+  // Result scope band: the identity/range THIS report actually used, visually apart from
+  // the pending query form above it. A one-line summary keeps the first screen compact;
+  // the full metadata stays one disclosure away.
+  const band = el('section', 'card scope-band');
+  const bandHead = el('div', 'band-head');
+  bandHead.appendChild(el('h2', null, '结果范围与状态'));
+  bandHead.appendChild(el('span', 'status-tag status-' + obj.status, STATES[obj.status] || obj.status));
+  band.appendChild(bandHead);
+  band.appendChild(el('p', 'band-summary', 'Harness（实际身份）：' + obj.harness + '；会话集合 ' + scope.sessions.length + ' 个；时间范围 '
+    + (scope.from || '未指定') + '（含）→ ' + scope.to + '（不含）；显示时区 ' + scope.tz + '；'
+    + (scope.main_only ? '仅主代理常规调用' : '含可靠归属的后代与内部调用')));
+  const fullRange = el('details', 'inline-details');
+  fullRange.appendChild(el('summary', null, '核对完整范围与元数据（截止点来源、代理策略、覆盖说明、读取时间与完整会话集合）'));
+  const bandDl = document.createElement('dl');
+  bandDl.className = 'meta-grid';
+  const bandAdd = (term, value) => {
+    bandDl.appendChild(el('dt', null, term));
+    const dd = el('dd');
+    if (value instanceof Node) dd.appendChild(value); else dd.textContent = value === null || value === undefined ? '未指定' : value;
+    bandDl.appendChild(dd);
+  };
+  bandAdd('Harness（实际身份）', obj.harness);
+  const sessionsSummary = document.createDocumentFragment();
+  sessionsSummary.appendChild(document.createTextNode(scope.sessions.length + ' 个（' + scope.sessions.slice(0, 5).map(s => short(s, 16)).join('、')
+    + (scope.sessions.length > 5 ? ' …' : '') + '）'));
+  const fullSet = el('details', 'inline-details');
+  fullSet.appendChild(el('summary', null, '核对完整会话集合（' + scope.sessions.length + ' 个稳定身份）'));
+  const sessionList = document.createElement('ul');
+  sessionList.className = 'notes';
+  for (const sid of scope.sessions) {
+    const li = el('li');
+    li.appendChild(el('span', 'path', sid));
+    sessionList.appendChild(li);
+  }
+  fullSet.appendChild(sessionList);
+  sessionsSummary.appendChild(fullSet);
+  bandAdd('会话集合', sessionsSummary);
+  bandAdd('时间范围', (scope.from || '未指定') + '（含）→ ' + scope.to + '（不含）');
+  bandAdd('固定截止点', scope.to + '（来源：' + scope.cutoff_source + '）');
+  bandAdd('显示时区', scope.tz);
+  bandAdd('代理策略', scope.main_only ? '仅主代理常规调用' : '含可靠归属的后代与内部调用');
+  bandAdd('覆盖说明', obj.coverage);
+  bandAdd('实际读取时间', obj.read_at);
+  fullRange.appendChild(bandDl);
+  band.appendChild(fullRange);
+  band.appendChild(el('p', 'hint-line', '本范围带是这份结果实际采用的身份、范围与状态，与待提交的查询表单分开；编辑表单不改变本报告。'));
+  report.appendChild(band);
 
-  card(el('h2', null, '总览（与 CLI 同值）'), (() => {
-    const table = document.createElement('table');
-    const thead = document.createElement('thead');
-    const headRow = document.createElement('tr');
-    ['分组', '输入', '输出', '缓存读取', '缓存命中率', '总量'].forEach(h => headRow.appendChild(el('th', null, h)));
-    thead.appendChild(headRow);
-    table.appendChild(thead);
-    const tbody = document.createElement('tbody');
-    for (const row of obj.rows) addRow(tbody, GROUP_LABELS[row.group] || row.group, row, false);
-    addRow(tbody, '已记录小计', obj.summary, true);
-    table.appendChild(tbody);
-    const note = el('p', null, '输入包含缓存读取；缓存与已包含的推理输出不再相加。缓存命中率的分母是配对输入'
-      + '（输入与缓存读取均已知的记录子集），不是总输入。调用数：'
-      + (obj.summary.call_count === null ? '未知' : obj.summary.call_count.toString())
-      + '；其中已识别 ' + (obj.summary.known_call_count === null ? '未知' : obj.summary.known_call_count.toString()) + ' 次。');
-    note.style.fontSize = '.85rem';
-    const wrap = document.createDocumentFragment();
-    wrap.appendChild(table);
-    wrap.appendChild(note);
-    return wrap;
-  })());
+  // Four metric cards straight from report.summary; full integers, states and reasons kept.
+  const metricCards = el('div', 'metric-cards');
+  const confirmedZero = obj.status === 'confirmed_zero';
+  const metricCard = (label, metric, note) => {
+    const cardNode = el('div', 'metric-card');
+    if (metric.state === 'partial') cardNode.classList.add('partial');
+    if (metric.state === 'unknown' || metric.value === null) cardNode.classList.add('unknown');
+    cardNode.appendChild(el('div', 'metric-label', label));
+    const formatted = fmtInt(metric.value, metric.state);
+    cardNode.appendChild(el('div', 'metric-value', formatted ? formatted.text : '未知'));
+    const notes = [];
+    if (metric.state === 'partial') notes.push('部分：仍缺完整覆盖证据');
+    if (metric.state === 'unknown' || metric.value === null) notes.push('未知');
+    if (metric.state !== 'known' && Array.isArray(metric.reasons) && metric.reasons.length) notes.push(metric.reasons.join('；'));
+    if (confirmedZero && metric.value === 0n) notes.push('确认零：范围内各会话均有完整零调用账本');
+    if (note) notes.push(note);
+    cardNode.appendChild(el('div', 'metric-note', notes.length ? notes.join('；') : '已记录'));
+    return cardNode;
+  };
+  metricCards.appendChild(metricCard('已记录总量', obj.summary.metrics.total, null));
+  metricCards.appendChild(metricCard('输入（含缓存读取）', obj.summary.metrics.input, null));
+  metricCards.appendChild(metricCard('输出', obj.summary.metrics.output, null));
+  const rate = obj.summary.cache_hit_rate;
+  const rateCard = el('div', 'metric-card');
+  if (rate.state === 'partial') rateCard.classList.add('partial');
+  if (rate.value === null) rateCard.classList.add('unknown');
+  rateCard.appendChild(el('div', 'metric-label', '缓存命中率'));
+  const pctValue = rate.value === null ? null : rate.value * 100;
+  rateCard.appendChild(el('div', 'metric-value', pctValue === null
+    ? (rate.state === 'not_applicable' ? '不适用' : '未知')
+    : (Number.isInteger(pctValue) ? pctValue.toFixed(0) : pctValue.toFixed(3).replace(/0+$/, '')) + '%'));
+  const rateNotes = [];
+  if (rate.value === null) rateNotes.push(rate.state === 'not_applicable' ? '配对输入为 0，命中率不适用（不是 0%）' : '未知：没有输入与缓存读取均已知配对记录');
+  if (rate.state === 'partial') rateNotes.push('部分：仅已知配对子集');
+  rateNotes.push('配对子集 ' + rate.paired_records.toString() + ' 条记录、配对输入 ' + rate.input.toLocaleString('en-US')
+    + '；分母是配对输入（输入与缓存读取均已知的记录子集），不是总输入；缓存读取不重复相加');
+  rateCard.appendChild(el('div', 'metric-note', rateNotes.join('；')));
+  metricCards.appendChild(rateCard);
+  report.appendChild(metricCards);
 
   const trendSection = (() => {
-    const nodes = [el('h2', null, '按日趋势（日范围＝原范围与本地日交集）')];
+    const head = el('div', 'trend-head');
+    head.appendChild(el('h2', null, '日趋势（每个保存日一根柱；日范围＝原范围与本地日交集）'));
     const wrap = el('div');
     const metrics = [['input', '输入'], ['output', '输出'], ['cache_read', '缓存读取'], ['total', '总量']];
     const metricField = document.createElement('fieldset');
+    metricField.className = 'inline-radios';
     metricField.appendChild(el('legend', null, '指标'));
     for (const [key, label] of metrics) {
       const l = el('label', null);
@@ -1298,10 +1365,10 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
       l.appendChild(radio); l.appendChild(document.createTextNode(label));
       metricField.appendChild(l);
     }
-    wrap.appendChild(metricField);
+    head.appendChild(metricField);
     const chartHost = el('div'); chartHost.id = sectionId + '-trend-chart-host'; chartHost.className = 'chart-host';
     wrap.appendChild(chartHost);
-    nodes.push(wrap);
+    const nodes = [head, wrap];
     return { nodes, render };
     function render() {
       const metricKey = document.querySelector('input[name="' + sectionId + ':trend-metric"]:checked').value;
@@ -1309,62 +1376,102 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
       chartHost.textContent = '';
       const days = obj.days || [];
       const unbucketed = obj.unbucketed || { records: 0 };
-      chartHost.appendChild(el('p', 'hint-line', '当前指标：' + metricLabel + '；共 ' + days.length + ' 天'
-        + (unbucketed.records ? '；另有 ' + unbucketed.records.toString() + ' 条无法归桶（见下）' : '') + '。'));
+      // The metric/bucket summary sits under the chart so the plot itself starts higher.
+      const trendHint = el('p', 'hint-line', '当前指标：' + metricLabel + '；共 ' + days.length + ' 个保存日桶（按时间排列，不聚合、不补零桶）；无法归桶 '
+        + unbucketed.records.toString() + ' 条' + (unbucketed.records ? '（说明见下方常显卡片）' : '') + '。');
       if (!days.length) {
+        chartHost.appendChild(trendHint);
         chartHost.appendChild(el('p', 'unavailable', '无可归桶的日期数据；未知不画零，缺口见“来源与缺口”。'));
         return;
       }
       const anyKnown = days.some(d => d.metrics[metricKey].value !== null);
       if (!anyKnown) {
+        chartHost.appendChild(trendHint);
         chartHost.appendChild(el('p', 'unavailable', '图表不可用：该指标无任何已记录数值。'));
         return;
       }
-      const barHeight = 24, labelWidth = 110, valueWidth = 200, gap = 5;
-      const width = Math.min(920, chartHost.clientWidth || 920);
+      const SVGNS = 'http://www.w3.org/2000/svg';
+      const slotW = 48, barW = 30, plotH = 220, topPad = 16, labelH = 64, leftPad = 70, rightPad = 12;
+      const width = leftPad + days.length * slotW + rightPad;
+      const height = topPad + plotH + labelH;  // stable height: long series grow width and scroll
       const valueMax = days.reduce((max, d) => d.metrics[metricKey].value > max ? d.metrics[metricKey].value : max, 0n);
-      const trackWidth = Math.max(120, width - labelWidth - valueWidth - 16);
-      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      const baseline = topPad + plotH;
+      const yFor = v => baseline - (valueMax === 0n ? 0 : Number(v * 10000n / valueMax) / 10000) * plotH;
+      const svg = document.createElementNS(SVGNS, 'svg');
       svg.setAttribute('width', String(width));
-      svg.setAttribute('height', String(days.length * (barHeight + gap) + 4));
+      svg.setAttribute('height', String(height));
       svg.setAttribute('role', 'img');
-      svg.setAttribute('aria-label', '按日' + metricLabel + '条形图');
+      svg.setAttribute('aria-label', '按日' + metricLabel + '柱状图');
+      [[0n, '0', 'trend-axis'], [valueMax / 2n, fmtInt(valueMax / 2n).text, 'trend-grid'], [valueMax, fmtInt(valueMax).text, 'trend-grid']].forEach(pair => {
+        const y = yFor(pair[0]);
+        const line = document.createElementNS(SVGNS, 'line');
+        line.setAttribute('x1', String(leftPad)); line.setAttribute('x2', String(width - rightPad));
+        line.setAttribute('y1', String(y)); line.setAttribute('y2', String(y));
+        line.setAttribute('class', pair[2]);
+        svg.appendChild(line);
+        const gridLabel = document.createElementNS(SVGNS, 'text');
+        gridLabel.setAttribute('x', String(leftPad - 6)); gridLabel.setAttribute('y', String(y + 3));
+        gridLabel.setAttribute('text-anchor', 'end'); gridLabel.setAttribute('class', 'trend-grid-label');
+        gridLabel.textContent = pair[1];
+        svg.appendChild(gridLabel);
+      });
       days.forEach((day, i) => {
-        const y = i * (barHeight + gap) + 2;
+        const x = leftPad + i * slotW;
         const metric = day.metrics[metricKey];
-        const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        const group = document.createElementNS(SVGNS, 'g');
+        group.setAttribute('class', 'trend-day');
+        const title = document.createElementNS(SVGNS, 'title');
+        title.textContent = day.date + '：' + metricLabel + ' '
+          + (metric.value === null ? '未知（' + ((metric.reasons || []).join('；') || '来源未报告') + '）'
+             : metric.value.toLocaleString('en-US') + (metric.state !== 'known' ? '（部分）' : ''));
+        group.appendChild(title);
         if (onDayClick) {
-          group.style.cursor = 'pointer';
+          group.setAttribute('tabindex', '0');
+          group.setAttribute('role', 'button');
+          group.setAttribute('aria-label', '日期 ' + day.date + '，' + metricLabel
+            + (metric.value === null ? ' 未知' : ' ' + metric.value.toLocaleString('en-US')) + '；回车查看当日分布');
           group.addEventListener('click', () => onDayClick(day));
+          group.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onDayClick(day); }
+          });
         }
-        const labelNode = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        labelNode.setAttribute('x', String(labelWidth - 6)); labelNode.setAttribute('y', String(y + 16));
-        labelNode.setAttribute('text-anchor', 'end'); labelNode.setAttribute('class', 'bar-label');
+        const hit = document.createElementNS(SVGNS, 'rect');
+        hit.setAttribute('x', String(x + 2)); hit.setAttribute('y', String(topPad));
+        hit.setAttribute('width', String(slotW - 4)); hit.setAttribute('height', String(plotH));
+        hit.setAttribute('class', 'trend-hit');
+        group.appendChild(hit);
+        if (metric.value !== null) {
+          const columnHeight = metric.value === 0n ? 0 : Math.max(2, Math.round(baseline - yFor(metric.value)));
+          if (columnHeight > 0) {
+            const bar = document.createElementNS(SVGNS, 'rect');
+            bar.setAttribute('x', String(x + (slotW - barW) / 2)); bar.setAttribute('y', String(baseline - columnHeight));
+            bar.setAttribute('width', String(barW)); bar.setAttribute('height', String(columnHeight));
+            bar.setAttribute('class', 'trend-bar' + (metric.state !== 'known' ? ' partial' : ''));
+            group.appendChild(bar);
+          }
+          // Exact values stay on the per-day tooltip/title; inline labels would collide
+          // at this slot width.
+        } else {
+          const unknown = document.createElementNS(SVGNS, 'text');
+          unknown.setAttribute('x', String(x + slotW / 2)); unknown.setAttribute('y', String(baseline - 6));
+          unknown.setAttribute('text-anchor', 'middle'); unknown.setAttribute('class', 'trend-unknown');
+          unknown.textContent = '未知';
+          group.appendChild(unknown);
+        }
+        const labelNode = document.createElementNS(SVGNS, 'text');
+        const lx = x + slotW / 2, ly = baseline + 12;
+        labelNode.setAttribute('x', String(lx)); labelNode.setAttribute('y', String(ly));
+        labelNode.setAttribute('text-anchor', 'end'); labelNode.setAttribute('class', 'trend-label');
+        labelNode.setAttribute('transform', 'rotate(-45 ' + lx + ' ' + ly + ')');
         labelNode.textContent = day.date;
         group.appendChild(labelNode);
-        const track = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        track.setAttribute('x', String(labelWidth)); track.setAttribute('y', String(y));
-        track.setAttribute('width', String(trackWidth)); track.setAttribute('height', String(barHeight));
-        track.setAttribute('class', 'bar-track');
-        group.appendChild(track);
-        if (metric.value !== null) {
-          const scaled = valueMax === 0n ? 0 : Number(metric.value * 10000n / valueMax) / 10000;
-          const fill = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-          fill.setAttribute('x', String(labelWidth)); fill.setAttribute('y', String(y));
-          fill.setAttribute('width', String(Math.round(scaled * trackWidth))); fill.setAttribute('height', String(barHeight));
-          fill.setAttribute('class', 'bar-fill' + (metric.state !== 'known' ? ' partial' : ''));
-          group.appendChild(fill);
-        }
-        const valueNode = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        valueNode.setAttribute('x', String(labelWidth + trackWidth + 8)); valueNode.setAttribute('y', String(y + 16));
-        valueNode.setAttribute('class', 'bar-value');
-        valueNode.textContent = metric.value === null ? '未知（无数值条）'
-          : metric.value.toLocaleString('en-US') + (metric.state !== 'known' ? '（部分）' : '');
-        group.appendChild(valueNode);
         svg.appendChild(group);
       });
-      chartHost.appendChild(svg);
-      if (onDayClick) chartHost.appendChild(el('p', 'hint-line', '点选日期条形查看当日模型/会话分布（只切换视图，不重新读取来源）。'));
+      const scroll = el('div', 'trend-scroll');
+      scroll.appendChild(svg);
+      chartHost.appendChild(scroll);
+      chartHost.appendChild(trendHint);
+      if (onDayClick) chartHost.appendChild(el('p', 'hint-line', '点选日期柱查看当日模型/会话分布（键盘：Tab 聚焦日期柱后 Enter/空格；只切换视图，不重新读取来源）。'));
     }
   })();
   card(...trendSection.nodes);
@@ -1373,9 +1480,9 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
   });
   trendSection.render();
 
-  card((() => {
+  (() => {
     const unbucketed = obj.unbucketed || { records: 0 };
-    if (!unbucketed.records) return el('p', null, '');
+    if (!unbucketed.records) return;  // zero case stays visible as a count in the trend summary line
     const m = unbucketed.metrics || {};
     const known = ['input', 'output', 'cache_read', 'total'].filter(k => m[k] && m[k].value !== null)
       .map(k => ({ input: '输入', output: '输出', cache_read: '缓存读取', total: '总量' })[k]
@@ -1383,13 +1490,14 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
     const p = el('p', null, '无法归桶：' + unbucketed.records.toString() + ' 条（已计入总览、未计入任何一天；'
       + (unbucketed.reasons || []).join('；') + '）。' + (known.length ? '已记录：' + known.join('、') + '。' : '无可记录量。'));
     p.className = 'notes';
-    return p;
-  })());
+    card(el('h2', null, '无法归桶量对账（常显）'), p);
+  })();
 
   const rankingSection = (() => {
     const nodes = [el('h2', null, '模型 / 会话排行（同一结果的独立视图，不加入合计；未知不归零；按所选指标降序）')];
     const metrics = [['input', '输入'], ['output', '输出'], ['cache_read', '缓存读取'], ['total', '总量']];
     const metricField = document.createElement('fieldset');
+    metricField.className = 'inline-radios';
     metricField.appendChild(el('legend', null, '排行指标与排序'));
     for (const [key, label] of metrics) {
       const l = el('label', null);
@@ -1444,12 +1552,18 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
           }
         }
         t.appendChild(tbody);
-        frag.appendChild(t);
+        frag.appendChild(tableScroll(t));
         return frag;
       };
-      host.appendChild(table('模型排行', obj.rankings.model));
-      host.appendChild(el('p', 'hint-line', '会话行为该会话自身记录的小计；单会话报告默认含可靠归属后代，口径不同。'));
-      host.appendChild(table('会话排行', obj.rankings.session));
+      const grid = el('div', 'ranking-grid');
+      const modelBlock = el('div', 'ranking-block');
+      modelBlock.appendChild(table('模型排行', obj.rankings.model));
+      const sessionBlock = el('div', 'ranking-block');
+      sessionBlock.appendChild(table('会话排行', obj.rankings.session));
+      sessionBlock.appendChild(el('p', 'hint-line', '会话行为该会话自身记录的小计；单会话报告默认含可靠归属后代，口径不同。'));
+      grid.appendChild(modelBlock);
+      grid.appendChild(sessionBlock);
+      host.appendChild(grid);
     }
   })();
   card(...rankingSection.nodes);
@@ -1458,24 +1572,46 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
   });
   rankingSection.render();
 
+  report.appendChild(evidenceCard('分组用量（互斥分组，与 CLI 同值）', [(() => {
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    ['分组', '输入', '输出', '缓存读取', '缓存命中率', '总量'].forEach(h => headRow.appendChild(el('th', null, h)));
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    for (const row of obj.rows) addRow(tbody, GROUP_LABELS[row.group] || row.group, row, false);
+    addRow(tbody, '已记录小计', obj.summary, true);
+    table.appendChild(tbody);
+    const note = el('p', null, '输入包含缓存读取；缓存与已包含的推理输出不再相加。缓存命中率的分母是配对输入'
+      + '（输入与缓存读取均已知的记录子集），不是总输入。调用数：'
+      + (obj.summary.call_count === null ? '未知' : obj.summary.call_count.toString())
+      + '；其中已识别 ' + (obj.summary.known_call_count === null ? '未知' : obj.summary.known_call_count.toString()) + ' 次。');
+    note.className = 'hint-line';
+    const wrap = document.createDocumentFragment();
+    wrap.appendChild(tableScroll(table));
+    wrap.appendChild(note);
+    return wrap;
+  })()]));
+
   const ovRecords = buildRecordsDetail(obj);
   if (ovRecords) {
-    card(...ovRecords.nodes);
+    report.appendChild(evidenceCard('调用明细', ovRecords.nodes));
     overviewLocate = ovRecords.locate;
     if (typeof state !== 'undefined' && state.overview && state.overview.report === obj) state.overview.locate = overviewLocate;
     rankingSection.render();  // rewire ranking locate buttons
   }
   if (obj.explanation && Array.isArray(obj.explanation.turns)) {
-    card(el('h2', null, '整体轮次时间线与按会话耗时'), buildTimelineCard(obj, overviewLocate));
+    report.appendChild(evidenceCard('整体轮次时间线与按会话耗时', [buildTimelineCard(obj, overviewLocate)]));
   }
   if (obj.explanation && ((Array.isArray(obj.explanation.internal) && obj.explanation.internal.length)
       || (Array.isArray(obj.explanation.relations) && obj.explanation.relations.length)
       || (Array.isArray(obj.explanation.excluded) && obj.explanation.excluded.length))) {
-    card(el('h2', null, '内部分布、后代关系与未计量证据'), buildInternalRelationsCard(obj, overviewLocate));
+    report.appendChild(evidenceCard('内部分布、后代关系与未计量证据', [buildInternalRelationsCard(obj, overviewLocate)]));
   }
 
   if (Array.isArray(obj.session_index) && obj.session_index.length) {
-    card(el('h2', null, '会话索引（范围内会话的白名单元数据）'), (() => {
+    report.appendChild(evidenceCard('会话索引（范围内会话的白名单元数据）', [(() => {
       const table = document.createElement('table');
       const headRow = document.createElement('tr');
       ['会话', '开始', '最近轮次结束', '轮次数', 'usage 记录', '已识别调用', '关系'].forEach(h => headRow.appendChild(el('th', null, h)));
@@ -1494,8 +1630,8 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
         tbody.appendChild(tr);
       }
       table.appendChild(tbody);
-      return table;
-    })());
+      return tableScroll(table);
+    })()]));
   }
 
   const extra = [];
@@ -1513,10 +1649,10 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
     const ul = document.createElement('ul');
     ul.className = 'notes';
     extra.forEach(x => ul.appendChild(el('li', null, x)));
-    card(el('h2', null, '独立证据（不并入小计）'), ul);
+    report.appendChild(evidenceCard('独立证据（不并入小计）', [ul]));
   }
 
-  card(el('h2', null, '定位证据'), (() => {
+  report.appendChild(evidenceCard('定位证据', [(() => {
     const frag = document.createDocumentFragment();
     if (obj.localization) {
       const dl = document.createElement('dl');
@@ -1530,9 +1666,9 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
       frag.appendChild(el('p', null, '旧报告未保存定位证据。'));
     }
     return frag;
-  })());
+  })()]));
 
-  card(el('h2', null, '内部来源支持'), (() => {
+  report.appendChild(evidenceCard('内部来源支持', [(() => {
     if (!obj.internal_support) return el('p', null, '报告未保存内部来源支持说明。');
     const ul = document.createElement('ul');
     ul.className = 'notes';
@@ -1541,34 +1677,35 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
       ul.appendChild(el('li', null, SUPPORT_LABELS[key] + '：' + (SUPPORT_STATES[item.status] || item.status) + '。' + item.summary));
     }
     return ul;
-  })());
+  })()]));
 
   card(el('h2', null, '来源与缺口'), (() => {
     const frag = document.createDocumentFragment();
-    const sources = document.createElement('ul');
-    sources.className = 'notes';
-    for (const path of obj.source_files) {
-      const li = el('li', null, '来源（仅展示路径，不自动读取）：');
-      li.appendChild(el('span', 'path', path));
-      sources.appendChild(li);
-    }
-    frag.appendChild(sources);
     if (obj.issues && obj.issues.length) {
       const grouped = {};
       for (const issue of obj.issues) grouped[issue.reason] = (grouped[issue.reason] || 0) + 1;
       const ul = document.createElement('ul');
       ul.className = 'notes';
       for (const reason of Object.keys(grouped)) ul.appendChild(el('li', null, '缺口：' + reason + '（' + grouped[reason] + ' 处）'));
-      frag.appendChild(el('p', null, '缺口说明：'));
+      frag.appendChild(el('p', null, '缺口说明（始终可见，不折叠）：'));
       frag.appendChild(ul);
     } else {
       frag.appendChild(el('p', null, '无已记录缺口（不代表证明完整覆盖）。'));
     }
+    const sourcesDetails = el('details', 'evidence-inner');
+    sourcesDetails.appendChild(el('summary', null, '来源文件列表（' + obj.source_files.length + ' 个；仅展示路径，不自动读取）'));
+    const sources = document.createElement('ul');
+    sources.className = 'notes';
+    for (const path of obj.source_files) {
+      const li = el('li');
+      li.appendChild(el('span', 'path', path));
+      sources.appendChild(li);
+    }
+    sourcesDetails.appendChild(sources);
+    frag.appendChild(sourcesDetails);
     return frag;
   })());
 
-  const loaded = el('p', null, footerText);
-  loaded.style.fontSize = '.82rem';
-  loaded.style.color = '#6b7280';
+  const loaded = el('p', 'hint-line', footerText);
   report.appendChild(loaded);
 }

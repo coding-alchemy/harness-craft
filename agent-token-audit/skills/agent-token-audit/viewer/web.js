@@ -11,6 +11,33 @@ const state = { harness: null, session: null, selectedTurns: [], lastTurnIndex: 
                 sessionsListing: [], sessionChecks: null, sessionsView: null, overview: null };
 
 function $(id) { return document.getElementById(id); }
+// In-page tabs only toggle visibility: no request, no statistics, no state reset.
+const TAB_IDS = ['overview', 'sessions', 'saved'];
+function selectTab(name) {
+  for (const t of TAB_IDS) {
+    $('tab-' + t).setAttribute('aria-selected', String(t === name));
+    $('panel-' + t).hidden = t !== name;
+  }
+}
+for (const name of TAB_IDS) {
+  $('tab-' + name).addEventListener('click', () => selectTab(name));
+}
+document.querySelector('.tabs').addEventListener('keydown', event => {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+  const current = TAB_IDS.findIndex(t => $('tab-' + t).getAttribute('aria-selected') === 'true');
+  const next = (current + (event.key === 'ArrowRight' ? 1 : TAB_IDS.length - 1)) % TAB_IDS.length;
+  event.preventDefault();
+  selectTab(TAB_IDS[next]);
+  $('tab-' + TAB_IDS[next]).focus();
+});
+// The fresh-result trio is shared by session statistics and recompute/update; moving the
+// existing nodes into the initiating tab keeps their event bindings and content intact.
+function moveFreshTo(panelId) {
+  const panel = $(panelId);
+  panel.appendChild($('fresh-report'));
+  panel.appendChild($('fresh-actions'));
+  panel.appendChild($('fresh-report-empty'));
+}
 function setStatus(message, isError) {
   const node = $('status');
   node.textContent = message || '';
@@ -213,7 +240,7 @@ function renderSessions(listing) {
       });
       tbody.appendChild(tr);
     }
-    tableHost.appendChild(table);
+    tableHost.appendChild(tableScroll(table));
     if (notes.length || unmatched.length) {
       const ul = document.createElement('ul'); ul.className = 'notes';
       for (const note of notes.slice(0, 5)) ul.appendChild(el('li', null, note));
@@ -285,7 +312,7 @@ function renderTurns(listing, keepSelection) {
     });
     tbody.appendChild(tr);
   });
-  host.appendChild(table);
+  host.appendChild(tableScroll(table));
   $('turns-card').hidden = false;
 }
 
@@ -311,7 +338,7 @@ function renderRequests(listing) {
     cell.appendChild(button);
     tbody.appendChild(tr);
   }
-  host.appendChild(table);
+  host.appendChild(tableScroll(table));
   if (!items.length) host.appendChild(el('p', 'hint-line', '该会话无可用的用户请求候选；请使用显式时间或截至现在。'));
   $('requests-card').hidden = false;
 }
@@ -331,6 +358,9 @@ function cutoffValue() {
 function refreshScopeSummary() {
   const summary = $('scope-summary');
   $('clear-turns').hidden = state.selectedTurns.length === 0;
+  // setBusy only re-evaluates enablement around requests; keep the clear control in sync
+  // with selection changes that happen between requests.
+  if (!inflight) $('clear-turns').disabled = !state.session || state.selectedTurns.length === 0;
   if (!state.session) { summary.textContent = ''; return; }
   const parts = ['会话 ' + short(state.session, 24)];
   parts.push(state.selectedTurns.length ? '轮次集合（' + state.selectedTurns.length + ' 个，按列表顺序）' : '轮次：整个会话（turns=null）');
@@ -363,6 +393,8 @@ async function runReport(overrides) {
   if (payload.to && payload.request_id) { setStatus('请求起点与显式截止点不能同时使用', true); return; }
   const data = await call('report', payload);
   if (data.busy || data.fatal || data.stale) return;
+  moveFreshTo('panel-sessions');
+  selectTab('sessions');
   if (!data.ok) { const message = data.error || '统计失败'; setStatus(message, true); failFresh(message); return; }
   showFreshResult(data.report, '网页统计结果（明确读取当前来源生成；format_version=2）。实际采用范围与截止点见“报告范围与状态”；已加载基准（如有）不受影响。');
   setStatus('统计完成；状态：' + (STATES[data.report.status] || data.report.status)
@@ -494,6 +526,8 @@ $('context-request-run').addEventListener('click', async () => {
                                       request_id: context.request_id,
                                       main_only: document.querySelector('input[name=agents]:checked').value === 'main' });
   if (data.busy || data.fatal || data.stale) return;
+  moveFreshTo('panel-sessions');
+  selectTab('sessions');
   if (!data.ok) { setStatus(data.error || '转交请求统计失败', true); failFresh(data.error || '转交请求统计失败'); return; }
   showFreshResult(data.report, '转交请求统计结果（明确读取当前来源生成；format_version=2）。截止点为该请求自身的创建/入队时间；实际范围见“报告范围与状态”。');
   setStatus('转交请求统计完成；状态：' + (STATES[data.report.status] || data.report.status));
@@ -548,9 +582,14 @@ refreshOverviewSummary();
 function showOverviewResult(reportObj) {
   const host = $('overview-result');
   host.hidden = false;
+  selectTab('overview');
+  $('empty').hidden = true;  // An overview result replaces the initial "nothing has run" placeholder.
   try {
     validateReport(reportObj);
     renderOverviewReport(reportObj, '整体用量结果（format_version=3）。日趋势、模型/会话排行与总览来自同一次读取；点选日期只切换视图，不重新读取来源。', 'overview-result', onOverviewDayClick);
+    // Result delivered: fold the query form to its one-line entry so the dashboard owns the
+    // first screen; expanding it restores the full form for the next explicit query.
+    $('ov-query-collapse').open = false;
     refreshOverviewDrill();
     const actions = $('overview-actions');
     actions.hidden = false;
@@ -561,6 +600,8 @@ function showOverviewResult(reportObj) {
     card.appendChild(el('h2', null, '整体结果未取得'));
     card.appendChild(el('p', null, '返回的报告未通过合同校验：' + (error && error.message ? error.message : String(error))));
     host.appendChild(card);
+    // Same failure contract as a rejected query: the form reopens next to the error.
+    $('ov-query-collapse').open = true;
   }
 }
 
@@ -579,7 +620,12 @@ function runOverviewQuery(overrides) {
   Object.assign(payload, overrides || {});
   return call('overview', payload).then(data => {
     if (data.busy || data.fatal || data.stale) return;
-    if (!data.ok) { setStatus(data.error || '整体查询失败', true); return; }
+    if (!data.ok) {
+      setStatus(data.error || '整体查询失败', true);
+      // A failed query reopens the form so the pending conditions stay editable next to the error.
+      $('ov-query-collapse').open = true;
+      return;
+    }
     state.overview = { report: data.report, drill: { date: null } };
     showOverviewResult(data.report);
     setStatus('整体查询完成；状态：' + (STATES[data.report.status] || data.report.status)
@@ -617,7 +663,7 @@ function refreshOverviewDrill() {
   }
   panel.appendChild(el('p', 'hint-line', '返回不会丢弃整体结果、查询条件与固定截止点；每层显示实际范围。'));
   if (!drill.date) {
-    panel.appendChild(el('p', null, '点选上方趋势图中的日期条形，查看该日（原范围与该日交集）的模型/会话分布。'));
+    panel.appendChild(el('p', null, '点选上方趋势图中的日期柱，查看该日（原范围与该日交集）的模型/会话分布。'));
     $('overview-result').appendChild(panel);
     return;
   }
@@ -641,10 +687,15 @@ function refreshOverviewDrill() {
     const ovLocate = state.overview && state.overview.locate;
     for (const row of rows) {
       const tr = document.createElement('tr');
-      const labelCell = el('td', onRow ? 'expandable' : null, row.label);
+      const labelCell = el('td', null);
       if (onRow) {
-        labelCell.title = '点击进入该会话当日统计（既有单会话流程）';
-        labelCell.addEventListener('click', () => onRow(row));
+        const enterBtn = el('button', 'linklike', row.label);
+        enterBtn.type = 'button';
+        enterBtn.title = '点击进入该会话当日统计（既有单会话流程）';
+        enterBtn.addEventListener('click', () => onRow(row));
+        labelCell.appendChild(enterBtn);
+      } else {
+        labelCell.textContent = row.label;
       }
       tr.appendChild(labelCell);
       for (const key of ['input', 'output', 'cache_read']) {
@@ -670,12 +721,14 @@ function refreshOverviewDrill() {
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
-    panel.appendChild(table);
+    panel.appendChild(tableScroll(table));
   };
   distTable('当日模型分布', day.by_model || [], null);
   panel.appendChild(el('p', 'hint-line', '会话行为该会话自身记录的已记录小计；点击进入的既有单会话报告默认含可靠归属后代，口径不同，结果页会同时显示实际范围。'));
   distTable('当日会话分布', day.by_session || [], row => enterSessionFromDrill(row.id, drill.date));
   $('overview-result').appendChild(panel);
+  // The panel is appended below the evidence blocks; bring it into view after a day pick.
+  panel.scrollIntoView({ block: 'nearest' });
 }
 
 function enterSessionFromDrill(sessionId, date) {
@@ -873,7 +926,6 @@ function refreshUpdateDiff() {
     + '\n新范围：' + describeScope(newScope)
     + '\n差异：' + scopeDiff(oldScope, newScope)
     + (values.to ? '' : '（截止点留空，将更新到本次网页请求入口时间）');
-  diff.style.whiteSpace = 'pre-wrap';
 }
 
 function loadSavedFile(file) {
@@ -922,6 +974,8 @@ $('recompute-run').addEventListener('click', async () => {
   if (!baseline.text) return;
   const data = await call('recompute', { report_text: baseline.text });
   if (data.busy || data.fatal || data.stale) return;
+  moveFreshTo('panel-saved');
+  selectTab('saved');
   if (!data.ok) { setStatus(data.error || '原范围重算失败', true); failFresh(data.error || '原范围重算失败'); return; }
   showFreshResult(data.report, '原范围重算结果（format_version=' + data.report.format_version + '）。保持保存的范围、代理策略与截止点，读取当前来源生成；基准仍可对照。');
   setStatus('原范围重算完成；状态：' + (STATES[data.report.status] || data.report.status)
@@ -971,6 +1025,8 @@ $('update-run').addEventListener('click', async () => {
   if (agents !== 'keep') payload.main_only = agents === 'main';
   const data = await call('recompute', payload);
   if (data.busy || data.fatal || data.stale) return;
+  moveFreshTo('panel-saved');
+  selectTab('saved');
   if (!data.ok) { setStatus(data.error || '更新失败', true); failFresh(data.error || '更新失败'); return; }
   showFreshResult(data.report, '明确更新结果（format_version=' + data.report.format_version + '）。实际采用范围与截止点见上方；与保存基准的差异已在提交前显示。');
   setStatus('明确更新完成；状态：' + (STATES[data.report.status] || data.report.status));
