@@ -63,6 +63,36 @@ def bind(data):
         record['owner_turn'] = record['turn'] if current == sid else origin
         if current != sid and record['group'] == 'main':
             record['group'] = 'child'
+    # Tool events are an independent channel: same evidence-based attribution and
+    # ancestor-copy marking as metered records, never additional token records.
+    tool_events = data.get('tool_events', [])
+    tools_by_session = {}
+    for event in tool_events:
+        tools_by_session.setdefault(event['session'], set()).add(event['call_id'])
+    for event in tool_events:
+        sid = event['session']; ancestors = set(); cursor = sid
+        while cursor in sessions and sessions[cursor].get('forked_from') and not sessions[cursor].get('parent'):
+            cursor = sessions[cursor]['forked_from']
+            if cursor == sid or cursor in ancestors:
+                break
+            ancestors.add(cursor)
+        if ancestors and any(event['call_id'] in tools_by_session.get(a, set()) for a in ancestors):
+            # Full tool identity already metered in an ancestor session: excluded later with
+            # a visible reason; a re-execution under a NEW identity still counts.
+            event['inherited_copy'] = True
+        current = sid; visited = set(); origin = event.get('root_turn')
+        while current in sessions and sessions[current].get('parent'):
+            if current in visited:
+                data['issues'].append({'reason': '父子关系循环，无法归属', 'source': event['sources'][0], 'session': sid})
+                break
+            visited.add(current)
+            if sessions[current].get('origin_turn'):
+                origin = sessions[current]['origin_turn']
+            current = sessions[current]['parent']
+        event['owner_session'] = current
+        event['owner_turn'] = event['turn'] if current == sid else origin
+        if current != sid and event['group'] == 'main':
+            event['group'] = 'child'
     # Tool totals are an independent channel, never additional usage records.
     unique = {}
     for tool in tools:

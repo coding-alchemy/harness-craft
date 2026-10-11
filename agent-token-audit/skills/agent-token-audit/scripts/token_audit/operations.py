@@ -6,7 +6,7 @@ inputs, pass a Query and decide how to present the returned outcome.
 import dataclasses
 import os
 from pathlib import Path
-from . import codex, zcode
+from . import analysis, codex, zcode
 from .core import known, local_timezone_name, overview, report, timestamp
 from .formats import validate_report
 from .relations import bind
@@ -136,6 +136,7 @@ class Query:
     detail: str = None
     saved: dict = None
     update: bool = False
+    pricing: object = None
     descriptor: dict = None
     guard: object = None
 
@@ -155,7 +156,19 @@ def resolve_overview_request_cutoff(data, request_id):
     return cutoff, matches[0]['time_source']
 
 
-def run_overview(query, data, cutoff, cutoff_source, descriptor):
+def _performance_extension(query, data, result, descriptor, tz_name, tz_evidence):
+    """The performance section saved for every new v2/v3 report, priced or not."""
+    candidates = result.pop('_performance_candidates', [])
+    evidence = (data.get('performance_evidence') or {}).get('columns')
+    return analysis.build_performance(candidates, {r['key'] for r in result['records']}, result['harness'],
+                                      descriptor['kind'], result['scope']['from'], result['scope']['to'],
+                                      tz_name, tz_evidence, evidence,
+                                      tool_candidates=result.pop('_tool_candidates', []),
+                                      tool_supplements=result.pop('_tool_supplements', []),
+                                      tool_evidence=(data.get('performance_evidence') or {}).get('tool_usage'))
+
+
+def run_overview(query, data, cutoff, cutoff_source, descriptor, pricing=None):
     explicit = query.sessions is not None
     if query.sessions is None:
         query.sessions = sorted(data['sessions'])
@@ -186,16 +199,37 @@ def run_overview(query, data, cutoff, cutoff_source, descriptor):
                       main_only=bool(query.main_only), cutoff_source=cutoff_source,
                       localization=localization, missing_ok=bool(query.saved))
     result['input'] = descriptor
+    buckets = None
+    if pricing is not None:
+        # Overall cost projections consume the kernel's saved day buckets/unbucketed set;
+        # the analysis module only re-groups its own per-record priced components.
+        buckets = {'days': [{'date': day['date'], 'record_keys': day['record_keys']} for day in result['days']],
+                   'unbucketed': result['unbucketed']['record_keys']}
+    performance = _performance_extension(query, data, result, descriptor, query.tz, '整体报告保存的显示时区')
+    result['analysis'] = analysis.build_analysis(result['records'], pricing, buckets, performance)
     exit_code = 3 if result['status'] == 'unstatisticable' else 0 if result['status'] == 'confirmed_zero' else 2
     return {'kind': 'report', 'report': result, 'exit': exit_code}
 
 
 def run(query):
     saved = validate_report(query.saved) if query.saved is not None else None
+    # Pricing is validated before any source read; listings, show and export never take
+    # a new pricing config, and a saved report's own snapshot is the recompute default.
+    pricing = None
+    if query.pricing is not None:
+        if query.operation not in ('report', 'overview', 'recompute'):
+            raise ValueError('价格配置仅用于明确的 report/overview 查询或重算；候选列举、show 与导出不接受价格')
+        pricing = analysis.validate_pricing_config(query.pricing)
+    if query.operation == 'recompute' and pricing is None and saved is not None:
+        saved_analysis = saved.get('analysis')
+        # Performance-only saved extensions carry no pricing snapshot; the recompute then
+        # stays unpriced like a query without a config.
+        if saved_analysis is not None and 'cost' in saved_analysis:
+            pricing = analysis.validate_pricing_config(saved_analysis['cost']['config'])
     if query.operation == 'show':
         if any((query.sources, query.database, query.turns, query.since, query.to, query.request_start,
                 query.request_id, query.use_current, query.update, query.session, query.harness,
-                query.label, query.detail)) or query.main_only is not None:
+                query.label, query.detail)) or query.main_only is not None or query.pricing is not None:
             raise ValueError('show 只展示原报告；修改范围请使用 recompute --update')
         return {'kind': 'report', 'report': saved, 'exit': 0}
     if sum(bool(v) for v in (query.to, query.request_start, query.request_id)) > 1:
@@ -275,7 +309,7 @@ def run(query):
     if query.operation == 'overview' or saved_overall and query.operation == 'recompute':
         if query.request_id:
             cutoff, cutoff_source = resolve_overview_request_cutoff(data, query.request_id)
-        return run_overview(query, data, cutoff, cutoff_source, descriptor)
+        return run_overview(query, data, cutoff, cutoff_source, descriptor, pricing)
     if not query.session:
         raise ValueError('report 需要明确 --session；先用 sessions 查看候选')
     if query.operation == 'requests':
@@ -292,6 +326,15 @@ def run(query):
                     localization=localization_of(query.session, query.use_current, saved, harness, cutoff, cutoff_source))
     result['input'] = descriptor
     result['scope']['label'] = query.label
+    # New single-session reports use local time; saved performance keeps its own day
+    # boundary when recomputed on a machine with a different local timezone.
+    saved_performance = (saved.get('analysis') or {}).get('performance') if saved else None
+    performance_tz = saved_performance['tz'] if saved_performance else {
+        'name': local_timezone_name(),
+        'evidence': '单会话报告无时区合同；性能日分布使用本机本地时区并在此声明'}
+    performance = _performance_extension(query, data, result, descriptor,
+                                         performance_tz['name'], performance_tz['evidence'])
+    result['analysis'] = analysis.build_analysis(result['records'], pricing, None, performance)
     if query.detail:
         result['details'] = [dict(dimension=query.detail, name=row['label'], metrics=row['metrics'],
                                   cache_hit_rate=row['cache_hit_rate'], call_count=row['call_count'],

@@ -1,5 +1,6 @@
 """Shared metric, provenance, deduplication and presentation contracts."""
 import datetime as dt
+from decimal import Decimal, ROUND_HALF_UP
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,11 @@ def timestamp(value):
 
 def now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def iso_ms(value):
+    """Epoch milliseconds to an ISO string; None stays None."""
+    return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc).isoformat() if value is not None else None
 
 
 def cell(value=None, state='unknown', reason='源未报告', field=None):
@@ -850,7 +856,7 @@ def report(data, session_id, cutoff, main_only=False, turns=None, since=None, cu
               and (i.get('session') or i.get('source', {}).get('path') in paths)]
     records = [r for r in data['records'] if r['session'] in family
                and (not main_only or (r['session'] == session_id and r['group'] == 'main'))]
-    selected, unassigned = [], []
+    selected, unassigned, perf_candidates = [], [], []
     for r in records:
         if turns is not None:
             members = r.get('interval_turns')
@@ -868,6 +874,9 @@ def report(data, session_id, cutoff, main_only=False, turns=None, since=None, cu
                     except (ValueError,TypeError):
                         pass
                 continue
+        # Performance candidates pass the same session/turn/descendant/agent filters but are
+        # admitted per metric by their own time events, never by the token-time filter below.
+        perf_candidates.append(r)
         try:
             at = timestamp(r['time'])
             if at >= end:
@@ -883,6 +892,21 @@ def report(data, session_id, cutoff, main_only=False, turns=None, since=None, cu
         except (ValueError, TypeError):
             issues.append({'reason': '调用缺少可信时间，无法判断截止点', 'source': r['sources'][0]})
     chosen_turns = [available[t] for t in (turns if turns is not None else available)]
+    # Tool candidates: independent channel, same session/turn/descendant/agent-policy/source
+    # filters as the token selection but admitted per metric by their own completion events.
+    # Policy/attribution failures stay visible as exclusions instead of silent drops.
+    tool_candidates = []
+    for e in data.get('tool_events', []):
+        if e['session'] not in family:
+            continue
+        if main_only and not (e['session'] == session_id and e['group'] == 'main'):
+            e = dict(e, _agent_excluded='非可靠主代理常规工具（属后代/内部或分类、关系未知）；仅主代理策略不纳入，不补造内部分类')
+        if turns is not None:
+            owner = e.get('owner_turn') if e['session'] != session_id else e['turn']
+            if owner not in turns:
+                e = dict(e, _turn_excluded='工具轮次无法归属所选轮次集合；未摊入邻近轮次')
+        tool_candidates.append(e)
+    tool_supplements = [s for s in data.get('tool_supplements', []) if s['session'] in family]
     explain_records(selected)
     explain_records(unassigned)
     turn_rows, turn_excluded = build_turn_explanations(data, session_id, family, available,
@@ -956,6 +980,9 @@ def report(data, session_id, cutoff, main_only=False, turns=None, since=None, cu
     explanation['relations'] = build_relation_rows(data, family, session_id)
     explanation['excluded'] = build_excluded_rows(issues) + turn_excluded
     result['explanation'] = explanation
+    result['_performance_candidates'] = perf_candidates
+    result['_tool_candidates'] = tool_candidates
+    result['_tool_supplements'] = tool_supplements
     alternates = [alt for alt in data.get('alternate_sources', []) if alt['session'] in family]
     if alternates:
         result['alternate_sources'] = alternates
@@ -993,8 +1020,9 @@ def overview(data, session_ids, cutoff, since=None, tz='UTC', main_only=False,
         issues.append({'reason': '保存的会话在当前来源缺失，未计入用量；未使用旧报告数值', 'session': sid})
     records = [r for r in data['records'] if r['session'] in family
                and (not main_only or (r['session'] in roots and r['group'] == 'main'))]
-    selected = []
+    selected, perf_candidates = [], []
     for r in records:
+        perf_candidates.append(r)
         try:
             at = timestamp(r['time'])
             if at >= end:
@@ -1013,6 +1041,16 @@ def overview(data, session_ids, cutoff, since=None, tz='UTC', main_only=False,
             issues.append({'reason': '调用缺少可信时间，无法判断截止点；未计入任何合计', 'source': r['sources'][0],
                            'session': r['session']})
     day_records, unbucketed = {}, []
+    # Tool candidates: independent channel, same session/descendant/agent-policy filters;
+    # policy failures stay visible as exclusions instead of silent drops.
+    tool_candidates = []
+    for e in data.get('tool_events', []):
+        if e['session'] not in family:
+            continue
+        if main_only and not (e['session'] in roots and e['group'] == 'main'):
+            e = dict(e, _agent_excluded='非可靠主代理常规工具（属后代/内部或分类、关系未知）；仅主代理策略不纳入，不补造内部分类')
+        tool_candidates.append(e)
+    tool_supplements = [s for s in data.get('tool_supplements', []) if s['session'] in family]
     for r in selected:
         at = timestamp(r['time'])
         date = at.astimezone(zone).date().isoformat()
@@ -1131,6 +1169,9 @@ def overview(data, session_ids, cutoff, since=None, tz='UTC', main_only=False,
                              'internal': build_internal_breakdown(selected),
                              'relations': build_relation_rows(data, family, None),
                              'excluded': build_excluded_rows(issues) + turn_excluded}
+    result['_performance_candidates'] = perf_candidates
+    result['_tool_candidates'] = tool_candidates
+    result['_tool_supplements'] = tool_supplements
     return result
 
 
@@ -1138,6 +1179,171 @@ def display_value(metric):
     if metric['value'] is None:
         return '未知'
     return f"{metric['value']:,}" + ('（部分）' if metric['state'] != 'known' else '')
+
+
+COST_COMPONENT_LABELS = {'input': '总输入', 'non_cache_read': '非缓存读取输入', 'cache_read': '缓存读取',
+                         'other_input': '其他输入', 'cache_write': '缓存写入', 'output': '输出',
+                         'other_output': '其他输出', 'reasoning': '推理输出'}
+
+
+def cost_lines(result):
+    """Cost-analysis projection shared by Markdown output; JSON stays the complete entry."""
+    from .analysis import display_amount  # Runtime import: analysis consumes the kernel.
+    ext = result.get('analysis')
+    if ext is None:
+        return ['费用估算：本报告未保存费用分析（未配置价格查询或旧报告）；token 结果不受影响。']
+    if 'cost' not in ext:
+        return ['费用估算：本次查询未配置价格，结果不含费用估算；token 与性能结果不受影响，明确带价格重算才生成费用。']
+    cost = ext['cost']
+    config = cost['config']
+    summary = cost['summary']
+    lines = ['费用估算（明确本地价格规则；各币种分别小计，不做汇率换算；不是账单结论）：'
+             '配置 schema v%d，修订 %s，规则 %d 条、别名 %d 条（快照随 JSON 保存，含未命中规则）'
+             % (ext['schema_version'], config['revision'], len(config['rules']), len(config['aliases']))]
+    currencies = summary['currencies']
+    if currencies:
+        lines += ['| 币种 | 已定价小计（精确） | 显示（两位小数四舍五入） | 完整计价 | 部分计价 |',
+                  '| --- | ---: | ---: | ---: | ---: |']
+        for currency in sorted(currencies):
+            bucket = currencies[currency]
+            shown = display_amount(bucket['amount'])
+            lines.append('| %s | %s | %s | %d | %d |'
+                         % (currency, bucket['amount'], shown, bucket['priced_records'], bucket['partially_priced_records']))
+        for currency in sorted(currencies):
+            bucket = currencies[currency]
+            parts = ['%s %s（金额 %s）' % (COST_COMPONENT_LABELS.get(name, name), format(cell['tokens'], ','), cell['amount'])
+                     for name, cell in sorted(bucket['components'].items())]
+            lines.append('%s 精确分项：%s；各记录实际单价与命中规则见 JSON 逐记录计价' % (currency, '；'.join(parts)))
+    else:
+        lines.append('无任何已定价金额（范围内无记录或未命中规则；这不等于费用为零）。')
+    lines.append('计价覆盖：计量记录 %d 条，完整计价 %d、部分计价 %d、未定价 %d、规则冲突 %d；'
+                 '已定价小计只含已计价分项，未定价金额未知'
+                 % (summary['records'], summary['priced'], summary['partially_priced'],
+                    summary['unpriced'], summary['rule_conflicts']))
+    for reason, count in sorted(summary['unpriced_reasons'].items()):
+        lines.append('未定价原因：%s（%d 条）' % (reason, count))
+    projections = cost.get('projections')
+    if projections is not None:
+        # v3 only: saved views of the same priced components; never added back into totals.
+        lines.append('费用投影（同一计价结果的独立视图，不再加入合计；各币种分别排行，不换汇）：')
+        for dimension, title, label_of in (
+                ('model', '模型', lambda m: m['identity']['provider'] + '/' + m['identity']['model']),
+                ('session', '会话', lambda m: m['session'])):
+            members = projections[dimension]
+            member_currencies = sorted({c for m in members for c in m['currencies']})
+            if not member_currencies:
+                lines.append('%s费用排行：无已定价成员（未定价原因见上方摘要）' % title)
+                continue
+            for currency in member_currencies:
+                lines += ['| %s费用排行（%s，按精确金额降序） | 已定价金额（精确） | 计价记录 |' % (title, currency),
+                          '| --- | ---: | ---: |']
+                ranked = sorted((m for m in members if currency in m['currencies']),
+                                key=lambda m: Decimal(m['currencies'][currency]['amount']), reverse=True)
+                for member in ranked:
+                    lines.append('| %s | %s | %d |'
+                                 % (label_of(member), member['currencies'][currency]['amount'], len(member['record_keys'])))
+        day_currencies = sorted({c for d in projections['day'] for c in d['currencies']})
+        if day_currencies:
+            for currency in day_currencies:
+                lines += ['| 日期（%s 已定价金额；只含保存日桶，未知不画零桶） | 精确 |' % currency, '| --- | ---: |']
+                for member in projections['day']:
+                    if currency in member['currencies']:
+                        lines.append('| %s | %s |' % (member['date'], member['currencies'][currency]['amount']))
+        else:
+            lines.append('日期费用分布：各保存日均无已定价金额（未知不画零桶）')
+        unbucketed = projections['unbucketed']
+        unbucketed_currencies = sorted(unbucketed['currencies'])
+        lines.append('无法归日：%d 条（累计区间跨日界等；已计入总览与对应币种小计，不分摊、不与日期视图再次相加）%s'
+                     % (len(unbucketed['record_keys']),
+                        '；已定价金额 ' + '；'.join('%s %s' % (c, unbucketed['currencies'][c]['amount'])
+                                                 for c in unbucketed_currencies) if unbucketed_currencies else '；无已定价金额'))
+    lines.append('显示精度：金额显示默认两位小数四舍五入；精确未舍入值见 JSON 导出的各 amount 字段。')
+    return lines
+
+
+PERF_KIND_LABELS = {'missing': '缺失', 'conflict': '冲突', 'unsupported': '无法证明', 'range': '范围外'}
+
+
+def _perf_ratio(numerator, denominator, per_second=False):
+    """Two-decimal half-up display of an exact integer ratio; never a fake zero."""
+    value = Decimal(numerator * 1000 if per_second else numerator) / Decimal(denominator)
+    return str(value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+
+
+def performance_lines(result):
+    """Performance-analysis projection shared by Markdown output; JSON stays the complete entry."""
+    ext = result.get('analysis')
+    if ext is None or 'performance' not in ext:
+        return ['模型性能：本报告未保存性能分析（旧报告）；token 结果不受影响。']
+    perf = ext['performance']
+    lines = ['模型性能（各指标独立入样；候选复用相同会话、轮次/后代、代理策略与来源边界，不进入 token 选集、不改变 token 合计；'
+             '有效集合与 token 集合可能不同；按相同 Harness、粒度与事件定义分别聚合，不做跨 Harness 效率比较）：']
+    for name in ('ttft', 'throughput'):
+        metric = perf['metrics'][name]
+        head = metric['label'] + '（' + metric['definition'] + '；' + metric['admission']
+        if metric['overhead']:
+            head += '；' + metric['overhead']
+        support = metric['support']
+        if support['status'] != 'supported':
+            lines.append(head + '）：不可用（' + support['status'] + '）——' + support['reason'])
+            continue
+        aggregate = metric['aggregate']
+        kinds = '、'.join(PERF_KIND_LABELS[kind] + ' ' + str(aggregate['excluded_by_kind'][kind])
+                          for kind in ('missing', 'conflict', 'unsupported', 'range'))
+        lines.append(head + '）：候选 %d，有效 %d、排除 %d（%s）'
+                     % (aggregate['candidates'], aggregate['valid'], aggregate['excluded'], kinds))
+        if aggregate['denominator']:
+            if name == 'ttft':
+                lines.append('  有效样本均值 %s ms（精确分子 %d ms ÷ 分母 %d 个有效样本；显示两位小数四舍五入）；'
+                             '其中 %d 条有效样本无对应 token 记录引用'
+                             % (_perf_ratio(aggregate['numerator'], aggregate['denominator']),
+                                aggregate['numerator'], aggregate['denominator'], aggregate['no_token_record']))
+            else:
+                lines.append('  聚合吞吐 %s token/秒（同一有效集合输出 %d token ÷ 区间时长 %d ms 之和，不平均逐行速率；'
+                             '显示两位小数四舍五入）；其中 %d 条有效样本无对应 token 记录引用'
+                             % (_perf_ratio(aggregate['numerator'], aggregate['denominator'], True),
+                                aggregate['numerator'], aggregate['denominator'], aggregate['no_token_record']))
+        else:
+            lines.append('  无有效样本；不给均值/聚合值（未知不画零，不产生伪零或无穷值）。')
+        for reason, count in sorted(metric['aggregate']['exclusion_reasons'].items()):
+            lines.append('  排除原因：%s（%d 条）' % (reason, count))
+    lines += tool_duration_lines(perf)
+    lines.append('性能日分布时区：%s（%s）；分组/日分布由各成员精确分子/分母重新生成，不从舍入后的上层值推导。'
+                 % (perf['tz']['name'], perf['tz']['evidence']))
+    return lines
+
+
+def tool_duration_lines(perf):
+    """Tool-execution-duration block: execution sum and the span envelope stay separate."""
+    metric = perf['metrics'].get('tool_duration')
+    if metric is None:
+        return ['工具执行耗时：本报告未保存工具耗时分析（旧报告）；token 与其他性能结果不受影响。']
+    head = metric['label'] + '（' + metric['definition'] + '；' + metric['admission']
+    support = metric['support']
+    if support['status'] != 'supported':
+        return [head + '）：不可用（' + support['status'] + '）——' + support['reason']]
+    aggregate = metric['aggregate']
+    kinds = '、'.join(PERF_KIND_LABELS[kind] + ' ' + str(aggregate['excluded_by_kind'][kind])
+                      for kind in ('missing', 'conflict', 'unsupported', 'range'))
+    lines = [head + '）：候选 %d，有效 %d、排除 %d（%s）；独立工具通道，不要求模型 usage，不改变 token 合计'
+             % (aggregate['candidates'], aggregate['valid'], aggregate['excluded'], kinds)]
+    if aggregate['denominator']:
+        lines.append('  执行耗时和 %s ms（%d 个有效样本精确耗时之和，共 %d ns；显示两位小数四舍五入）；'
+                     '已完成失败执行保留真实耗时与失败状态'
+                     % (_perf_ratio(aggregate['numerator'], 1000000), aggregate['denominator'], aggregate['numerator']))
+    else:
+        lines.append('  无有效样本；不给耗时和（未知不画零）。')
+    wall = aggregate['wall']
+    if wall['state'] == 'known':
+        lines.append('  调度/执行跨度包络 %s s（%s；%s）'
+                     % (_perf_ratio(wall['value'], 1000000000), wall['basis'], wall['reason']))
+    else:
+        lines.append('  调度/执行跨度包络：%s（%s）' % ('冲突' if wall['state'] == 'conflict' else '未知', wall['reason']))
+    for reason, count in sorted(aggregate['exclusion_reasons'].items()):
+        lines.append('  排除原因：%s（%d 条）' % (reason, count))
+    for item in aggregate['supplements']:
+        lines.append('  补充项（单列不计入）：%s——%s' % (item['key'], item['reason']))
+    return lines
 
 
 def markdown(result):
@@ -1180,6 +1386,8 @@ def markdown(result):
     if result.get('views') is None:
         lines.append('明细视图（模型/代理/轮次）：旧报告未保存，不可用')
     lines.append(f"调用数：{result['summary']['call_count'] if result['summary']['call_count'] is not None else '未知'}；其中已识别 {result['summary'].get('known_call_count', 0)} 次")
+    lines += cost_lines(result)
+    lines += performance_lines(result)
     lines.append(explanation_note(result))
     activity = result.get('activity', {})
     lines.append(f"活跃状态：{STATES.get(activity.get('status'), '未知')}；墙钟秒：{activity.get('wall_seconds') if activity.get('wall_seconds') is not None else '未知'}；调用耗时毫秒之和：{activity.get('call_duration_ms') if activity.get('call_duration_ms') is not None else '未知'}")
@@ -1271,6 +1479,8 @@ def overview_markdown(result):
             for key, value in support.items()))
     lines.append(f"调用数：{result['summary']['call_count'] if result['summary']['call_count'] is not None else '未知'}"
                  f"；其中已识别 {result['summary'].get('known_call_count', 0)} 次")
+    lines += cost_lines(result)
+    lines += performance_lines(result)
     lines.append(explanation_note(result))
     lines += [f"来源：{safe(p)}" for p in result['source_files']]
     issue_groups = {}

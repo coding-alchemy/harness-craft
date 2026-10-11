@@ -2,7 +2,7 @@
 from pathlib import Path
 import datetime as dt
 import json
-from .core import deduplicate, normalize, source_lines
+from .core import deduplicate, iso_ms, normalize, source_lines, timestamp
 
 MAPPING = {'input': 'input_tokens', 'output': 'output_tokens', 'cache_read': 'cached_input_tokens',
            'cache_write': 'cache_write_input_tokens', 'reasoning': 'reasoning_output_tokens'}
@@ -30,6 +30,7 @@ def discover(roots, guard=None):
 def read(roots, guard=None):
     paths = discover(roots, guard)
     sessions, records, issues, contexts, requests, compactions = {}, [], [], {}, [], []
+    tool_events = []
     for path, line, obj, error in source_lines(paths):
         loc = {'path': path, 'line': line}
         if error:
@@ -38,7 +39,7 @@ def read(roots, guard=None):
         typ = obj.get('type'); payload = obj.get('payload', {})
         if not isinstance(payload, dict):
             continue
-        ctx = contexts.setdefault(path, {'session': None, 'turn': None, 'model': None,
+        ctx = contexts.setdefault(path, {'session': None, 'turn': None, 'model': None, 'provider': None,
                                          'counter': None, 'counter_time': None, 'pending_turns': set(), 'direct': [], 'outputs': []})
         identity_fields = ('id', 'thread_id', 'turn_id', 'root_turn_id', 'response_id', 'forked_from_id')
         if any(payload.get(k) is not None and not isinstance(payload[k], str) for k in identity_fields):
@@ -53,6 +54,10 @@ def read(roots, guard=None):
                 issues.append({'reason': '会话身份缺失', 'source': loc})
                 continue
             ctx['session'] = sid
+            # The session-declared source provider identity is kept for pricing; it is
+            # never rewritten (e.g. openai_http stays openai_http).
+            if isinstance(payload.get('model_provider'), str):
+                ctx['provider'] = payload['model_provider']
             sessions.setdefault(sid, {'id': sid, 'harness': 'codex', 'start': payload.get('timestamp'),
                                      'version': payload.get('cli_version'), 'paths': [], 'turns': {},
                                      'source': payload.get('source'), 'forked_from': payload.get('forked_from_id')})
@@ -66,6 +71,16 @@ def read(roots, guard=None):
                 sessions[sid]['paths'].append(path)
         elif typ == 'turn_context':
             ctx['turn'] = payload.get('turn_id'); ctx['model'] = payload.get('model')
+            if isinstance(payload.get('model_provider_id'), str):
+                ctx['provider'] = payload['model_provider_id']
+        elif typ == 'thread_settings_applied':
+            # Explicit applied settings bind provider/model identity to their scope only.
+            settings = payload.get('thread_settings', {})
+            if isinstance(settings, dict):
+                if isinstance(settings.get('model_provider_id'), str):
+                    ctx['provider'] = settings['model_provider_id']
+                if isinstance(settings.get('model'), str):
+                    ctx['model'] = settings['model']
         elif typ == 'response_item' and payload.get('type') == 'message' and payload.get('role') == 'user':
             metadata = payload.get('internal_chat_message_metadata_passthrough', {})
             if isinstance(metadata,str):
@@ -104,6 +119,52 @@ def read(roots, guard=None):
             # is the metered evidence. latest_token_usage_record is a copy of the same call,
             # never an additional one.
             compactions.append((payload.get('compaction_response_id'), loc, ctx['session']))
+        elif typ == 'event_msg' and payload.get('type') == 'item_completed':
+            # Only these two item types prove an actual execution with structured identity,
+            # status and a native duration; other item types and plain text output are not
+            # tool-duration evidence. Command arguments and output bodies are never copied.
+            item = payload.get('item')
+            if not isinstance(item, dict) or item.get('type') not in ('CommandExecution', 'McpToolCall'):
+                continue
+            sid = payload.get('thread_id') or ctx['session']
+            ident = item.get('id')
+            if sid not in sessions:
+                issues.append({'reason': '工具事件会话身份未匹配', 'source': loc, 'session': ctx['session']})
+                continue
+            if not isinstance(ident, str) or not ident:
+                issues.append({'reason': '工具事件缺少真实 item 身份；未纳入', 'source': loc, 'session': sid})
+                continue
+            event = {'key': 'codex-tool:' + sid + ':' + ident, 'call_id': ident, 'session': sid,
+                     'turn': payload.get('turn_id') or ctx['turn'], 'root_turn': None,
+                     'category': item['type'], 'group': 'main',
+                     'status': item.get('status') if isinstance(item.get('status'), str) else 'unknown',
+                     'completed_at': obj.get('timestamp'), 'sources': [loc],
+                     'duration_ns': None, 'duration_precision': 'ms', 'zero_unconfirmed': False,
+                     'exec_start': None, 'exec_end': None, 'dispatch_start': None, 'dispatch_end': None,
+                     'conflict': None}
+            duration = item.get('duration')
+            if duration is not None:
+                secs, nanos = duration.get('secs'), duration.get('nanos') if isinstance(duration, dict) else (None, None)
+                valid = (isinstance(duration, dict)
+                         and all(type(v) is int and v >= 0 for v in (secs, nanos)) and nanos < 1000000000)
+                if valid:
+                    # secs/nanos convert exactly; never truncated to whole milliseconds.
+                    event['duration_ns'] = secs * 1000000000 + nanos
+                    event['duration_precision'] = 'ns'
+                else:
+                    event['conflict'] = '原生 duration 的 secs/nanos 为负数、布尔值或非整数，不能作为有效耗时'
+            start, finish = item.get('start'), item.get('end')
+            for value in (start, finish):
+                if value is not None and (type(value) is not int or value < 0):
+                    event['conflict'] = event['conflict'] or '工具起止毫秒时间为负数、布尔值或非整数'
+            if type(start) is int and type(finish) is int and start >= 0 and finish >= 0:
+                if finish < start:
+                    event['conflict'] = event['conflict'] or '工具起止逆序，不能作为有效跨度'
+                else:
+                    # Execution endpoints in epoch ms; the ms span and the native ns
+                    # duration are different granularities, saved separately, no conflict.
+                    event['exec_start'], event['exec_end'] = iso_ms(start), iso_ms(finish)
+            tool_events.append(event)
         elif typ == 'event_msg' and payload.get('type') in ('task_started','task_complete','turn_aborted'):
             sid = ctx['session']; turn = payload.get('turn_id') or ctx['turn']
             if sid not in sessions or not turn:
@@ -132,7 +193,7 @@ def read(roots, guard=None):
             records.append({'key': 'codex:' + sid + ':' + str(rid), 'call_id': str(rid), 'session': sid,
                             'turn': payload.get('turn_id') or ctx['turn'],
                             'root_turn': payload.get('root_turn_id'), 'agent': sid,
-                            'group': 'main', 'model': ctx['model'] or '模型未知',
+                            'group': 'main', 'model': ctx['model'] or '模型未知', 'provider': ctx['provider'],
                             'time': obj.get('timestamp'), 'sources': [loc],
                             'granularity': 'model_call', 'time_kind': 'usage_record_time', 'source_status': 'unknown',
                             'metrics': normalize(usage, MAPPING, True), 'call_count': 1})
@@ -166,7 +227,7 @@ def read(roots, guard=None):
             elif unique_last and sid in sessions:
                 records.append({'key': f'codex-reply:{sid}:{reply}', 'call_id': reply,
                                 'session': sid, 'agent': sid, 'turn': ctx['turn'], 'root_turn': None,
-                                'group': 'main', 'model': ctx['model'] or '模型未知',
+                                'group': 'main', 'model': ctx['model'] or '模型未知', 'provider': ctx['provider'],
                                 'time': obj.get('timestamp'), 'sources': [loc],
                                 'granularity': 'reply_usage', 'time_kind': 'reply_usage_time', 'source_status': 'unknown',
                                 'metrics': normalize(last, MAPPING, True), 'call_count': 1,
@@ -183,7 +244,7 @@ def read(roots, guard=None):
                     records.append({'key': f'codex-interval:{sid}:{ctx["counter_time"]}:{obj.get("timestamp")}',
                                     'session': sid, 'agent': sid, 'turn': turns[0] if len(turns) == 1 else None,
                                     'interval_turns': turns, 'interval_start': ctx['counter_time'], 'root_turn': None,
-                                    'group': 'main', 'model': '模型未知', 'time': obj.get('timestamp'), 'sources': [loc],
+                                    'group': 'main', 'model': '模型未知', 'provider': None, 'time': obj.get('timestamp'), 'sources': [loc],
                                     'granularity': 'cumulative_interval', 'time_kind': 'count_interval_time',
                                     'source_status': 'unknown',
                                     'metrics': normalize(differences, MAPPING, True), 'call_count': None})
@@ -230,5 +291,40 @@ def read(roots, guard=None):
             for source in request['sources']:
                 if source not in existing['sources']:
                     existing['sources'].append(source)
+    # The same session can span several rollout files (resume copies): merge repeated tool
+    # identities once; conflicting copies stay in conflict instead of double counting.
+    unique_tools = {}
+    for event in tool_events:
+        old = unique_tools.get(event['key'])
+        if old is None:
+            unique_tools[event['key']] = event
+            continue
+        old['sources'] += [s for s in event['sources'] if s not in old['sources']]
+        for field in ('status', 'completed_at', 'exec_start', 'exec_end'):
+            new = event[field]
+            if new is None:
+                continue
+            if old[field] is None:
+                old[field] = new
+                continue
+            if old[field] == new:
+                continue
+            same = False
+            if field != 'status':
+                try:
+                    same = timestamp(old[field]) == timestamp(new)
+                except (ValueError, TypeError):
+                    same = False
+            if not same:
+                old['conflict'] = old['conflict'] or '同一工具身份的来源副本在 ' + field + ' 上冲突'
+        if event['duration_ns'] is not None:
+            if old['duration_ns'] is None:
+                old['duration_ns'] = event['duration_ns']
+                old['duration_precision'] = event['duration_precision']
+            elif old['duration_ns'] != event['duration_ns']:
+                old['conflict'] = old['conflict'] or '同一工具身份的来源副本耗时冲突'
+        if event['conflict']:
+            old['conflict'] = old['conflict'] or event['conflict']
     return {'harness': 'codex', 'sessions': sessions, 'records': deduplicate(records, issues),
-            'issues': issues, 'source_files': [str(p) for p in paths], 'requests': list(unique_requests.values()) + unkeyed_requests}
+            'issues': issues, 'source_files': [str(p) for p in paths], 'requests': list(unique_requests.values()) + unkeyed_requests,
+            'tool_events': list(unique_tools.values())}

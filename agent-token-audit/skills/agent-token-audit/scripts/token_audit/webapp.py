@@ -196,12 +196,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
             harness = saved_harness
         if action != 'export' and harness not in self.app.sources:
             raise ValueError('未知或本次启动未配置的 Harness：' + str(harness))
+        pricing = None
+        if 'parent_report_text' in request:
+            # Drill-down semantics: the day→session query carries the parent overall
+            # report itself, so its saved pricing snapshot (not the page's pending config)
+            # prices the new single-session report. Mutually exclusive with pricing_text.
+            if action != 'report':
+                raise ValueError('只有整体下钻的会话统计接受父报告价格快照')
+            if 'pricing_text' in request:
+                raise ValueError('下钻价格来源只能是一个：父报告保存的价格快照或新提交的价格配置')
+            parent = validate_report(self._decoded_report(request['parent_report_text']))
+            if parent.get('format_version') != 3:
+                raise ValueError('下钻价格快照只接受整体报告（v3）；请从整体结果进入会话当日统计')
+            if harness is not None and harness != parent['harness']:
+                raise ValueError('下钻会话统计与父报告 Harness 不一致；请切回父报告来源再查询')
+            parent_analysis = parent.get('analysis')
+            if parent_analysis is not None and 'cost' in parent_analysis:
+                pricing = operations.analysis.validate_pricing_config(parent_analysis['cost']['config'])
+        if 'pricing_text' in request:
+            # A present-but-null/empty/non-JSON pricing field is rejected outright; only
+            # explicit queries and recompute accept a new config, and the browser can only
+            # submit local file text (never a path, URL or command).
+            if action not in ('report', 'overview', 'recompute'):
+                raise ValueError('该操作不接受价格配置；价格仅用于明确统计、整体查询或重算')
+            pricing_text = request['pricing_text']
+            if not isinstance(pricing_text, str) or not pricing_text.strip():
+                raise ValueError('价格配置文本缺失或为空；未选择配置请省略 pricing_text 字段')
+            try:
+                pricing = json.loads(pricing_text)
+            except ValueError:
+                raise ValueError('价格配置不是有效 JSON') from None
+            if pricing is None:
+                raise ValueError('价格配置为 null；未选择配置请省略 pricing_text 字段')
         context_session = self.app.context.get('session') if self.app.context.get('harness') == harness else None
         query = operations.Query(operation=action if action != 'export' else 'report',
                                  started=entry, started_source='web_request_start',
                                  harness=harness, descriptor=self.app.sources.get(harness),
                                  guard=self.app.guard, session=request.get('session'),
-                                 saved=saved_obj if action == 'recompute' else None)
+                                 saved=saved_obj if action == 'recompute' else None,
+                                 pricing=pricing)
         if request.get('use_context'):
             # The startup chain declared this identity; operations re-verifies the unique source match.
             if not context_session:

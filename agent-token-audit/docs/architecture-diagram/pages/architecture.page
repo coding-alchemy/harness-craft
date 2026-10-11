@@ -4,7 +4,7 @@
     "type": "solid",
     "color": "$paper"
   },
-  "notes": "上下三层泳道、层内左到右流程。来源是外部只读依赖。候选查询不进入计量内核；保存报告展示跳过来源与内核。Python与浏览器校验分别保护各自输入。",
+  "notes": "三层上下泳道。operations 校验并传递/复用价格；core产生token报告骨架与独立候选，analysis无I/O生成费用/性能扩展。候选查询不进入内核。保存展示直接进入Python/浏览器独立校验与呈现，不回源、不重新计价。",
   "elements": [
     {
       "elementId": "access-layer",
@@ -33,7 +33,7 @@
         430,
         570,
         1320,
-        290
+        480
       ],
       "shapeName": "rect",
       "fill": {
@@ -51,7 +51,7 @@
       "elementType": "shape",
       "bounds": [
         430,
-        935,
+        1125,
         1320,
         435
       ],
@@ -207,6 +207,26 @@
       }
     },
     {
+      "elementId": "analysis-box",
+      "elementType": "shape",
+      "bounds": [
+        1290,
+        840,
+        410,
+        150
+      ],
+      "shapeName": "rect",
+      "fill": {
+        "type": "solid",
+        "color": "$white"
+      },
+      "border": {
+        "style": "solid",
+        "width": 2,
+        "color": "$read"
+      }
+    },
+    {
       "elementId": "core-box",
       "elementType": "shape",
       "bounds": [
@@ -231,7 +251,7 @@
       "elementType": "shape",
       "bounds": [
         470,
-        985,
+        1175,
         330,
         130
       ],
@@ -251,7 +271,7 @@
       "elementType": "shape",
       "bounds": [
         930,
-        985,
+        1175,
         330,
         130
       ],
@@ -271,7 +291,7 @@
       "elementType": "shape",
       "bounds": [
         1370,
-        985,
+        1175,
         330,
         130
       ],
@@ -291,7 +311,7 @@
       "elementType": "shape",
       "bounds": [
         930,
-        1190,
+        1380,
         330,
         150
       ],
@@ -311,7 +331,7 @@
       "elementType": "shape",
       "bounds": [
         1370,
-        1165,
+        1355,
         330,
         95
       ],
@@ -331,7 +351,7 @@
       "elementType": "shape",
       "bounds": [
         1370,
-        1270,
+        1460,
         330,
         95
       ],
@@ -351,7 +371,7 @@
       "elementType": "shape",
       "bounds": [
         60,
-        1160,
+        1350,
         310,
         160
       ],
@@ -542,19 +562,19 @@
       }
     },
     {
-      "elementId": "core-report",
+      "elementId": "analysis-report",
       "elementType": "line",
       "bounds": [
         635,
-        790,
+        990,
         860,
-        195
+        185
       ],
       "viewBox": [
         860,
-        195
+        185
       ],
-      "points": "860,0 860,110 0,110 0,195",
+      "points": "860,0 860,110 0,110 0,185",
       "curve": "sharp",
       "arrow": [
         null,
@@ -571,7 +591,7 @@
       "elementType": "line",
       "bounds": [
         800,
-        1050,
+        1240,
         65,
         1
       ],
@@ -596,7 +616,7 @@
       "elementType": "line",
       "bounds": [
         865,
-        1050,
+        1240,
         65,
         1
       ],
@@ -621,7 +641,7 @@
       "elementType": "line",
       "bounds": [
         865,
-        1050,
+        1240,
         65,
         212
       ],
@@ -646,7 +666,7 @@
       "elementType": "line",
       "bounds": [
         1260,
-        1050,
+        1240,
         110,
         1
       ],
@@ -671,7 +691,7 @@
       "elementType": "line",
       "bounds": [
         1260,
-        1262,
+        1452,
         50,
         1
       ],
@@ -696,7 +716,7 @@
       "elementType": "line",
       "bounds": [
         1310,
-        1205,
+        1395,
         60,
         57
       ],
@@ -721,7 +741,7 @@
       "elementType": "line",
       "bounds": [
         1310,
-        1262,
+        1452,
         60,
         48
       ],
@@ -746,7 +766,7 @@
       "elementType": "line",
       "bounds": [
         370,
-        1050,
+        1240,
         100,
         190
       ],
@@ -764,6 +784,31 @@
         "style": "solid",
         "width": 3,
         "color": "$saved"
+      }
+    },
+    {
+      "elementId": "core-analysis",
+      "elementType": "line",
+      "bounds": [
+        1495,
+        790,
+        1,
+        50
+      ],
+      "viewBox": [
+        1,
+        50
+      ],
+      "points": "0,0 0,50",
+      "curve": "sharp",
+      "arrow": [
+        null,
+        "arrow"
+      ],
+      "border": {
+        "style": "solid",
+        "width": 3,
+        "color": "$read"
       }
     },
     {
@@ -801,7 +846,7 @@
         48
       ],
       "content": {
-        "text": "先看层间职责，再顺着框与箭头阅读层内处理环节",
+        "text": "显式查询共用 Python 计算；保存展示绕过来源与计算，离线保留精确值",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -896,7 +941,7 @@
       "elementType": "text",
       "bounds": [
         60,
-        935,
+        1125,
         330,
         52
       ],
@@ -921,7 +966,7 @@
       "elementType": "text",
       "bounds": [
         60,
-        996,
+        1186,
         330,
         73
       ],
@@ -1076,7 +1121,7 @@
         75
       ],
       "content": {
-        "text": "操作 / 范围 / 时间\n入口解析与参数转换",
+        "text": "范围 / 时间 / pricing\n显式加载本地价格 JSON",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -1126,7 +1171,7 @@
         90
       ],
       "content": {
-        "text": "operations.run(Query)\n定位候选、固定范围\n展示短路 / 统计 / 明确重算",
+        "text": "operations.run(Query)\n验证 / 复用价格与范围\n展示短路 / 查询 / 明确重算",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -1251,7 +1296,7 @@
         85
       ],
       "content": {
-        "text": "codex / zcode\n字段解析、去重、缺口",
+        "text": "codex / zcode\nusage / 身份 / 时间 / 工具",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -1351,7 +1396,7 @@
         85
       ],
       "content": {
-        "text": "core.report / overview\n选集 → 汇总 / 日桶 / 排行 / 解释\n生成 v2 单会话或 v3 整体报告",
+        "text": "core.report / overview\ntoken 选集 / 日桶 / 排行 / 解释\nv2 / v3 骨架与独立候选",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -1421,12 +1466,12 @@
       "elementType": "text",
       "bounds": [
         865,
-        865,
+        1055,
         470,
         30
       ],
       "content": {
-        "text": "同一份报告：数值、范围、状态、记录键",
+        "text": "同一报告：token、费用、性能、范围、键",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -1446,7 +1491,7 @@
       "elementType": "text",
       "bounds": [
         488,
-        996,
+        1186,
         294,
         38
       ],
@@ -1471,12 +1516,12 @@
       "elementType": "text",
       "bounds": [
         488,
-        1040,
+        1230,
         294,
         65
       ],
       "content": {
-        "text": "新生成 v2 / v3\n或加载保存 v1 / v2 / v3",
+        "text": "新 v2 / v3 + analysis\n或加载保存 v1 / v2 / v3",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -1496,7 +1541,7 @@
       "elementType": "text",
       "bounds": [
         948,
-        996,
+        1186,
         294,
         38
       ],
@@ -1521,7 +1566,7 @@
       "elementType": "text",
       "bounds": [
         948,
-        1040,
+        1230,
         294,
         65
       ],
@@ -1546,7 +1591,7 @@
       "elementType": "text",
       "bounds": [
         1388,
-        996,
+        1186,
         294,
         38
       ],
@@ -1571,7 +1616,7 @@
       "elementType": "text",
       "bounds": [
         1388,
-        1040,
+        1230,
         294,
         65
       ],
@@ -1596,7 +1641,7 @@
       "elementType": "text",
       "bounds": [
         948,
-        1201,
+        1391,
         294,
         38
       ],
@@ -1621,12 +1666,12 @@
       "elementType": "text",
       "bounds": [
         948,
-        1245,
+        1435,
         294,
         85
       ],
       "content": {
-        "text": "shared.js + lossless-json\n校验 → DOM / SVG\n图表、筛选与记录联动",
+        "text": "shared.js + lossless-json\n独立校验 → DOM / SVG\n指标 / 趋势 / 分组 / 证据定位",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -1646,7 +1691,7 @@
       "elementType": "text",
       "bounds": [
         1388,
-        1176,
+        1366,
         294,
         38
       ],
@@ -1671,12 +1716,12 @@
       "elementType": "text",
       "bounds": [
         1388,
-        1220,
+        1410,
         294,
         30
       ],
       "content": {
-        "text": "HTTP 结果 / 本地保存文件",
+        "text": "三标签 / 显式查询 / 价格",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -1696,7 +1741,7 @@
       "elementType": "text",
       "bounds": [
         1388,
-        1281,
+        1471,
         294,
         38
       ],
@@ -1721,7 +1766,7 @@
       "elementType": "text",
       "bounds": [
         1388,
-        1325,
+        1515,
         294,
         30
       ],
@@ -1746,7 +1791,7 @@
       "elementType": "text",
       "bounds": [
         78,
-        1171,
+        1361,
         274,
         38
       ],
@@ -1771,12 +1816,12 @@
       "elementType": "text",
       "bounds": [
         78,
-        1215,
+        1405,
         274,
         95
       ],
       "content": {
-        "text": "用户显式导出的文件\n展示不读来源、不重新计量\n重算经 operations 回源",
+        "text": "用户明确导出的文件\n展示不读源、不重新计价\n重算沿保存规则与时区",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -1796,7 +1841,7 @@
       "elementType": "text",
       "bounds": [
         60,
-        1090,
+        1280,
         330,
         36
       ],
@@ -1821,18 +1866,68 @@
       "elementType": "text",
       "bounds": [
         60,
-        1390,
+        1580,
         1680,
         37
       ],
       "content": {
-        "text": "逻辑职责分层 · 框表示实际模块或数据 · 箭头表示处理/消费方向 · 离线页不能回源统计",
+        "text": "职责分层 · 价格由用户明确配置 · 分析不改变 token 小计 · 离线页只展示保存值",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
         },
         "fontSize": 23,
         "color": "$muted",
+        "bold": false,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "analysis-title",
+      "elementType": "text",
+      "bounds": [
+        1308,
+        851,
+        374,
+        38
+      ],
+      "content": {
+        "text": "费用 / 独立性能分析",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 27,
+        "color": "$read",
+        "bold": true,
+        "lineHeight": 1.25,
+        "align": [
+          "left",
+          "middle"
+        ]
+      }
+    },
+    {
+      "elementId": "analysis-body",
+      "elementType": "text",
+      "bounds": [
+        1308,
+        895,
+        374,
+        85
+      ],
+      "content": {
+        "text": "analysis：无 I/O\nbuild_performance / build_analysis\n价格分项 / 独立样本与投影",
+        "fontFamily": {
+          "latin": "Arial",
+          "ea": "Hiragino Sans GB"
+        },
+        "fontSize": 22,
+        "color": "$ink",
         "bold": false,
         "lineHeight": 1.25,
         "align": [

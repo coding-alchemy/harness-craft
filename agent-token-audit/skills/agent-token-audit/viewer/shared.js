@@ -15,6 +15,80 @@ const TIME_KIND_LABELS = { usage_record_time: 'usage 记录时间（无调用起
 const GRANULARITIES = ['model_call', 'reply_usage', 'cumulative_interval', 'logical_request', 'unknown'];
 const TIME_KINDS = ['usage_record_time', 'reply_usage_time', 'count_interval_time', 'completion_time', 'unknown'];
 const DURATION_STATES = ['known', 'unknown', 'conflict'];
+const COST_COMPONENT_LABELS = { input: '总输入', non_cache_read: '非缓存读取输入', cache_read: '缓存读取', other_input: '其他输入',
+                                cache_write: '缓存写入', output: '输出', other_output: '其他输出', reasoning: '推理输出' };
+const COST_STATUS_LABELS = { priced: '完整计价', partially_priced: '部分计价', unpriced: '未定价', rule_conflict: '规则冲突' };
+const RULE_COMPONENTS = {
+  total_input: [['input', 'price_per_million']],
+  split_cache_read: [['non_cache_read', 'non_cache_read_per_million'], ['cache_read', 'cache_read_per_million']],
+  split_cache_read_write: [['other_input', 'other_input_per_million'], ['cache_read', 'cache_read_per_million'], ['cache_write', 'cache_write_per_million']],
+  total_output: [['output', 'price_per_million']],
+  split_reasoning: [['other_output', 'other_output_per_million'], ['reasoning', 'reasoning_per_million']],
+};
+const INPUT_COMPONENTS = ['input', 'non_cache_read', 'cache_read', 'other_input', 'cache_write'];
+const DECIMAL_TEXT = /^(0|[1-9]\d*)(\.\d+)?$/;
+function scaledDecimal(text) {
+  // Exact decimal parsing over BigInt; amounts and unit prices never go through floats.
+  if (typeof text !== 'string' || !DECIMAL_TEXT.test(text)) throw new Error('金额/单价必须是非负有限十进制字符串：' + String(text));
+  const parts = text.split('.');
+  const frac = parts[1] || '';
+  return { value: BigInt(parts[0] + frac), scale: frac.length };
+}
+function canonScaled(value, scale) {
+  let digits = value.toString();
+  if (digits.length <= scale) digits = digits.padStart(scale + 1, '0');
+  const intPart = digits.slice(0, digits.length - scale) || '0';
+  const frac = scale ? digits.slice(-scale).replace(/0+$/, '') : '';
+  return frac ? intPart + '.' + frac : intPart;
+}
+function componentAmountText(tokens, priceText) {
+  const price = scaledDecimal(priceText);
+  return canonScaled(BigInt(tokens) * price.value, price.scale + 6);
+}
+function sumAmounts(texts) {
+  const parts = texts.map(scaledDecimal);
+  const scale = Math.max(0, ...parts.map(p => p.scale));
+  const total = parts.reduce((sum, p) => sum + p.value * 10n ** BigInt(scale - p.scale), 0n);
+  return canonScaled(total, scale);
+}
+function displayAmount(text) {
+  // Display default: exactly two decimals, round half up; the saved value stays unrounded.
+  const s = scaledDecimal(text);
+  const scale = Math.max(s.scale, 3);
+  const v = s.value * 10n ** BigInt(scale - s.scale);
+  const unit = 10n ** BigInt(scale - 2);
+  let cents = v / unit;
+  if ((v % unit) * 2n >= unit) cents += 1n;
+  const digits = cents.toString().padStart(3, '0');
+  return digits.slice(0, -2) + '.' + digits.slice(-2);
+}
+function compareAmountTexts(a, b) {
+  // Exact decimal comparison over BigInt; ranking never goes through floats.
+  const sa = scaledDecimal(a), sb = scaledDecimal(b);
+  const scale = Math.max(sa.scale, sb.scale);
+  const va = sa.value * 10n ** BigInt(scale - sa.scale);
+  const vb = sb.value * 10n ** BigInt(scale - sb.scale);
+  return va === vb ? 0 : va < vb ? -1 : 1;
+}
+function ruleComponentPrices(rule) {
+  const pairs = RULE_COMPONENTS[rule.input.kind].concat(RULE_COMPONENTS[rule.output.kind]);
+  return pairs.map(([name, key]) => [name, (INPUT_COMPONENTS.includes(name) ? rule.input : rule.output)[key]]);
+}
+
+function componentTokens(name, metrics) {
+  const valueOf = key => {
+    const metric = metrics[key];
+    return metric && ['reported', 'derived'].includes(metric.state) && metric.value !== null ? metric.value : null;
+  };
+  if (name === 'other_input' || name === 'other_output') {
+    const keys = name === 'other_input' ? ['input', 'cache_read', 'cache_write'] : ['output', 'reasoning'];
+    const values = keys.map(valueOf);
+    if (values.some(v => v === null)) return null;
+    const value = values.slice(1).reduce((total, part) => total - part, values[0]);
+    return value < 0n ? null : value;
+  }
+  return valueOf(name);
+}
 const TURN_STATUS_LABELS = { running: '进行中', completed: '已完成', cancelled: '已取消', error: '失败', unknown: '未知' };
 const PRIVATE_KEYS = new Set(['request', 'response', 'headers', 'authorization', 'cookie', 'prompt', 'text', 'content', 'api_key', 'password']);
 const TIMEZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
@@ -81,7 +155,8 @@ function checkAggregateRow(row, what) {
   }
   const rate = row.cache_hit_rate;
   if (!rate || typeof rate !== 'object') throw new Error(what + ' 缺少缓存覆盖状态');
-  if (rate.value !== null && (typeof rate.value !== 'number' || !(rate.value >= 0 && rate.value <= 1))) {
+  if (rate.value !== null && !((typeof rate.value === 'number' || typeof rate.value === 'bigint')
+      && rate.value >= 0 && rate.value <= 1)) {
     throw new Error(what + ' 缓存命中率必须为 0 到 1 的数值或 null');
   }
   if (!['known', 'partial', 'unknown', 'not_applicable'].includes(rate.state)) throw new Error(what + ' 缓存覆盖状态未知');
@@ -268,6 +343,806 @@ function checkExplanationBlock(exp, obj) {
   });
 }
 
+function checkPricingConfig(config) {
+  // The browser independently validates the saved pricing snapshot (structure, version,
+  // rule ids, times, price formats); it never matches rules or recomputes prices for display.
+  const what = '价格配置快照';
+  if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error(what + '必须是对象');
+  for (const key of Object.keys(config)) {
+    if (!['schema_version', 'revision', 'rules', 'aliases'].includes(key)) throw new Error(what + '含未知字段：' + key);
+  }
+  if (typeof config.schema_version !== 'bigint' || config.schema_version !== 1n) throw new Error(what + '版本不支持');
+  if (typeof config.revision !== 'string' || !config.revision.trim()) throw new Error(what + '缺少修订标识');
+  if (!Array.isArray(config.rules)) throw new Error(what + '规则必须是数组');
+  const textOf = (value, name, max) => {
+    if (typeof value !== 'string' || !value.trim() || value.length > (max || 256)) throw new Error(what + name + '必须是非空字符串');
+    return value;
+  };
+  const priceOf = (value, name) => {
+    if (typeof value !== 'string' || !DECIMAL_TEXT.test(value)) throw new Error(what + name + '必须是十进制字符串');
+    return value;
+  };
+  const sourceOf = (value, name) => {
+    if (!value || typeof value !== 'object'
+        || typeof value.reference !== 'string' || typeof value.version !== 'string') throw new Error(what + name + '来源须含引用与版本');
+  };
+  const partitionOf = (value, kinds, name) => {
+    if (!value || typeof value !== 'object' || !kinds.includes(value.kind)) throw new Error(what + name + '分区类型未知');
+    for (const [, priceKey] of RULE_COMPONENTS[value.kind]) priceOf(value[priceKey], name + '单价 ' + priceKey);
+    if (['split_cache_read_write', 'split_reasoning'].includes(value.kind)) textOf(value.basis, name + '互斥/包含依据', 512);
+  };
+  const rules = new Map();
+  config.rules.forEach((rule, i) => {
+    const name = '规则 ' + i;
+    if (!rule || typeof rule !== 'object') throw new Error(what + name + '结构无效');
+    for (const key of Object.keys(rule)) {
+      if (!['id', 'source', 'provider', 'model', 'effective_from', 'effective_to', 'currency', 'input', 'output'].includes(key)) {
+        throw new Error(what + name + '含未知字段：' + key);
+      }
+    }
+    textOf(rule.id, name + ' 稳定 ID', 128);
+    if (rules.has(rule.id)) throw new Error(what + '规则 ID 重复 ' + rule.id);
+    sourceOf(rule.source, name);
+    textOf(rule.provider, name + ' 供应商', 128);
+    textOf(rule.model, name + ' 完整模型身份');
+    textOf(rule.currency, name + ' 币种', 32);
+    if (!validTime(rule.effective_from)) throw new Error(what + name + ' 生效起点无效');
+    if (rule.effective_to !== undefined && rule.effective_to !== null) {
+      if (!validTime(rule.effective_to)) throw new Error(what + name + ' 生效终点无效');
+      if (!(instantMicros(rule.effective_from) < instantMicros(rule.effective_to))) throw new Error(what + name + ' 生效区间无效');
+    }
+    partitionOf(rule.input, ['total_input', 'split_cache_read', 'split_cache_read_write'], name + ' 输入');
+    partitionOf(rule.output, ['total_output', 'split_reasoning'], name + ' 输出');
+    rules.set(rule.id, rule);
+  });
+  const aliases = new Map();
+  const aliasFrom = new Map();
+  (Array.isArray(config.aliases) ? config.aliases : []).forEach((alias, i) => {
+    const name = '别名 ' + i;
+    if (!alias || typeof alias !== 'object'
+        || !['id', 'source', 'from', 'to', 'basis'].every(k => k in alias)
+        || Object.keys(alias).length !== 5) throw new Error(what + name + '结构未知');
+    textOf(alias.id, name + ' 稳定 ID', 128);
+    sourceOf(alias.source, name);
+    textOf(alias.basis, name + ' 映射依据', 512);
+    for (const endpoint of ['from', 'to']) {
+      const point = alias[endpoint];
+      if (!point || typeof point !== 'object') throw new Error(what + name + ' ' + endpoint + ' 身份无效');
+      textOf(point.provider, name + ' ' + endpoint + ' 供应商', 128);
+      textOf(point.model, name + ' ' + endpoint + ' 完整模型身份');
+    }
+    if (alias.from.provider === alias.to.provider && alias.from.model === alias.to.model) {
+      throw new Error(what + name + ' 源与目标身份相同（循环映射）');
+    }
+    const key = alias.from.provider + '\u0001' + alias.from.model;
+    if (aliasFrom.has(key)) throw new Error(what + name + ' 与其他别名的源身份冲突');
+    aliasFrom.set(key, alias);
+    aliases.set(alias.id, alias);
+  });
+  for (const alias of aliases.values()) {
+    if (aliasFrom.has(alias.to.provider + '\u0001' + alias.to.model)) throw new Error(what + '别名只允许一次精确映射，不支持链式推断');
+  }
+  return { rules, aliases };
+}
+
+function costTotals(entries) {
+  // Exact per-currency BigInt totals over one set of pricing entries (audit recompute).
+  const totals = {};
+  for (const entry of entries) {
+    if (!entry.components.length) continue;
+    const bucket = totals[entry.currency] = totals[entry.currency] || { amounts: [], components: {} };
+    for (const component of entry.components) {
+      const cell = bucket.components[component.name] = bucket.components[component.name] || { tokens: 0n, amounts: [] };
+      cell.tokens += component.tokens;
+      cell.amounts.push(component.amount);
+      bucket.amounts.push(component.amount);
+    }
+  }
+  return totals;
+}
+
+function checkProjectionCurrencies(saved, expected, what) {
+  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw new Error('费用投影币种无效：' + what);
+  const names = Object.keys(expected).sort();
+  if (Object.keys(saved).sort().join('') !== names.join('')) throw new Error('费用投影币种集合与逐记录计价不一致：' + what);
+  for (const currency of names) {
+    const bucket = saved[currency];
+    if (!bucket || typeof bucket !== 'object'
+        || Object.keys(bucket).sort().join(',') !== 'amount,components') throw new Error('费用投影币种结构无效：' + what);
+    if (bucket.amount !== sumAmounts(expected[currency].amounts)) throw new Error('费用投影金额与逐记录计价不一致：' + what);
+    const components = bucket.components;
+    const expectedComponents = expected[currency].components;
+    const componentNames = Object.keys(expectedComponents).sort();
+    if (!components || typeof components !== 'object'
+        || Object.keys(components).sort().join('') !== componentNames.join('')) throw new Error('费用投影分项集合不一致：' + what);
+    for (const name of componentNames) {
+      const cell = components[name];
+      const expectedCell = expectedComponents[name];
+      if (!cell || typeof cell !== 'object' || cell.tokens !== expectedCell.tokens
+          || cell.amount !== sumAmounts(expectedCell.amounts)) throw new Error('费用投影分项与逐记录计价不一致：' + what);
+    }
+  }
+}
+
+function checkCostProjections(obj, entries, projections) {
+  if (!projections || typeof projections !== 'object' || Array.isArray(projections)
+      || Object.keys(projections).sort().join(',') !== 'day,model,session,unbucketed') throw new Error('费用投影结构无效');
+  const entryByKey = new Map(entries.map(e => [e.record_key, e]));
+  const sessionOf = new Map((obj.records || []).map(r => [r.key, r.session]));
+  const priced = entries.filter(e => e.components.length);
+  const checkMember = (member, keys, what) => {
+    if (!member || typeof member !== 'object') throw new Error('费用投影成员结构无效：' + what);
+    const savedKeys = member.record_keys;
+    if (!Array.isArray(savedKeys) || savedKeys.some(k => typeof k !== 'string')) throw new Error('费用投影成员记录引用无效：' + what);
+    if (new Set(savedKeys).size !== savedKeys.length || savedKeys.length !== keys.length
+        || keys.some(k => !savedKeys.includes(k))) throw new Error('费用投影成员记录集合不一致：' + what);
+    checkProjectionCurrencies(member.currencies, costTotals(savedKeys.map(k => entryByKey.get(k))), what);
+  };
+  const modelGroups = new Map();
+  for (const entry of priced) {
+    const key = entry.identity.provider + '' + entry.identity.model;
+    if (!modelGroups.has(key)) modelGroups.set(key, { identity: entry.identity, keys: [] });
+    modelGroups.get(key).keys.push(entry.record_key);
+  }
+  if (!Array.isArray(projections.model) || projections.model.length !== modelGroups.size) {
+    throw new Error('模型费用投影成员集合与逐记录计价不一致');
+  }
+  const seenModels = new Set();
+  projections.model.forEach((member, i) => {
+    const what = 'model ' + i;
+    const identity = member && member.identity;
+    if (!identity || typeof identity.provider !== 'string' || !identity.provider
+        || typeof identity.model !== 'string' || !identity.model) throw new Error('模型费用投影身份无效：' + what);
+    const key = identity.provider + '' + identity.model;
+    if (seenModels.has(key) || !modelGroups.has(key)) throw new Error('模型费用投影成员重复或身份无已计价记录：' + what);
+    seenModels.add(key);
+    checkMember(member, modelGroups.get(key).keys, what);
+  });
+  const sessionGroups = new Map();
+  for (const entry of priced) {
+    const sid = sessionOf.get(entry.record_key);
+    if (!sessionGroups.has(sid)) sessionGroups.set(sid, []);
+    sessionGroups.get(sid).push(entry.record_key);
+  }
+  if (!Array.isArray(projections.session) || projections.session.length !== sessionGroups.size) {
+    throw new Error('会话费用投影成员集合与逐记录计价不一致');
+  }
+  const seenSessions = new Set();
+  projections.session.forEach((member, i) => {
+    const what = 'session ' + i;
+    if (typeof member.session !== 'string' || seenSessions.has(member.session) || !sessionGroups.has(member.session)) {
+      throw new Error('会话费用投影成员重复或身份无已计价记录：' + what);
+    }
+    seenSessions.add(member.session);
+    checkMember(member, sessionGroups.get(member.session), what);
+  });
+  const reportDays = obj.days || [];
+  if (!Array.isArray(projections.day) || projections.day.length !== reportDays.length) {
+    throw new Error('日期费用投影与本报告日趋势不一致');
+  }
+  const memberDates = projections.day.map(m => m.date);
+  const sortedDates = memberDates.slice().sort();
+  const partition = new Set();
+  projections.day.forEach((member, i) => {
+    if (member.date !== reportDays[i].date || memberDates[i] !== sortedDates[i]) {
+      throw new Error('日期费用投影日期与本报告日趋势不一致：day ' + i);
+    }
+    checkMember(member, reportDays[i].record_keys, 'day ' + i);
+    member.record_keys.forEach(k => partition.add(k));
+  });
+  checkMember(projections.unbucketed, (obj.unbucketed || {}).record_keys || [], 'unbucketed');
+  projections.unbucketed.record_keys.forEach(k => partition.add(k));
+  // Day members plus the unbucketed item partition every metered record: the projections
+  // reconcile against the per-currency summary instead of adding into it.
+  const metered = (obj.records || []).map(r => r.key);
+  if (partition.size !== metered.length || metered.some(k => !partition.has(k))) {
+    throw new Error('日期费用投影与无法归日项未覆盖本报告全部计量记录');
+  }
+}
+
+const PERF_METRIC_NAMES = ['ttft', 'throughput'];
+const PERF_ALL_METRICS = ['ttft', 'throughput', 'tool_duration'];
+const PERF_EXCLUSION_KINDS = ['missing', 'conflict', 'unsupported', 'range'];
+const PERF_SUPPORT_STATES = ['supported', 'source_not_provided', 'not_checked'];
+const PERF_COMPLETION_STATES = ['ended_before_cutoff', 'ended_after_cutoff', 'no_end_evidence'];
+const PERF_UNITS = { ttft: { numerator: 'ms', denominator: '样本', value: 'ms' },
+                     throughput: { numerator: 'token', denominator: 'ms', value: 'token/s' },
+                     tool_duration: { numerator: 'ns', denominator: '样本', value: 'ms' } };
+const TOOL_SAMPLE_STATES = ['completed', 'failed'];
+function sameUnits(a, b) {
+  return a && typeof a === 'object' && !Array.isArray(a)
+    && Object.keys(b).every(k => a[k] === b[k]) && Object.keys(a).length === Object.keys(b).length;
+}
+function perfDayOf(isoTime, tzName) {
+  // Local calendar date of an event in the saved timezone; day buckets are never
+  // recomputed by ad-hoc browser rules, this mirrors the kernel day-boundary rule.
+  const ms = Number(instantMicros(isoTime) / 1000n);
+  const offset = /^([+-])(\d{2}):(\d{2})$/.exec(tzName);
+  if (offset) {
+    const minutes = (parseInt(offset[2], 10) * 60 + parseInt(offset[3], 10)) * (offset[1] === '+' ? 1 : -1);
+    return new Date(ms + minutes * 60000).toISOString().slice(0, 10);
+  }
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: tzName, year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(new Date(ms));
+  const get = type => parts.find(p => p.type === type).value;
+  return get('year') + '-' + get('month') + '-' + get('day');
+}
+function checkPerfSample(sample, name, recordsByKey, what) {
+  if (!sample || typeof sample !== 'object' || Array.isArray(sample)) throw new Error('性能样本结构无效：' + what);
+  const common = ['key', 'record_key', 'session', 'turn', 'owner_session', 'owner_turn', 'granularity',
+                  'provider', 'model', 'precision', 'source'];
+  const expected = name === 'ttft'
+    ? common.concat(['value', 'basis', 'started_at', 'first_token_at', 'native_ttft_ms', 'completed_at', 'completion'])
+    : common.concat(['output', 'interval_ms', 'basis', 'first_token_at', 'completed_at']);
+  const keys = Object.keys(sample);
+  if (keys.length !== expected.length || expected.some(k => !(k in sample))) throw new Error('性能样本结构无效：' + what);
+  if (typeof sample.key !== 'string') throw new Error('性能样本缺少稳定样本键：' + what);
+  if (sample.record_key !== null && (typeof sample.record_key !== 'string' || !recordsByKey.has(sample.record_key))) {
+    throw new Error('性能样本引用了本报告不存在的 token 记录（悬空引用）：' + what);
+  }
+  if (typeof sample.session !== 'string' || typeof sample.owner_session !== 'string') throw new Error('性能样本会话/归属无效：' + what);
+  for (const field of ['turn', 'owner_turn']) {
+    if (sample[field] !== null && typeof sample[field] !== 'string') throw new Error('性能样本轮次/归属无效：' + what);
+  }
+  if (!GRANULARITIES.includes(sample.granularity)) throw new Error('性能样本粒度未知：' + what);
+  if (sample.provider !== null && typeof sample.provider !== 'string') throw new Error('性能样本供应商无效：' + what);
+  if (typeof sample.model !== 'string' || !sample.model) throw new Error('性能样本模型无效：' + what);
+  if (sample.precision !== 'ms' || !['native', 'derived'].includes(sample.basis)) throw new Error('性能样本精度/依据无效：' + what);
+  checkSourceLoc(sample.source, '性能样本来源');
+  const timeOf = (field, required) => {
+    const value = sample[field];
+    if (value === null) {
+      if (required) throw new Error('性能样本缺少事件时间 ' + field + '：' + what);
+      return null;
+    }
+    if (!validTime(value)) throw new Error('性能样本事件时间无效：' + what);
+    return value;
+  };
+  const nonneg = (field, minimum) => {
+    const value = sample[field];
+    if (typeof value !== 'bigint' || value < minimum) throw new Error('性能样本数值无效（非有限或负数不入有效值）：' + what);
+    return value;
+  };
+  const first = timeOf('first_token_at', true);
+  timeOf('completed_at', false);
+  if (name === 'ttft') {
+    const began = timeOf('started_at', true);
+    const value = nonneg('value', 0n);
+    const native = sample.native_ttft_ms;
+    if (native !== null && (typeof native !== 'bigint' || native < 0n)) throw new Error('性能样本原生 TTFT 无效：' + what);
+    if (value !== (instantMicros(first) - instantMicros(began)) / 1000n) {
+      throw new Error('性能样本 TTFT 与事件时间差矛盾（坏样本冲突）：' + what);
+    }
+    if ((native === null) !== (sample.basis === 'derived') || (native !== null && native !== value)) {
+      throw new Error('性能样本原生 TTFT 与推导值/依据矛盾（坏样本冲突）：' + what);
+    }
+    if (!PERF_COMPLETION_STATES.includes(sample.completion)) throw new Error('性能样本完成状态未知：' + what);
+    return [value, 1n];
+  }
+  const output = nonneg('output', 0n);
+  const interval = nonneg('interval_ms', 1n);
+  const completed = timeOf('completed_at', true);
+  if (interval !== (instantMicros(completed) - instantMicros(first)) / 1000n) {
+    throw new Error('性能样本观测区间与事件时间差矛盾（坏样本冲突）：' + what);
+  }
+  return [output, interval];
+}
+function checkToolSample(sample, what) {
+  // One saved tool-duration sample: stable identity, finished status, exact ns value with
+  // its native/derived basis, and separately saved scheduling endpoints.
+  const expected = ['basis', 'category', 'completed_at', 'dispatch_end', 'dispatch_start', 'exec_end', 'exec_start',
+                    'key', 'native_duration_ns', 'owner_session', 'owner_turn', 'precision', 'record_key',
+                    'session', 'source', 'status', 'turn', 'value'];
+  if (!sample || typeof sample !== 'object' || Array.isArray(sample)
+      || Object.keys(sample).sort().join(',') !== expected.join(',')) throw new Error('工具样本结构无效：' + what);
+  if (typeof sample.key !== 'string') throw new Error('工具样本缺少稳定样本键：' + what);
+  if (sample.record_key !== null) throw new Error('工具样本不得引用 token 记录（独立通道，不伪造引用）：' + what);
+  if (typeof sample.session !== 'string' || typeof sample.owner_session !== 'string') throw new Error('工具样本会话/归属无效：' + what);
+  for (const field of ['turn', 'owner_turn']) {
+    if (sample[field] !== null && typeof sample[field] !== 'string') throw new Error('工具样本轮次/归属无效：' + what);
+  }
+  if (typeof sample.category !== 'string' || !sample.category) throw new Error('工具样本类别无效：' + what);
+  if (!TOOL_SAMPLE_STATES.includes(sample.status)) throw new Error('工具样本状态无效（仅已完成/已失败执行携带耗时）：' + what);
+  if (typeof sample.value !== 'bigint' || sample.value < 0n) throw new Error('工具样本耗时无效（非有限或负数不入有效值）：' + what);
+  if (!['native', 'derived'].includes(sample.basis) || !['ns', 'ms'].includes(sample.precision)) {
+    throw new Error('工具样本依据/精度无效：' + what);
+  }
+  const native = sample.native_duration_ns;
+  if (sample.basis === 'native') {
+    if (typeof native !== 'bigint' || native !== sample.value) throw new Error('工具样本原生耗时与有效值矛盾（坏样本冲突）：' + what);
+  } else if (native !== null) {
+    throw new Error('推导耗时样本不得携带原生值（坏样本冲突）：' + what);
+  }
+  const timeOf = (field, required) => {
+    const value = sample[field];
+    if (value === null) {
+      if (required) throw new Error('工具样本缺少事件时间：' + what);
+      return null;
+    }
+    if (!validTime(value)) throw new Error('工具样本事件时间无效：' + what);
+    return value;
+  };
+  const execStart = timeOf('exec_start', false);
+  const execEnd = timeOf('exec_end', false);
+  timeOf('completed_at', true);
+  if ((execStart === null) !== (execEnd === null)) throw new Error('工具样本执行起止必须成对出现：' + what);
+  if (execStart !== null) {
+    const span = (instantMicros(execEnd) - instantMicros(execStart)) / 1000n;
+    if (span < 0n) throw new Error('工具样本执行起止逆序：' + what);
+    if (sample.basis === 'derived' && sample.value !== span * 1000000n) {
+      throw new Error('工具样本推导耗时与执行起止跨度矛盾（坏样本冲突）：' + what);
+    }
+  }
+  const dispatchStart = timeOf('dispatch_start', false);
+  const dispatchEnd = timeOf('dispatch_end', false);
+  if ((dispatchStart === null) !== (dispatchEnd === null)) throw new Error('工具样本调度起止必须成对出现：' + what);
+  if (dispatchStart !== null && instantMicros(dispatchEnd) < instantMicros(dispatchStart)) {
+    throw new Error('工具样本调度起止逆序：' + what);
+  }
+  checkSourceLoc(sample.source, '工具样本来源');
+  return sample.value;
+}
+function toolWallOf(samples) {
+  // Recompute the saved span envelope from the samples themselves (audit rule).
+  if (!samples.length) return ['unknown', null];
+  const begins = [], ends = [];
+  let missing = false;
+  for (const sample of samples) {
+    const start = sample.dispatch_start || sample.exec_start;
+    const end = sample.dispatch_end || sample.exec_end;
+    if (start === null || end === null) { missing = true; continue; }
+    if (instantMicros(end) < instantMicros(start)) return ['conflict', null];
+    begins.push(instantMicros(start));
+    ends.push(instantMicros(end));
+  }
+  if (missing) return ['unknown', null];
+  const min = begins.reduce((a, b) => a < b ? a : b);
+  const max = ends.reduce((a, b) => a > b ? a : b);
+  return ['known', (max - min) / 1000n * 1000000n];
+}
+function checkToolDurationBlock(obj, metric, tzName) {
+  // Tool-execution-duration metric: independent channel (samples never reference token
+  // records), exact ns sums, the span envelope recomputed from samples, and unmerged
+  // supplements listed with reasons.
+  const what = '性能指标 tool_duration';
+  const support = metric.support;
+  const samples = metric.samples, aggregate = metric.aggregate, projections = metric.projections;
+  if (!projections || typeof projections !== 'object' || Array.isArray(projections)
+      || Object.keys(projections).sort().join(',') !== 'category,day,session') {
+    throw new Error('工具指标投影结构无效：' + what);
+  }
+  if (!aggregate || typeof aggregate !== 'object'
+      || Object.keys(aggregate).sort().join(',')
+         !== 'candidates,denominator,display,excluded,excluded_by_kind,exclusion_reasons,no_token_record,numerator,supplements,valid,wall') {
+    throw new Error('工具指标聚合结构无效：' + what);
+  }
+  const display = aggregate.display;
+  if (!display || typeof display !== 'object' || display.decimals !== 2n
+      || display.rounding !== 'half_up' || typeof display.note !== 'string') throw new Error('性能显示精度说明无效：' + what);
+  const wall = aggregate.wall;
+  if (!wall || typeof wall !== 'object'
+      || Object.keys(wall).sort().join(',') !== 'basis,reason,state,unit,value'
+      || wall.unit !== 'ns' || !['known', 'unknown', 'conflict'].includes(wall.state)
+      || typeof wall.basis !== 'string' || !wall.basis || typeof wall.reason !== 'string' || !wall.reason
+      || (wall.value !== null && (typeof wall.value !== 'bigint' || wall.value < 0n))) {
+    throw new Error('工具跨度包络无效：' + what);
+  }
+  const supplements = aggregate.supplements;
+  if (!Array.isArray(supplements)) throw new Error('工具补充项结构无效：' + what);
+  supplements.forEach((item, i) => {
+    if (!item || typeof item !== 'object'
+        || Object.keys(item).sort().join(',') !== 'key,reason,session,source'
+        || typeof item.key !== 'string' || typeof item.session !== 'string'
+        || typeof item.reason !== 'string' || !item.reason) throw new Error('工具补充项结构无效：' + what + ' supplements ' + i);
+    checkSourceLoc(item.source, '工具补充项来源');
+  });
+  const nonnegCount = value => typeof value === 'bigint' && value >= 0n;
+  if (support.status !== 'supported') {
+    if (!support.reason || samples.length || projections.category.length || projections.session.length || projections.day.length) {
+      throw new Error('不可用指标不得携带有效样本或投影：' + what);
+    }
+    if (aggregate.valid !== 0n || aggregate.excluded !== 0n || aggregate.numerator !== 0n || aggregate.denominator !== 0n
+        || aggregate.no_token_record !== 0n || Object.keys(aggregate.exclusion_reasons).length
+        || PERF_EXCLUSION_KINDS.some(k => aggregate.excluded_by_kind[k] !== 0n)) {
+      throw new Error('不可用指标不得携带有效值：' + what);
+    }
+    if (!nonnegCount(aggregate.candidates)) throw new Error('性能候选计数无效：' + what);
+    if (wall.value !== null || wall.state !== 'unknown') throw new Error('不可用指标不得携带跨度包络值：' + what);
+    return;
+  }
+  const keys = samples.map(s => s && s.key);
+  if (new Set(keys).size !== keys.length) throw new Error('工具样本键重复：' + what);
+  if (keys.some((k, i) => i && keys[i - 1] >= k)) throw new Error('工具样本顺序无效（须按键排序）：' + what);
+  let total = 0n;
+  samples.forEach((sample, i) => { total += checkToolSample(sample, what + ' 样本 ' + i); });
+  for (const field of ['candidates', 'valid', 'excluded', 'numerator', 'denominator', 'no_token_record']) {
+    if (!nonnegCount(aggregate[field])) throw new Error('工具聚合计数无效：' + what);
+  }
+  if (aggregate.valid !== BigInt(samples.length) || aggregate.candidates !== aggregate.valid + aggregate.excluded) {
+    throw new Error('工具候选/有效/排除计数不一致：' + what);
+  }
+  if (aggregate.numerator !== total || aggregate.denominator !== BigInt(samples.length)
+      || aggregate.no_token_record !== BigInt(samples.length)) {
+    throw new Error('工具聚合分子/分母与样本重算不一致：' + what);
+  }
+  const kinds = aggregate.excluded_by_kind;
+  if (!kinds || typeof kinds !== 'object' || Object.keys(kinds).sort().join(',') !== PERF_EXCLUSION_KINDS.slice().sort().join(',')
+      || PERF_EXCLUSION_KINDS.some(k => !nonnegCount(kinds[k]))
+      || PERF_EXCLUSION_KINDS.reduce((sum, k) => sum + kinds[k], 0n) !== aggregate.excluded) {
+    throw new Error('工具排除分类计数不一致：' + what);
+  }
+  const reasons = aggregate.exclusion_reasons;
+  if (!reasons || typeof reasons !== 'object' || Array.isArray(reasons)
+      || Object.keys(reasons).some(r => typeof reasons[r] !== 'bigint' || reasons[r] < 1n)
+      || Object.keys(reasons).reduce((sum, r) => sum + reasons[r], 0n) !== aggregate.excluded) {
+    throw new Error('工具排除原因计数不一致：' + what);
+  }
+  const wallParts = toolWallOf(samples);
+  if (wall.state !== wallParts[0] || wall.value !== wallParts[1]) throw new Error('工具跨度包络与样本重算不一致：' + what);
+  const memberCheck = (members, keyOf, labelField) => {
+    const groups = new Map();
+    for (const sample of samples) {
+      const key = keyOf(sample);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(sample.key);
+    }
+    if (!Array.isArray(members) || members.length !== groups.size) throw new Error('工具投影成员集合与样本重算不一致：' + what);
+    const seen = new Set();
+    members.forEach(member => {
+      if (!member || typeof member !== 'object'
+          || Object.keys(member).sort().join(',') !== [labelField, 'denominator', 'numerator', 'sample_keys'].sort().join(',')) {
+        throw new Error('工具投影成员结构无效：' + what);
+      }
+      const label = member[labelField];
+      if (typeof label !== 'string' || !label) throw new Error('工具投影成员标签无效：' + what);
+      if (seen.has(label) || !groups.has(label)) throw new Error('工具投影成员重复或无对应样本：' + what);
+      seen.add(label);
+      const expectedKeys = groups.get(label).slice().sort();
+      if (!Array.isArray(member.sample_keys) || member.sample_keys.length !== expectedKeys.length
+          || expectedKeys.some((k, i) => member.sample_keys[i] !== k)) {
+        throw new Error('工具投影成员样本集合与重算不一致：' + what);
+      }
+      let numerator = 0n;
+      for (const sample of samples) if (groups.get(label).includes(sample.key)) numerator += sample.value;
+      if (member.numerator !== numerator || member.denominator !== BigInt(groups.get(label).length)) {
+        throw new Error('工具投影成员分子/分母与样本重算不一致：' + what);
+      }
+    });
+    const sortedKeys = [...seen].sort();
+    if (members.some((m, i) => m[labelField] !== sortedKeys[i])) throw new Error('工具投影成员顺序无效：' + what);
+  };
+  memberCheck(projections.category, s => s.category, 'category');
+  memberCheck(projections.session, s => s.session, 'session');
+  memberCheck(projections.day, s => perfDayOf(s.completed_at, tzName), 'date');
+}
+function checkPerformanceBlock(obj, perf) {
+  // Independent per-metric valid sets with exact numerator/denominator; conflicting
+  // samples, dangling record references, negative/non-finite valid values and aggregate
+  // inconsistencies are rejected, never silently dropped.
+  if (!perf || typeof perf !== 'object' || Array.isArray(perf)
+      || Object.keys(perf).sort().join(',') !== 'harness,metrics,note,source_kind,tz') {
+    throw new Error('性能分析扩展结构无效');
+  }
+  if (perf.harness !== obj.harness || perf.source_kind !== obj.input.kind) {
+    throw new Error('性能分析与本报告 Harness/来源入口不一致');
+  }
+  const tz = perf.tz;
+  if (!tz || typeof tz !== 'object' || Object.keys(tz).sort().join(',') !== 'evidence,name'
+      || typeof tz.name !== 'string' || !tz.name || typeof tz.evidence !== 'string' || !tz.evidence) {
+    throw new Error('性能分析日分布时区说明无效');
+  }
+  if (typeof perf.note !== 'string' || !perf.metrics || typeof perf.metrics !== 'object' || Array.isArray(perf.metrics)
+      || !perf.metrics.ttft || !perf.metrics.throughput
+      || Object.keys(perf.metrics).some(k => !PERF_ALL_METRICS.includes(k))) throw new Error('性能分析指标结构无效');
+  const recordsByKey = new Map((obj.records || []).map(r => [r.key, r]));
+  for (const name of PERF_ALL_METRICS) {
+    if (!(name in perf.metrics)) continue;  // reports saved before the tool metric stay legal
+    const what = '性能指标 ' + name;
+    const metric = perf.metrics[name];
+    if (!metric || typeof metric !== 'object'
+        || Object.keys(metric).sort().join(',') !== 'admission,aggregate,definition,label,overhead,projections,samples,support,unit,units') {
+      throw new Error('性能指标结构无效：' + what);
+    }
+    for (const field of ['label', 'definition', 'admission']) {
+      if (typeof metric[field] !== 'string' || !metric[field]) throw new Error('性能指标事件定义无效：' + what);
+    }
+    if (metric.unit !== PERF_UNITS[name].value || !sameUnits(metric.units, PERF_UNITS[name])) throw new Error('性能指标单位无效：' + what);
+    if ((name !== 'throughput' && metric.overhead !== null)
+        || (name === 'throughput' && (typeof metric.overhead !== 'string' || !metric.overhead))) {
+      throw new Error('性能指标开销标注无效：' + what);
+    }
+    const support = metric.support;
+    if (!support || typeof support !== 'object' || Object.keys(support).sort().join(',') !== 'reason,status'
+        || !PERF_SUPPORT_STATES.includes(support.status) || typeof support.reason !== 'string') {
+      throw new Error('性能指标支持状态无效：' + what);
+    }
+    if (!Array.isArray(metric.samples)) throw new Error('性能指标样本/投影结构无效：' + what);
+    if (name === 'tool_duration') {
+      checkToolDurationBlock(obj, metric, perf.tz.name);
+      continue;
+    }
+    const samples = metric.samples, aggregate = metric.aggregate, projections = metric.projections;
+    if (!Array.isArray(samples) || !projections || typeof projections !== 'object'
+        || Object.keys(projections).sort().join(',') !== 'day,model,session') throw new Error('性能指标样本/投影结构无效：' + what);
+    if (!aggregate || typeof aggregate !== 'object'
+        || Object.keys(aggregate).sort().join(',') !== 'candidates,denominator,display,excluded,excluded_by_kind,exclusion_reasons,no_token_record,numerator,valid') {
+      throw new Error('性能聚合结构无效：' + what);
+    }
+    const display = aggregate.display;
+    if (!display || typeof display !== 'object' || display.decimals !== 2n
+        || display.rounding !== 'half_up' || typeof display.note !== 'string') throw new Error('性能显示精度说明无效：' + what);
+    const nonnegCount = value => typeof value === 'bigint' && value >= 0n;
+    if (support.status !== 'supported') {
+      if (!support.reason || samples.length || projections.model.length || projections.session.length || projections.day.length) {
+        throw new Error('不可用指标不得携带有效样本或投影：' + what);
+      }
+      if (aggregate.valid !== 0n || aggregate.excluded !== 0n || aggregate.numerator !== 0n || aggregate.denominator !== 0n
+          || aggregate.no_token_record !== 0n || Object.keys(aggregate.exclusion_reasons).length
+          || PERF_EXCLUSION_KINDS.some(k => aggregate.excluded_by_kind[k] !== 0n)) {
+        throw new Error('不可用指标不得携带有效值：' + what);
+      }
+      if (!nonnegCount(aggregate.candidates)) throw new Error('性能候选计数无效：' + what);
+      continue;
+    }
+    const keys = samples.map(s => s && s.key);
+    if (new Set(keys).size !== keys.length) throw new Error('性能样本键重复：' + what);
+    if (keys.some((k, i) => i && keys[i - 1] >= k)) throw new Error('性能样本顺序无效（须按键排序）：' + what);
+    let numerator = 0n, denominator = 0n, noToken = 0n;
+    samples.forEach((sample, i) => {
+      const parts = checkPerfSample(sample, name, recordsByKey, what + ' 样本 ' + i);
+      numerator += parts[0];
+      denominator += parts[1];
+      if (sample.record_key === null) noToken += 1n;
+    });
+    for (const field of ['candidates', 'valid', 'excluded', 'numerator', 'denominator', 'no_token_record']) {
+      if (!nonnegCount(aggregate[field])) throw new Error('性能聚合计数无效：' + what);
+    }
+    if (aggregate.valid !== BigInt(samples.length) || aggregate.candidates !== aggregate.valid + aggregate.excluded) {
+      throw new Error('性能候选/有效/排除计数不一致：' + what);
+    }
+    if (aggregate.numerator !== numerator || aggregate.denominator !== denominator) {
+      throw new Error('性能聚合分子/分母与样本重算不一致：' + what);
+    }
+    if (aggregate.no_token_record !== noToken) throw new Error('性能无 token 记录样本计数不一致：' + what);
+    const kinds = aggregate.excluded_by_kind;
+    if (!kinds || typeof kinds !== 'object' || Object.keys(kinds).sort().join(',') !== PERF_EXCLUSION_KINDS.slice().sort().join(',')
+        || PERF_EXCLUSION_KINDS.some(k => !nonnegCount(kinds[k]))
+        || PERF_EXCLUSION_KINDS.reduce((sum, k) => sum + kinds[k], 0n) !== aggregate.excluded) {
+      throw new Error('性能排除分类计数不一致：' + what);
+    }
+    const reasons = aggregate.exclusion_reasons;
+    if (!reasons || typeof reasons !== 'object' || Array.isArray(reasons)
+        || Object.keys(reasons).some(r => typeof reasons[r] !== 'bigint' || reasons[r] < 1n)
+        || Object.keys(reasons).reduce((sum, r) => sum + reasons[r], 0n) !== aggregate.excluded) {
+      throw new Error('性能排除原因计数不一致：' + what);
+    }
+    const partOf = sample => name === 'ttft' ? [sample.value, 1n] : [sample.output, sample.interval_ms];
+    const eventOf = sample => name === 'ttft' ? sample.first_token_at : sample.completed_at;
+    const memberCheck = (members, keyOf, labelField, labelOf, labelCheck) => {
+      const groups = new Map();
+      for (const sample of samples) {
+        const key = keyOf(sample);
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(sample.key);
+      }
+      if (!Array.isArray(members) || members.length !== groups.size) throw new Error('性能投影成员集合与样本重算不一致：' + what);
+      const seen = new Set();
+      members.forEach(member => {
+        if (!member || typeof member !== 'object'
+            || Object.keys(member).sort().join(',') !== [labelField, 'denominator', 'numerator', 'sample_keys'].sort().join(',')) {
+          throw new Error('性能投影成员结构无效：' + what);
+        }
+        const key = labelOf(labelCheck(member[labelField]));
+        if (seen.has(key) || !groups.has(key)) throw new Error('性能投影成员重复或无对应样本：' + what);
+        seen.add(key);
+        const expectedKeys = groups.get(key).slice().sort();
+        if (!Array.isArray(member.sample_keys) || member.sample_keys.length !== expectedKeys.length
+            || expectedKeys.some((k, i) => member.sample_keys[i] !== k)) {
+          throw new Error('性能投影成员样本集合与重算不一致：' + what);
+        }
+        let n = 0n, d = 0n;
+        for (const sample of samples) {
+          if (!groups.get(key).includes(sample.key)) continue;
+          const parts = partOf(sample);
+          n += parts[0];
+          d += parts[1];
+        }
+        if (member.numerator !== n || member.denominator !== d) throw new Error('性能投影成员分子/分母与样本重算不一致：' + what);
+      });
+      const sortedKeys = [...seen].sort();
+      if (members.some((m, i) => labelOf(labelCheck(m[labelField])) !== sortedKeys[i])) {
+        throw new Error('性能投影成员顺序无效：' + what);
+      }
+    };
+    memberCheck(projections.model,
+      s => (s.provider === null ? '' : s.provider) + '' + s.model, 'identity',
+      label => (label.provider === null ? '' : label.provider) + '' + label.model,
+      label => {
+        if (!label || typeof label !== 'object' || Object.keys(label).sort().join(',') !== 'model,provider'
+            || (label.provider !== null && typeof label.provider !== 'string')
+            || typeof label.model !== 'string' || !label.model) throw new Error('性能投影模型身份无效：' + what);
+        return label;
+      });
+    memberCheck(projections.session, s => s.session, 'session', label => label, label => {
+      if (typeof label !== 'string' || !label) throw new Error('性能投影成员标签无效：' + what);
+      return label;
+    });
+    memberCheck(projections.day, s => perfDayOf(eventOf(s), tz.name), 'date', label => label, label => {
+      if (typeof label !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(label)) throw new Error('性能投影成员标签无效：' + what);
+      return label;
+    });
+  }
+}
+function checkAnalysisBlock(obj) {
+  const ext = obj.analysis;
+  if (!ext || typeof ext !== 'object' || Array.isArray(ext)) throw new Error('未知的分析扩展版本或结构');
+  const extKeys = Object.keys(ext);
+  if (typeof ext.schema_version !== 'bigint' || ext.schema_version !== 1n
+      || extKeys.some(k => !['schema_version', 'cost', 'performance'].includes(k))
+      || (!ext.cost && !ext.performance)) throw new Error('未知的分析扩展版本或结构');
+  if (ext.cost) checkCostBlock(obj, ext.cost);
+  if (ext.performance) checkPerformanceBlock(obj, ext.performance);
+}
+
+function checkCostBlock(obj, cost) {
+  const overall = (typeof obj.format_version === 'bigint' ? Number(obj.format_version) : obj.format_version) === 3;
+  // Projections are required on overall (v3) reports and forbidden on single-session ones.
+  const expectedCostKeys = overall ? 'config,projections,records,summary' : 'config,records,summary';
+  if (typeof cost !== 'object' || Array.isArray(cost)
+      || Object.keys(cost).sort().join(',') !== expectedCostKeys) throw new Error('费用分析扩展结构无效');
+  const { rules, aliases } = checkPricingConfig(cost.config);
+  if (!Array.isArray(cost.records)) throw new Error('费用分析逐记录计价必须是数组');
+  const meteredByKey = new Map((obj.records || []).map(record => [record.key, record]));
+  const keys = [];
+  cost.records.forEach((entry, i) => {
+    const what = 'analysis.records ' + i;
+    if (!entry || typeof entry !== 'object') throw new Error('逐记录计价结构无效：' + what);
+    for (const key of Object.keys(entry)) {
+      if (!['record_key', 'identity', 'status', 'currency', 'matched', 'components', 'unpriced', 'conflicts'].includes(key)) {
+        throw new Error('逐记录计价结构无效：' + what);
+      }
+    }
+    if (typeof entry.record_key !== 'string') throw new Error('逐记录计价缺少记录引用：' + what);
+    keys.push(entry.record_key);
+    if (!['priced', 'partially_priced', 'unpriced', 'rule_conflict'].includes(entry.status)) {
+      throw new Error('逐记录计价状态未知：' + what);
+    }
+    if (entry.identity !== null && entry.identity !== undefined) {
+      const identity = entry.identity;
+      if (typeof identity !== 'object' || typeof identity.provider !== 'string' || !identity.provider
+          || typeof identity.model !== 'string' || !identity.model) throw new Error('逐记录计价身份无效：' + what);
+    }
+    let rule = null;
+    if (entry.matched !== null && entry.matched !== undefined) {
+      const matched = entry.matched;
+      if (typeof matched !== 'object' || typeof matched.rule_id !== 'string') throw new Error('逐记录计价命中结构无效：' + what);
+      rule = rules.get(matched.rule_id);
+      if (!rule) throw new Error('逐记录计价引用了配置中不存在的规则：' + what);
+      if (matched.alias_id !== null && matched.alias_id !== undefined && !aliases.has(matched.alias_id)) {
+        throw new Error('逐记录计价引用了配置中不存在的别名：' + what);
+      }
+      const record = meteredByKey.get(entry.record_key), identity = entry.identity;
+      if (!identity || !record || identity.provider !== record.provider || identity.model !== record.model) {
+        throw new Error('计价身份与引用计量记录不一致：' + what);
+      }
+      let ruleIdentity = identity;
+      if (matched.alias_id !== null && matched.alias_id !== undefined) {
+        const alias = (cost.config.aliases || []).find(a => a.id === matched.alias_id
+          && a.from.provider === identity.provider && a.from.model === identity.model);
+        if (!alias) {
+          throw new Error('计价别名来源身份与引用计量记录不一致：' + what);
+        }
+        ruleIdentity = alias.to;
+      }
+      if (ruleIdentity.provider !== rule.provider || ruleIdentity.model !== rule.model) {
+        throw new Error('命中价格规则身份与引用计量记录或别名目标不一致：' + what);
+      }
+      if (entry.currency !== rule.currency) throw new Error('逐记录计价币种与命中规则不一致：' + what);
+    }
+    if (!Array.isArray(entry.components)) throw new Error('逐记录计价分项无效：' + what);
+    const expected = rule ? new Map(ruleComponentPrices(rule)) : new Map();
+    const seen = new Set();
+    for (const component of entry.components) {
+      if (!component || typeof component !== 'object') throw new Error('计价分项结构无效：' + what);
+      if (!expected.has(component.name) || seen.has(component.name)) throw new Error('计价分项不属于命中规则或重复：' + what);
+      seen.add(component.name);
+      if (!isIndex(component.tokens)) throw new Error('计价分项 token 必须为非负整数：' + what);
+      const record = meteredByKey.get(entry.record_key);
+      const partition = record ? componentTokens(component.name, record.metrics) : null;
+      if (partition === null || component.tokens !== partition) throw new Error('计价分区 token 与引用计量记录不一致：' + what);
+      if (component.price_per_million !== expected.get(component.name)) throw new Error('计价分项单价与命中规则不一致：' + what);
+      if (componentAmountText(component.tokens, component.price_per_million) !== component.amount) {
+        throw new Error('计价分项金额与精确 token×单价 不一致：' + what);
+      }
+    }
+    if (!Array.isArray(entry.unpriced)) throw new Error('逐记录未定价原因无效：' + what);
+    for (const item of entry.unpriced) {
+      if (!item || typeof item !== 'object'
+          || (item.component !== null && typeof item.component !== 'string')
+          || typeof item.reason !== 'string') throw new Error('逐记录未定价原因无效：' + what);
+    }
+    const total = expected.size;
+    if (entry.status === 'priced' && (!rule || entry.components.length !== total)) throw new Error('计价状态与分项不一致：' + what);
+    if (entry.status === 'partially_priced' && !(rule && entry.components.length > 0 && entry.components.length < total)) {
+      throw new Error('计价状态与分项不一致：' + what);
+    }
+    if (['unpriced', 'rule_conflict'].includes(entry.status) && entry.components.length) {
+      throw new Error('计价状态与分项不一致：' + what);
+    }
+    if (entry.status === 'rule_conflict') {
+      if (entry.matched !== null && entry.matched !== undefined) throw new Error('规则冲突记录不得携带命中规则：' + what);
+      if (!Array.isArray(entry.conflicts) || entry.conflicts.length < 2
+          || entry.conflicts.some(c => typeof c !== 'string' || !rules.has(c))) {
+        throw new Error('规则冲突记录须列出配置中存在的冲突规则：' + what);
+      }
+    } else if ('conflicts' in entry) {
+      throw new Error('非冲突记录不得携带冲突规则列表：' + what);
+    }
+  });
+  if (new Set(keys).size !== keys.length) throw new Error('逐记录计价记录引用重复');
+  const metered = new Set((obj.records || []).map(r => r.key));
+  if (keys.length !== metered.size || keys.some(k => !metered.has(k))) {
+    throw new Error('逐记录计价未覆盖本报告全部计量记录或引用悬空');
+  }
+  const summary = cost.summary;
+  if (!summary || typeof summary !== 'object'
+      || Object.keys(summary).sort().join(',') !== 'currencies,display,partially_priced,priced,records,rule_conflicts,unpriced,unpriced_reasons') {
+    throw new Error('费用摘要结构无效');
+  }
+  const counts = { records: 0n, priced: 0n, partially_priced: 0n, unpriced: 0n, rule_conflicts: 0n };
+  const reasons = {};
+  const recordCounts = {};
+  for (const entry of cost.records) {
+    counts.records += 1n;
+    counts[{ priced: 'priced', partially_priced: 'partially_priced', unpriced: 'unpriced', rule_conflict: 'rule_conflicts' }[entry.status]] += 1n;
+    for (const item of entry.unpriced) reasons[item.reason] = (reasons[item.reason] || 0n) + 1n;
+    if (!entry.components.length) continue;
+    const countsBucket = recordCounts[entry.currency] = recordCounts[entry.currency] || { priced_records: 0n, partially_priced_records: 0n };
+    countsBucket[{ priced: 'priced_records', partially_priced: 'partially_priced_records' }[entry.status]] += 1n;
+  }
+  const totals = costTotals(cost.records);
+  for (const field of ['records', 'priced', 'partially_priced', 'unpriced', 'rule_conflicts']) {
+    if (summary[field] !== counts[field]) throw new Error('费用摘要计数与逐记录计价不一致');
+  }
+  const currencies = summary.currencies;
+  if (!currencies || typeof currencies !== 'object' || Array.isArray(currencies)) throw new Error('费用摘要币种无效');
+  const expectedCurrencies = Object.keys(totals).sort();
+  if (Object.keys(currencies).sort().join('') !== expectedCurrencies.join('')) throw new Error('费用摘要币种集合与逐记录计价不一致');
+  for (const currency of expectedCurrencies) {
+    const bucket = currencies[currency];
+    const expected = totals[currency];
+    if (!bucket || typeof bucket !== 'object'
+        || Object.keys(bucket).sort().join(',') !== 'amount,components,partially_priced_records,priced_records') {
+      throw new Error('币种费用摘要结构无效：' + currency);
+    }
+    if (bucket.amount !== sumAmounts(expected.amounts)) throw new Error('币种费用摘要金额与逐记录计价不一致：' + currency);
+    if (bucket.priced_records !== recordCounts[currency].priced_records
+        || bucket.partially_priced_records !== recordCounts[currency].partially_priced_records) {
+      throw new Error('币种费用摘要计数不一致：' + currency);
+    }
+    const names = Object.keys(expected.components).sort();
+    if (!bucket.components || typeof bucket.components !== 'object'
+        || Object.keys(bucket.components).sort().join('') !== names.join('')) throw new Error('币种费用摘要分项集合不一致：' + currency);
+    for (const name of names) {
+      const cell = bucket.components[name];
+      const expectedCell = expected.components[name];
+      if (!cell || typeof cell !== 'object' || cell.tokens !== expectedCell.tokens
+          || cell.amount !== sumAmounts(expectedCell.amounts)) {
+        throw new Error('币种费用摘要分项与逐记录计价不一致：' + currency);
+      }
+    }
+  }
+  const summaryReasons = summary.unpriced_reasons;
+  if (!summaryReasons || typeof summaryReasons !== 'object' || Array.isArray(summaryReasons)) throw new Error('费用摘要未定价原因无效');
+  const reasonKeys = Object.keys(reasons);
+  if (Object.keys(summaryReasons).length !== reasonKeys.length
+      || reasonKeys.some(k => summaryReasons[k] !== reasons[k])) throw new Error('费用摘要未定价原因与逐记录计价不一致');
+  const display = summary.display;
+  if (!display || typeof display !== 'object' || display.decimals !== 2n
+      || display.rounding !== 'half_up' || typeof display.note !== 'string') throw new Error('费用摘要显示精度说明无效');
+  if (overall) checkCostProjections(obj, cost.records, cost.projections);
+}
+
 function validateReport(obj) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error('JSON 顶层必须是报告对象');
   // Lossless parsing turns integer literals into BigInt; normalize small contract integers.
@@ -424,6 +1299,10 @@ function validateReport(obj) {
     if (version === 1) throw new Error('v1 报告不含解释扩展');
     checkExplanationBlock(obj.explanation, obj);
   }
+  if ('analysis' in obj) {
+    if (version === 1) throw new Error('v1 报告不含分析扩展');
+    checkAnalysisBlock(obj);
+  }
   for (const key of ['read_at', 'status', 'coverage']) requireString(obj[key], '报告元数据 ' + key);
   const input = obj.input;
   if (!input || !['jsonl', 'zcode_database'].includes(input.kind)
@@ -451,7 +1330,7 @@ function percent(rate) {
   if (rate.value === null) {
     return { text: rate.state === 'not_applicable' ? '不适用（配对输入为 0）' : '未知', unknown: true };
   }
-  const pct = (rate.value * 100);
+  const pct = (typeof rate.value === 'bigint' ? Number(rate.value) : rate.value) * 100;
   const text = (Number.isInteger(pct) ? pct.toFixed(0) : pct.toFixed(3).replace(/0+$/, '')) + '%';
   if (rate.state === 'partial') {
     return { text: text + `（已知子集：${rate.paired_records.toString()} 条，配对输入 ${rate.input.toString()}）`, partial: true };
@@ -464,6 +1343,21 @@ function el(tag, className, text) {
   if (text !== undefined) node.textContent = text;
   return node;
 }
+function tableScroll(table) {
+  const wrap = el('div', 'table-scroll');
+  wrap.appendChild(table);
+  return wrap;
+}
+function evidenceCard(title, nodes) {
+  const details = el('details', 'card evidence');
+  const summary = document.createElement('summary');
+  summary.textContent = title;
+  details.appendChild(summary);
+  const body = el('div', 'evidence-body');
+  nodes.forEach(n => body.appendChild(n));
+  details.appendChild(body);
+  return details;
+}
 function metricCell(tableCell, value, state) {
   const info = cellInt(value, state);
   tableCell.textContent = info.text;
@@ -473,7 +1367,7 @@ function metricCell(tableCell, value, state) {
 }
 function addRow(tbody, name, aggregate, emphasize) {
   const tr = document.createElement('tr');
-  if (emphasize) tr.style.fontWeight = '600';
+  if (emphasize) tr.classList.add('emphasize');
   tr.appendChild(el('td', null, name));
   for (const key of ['input', 'output', 'cache_read']) {
     metricCell(tr.appendChild(document.createElement('td')), aggregate.metrics[key].value, aggregate.metrics[key].state);
@@ -551,7 +1445,7 @@ function buildInternalRelationsCard(obj, locate) {
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
-    frag.appendChild(table);
+    frag.appendChild(tableScroll(table));
   }
   if (exp.relations && exp.relations.length) {
     frag.appendChild(el('h3', null, '会话关系（既有明确关系，不推断新关系）'));
@@ -604,13 +1498,18 @@ function buildRecordsDetail(obj) {
         : '收起调用明细';
       if (!host.firstChild) renderRecordsTable();
     });
-    nodes = [el('h2', null, '调用明细'), toggle, host];
+    nodes = [toggle, host];
 
     locateRecordsByKeys = keys => {
       if (!keys.length) return;
       locatedKeys = keys.slice();
       if (host.hidden) { host.hidden = false; toggle.textContent = '收起调用明细'; }
       drawRecordsTable();
+      let ancestor = host.parentElement;
+      while (ancestor) {
+        if (ancestor.tagName === 'DETAILS') ancestor.open = true;
+        ancestor = ancestor.parentElement;
+      }
       host.scrollIntoView({ block: 'nearest' });
     };
 
@@ -696,7 +1595,7 @@ function buildRecordsDetail(obj) {
           + (hasExplanation ? '' : '旧报告未保存记录级解释，仅展示已保存字段。');
       }
       host.appendChild(bar);
-      host.appendChild(table);
+      host.appendChild(tableScroll(table));
       host.appendChild(el('p', 'hint-line', '明细只展示报告已保存的白名单元数据（身份、时间、指标状态与来源定位）；不在浏览器重新归属或计量，不读取来源文件。'));
     }
 
@@ -825,13 +1724,701 @@ function buildTimelineCard(obj, locate) {
         tbody.appendChild(tr);
       }
       table.appendChild(tbody);
-      frag.appendChild(table);
+      frag.appendChild(tableScroll(table));
       if (!obj.explanation.turns.length) {
         frag.appendChild(el('p', 'unavailable', '本报告未保存轮次时间线行（旧报告或范围内无轮次证据）。'));
       }
       frag.appendChild(el('p', 'hint-line', '时间行“定位记录”只改变明细可见集合；范围、合计、分母与截止点不变，且不读取来源。'));
   }
   return frag;
+}
+
+function buildCostSection(obj) {
+  // Cost display only consumes the saved analysis extension; the browser never matches
+  // prices, recomputes amounts or re-aggregates beyond what the report saved.
+  const nodes = [el('h2', null, '费用估算（按币种分别小计；不做汇率换算；已定价部分不是账单结论）')];
+  const ext = obj.analysis;
+  if (!ext || !ext.cost) {
+    nodes.push(el('p', 'hint-line', ext
+      ? '本次查询未配置价格，结果不含费用估算；token 与性能结果不受影响，明确带价格重算才生成费用。'
+      : '本报告未保存费用分析（未配置价格的查询或旧报告）；token 结果不受影响，明确带价格重算才生成费用。'));
+    return nodes;
+  }
+  const cost = ext.cost;
+  const summary = cost.summary;
+  const config = cost.config;
+  nodes.push(el('p', 'hint-line', '价格配置快照：schema v' + ext.schema_version.toString() + '，修订 ' + config.revision
+    + '；规则 ' + config.rules.length + ' 条、别名 ' + config.aliases.length + ' 条（含未命中规则，依据见下方展开区）。'));
+  const currencies = Object.keys(summary.currencies).sort();
+  if (currencies.length) {
+    const table = document.createElement('table');
+    const headRow = document.createElement('tr');
+    ['币种', '已定价小计（两位小数四舍五入）', '精确未舍入值', '完整计价记录', '部分计价记录'].forEach(h => headRow.appendChild(el('th', null, h)));
+    const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = document.createElement('tbody'); table.appendChild(tbody);
+    for (const currency of currencies) {
+      const bucket = summary.currencies[currency];
+      const tr = document.createElement('tr');
+      tr.appendChild(el('td', null, currency));
+      tr.appendChild(el('td', null, displayAmount(bucket.amount)));
+      tr.appendChild(el('td', null, bucket.amount));
+      tr.appendChild(el('td', null, bucket.priced_records.toString()));
+      tr.appendChild(el('td', null, bucket.partially_priced_records.toString()));
+      tbody.appendChild(tr);
+    }
+    nodes.push(tableScroll(table));
+    for (const currency of currencies) {
+      const bucket = summary.currencies[currency];
+      const parts = Object.keys(bucket.components).sort().map(name => {
+        const cell = bucket.components[name];
+        return (COST_COMPONENT_LABELS[name] || name) + ' ' + cell.tokens.toLocaleString('en-US') + '（金额 ' + cell.amount + '）';
+      });
+      nodes.push(el('p', 'hint-line', currency + ' 精确分项：' + parts.join('；') + '；各记录实际单价与命中规则见“逐记录计价”。'));
+    }
+  } else {
+    nodes.push(el('p', 'unavailable', '无任何已定价金额（范围内无记录或未命中规则；未知不画零，这不等于费用为零）。'));
+  }
+  const projections = cost.projections;
+  if (projections) {
+    // v3 only: model/session/day members and the unbucketed item, all saved views of the
+    // same priced components; they never add back into any total and never convert currency.
+    nodes.push(el('h3', null, '费用投影（同一计价结果按模型/会话/日期的独立视图，不再加入合计；各币种分别排行，不换汇）'));
+    const rankTables = (title, labelOf, members) => {
+      const frag = document.createDocumentFragment();
+      const memberCurrencies = [...new Set(members.flatMap(m => Object.keys(m.currencies)))].sort();
+      if (!memberCurrencies.length) {
+        frag.appendChild(el('p', 'unavailable', title + '：无已定价成员（未定价原因见上方摘要；未知不画零）。'));
+        return frag;
+      }
+      for (const currency of memberCurrencies) {
+        frag.appendChild(el('h3', null, title + '（' + currency + '，按精确金额降序）'));
+        const ranked = members.filter(m => m.currencies[currency])
+          .sort((a, b) => compareAmountTexts(b.currencies[currency].amount, a.currencies[currency].amount));
+        const table = document.createElement('table');
+        const headRow = document.createElement('tr');
+        ['行', '已定价金额（两位小数四舍五入）', '精确未舍入值', '计价记录'].forEach(h => headRow.appendChild(el('th', null, h)));
+        const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
+        const tbody = document.createElement('tbody'); table.appendChild(tbody);
+        for (const member of ranked) {
+          const tr = document.createElement('tr');
+          const labelCell = el('td', 'path', short(labelOf(member), 40));
+          labelCell.title = labelOf(member);
+          tr.appendChild(labelCell);
+          tr.appendChild(el('td', null, displayAmount(member.currencies[currency].amount)));
+          tr.appendChild(el('td', null, member.currencies[currency].amount));
+          tr.appendChild(el('td', null, String(member.record_keys.length)));
+          tbody.appendChild(tr);
+        }
+        frag.appendChild(tableScroll(table));
+      }
+      return frag;
+    };
+    nodes.push(rankTables('模型费用排行', m => m.identity.provider + ' / ' + m.identity.model, projections.model));
+    nodes.push(rankTables('会话费用排行', m => m.session, projections.session));
+    const dayCurrencies = [...new Set(projections.day.flatMap(d => Object.keys(d.currencies)))].sort();
+    if (dayCurrencies.length) {
+      for (const currency of dayCurrencies) {
+        nodes.push(el('h3', null, '日期费用分布（' + currency + '；只含保存日桶，未知不画零桶）'));
+        const table = document.createElement('table');
+        const headRow = document.createElement('tr');
+        ['日期', '已定价金额（两位小数四舍五入）', '精确未舍入值'].forEach(h => headRow.appendChild(el('th', null, h)));
+        const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
+        const tbody = document.createElement('tbody'); table.appendChild(tbody);
+        for (const member of projections.day) {
+          if (!member.currencies[currency]) continue;
+          const tr = document.createElement('tr');
+          tr.appendChild(el('td', null, member.date));
+          tr.appendChild(el('td', null, displayAmount(member.currencies[currency].amount)));
+          tr.appendChild(el('td', null, member.currencies[currency].amount));
+          tbody.appendChild(tr);
+        }
+        nodes.push(tableScroll(table));
+      }
+    } else {
+      nodes.push(el('p', 'unavailable', '日期费用分布：各保存日均无已定价金额（未知不画零桶）。'));
+    }
+    const unbucketedCurrencies = Object.keys(projections.unbucketed.currencies).sort();
+    nodes.push(el('p', 'hint-line', '无法归日：' + String(projections.unbucketed.record_keys.length)
+      + ' 条（累计区间跨日界等；已计入总览与对应币种小计，不分摊、不与日期视图再次相加）'
+      + (unbucketedCurrencies.length
+        ? '；已定价金额 ' + unbucketedCurrencies.map(c => c + ' ' + projections.unbucketed.currencies[c].amount).join('；')
+        : '；无已定价金额') + '。'));
+  }
+  nodes.push(el('p', null, '计价覆盖：计量记录 ' + summary.records.toString() + ' 条，完整计价 ' + summary.priced.toString()
+    + '、部分计价 ' + summary.partially_priced.toString() + '、未定价 ' + summary.unpriced.toString()
+    + '、规则冲突 ' + summary.rule_conflicts.toString() + '；已定价小计只含已计价分项，未定价金额未知，不用占比表示缺口。'));
+  const reasonKeys = Object.keys(summary.unpriced_reasons).sort();
+  if (reasonKeys.length) {
+    const ul = document.createElement('ul');
+    ul.className = 'notes';
+    for (const reason of reasonKeys) {
+      ul.appendChild(el('li', null, '未定价：' + reason + '（' + summary.unpriced_reasons[reason].toString() + ' 条）'));
+    }
+    nodes.push(ul);
+  }
+  nodes.push(el('p', 'hint-line', '显示精度：' + summary.display.note + '。'));
+  nodes.push(evidenceCard('价格配置与规则依据（本次完整快照）', [(() => {
+    const frag = document.createDocumentFragment();
+    const table = document.createElement('table');
+    const headRow = document.createElement('tr');
+    ['规则 ID', '供应商', '完整模型身份', '生效区间（左闭右开）', '币种', '输入分区', '输出分区', '来源'].forEach(h => headRow.appendChild(el('th', null, h)));
+    const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = document.createElement('tbody'); table.appendChild(tbody);
+    const partitionText = partition => {
+      const pairs = RULE_COMPONENTS[partition.kind].map(([name, key]) => (COST_COMPONENT_LABELS[name] || name) + ' ' + partition[key] + '/百万');
+      return pairs.join('；') + (partition.basis ? '（依据：' + partition.basis + '）' : '');
+    };
+    for (const rule of config.rules) {
+      const tr = document.createElement('tr');
+      tr.appendChild(el('td', null, rule.id));
+      tr.appendChild(el('td', null, rule.provider));
+      tr.appendChild(el('td', null, rule.model));
+      tr.appendChild(el('td', null, rule.effective_from + ' ~ ' + (rule.effective_to || '无上限')));
+      tr.appendChild(el('td', null, rule.currency));
+      tr.appendChild(el('td', null, partitionText(rule.input)));
+      tr.appendChild(el('td', null, partitionText(rule.output)));
+      tr.appendChild(el('td', null, rule.source.reference + '（' + rule.source.version + '）'));
+      tbody.appendChild(tr);
+    }
+    if (!config.rules.length) frag.appendChild(el('p', 'unavailable', '配置不含任何规则；全部记录保持未定价。'));
+    else frag.appendChild(tableScroll(table));
+    if (config.aliases.length) {
+      const ul = document.createElement('ul');
+      ul.className = 'notes';
+      for (const alias of config.aliases) {
+        ul.appendChild(el('li', null, '别名 ' + alias.id + '：' + alias.from.provider + '/' + alias.from.model
+          + ' → ' + alias.to.provider + '/' + alias.to.model + '（一次精确映射；依据：' + alias.basis
+          + '；来源：' + alias.source.reference + ' ' + alias.source.version + '）'));
+      }
+      frag.appendChild(ul);
+    }
+    return frag;
+  })()]));
+  nodes.push(evidenceCard('逐记录计价（引用本报告计量记录稳定键）', [(() => {
+    const table = document.createElement('table');
+    const headRow = document.createElement('tr');
+    ['记录', '价格身份（供应商/模型）', '状态', '命中规则', '计价分项（token × 单价/百万 = 金额）', '未定价原因'].forEach(h => headRow.appendChild(el('th', null, h)));
+    const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = document.createElement('tbody'); table.appendChild(tbody);
+    for (const entry of cost.records) {
+      const tr = document.createElement('tr');
+      const keyCell = tr.appendChild(el('td', 'path', short(entry.record_key, 28)));
+      keyCell.title = entry.record_key;
+      tr.appendChild(el('td', null, entry.identity ? entry.identity.provider + ' / ' + entry.identity.model : '未知'));
+      tr.appendChild(el('td', null, COST_STATUS_LABELS[entry.status] || entry.status));
+      tr.appendChild(el('td', null, entry.matched
+        ? entry.matched.rule_id + (entry.matched.alias_id ? '（经别名 ' + entry.matched.alias_id + '）' : '')
+        : entry.status === 'rule_conflict' ? '冲突：' + entry.conflicts.join('、') : '—'));
+      tr.appendChild(el('td', null, entry.components.map(c => (COST_COMPONENT_LABELS[c.name] || c.name)
+        + ' ' + c.tokens.toLocaleString('en-US') + ' × ' + c.price_per_million + ' = ' + c.amount).join('；') || '—'));
+      tr.appendChild(el('td', null, entry.unpriced.map(item => (item.component ? (COST_COMPONENT_LABELS[item.component] || item.component) + '：' : '') + item.reason).join('；') || '—'));
+      tbody.appendChild(tr);
+    }
+    if (!cost.records.length) return el('p', 'unavailable', '范围内无计量记录；无记录不自动视为费用零。');
+    return tableScroll(table);
+  })()]));
+  return nodes;
+}
+
+function perfRatioText(numerator, denominator, perSecond) {
+  // Exact two-decimal half-up of an integer ratio saved as numerator/denominator;
+  // perSecond rescales ms intervals to seconds. Never floats, never a fake zero.
+  const scaled = perSecond ? numerator * 100000n : numerator * 100n;
+  const rounded = (2n * scaled + denominator) / (2n * denominator);
+  return (rounded / 100n).toString() + '.' + (rounded % 100n).toString().padStart(2, '0');
+}
+
+const PERF_KIND_LABELS = { missing: '缺失', conflict: '冲突', unsupported: '无法证明', range: '范围外' };
+const PERF_COMPLETION_LABELS = { ended_before_cutoff: '截止前已完成', ended_after_cutoff: '截止点后结束', no_end_evidence: '无结束证据（未完成）' };
+const PERF_SUPPORT_LABELS = { supported: '支持', source_not_provided: '来源未提供', not_checked: '尚未核查' };
+
+function buildPerfMetricBlock(perf, name) {
+  const metric = perf.metrics[name];
+  // Display unit matches the CLI/Markdown wording; the saved contract unit stays 'token/s'.
+  const displayUnit = name === 'throughput' ? 'token/秒' : metric.unit;
+  const block = el('div', 'perf-metric');
+  block.appendChild(el('h3', null, metric.label + '（' + metric.definition + '）'));
+  block.appendChild(el('p', 'hint-line', '入样：' + metric.admission + '；单位：' + metric.unit
+    + (metric.overhead ? '；' + metric.overhead : '') + '。'));
+  const support = metric.support;
+  if (support.status !== 'supported') {
+    // A checked limitation replaces any chart: no all-unknown graph masquerading as support.
+    block.appendChild(el('p', 'unavailable', '不可用（' + (PERF_SUPPORT_LABELS[support.status] || support.status)
+      + '）：' + support.reason));
+    return block;
+  }
+  const aggregate = metric.aggregate;
+  const kindText = PERF_EXCLUSION_KINDS.map(k => PERF_KIND_LABELS[k] + ' ' + aggregate.excluded_by_kind[k].toString()).join('、');
+  block.appendChild(el('p', null, '候选 ' + aggregate.candidates.toString() + '；有效 ' + aggregate.valid.toString()
+    + '、排除 ' + aggregate.excluded.toString() + '（' + kindText + '）；无可靠候选分母时不给比例。'));
+  if (aggregate.denominator > 0n) {
+    const perSecond = name === 'throughput';
+    const valueText = perfRatioText(aggregate.numerator, aggregate.denominator, perSecond) + ' ' + displayUnit;
+    const detail = name === 'ttft'
+      ? '精确分子 ' + aggregate.numerator.toString() + ' ms ÷ 分母 ' + aggregate.denominator.toString() + ' 个有效样本'
+      : '同一有效集合输出 ' + aggregate.numerator.toString() + ' token ÷ 区间时长 ' + aggregate.denominator.toString() + ' ms 之和（不平均逐行速率）';
+    block.appendChild(el('p', null, (name === 'ttft' ? '有效样本均值 ' : '聚合吞吐 ') + valueText
+      + '（' + detail + '；显示两位小数四舍五入）；其中 ' + aggregate.no_token_record.toString()
+      + ' 条有效样本无对应 token 记录引用（性能独立入样）。'));
+  } else {
+    block.appendChild(el('p', 'unavailable', '无有效样本；不给均值/聚合值（未知不画零，不产生伪零或无穷值）。'));
+  }
+  const reasonKeys = Object.keys(aggregate.exclusion_reasons).sort();
+  if (reasonKeys.length) {
+    const ul = el('ul', 'notes');
+    for (const reason of reasonKeys) {
+      ul.appendChild(el('li', null, '排除原因：' + reason + '（' + aggregate.exclusion_reasons[reason].toString() + ' 条）'));
+    }
+    block.appendChild(ul);
+  }
+  if (!metric.samples.length) return block;
+
+  const perSecond = name === 'throughput';
+  const memberValue = member => perfRatioText(member.numerator, member.denominator, perSecond);
+  const memberGt = (a, b) => a.numerator * b.denominator > b.numerator * a.denominator;  // exact ratio compare
+
+  // Samples host with locate-by-saved-key; locating only changes the visible sample set.
+  const samplesHost = el('div');
+  let locatedKeys = null;
+  const drawSamples = () => {
+    samplesHost.textContent = '';
+    const located = locatedKeys !== null;
+    const bar = el('p', 'hint-line', '');
+    const table = document.createElement('table');
+    const headRow = document.createElement('tr');
+    const valueHead = name === 'ttft' ? 'TTFT（ms）' : '输出 ÷ 区间（ms）';
+    ['操作', '样本键', '会话', '轮次', '模型', '粒度', name === 'ttft' ? '完成状态' : '输出', valueHead, '依据', 'token 记录'].forEach(h => headRow.appendChild(el('th', null, h)));
+    const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = document.createElement('tbody'); table.appendChild(tbody);
+    const shown = located ? metric.samples.filter(s => locatedKeys.includes(s.key)) : metric.samples;
+    for (const sample of shown) {
+      const tr = document.createElement('tr');
+      tr.tabIndex = 0;
+      const opCell = tr.appendChild(document.createElement('td'));
+      const locateBtn = el('button', null, '定位');
+      locateBtn.type = 'button';
+      locateBtn.addEventListener('click', () => { locatedKeys = [sample.key]; drawSamples(); });
+      const detailBtn = el('button', null, '详情');
+      detailBtn.type = 'button';
+      detailBtn.addEventListener('click', () => toggleSampleDetail(sample, tr, tbody));
+      opCell.appendChild(locateBtn);
+      opCell.appendChild(document.createTextNode(' '));
+      opCell.appendChild(detailBtn);
+      const keyCell = tr.appendChild(el('td', 'path', short(sample.key, 26)));
+      keyCell.title = sample.key;
+      tr.appendChild(el('td', 'path', short(sample.session, 14)));
+      tr.appendChild(el('td', 'path', short(sample.turn, 12)));
+      tr.appendChild(el('td', null, sample.model));
+      tr.appendChild(el('td', null, GRANULARITY_LABELS[sample.granularity] || sample.granularity));
+      if (name === 'ttft') {
+        tr.appendChild(el('td', null, PERF_COMPLETION_LABELS[sample.completion] || sample.completion));
+        tr.appendChild(el('td', null, sample.value.toLocaleString('en-US')));
+      } else {
+        tr.appendChild(el('td', null, sample.output.toLocaleString('en-US')));
+        tr.appendChild(el('td', null, sample.interval_ms.toLocaleString('en-US')));
+      }
+      tr.appendChild(el('td', null, sample.basis === 'native' ? '原生' : '推导'));
+      tr.appendChild(el('td', null, sample.record_key === null ? '无（不伪造引用）' : '有'));
+      tr.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && event.target === tr) { event.preventDefault(); toggleSampleDetail(sample, tr, tbody); }
+        if (event.key === 'Escape' && locatedKeys !== null) { locatedKeys = null; drawSamples(); }
+      });
+      tbody.appendChild(tr);
+    }
+    if (located) {
+      const back = el('button', null, '返回全部样本');
+      back.type = 'button';
+      back.addEventListener('click', () => { locatedKeys = null; drawSamples(); });
+      bar.appendChild(back);
+      bar.appendChild(document.createTextNode(' 已定位 ' + shown.length + ' 条样本。定位只改变可见样本，候选/有效/排除计数、聚合分子/分母与范围不变；按 Esc 也可返回。'));
+    } else {
+      bar.textContent = '共 ' + metric.samples.length + ' 条有效样本。点击“定位”只看选中样本（Esc 或“返回全部样本”恢复）；点击“详情”或聚焦行后回车展开事件时间与来源定位。';
+    }
+    samplesHost.appendChild(bar);
+    samplesHost.appendChild(tableScroll(table));
+  };
+  const toggleSampleDetail = (sample, tr, tbody) => {
+    const next = tr.nextSibling;
+    if (next && next.className === 'record-detail') { next.remove(); return; }
+    const detailRow = document.createElement('tr');
+    detailRow.className = 'record-detail';
+    const cell = detailRow.appendChild(document.createElement('td'));
+    cell.colSpan = 10;
+    const dl = document.createElement('dl');
+    dl.className = 'meta-grid';
+    const add = (term, value) => { dl.appendChild(el('dt', null, term)); dl.appendChild(el('dd', null, value)); };
+    add('完整样本键', sample.key);
+    add('对应 token 记录', sample.record_key === null ? '无（候选无对应 token 计量记录；不伪造引用）' : sample.record_key);
+    add('会话 / 轮次', sample.session + ' / ' + (sample.turn === null ? '未知' : sample.turn));
+    add('归属', sample.owner_session + (sample.owner_turn ? '，轮次 ' + sample.owner_turn : ''));
+    add('首 token 事件', sample.first_token_at);
+    if (name === 'ttft') {
+      add('请求起点', sample.started_at);
+      add('原生 TTFT', sample.native_ttft_ms === null ? '未报告（推导值）' : sample.native_ttft_ms.toLocaleString('en-US') + ' ms（与时间差核对一致）');
+      add('完成事件', sample.completed_at === null ? '无结束证据' : sample.completed_at);
+      add('TTFT', sample.value.toLocaleString('en-US') + ' ms（' + (sample.basis === 'native' ? '原生' : '推导') + '；' + (PERF_COMPLETION_LABELS[sample.completion] || sample.completion) + '）');
+    } else {
+      add('区间终点', sample.completed_at);
+      add('观测区间', sample.interval_ms.toLocaleString('en-US') + ' ms（首 token → completed_at；终点含完成事件处理开销，非服务端纯生成速率）');
+      add('已知输出', sample.output.toLocaleString('en-US') + ' token');
+    }
+    add('精度', sample.precision + '（来源毫秒时间，保留原精度）');
+    const loc = sample.source || {};
+    add('来源定位', String(loc.path || '未知') + (loc.table ? '（表 ' + loc.table + (loc.id !== undefined && loc.id !== null ? '，行 ' + String(loc.id) : '') + ')' : loc.line ? '：第 ' + String(loc.line) + ' 行' : ''));
+    cell.appendChild(dl);
+    tbody.insertBefore(detailRow, tr.nextSibling);
+  };
+  const locateSamples = keys => {
+    locatedKeys = keys.slice();
+    drawSamples();
+    let ancestor = samplesHost.parentElement;
+    while (ancestor) {
+      if (ancestor.tagName === 'DETAILS') ancestor.open = true;
+      ancestor = ancestor.parentElement;
+    }
+    samplesHost.scrollIntoView({ block: 'nearest' });
+  };
+
+  const groupTable = (title, labelOf, members) => {
+    const frag = document.createDocumentFragment();
+    frag.appendChild(el('h3', null, title + '（成员值由该组精确分子/分母重新生成）'));
+    const table = document.createElement('table');
+    const headRow = document.createElement('tr');
+    ['行', '值（' + displayUnit + '，两位小数）', '精确分子 ÷ 分母', '样本数', '操作'].forEach(h => headRow.appendChild(el('th', null, h)));
+    const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = document.createElement('tbody'); table.appendChild(tbody);
+    for (const member of members) {
+      const tr = document.createElement('tr');
+      const labelCell = tr.appendChild(el('td', 'path', short(labelOf(member), 40)));
+      labelCell.title = labelOf(member);
+      tr.appendChild(el('td', null, memberValue(member)));
+      tr.appendChild(el('td', null, member.numerator.toString() + ' ÷ ' + member.denominator.toString()));
+      tr.appendChild(el('td', null, String(member.sample_keys.length)));
+      const op = tr.appendChild(document.createElement('td'));
+      const btn = el('button', null, '定位');
+      btn.type = 'button';
+      btn.title = '沿保存样本键定位该组成员样本（不改变范围与合计）';
+      btn.addEventListener('click', () => locateSamples(member.sample_keys));
+      op.appendChild(btn);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    frag.appendChild(tableScroll(table));
+    return frag;
+  };
+  block.appendChild(groupTable('按模型分组（完整供应商＋模型身份）',
+    m => (m.identity.provider === null ? '供应商未知' : m.identity.provider) + ' / ' + m.identity.model,
+    metric.projections.model));
+  block.appendChild(groupTable('按会话分组', m => m.session, metric.projections.session));
+
+  // Day chart: one bar per saved day member, scaled by exact ratio comparison.
+  const days = metric.projections.day;
+  block.appendChild(el('h3', null, '日分布（按各自入样事件与保存时区分日；未知不画零）'));
+  if (days.length) {
+    const maxMember = days.reduce((best, m) => memberGt(m, best) ? m : best, days[0]);
+    const barHeight = 22, labelWidth = 110, valueWidth = 220, gap = 6, trackWidth = 320;
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('width', String(labelWidth + trackWidth + valueWidth));
+    svg.setAttribute('height', String(days.length * (barHeight + gap) + 4));
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', metric.label + '日分布条形图');
+    days.forEach((member, i) => {
+      const y = i * (barHeight + gap) + 2;
+      const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      group.setAttribute('tabindex', '0');
+      group.setAttribute('role', 'button');
+      group.setAttribute('aria-label', '定位 ' + member.date + ' 的 ' + member.sample_keys.length + ' 条样本');
+      group.addEventListener('click', () => locateSamples(member.sample_keys));
+      group.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); locateSamples(member.sample_keys); }
+      });
+      const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+      title.textContent = member.date + '：' + memberValue(member) + ' ' + displayUnit + '（' + member.sample_keys.length + ' 条样本）';
+      group.appendChild(title);
+      const labelNode = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      labelNode.setAttribute('x', String(labelWidth - 6)); labelNode.setAttribute('y', String(y + 15));
+      labelNode.setAttribute('text-anchor', 'end'); labelNode.setAttribute('class', 'bar-label');
+      labelNode.textContent = member.date;
+      group.appendChild(labelNode);
+      const track = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      track.setAttribute('x', String(labelWidth)); track.setAttribute('y', String(y));
+      track.setAttribute('width', String(trackWidth)); track.setAttribute('height', String(barHeight));
+      track.setAttribute('class', 'bar-track');
+      group.appendChild(track);
+      const scaled = maxMember.numerator === 0n ? 0 : Number(member.numerator * 10000n * maxMember.denominator / (member.denominator * maxMember.numerator)) / 10000;
+      const barWidth = Math.max(2, Math.round(scaled * trackWidth));
+      const fill = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      fill.setAttribute('x', String(labelWidth)); fill.setAttribute('y', String(y));
+      fill.setAttribute('width', String(barWidth)); fill.setAttribute('height', String(barHeight));
+      fill.setAttribute('class', 'bar-fill');
+      group.appendChild(fill);
+      const valueNode = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      valueNode.setAttribute('x', String(labelWidth + trackWidth + 8)); valueNode.setAttribute('y', String(y + 15));
+      valueNode.setAttribute('class', 'bar-value');
+      valueNode.textContent = memberValue(member) + ' ' + displayUnit + ' · ' + member.sample_keys.length + ' 条';
+      group.appendChild(valueNode);
+      svg.appendChild(group);
+    });
+    block.appendChild(svg);
+    block.appendChild(el('p', 'hint-line', '点选日期条定位当日样本（键盘：Tab 聚焦后 Enter/空格；只切换视图，不改变计数与合计）。'));
+  }
+  const samplesCard = evidenceCard('有效样本明细（' + metric.samples.length + ' 条；稳定样本键＝完整会话＋源调用/逻辑请求身份）', [samplesHost]);
+  block.appendChild(samplesCard);
+  drawSamples();
+  return block;
+}
+
+function nsToScaledText(ns, unitNs) {
+  // Exact two-decimal half-up display of a nanosecond value in ms or s; never floats.
+  const rounded = (2n * ns * 100n + unitNs) / (2n * unitNs);
+  return (rounded / 100n).toString() + '.' + (rounded % 100n).toString().padStart(2, '0');
+}
+function nsToMsText(ns) { return nsToScaledText(ns, 1000000n); }
+function nsToSecText(ns) { return nsToScaledText(ns, 1000000000n); }
+
+function buildToolMetricBlock(perf) {
+  // Tool execution duration: same card/chart/locate mechanisms as the model metrics.
+  // The execution-duration sum and the scheduling/execution span envelope stay separate;
+  // unknown never draws a zero bar.
+  const metric = perf.metrics.tool_duration;
+  const block = el('div', 'perf-metric');
+  block.appendChild(el('h3', null, metric.label + '（' + metric.definition + '）'));
+  block.appendChild(el('p', 'hint-line', '入样：' + metric.admission + '；单位：ms（样本保存精确 ns 值；'
+    + '调度至完成的跨度独立展示，不加入执行耗时和）。'));
+  const support = metric.support;
+  if (support.status !== 'supported') {
+    block.appendChild(el('p', 'unavailable', '不可用（' + (PERF_SUPPORT_LABELS[support.status] || support.status)
+      + '）：' + support.reason));
+    return block;
+  }
+  const aggregate = metric.aggregate;
+  const kindText = PERF_EXCLUSION_KINDS.map(k => PERF_KIND_LABELS[k] + ' ' + aggregate.excluded_by_kind[k].toString()).join('、');
+  block.appendChild(el('p', null, '候选 ' + aggregate.candidates.toString() + '；有效 ' + aggregate.valid.toString()
+    + '、排除 ' + aggregate.excluded.toString() + '（' + kindText + '）；独立工具通道，不要求模型 usage，不改变 token 合计；无可靠候选分母时不给比例。'));
+  if (aggregate.denominator > 0n) {
+    block.appendChild(el('p', null, '执行耗时和 ' + nsToMsText(aggregate.numerator) + ' ms（'
+      + aggregate.denominator.toString() + ' 个有效样本精确耗时之和，共 ' + aggregate.numerator.toString()
+      + ' ns；显示两位小数四舍五入）；已完成失败执行保留真实耗时与失败状态；全部样本无对应 token 记录引用（独立通道）。'));
+  } else {
+    block.appendChild(el('p', 'unavailable', '无有效样本；不给耗时和（未知不画零）。'));
+  }
+  const wall = aggregate.wall;
+  block.appendChild(el('p', wall.state === 'known' ? null : 'unavailable',
+    '调度/执行跨度包络：' + (wall.state === 'known' ? nsToSecText(wall.value) + ' s' : wall.state === 'conflict' ? '冲突' : '未知')
+    + '（' + wall.basis + '；' + wall.reason + '）。'));
+  const reasonKeys = Object.keys(aggregate.exclusion_reasons).sort();
+  if (reasonKeys.length) {
+    const ul = el('ul', 'notes');
+    for (const reason of reasonKeys) {
+      ul.appendChild(el('li', null, '排除原因：' + reason + '（' + aggregate.exclusion_reasons[reason].toString() + ' 条）'));
+    }
+    block.appendChild(ul);
+  }
+  if (aggregate.supplements.length) {
+    const ul = el('ul', 'notes');
+    for (const item of aggregate.supplements) {
+      ul.appendChild(el('li', null, '补充项（单列不计入）：' + item.key + '——' + item.reason));
+    }
+    block.appendChild(ul);
+  }
+  if (!metric.samples.length) return block;
+
+  const samplesHost = el('div');
+  let locatedKeys = null;
+  const drawSamples = () => {
+    samplesHost.textContent = '';
+    const located = locatedKeys !== null;
+    const bar = el('p', 'hint-line', '');
+    const table = document.createElement('table');
+    const headRow = document.createElement('tr');
+    ['操作', '样本键', '会话', '轮次', '类别', '状态', '耗时（ms）', '依据', '精度'].forEach(h => headRow.appendChild(el('th', null, h)));
+    const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = document.createElement('tbody'); table.appendChild(tbody);
+    const shown = located ? metric.samples.filter(s => locatedKeys.includes(s.key)) : metric.samples;
+    for (const sample of shown) {
+      const tr = document.createElement('tr');
+      tr.tabIndex = 0;
+      const opCell = tr.appendChild(document.createElement('td'));
+      const locateBtn = el('button', null, '定位');
+      locateBtn.type = 'button';
+      locateBtn.addEventListener('click', () => { locatedKeys = [sample.key]; drawSamples(); });
+      const detailBtn = el('button', null, '详情');
+      detailBtn.type = 'button';
+      detailBtn.addEventListener('click', () => toggleSampleDetail(sample, tr, tbody));
+      opCell.appendChild(locateBtn);
+      opCell.appendChild(document.createTextNode(' '));
+      opCell.appendChild(detailBtn);
+      const keyCell = tr.appendChild(el('td', 'path', short(sample.key, 26)));
+      keyCell.title = sample.key;
+      tr.appendChild(el('td', 'path', short(sample.session, 14)));
+      tr.appendChild(el('td', 'path', short(sample.turn, 12)));
+      tr.appendChild(el('td', null, sample.category));
+      tr.appendChild(el('td', null, sample.status === 'failed' ? '已失败' : '已完成'));
+      tr.appendChild(el('td', null, nsToMsText(sample.value)));
+      tr.appendChild(el('td', null, sample.basis === 'native' ? '原生' : '推导'));
+      tr.appendChild(el('td', null, sample.precision));
+      tr.addEventListener('keydown', event => {
+        if (event.key === 'Enter' && event.target === tr) { event.preventDefault(); toggleSampleDetail(sample, tr, tbody); }
+        if (event.key === 'Escape' && locatedKeys !== null) { locatedKeys = null; drawSamples(); }
+      });
+      tbody.appendChild(tr);
+    }
+    if (located) {
+      const back = el('button', null, '返回全部样本');
+      back.type = 'button';
+      back.addEventListener('click', () => { locatedKeys = null; drawSamples(); });
+      bar.appendChild(back);
+      bar.appendChild(document.createTextNode(' 已定位 ' + shown.length + ' 条样本。定位只改变可见样本，候选/有效/排除计数、耗时和与跨度包络不变；按 Esc 也可返回。'));
+    } else {
+      bar.textContent = '共 ' + metric.samples.length + ' 条有效样本。点击“定位”只看选中样本（Esc 或“返回全部样本”恢复）；点击“详情”或聚焦行后回车展开事件时间与来源定位。';
+    }
+    samplesHost.appendChild(bar);
+    samplesHost.appendChild(tableScroll(table));
+  };
+  const toggleSampleDetail = (sample, tr, tbody) => {
+    const next = tr.nextSibling;
+    if (next && next.className === 'record-detail') { next.remove(); return; }
+    const detailRow = document.createElement('tr');
+    detailRow.className = 'record-detail';
+    const cell = detailRow.appendChild(document.createElement('td'));
+    cell.colSpan = 9;
+    const dl = document.createElement('dl');
+    dl.className = 'meta-grid';
+    const add = (term, value) => { dl.appendChild(el('dt', null, term)); dl.appendChild(el('dd', null, value)); };
+    add('完整样本键', sample.key);
+    add('会话 / 轮次', sample.session + ' / ' + (sample.turn === null ? '未知' : sample.turn));
+    add('归属', sample.owner_session + (sample.owner_turn ? '，轮次 ' + sample.owner_turn : ''));
+    add('类别 / 状态', sample.category + ' / ' + (sample.status === 'failed' ? '已失败（保留真实耗时与失败状态）' : '已完成'));
+    add('执行起止', sample.exec_start === null ? '无明确实际执行起止（不补造）' : sample.exec_start + ' → ' + sample.exec_end);
+    add('调度跨度', sample.dispatch_start === null ? '无调度时间证据'
+      : sample.dispatch_start + ' → ' + sample.dispatch_end + '（调度至完成；不加入执行耗时和）');
+    add('完成事件', sample.completed_at);
+    add('执行耗时', nsToMsText(sample.value) + ' ms（精确 ' + sample.value.toString() + ' ns；'
+      + (sample.basis === 'native' ? '原生' : '推导（实际执行起止求差）') + '；精度 ' + sample.precision + '）');
+    add('原生耗时', sample.native_duration_ns === null ? '无（推导样本）' : sample.native_duration_ns.toString() + ' ns');
+    const loc = sample.source || {};
+    add('来源定位', String(loc.path || '未知') + (loc.table ? '（表 ' + loc.table + (loc.id !== undefined && loc.id !== null ? '，行 ' + String(loc.id) : '') + ')' : loc.line ? '：第 ' + String(loc.line) + ' 行' : ''));
+    cell.appendChild(dl);
+    tbody.insertBefore(detailRow, tr.nextSibling);
+  };
+  const locateSamples = keys => {
+    locatedKeys = keys.slice();
+    drawSamples();
+    let ancestor = samplesHost.parentElement;
+    while (ancestor) {
+      if (ancestor.tagName === 'DETAILS') ancestor.open = true;
+      ancestor = ancestor.parentElement;
+    }
+    samplesHost.scrollIntoView({ block: 'nearest' });
+  };
+
+  const groupTable = (title, members) => {
+    const frag = document.createDocumentFragment();
+    frag.appendChild(el('h3', null, title + '（成员值由该组精确耗时之和重新生成）'));
+    const table = document.createElement('table');
+    const headRow = document.createElement('tr');
+    ['行', '耗时和（ms，两位小数）', '精确耗时之和（ns）', '样本数', '操作'].forEach(h => headRow.appendChild(el('th', null, h)));
+    const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
+    const tbody = document.createElement('tbody'); table.appendChild(tbody);
+    for (const member of members) {
+      const tr = document.createElement('tr');
+      const labelCell = tr.appendChild(el('td', 'path', short(member.category !== undefined ? member.category : member.session, 40)));
+      labelCell.title = member.category !== undefined ? member.category : member.session;
+      tr.appendChild(el('td', null, nsToMsText(member.numerator)));
+      tr.appendChild(el('td', null, member.numerator.toString()));
+      tr.appendChild(el('td', null, member.denominator.toString()));
+      const op = tr.appendChild(document.createElement('td'));
+      const btn = el('button', null, '定位');
+      btn.type = 'button';
+      btn.title = '沿保存样本键定位该组成员样本（不改变范围与合计）';
+      btn.addEventListener('click', () => locateSamples(member.sample_keys));
+      op.appendChild(btn);
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    frag.appendChild(tableScroll(table));
+    return frag;
+  };
+  block.appendChild(groupTable('按工具类别分组', metric.projections.category));
+  block.appendChild(groupTable('按会话分组', metric.projections.session));
+
+  // Day chart: one bar per saved day member, scaled by exact integer comparison of sums.
+  const days = metric.projections.day;
+  block.appendChild(el('h3', null, '日分布（按完成事件与保存时区分日；未知不画零）'));
+  if (days.length) {
+    const maxMember = days.reduce((best, m) => m.numerator > best.numerator ? m : best, days[0]);
+    const barHeight = 22, labelWidth = 110, valueWidth = 240, gap = 6, trackWidth = 320;
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('width', String(labelWidth + trackWidth + valueWidth));
+    svg.setAttribute('height', String(days.length * (barHeight + gap) + 4));
+    svg.setAttribute('role', 'img');
+    svg.setAttribute('aria-label', metric.label + '日分布条形图');
+    days.forEach((member, i) => {
+      const y = i * (barHeight + gap) + 2;
+      const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      group.setAttribute('tabindex', '0');
+      group.setAttribute('role', 'button');
+      group.setAttribute('aria-label', '定位 ' + member.date + ' 的 ' + member.sample_keys.length + ' 条样本');
+      group.addEventListener('click', () => locateSamples(member.sample_keys));
+      group.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); locateSamples(member.sample_keys); }
+      });
+      const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+      title.textContent = member.date + '：' + nsToMsText(member.numerator) + ' ms（' + member.sample_keys.length + ' 条样本）';
+      group.appendChild(title);
+      const labelNode = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      labelNode.setAttribute('x', String(labelWidth - 6)); labelNode.setAttribute('y', String(y + 15));
+      labelNode.setAttribute('text-anchor', 'end'); labelNode.setAttribute('class', 'bar-label');
+      labelNode.textContent = member.date;
+      group.appendChild(labelNode);
+      const track = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      track.setAttribute('x', String(labelWidth)); track.setAttribute('y', String(y));
+      track.setAttribute('width', String(trackWidth)); track.setAttribute('height', String(barHeight));
+      track.setAttribute('class', 'bar-track');
+      group.appendChild(track);
+      const scaled = maxMember.numerator === 0n ? 0 : Number(member.numerator * 10000n / maxMember.numerator) / 10000;
+      const barWidth = Math.max(2, Math.round(scaled * trackWidth));
+      const fill = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      fill.setAttribute('x', String(labelWidth)); fill.setAttribute('y', String(y));
+      fill.setAttribute('width', String(barWidth)); fill.setAttribute('height', String(barHeight));
+      fill.setAttribute('class', 'bar-fill');
+      group.appendChild(fill);
+      const valueNode = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      valueNode.setAttribute('x', String(labelWidth + trackWidth + 8)); valueNode.setAttribute('y', String(y + 15));
+      valueNode.setAttribute('class', 'bar-value');
+      valueNode.textContent = nsToMsText(member.numerator) + ' ms · ' + member.sample_keys.length + ' 条';
+      group.appendChild(valueNode);
+      svg.appendChild(group);
+    });
+    block.appendChild(svg);
+    block.appendChild(el('p', 'hint-line', '点选日期条定位当日样本（键盘：Tab 聚焦后 Enter/空格；只切换视图，不改变计数与合计）。'));
+  }
+  const samplesCard = evidenceCard('有效工具样本明细（' + metric.samples.length + ' 条；稳定样本键＝完整会话＋真实 item/tool_call_id）', [samplesHost]);
+  block.appendChild(samplesCard);
+  drawSamples();
+  return block;
+}
+
+function buildPerformanceSection(obj) {
+  // Performance display only consumes the saved extension; the browser never re-derives
+  // admission, re-aggregates ratios beyond member numerator/denominator, or ranks harnesses.
+  const nodes = [el('h2', null, '性能分析（模型 TTFT/来源观测区间吞吐与工具执行耗时；各指标独立入样，有效集合与 token 选集可能不同，不改变 token 合计）')];
+  const ext = obj.analysis;
+  if (!ext || !ext.performance) {
+    nodes.push(el('p', 'hint-line', '本报告未保存性能分析（旧报告）；token 结果不受影响。'));
+    return nodes;
+  }
+  const perf = ext.performance;
+  nodes.push(el('p', 'hint-line', perf.note));
+  nodes.push(el('p', 'hint-line', '性能日分布时区：' + perf.tz.name + '（' + perf.tz.evidence
+    + '）；分组与日分布由各成员精确分子/分母重新生成，不从舍入后的上层值推导。'));
+  for (const name of PERF_METRIC_NAMES) nodes.push(buildPerfMetricBlock(perf, name));
+  if (perf.metrics.tool_duration) {
+    nodes.push(buildToolMetricBlock(perf));
+  } else {
+    nodes.push(el('p', 'hint-line', '本报告未保存工具执行耗时分析（旧报告）；token 与其他性能结果不受影响，不补零。'));
+  }
+  return nodes;
 }
 
 function renderReport(obj, version, footerText, sectionId) {
@@ -881,15 +2468,18 @@ function renderReport(obj, version, footerText, sectionId) {
       + '（输入与缓存读取均已知的记录子集），不是总输入。调用数：'
       + (obj.summary.call_count === null ? '未知' : obj.summary.call_count.toString())
       + '；其中已识别 ' + (obj.summary.known_call_count === null ? '未知' : obj.summary.known_call_count.toString()) + ' 次。');
-    note.style.fontSize = '.85rem';
+    note.className = 'hint-line';
     const wrap = document.createDocumentFragment();
-    wrap.appendChild(table);
+    wrap.appendChild(tableScroll(table));
     wrap.appendChild(note);
     return wrap;
   })());
 
+  card(...buildCostSection(obj));
+  card(...buildPerformanceSection(obj));
+
   const localizationCard = (() => {
-    const nodes = [el('h2', null, '定位证据')];
+    const nodes = [];
     if (obj.localization) {
       const dl = document.createElement('dl');
       dl.className = 'meta-grid';
@@ -903,10 +2493,10 @@ function renderReport(obj, version, footerText, sectionId) {
     }
     return nodes;
   })();
-  card(...localizationCard);
+  report.appendChild(evidenceCard('定位证据', localizationCard));
 
   const supportCard = (() => {
-    const nodes = [el('h2', null, '内部来源支持')];
+    const nodes = [];
     if (obj.internal_support) {
       const ul = document.createElement('ul');
       ul.className = 'notes';
@@ -920,7 +2510,7 @@ function renderReport(obj, version, footerText, sectionId) {
     }
     return nodes;
   })();
-  card(...supportCard);
+  report.appendChild(evidenceCard('内部来源支持', supportCard));
 
   let viewLocateHandler = null;   // set by the records block once it exists
   let viewClearHandler = null;
@@ -1027,7 +2617,6 @@ function renderReport(obj, version, footerText, sectionId) {
           group.setAttribute('tabindex', '0');
           group.setAttribute('role', 'button');
           group.setAttribute('aria-label', '定位 ' + row.label + ' 的明细');
-          group.style.cursor = 'pointer';
           group.addEventListener('click', () => viewLocateHandler(row.aggregate.record_keys));
           group.addEventListener('keydown', event => {
             if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); viewLocateHandler(row.aggregate.record_keys); }
@@ -1128,14 +2717,16 @@ function renderReport(obj, version, footerText, sectionId) {
       tbody.appendChild(tr);
       tbody.appendChild(detailRow);
     }
-    tableHost.appendChild(table);
+    tableHost.appendChild(tableScroll(table));
     if (visible.length !== rows.length) {
       tableHost.appendChild(el('p', 'hint-line', '已按筛选隐藏 ' + (rows.length - visible.length) + ' 行；原范围、截止点、合计与占比分母保持不变。'));
     }
   }
 
   function percentText(value, denominator, presetRate) {
-    const rate = presetRate !== undefined ? presetRate : Number(value * 10000n / denominator) / 10000;
+    const rate = presetRate !== undefined
+      ? (typeof presetRate === 'bigint' ? Number(presetRate) : presetRate)
+      : Number(value * 10000n / denominator) / 10000;
     const pct = rate * 100;
     const text = (Number.isInteger(pct) ? pct.toFixed(0) : pct.toFixed(3).replace(/0+$/, '')) + '%';
     return text;
@@ -1158,25 +2749,28 @@ function renderReport(obj, version, footerText, sectionId) {
 
   card(el('h2', null, '来源与缺口'), (() => {
     const frag = document.createDocumentFragment();
-    const sources = document.createElement('ul');
-    sources.className = 'notes';
-    for (const path of obj.source_files) {
-      const li = el('li', null, '来源（仅展示路径，不自动读取）：');
-      li.appendChild(el('span', 'path', path));
-      sources.appendChild(li);
-    }
-    frag.appendChild(sources);
     if (obj.issues && obj.issues.length) {
       const grouped = {};
       for (const issue of obj.issues) grouped[issue.reason] = (grouped[issue.reason] || 0) + 1;
       const ul = document.createElement('ul');
       ul.className = 'notes';
       for (const reason of Object.keys(grouped)) ul.appendChild(el('li', null, '缺口：' + reason + '（' + grouped[reason] + ' 处）'));
-      frag.appendChild(el('p', null, '缺口说明：'));
+      frag.appendChild(el('p', null, '缺口说明（始终可见，不折叠）：'));
       frag.appendChild(ul);
     } else {
       frag.appendChild(el('p', null, '无已记录缺口（不代表证明完整覆盖）。'));
     }
+    const sourcesDetails = el('details', 'evidence-inner');
+    sourcesDetails.appendChild(el('summary', null, '来源文件列表（' + obj.source_files.length + ' 个；仅展示路径，不自动读取）'));
+    const sources = document.createElement('ul');
+    sources.className = 'notes';
+    for (const path of obj.source_files) {
+      const li = el('li');
+      li.appendChild(el('span', 'path', path));
+      sources.appendChild(li);
+    }
+    sourcesDetails.appendChild(sources);
+    frag.appendChild(sourcesDetails);
     return frag;
   })());
 
@@ -1199,29 +2793,27 @@ function renderReport(obj, version, footerText, sectionId) {
     const ul = document.createElement('ul');
     ul.className = 'notes';
     extra.forEach(x => ul.appendChild(el('li', null, x)));
-    card(el('h2', null, '独立证据（不并入小计）'), ul);
+    report.appendChild(evidenceCard('独立证据（不并入小计）', [ul]));
   }
   let locateRecordsByKeys = null;
   const recordsDetail = buildRecordsDetail(obj);
   if (recordsDetail) {
-    card(...recordsDetail.nodes);
+    report.appendChild(evidenceCard('调用明细', recordsDetail.nodes));
     locateRecordsByKeys = recordsDetail.locate;
     viewLocateHandler = recordsDetail.locate;
     viewClearHandler = recordsDetail.clear;
   }
   if (obj.explanation && Array.isArray(obj.explanation.turns)) {
-    card(el('h2', null, '轮次时间线与已有耗时'), buildTimelineCard(obj, locateRecordsByKeys));
+    report.appendChild(evidenceCard('轮次时间线与已有耗时', [buildTimelineCard(obj, locateRecordsByKeys)]));
   }
 
   if (obj.explanation && (Array.isArray(obj.explanation.internal) && obj.explanation.internal.length
       || Array.isArray(obj.explanation.relations) && obj.explanation.relations.length
       || Array.isArray(obj.explanation.excluded) && obj.explanation.excluded.length)) {
-    card(el('h2', null, '内部分布、后代关系与未计量证据'), buildInternalRelationsCard(obj, locateRecordsByKeys));
+    report.appendChild(evidenceCard('内部分布、后代关系与未计量证据', [buildInternalRelationsCard(obj, locateRecordsByKeys)]));
   }
 
-  const loaded = el('p', null, footerText);
-  loaded.style.fontSize = '.82rem';
-  loaded.style.color = '#6b7280';
+  const loaded = el('p', 'hint-line', footerText);
   report.appendChild(loaded);
 }
 
@@ -1241,54 +2833,101 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
   const scope = obj.scope;
   const card = (...nodes) => { const c = el('section', 'card'); nodes.forEach(n => c.appendChild(n)); report.appendChild(c); return c; };
 
-  card(el('h2', null, '整体范围与状态'), el('span', 'status-tag status-' + obj.status, STATES[obj.status] || obj.status), (() => {
-    const dl = document.createElement('dl');
-    dl.className = 'meta-grid';
-    const add = (term, value) => {
-      dl.appendChild(el('dt', null, term));
-      const dd = el('dd');
-      if (value instanceof Node) dd.appendChild(value); else dd.textContent = value === null || value === undefined ? '未指定' : value;
-      dl.appendChild(dd);
-    };
-    add('Harness', obj.harness);
-    add('会话集合', scope.sessions.length + ' 个（' + scope.sessions.slice(0, 5).map(s => short(s, 16)).join('、')
-      + (scope.sessions.length > 5 ? ' …' : '') + '）');
-    add('时间下界', scope.from || '未指定');
-    add('截止点', scope.to + '（来源：' + scope.cutoff_source + '）');
-    add('显示时区', scope.tz);
-    add('代理策略', scope.main_only ? '仅主代理常规调用' : '含可靠归属的后代与内部调用');
-    add('实际读取时间', obj.read_at);
-    add('覆盖说明', obj.coverage);
-    return dl;
-  })());
+  // Result scope band: the identity/range THIS report actually used, visually apart from
+  // the pending query form above it. A one-line summary keeps the first screen compact;
+  // the full metadata stays one disclosure away.
+  const band = el('section', 'card scope-band');
+  const bandHead = el('div', 'band-head');
+  bandHead.appendChild(el('h2', null, '结果范围与状态'));
+  bandHead.appendChild(el('span', 'status-tag status-' + obj.status, STATES[obj.status] || obj.status));
+  band.appendChild(bandHead);
+  band.appendChild(el('p', 'band-summary', 'Harness（实际身份）：' + obj.harness + '；会话集合 ' + scope.sessions.length + ' 个；时间范围 '
+    + (scope.from || '未指定') + '（含）→ ' + scope.to + '（不含）；显示时区 ' + scope.tz + '；'
+    + (scope.main_only ? '仅主代理常规调用' : '含可靠归属的后代与内部调用')));
+  const fullRange = el('details', 'inline-details');
+  fullRange.appendChild(el('summary', null, '核对完整范围与元数据（截止点来源、代理策略、覆盖说明、读取时间与完整会话集合）'));
+  const bandDl = document.createElement('dl');
+  bandDl.className = 'meta-grid';
+  const bandAdd = (term, value) => {
+    bandDl.appendChild(el('dt', null, term));
+    const dd = el('dd');
+    if (value instanceof Node) dd.appendChild(value); else dd.textContent = value === null || value === undefined ? '未指定' : value;
+    bandDl.appendChild(dd);
+  };
+  bandAdd('Harness（实际身份）', obj.harness);
+  const sessionsSummary = document.createDocumentFragment();
+  sessionsSummary.appendChild(document.createTextNode(scope.sessions.length + ' 个（' + scope.sessions.slice(0, 5).map(s => short(s, 16)).join('、')
+    + (scope.sessions.length > 5 ? ' …' : '') + '）'));
+  const fullSet = el('details', 'inline-details');
+  fullSet.appendChild(el('summary', null, '核对完整会话集合（' + scope.sessions.length + ' 个稳定身份）'));
+  const sessionList = document.createElement('ul');
+  sessionList.className = 'notes';
+  for (const sid of scope.sessions) {
+    const li = el('li');
+    li.appendChild(el('span', 'path', sid));
+    sessionList.appendChild(li);
+  }
+  fullSet.appendChild(sessionList);
+  sessionsSummary.appendChild(fullSet);
+  bandAdd('会话集合', sessionsSummary);
+  bandAdd('时间范围', (scope.from || '未指定') + '（含）→ ' + scope.to + '（不含）');
+  bandAdd('固定截止点', scope.to + '（来源：' + scope.cutoff_source + '）');
+  bandAdd('显示时区', scope.tz);
+  bandAdd('代理策略', scope.main_only ? '仅主代理常规调用' : '含可靠归属的后代与内部调用');
+  bandAdd('覆盖说明', obj.coverage);
+  bandAdd('实际读取时间', obj.read_at);
+  fullRange.appendChild(bandDl);
+  band.appendChild(fullRange);
+  band.appendChild(el('p', 'hint-line', '本范围带是这份结果实际采用的身份、范围与状态，与待提交的查询表单分开；编辑表单不改变本报告。'));
+  report.appendChild(band);
 
-  card(el('h2', null, '总览（与 CLI 同值）'), (() => {
-    const table = document.createElement('table');
-    const thead = document.createElement('thead');
-    const headRow = document.createElement('tr');
-    ['分组', '输入', '输出', '缓存读取', '缓存命中率', '总量'].forEach(h => headRow.appendChild(el('th', null, h)));
-    thead.appendChild(headRow);
-    table.appendChild(thead);
-    const tbody = document.createElement('tbody');
-    for (const row of obj.rows) addRow(tbody, GROUP_LABELS[row.group] || row.group, row, false);
-    addRow(tbody, '已记录小计', obj.summary, true);
-    table.appendChild(tbody);
-    const note = el('p', null, '输入包含缓存读取；缓存与已包含的推理输出不再相加。缓存命中率的分母是配对输入'
-      + '（输入与缓存读取均已知的记录子集），不是总输入。调用数：'
-      + (obj.summary.call_count === null ? '未知' : obj.summary.call_count.toString())
-      + '；其中已识别 ' + (obj.summary.known_call_count === null ? '未知' : obj.summary.known_call_count.toString()) + ' 次。');
-    note.style.fontSize = '.85rem';
-    const wrap = document.createDocumentFragment();
-    wrap.appendChild(table);
-    wrap.appendChild(note);
-    return wrap;
-  })());
+  // Four metric cards straight from report.summary; full integers, states and reasons kept.
+  const metricCards = el('div', 'metric-cards');
+  const confirmedZero = obj.status === 'confirmed_zero';
+  const metricCard = (label, metric, note) => {
+    const cardNode = el('div', 'metric-card');
+    if (metric.state === 'partial') cardNode.classList.add('partial');
+    if (metric.state === 'unknown' || metric.value === null) cardNode.classList.add('unknown');
+    cardNode.appendChild(el('div', 'metric-label', label));
+    const formatted = fmtInt(metric.value, metric.state);
+    cardNode.appendChild(el('div', 'metric-value', formatted ? formatted.text : '未知'));
+    const notes = [];
+    if (metric.state === 'partial') notes.push('部分：仍缺完整覆盖证据');
+    if (metric.state === 'unknown' || metric.value === null) notes.push('未知');
+    if (metric.state !== 'known' && Array.isArray(metric.reasons) && metric.reasons.length) notes.push(metric.reasons.join('；'));
+    if (confirmedZero && metric.value === 0n) notes.push('确认零：范围内各会话均有完整零调用账本');
+    if (note) notes.push(note);
+    cardNode.appendChild(el('div', 'metric-note', notes.length ? notes.join('；') : '已记录'));
+    return cardNode;
+  };
+  metricCards.appendChild(metricCard('已记录总量', obj.summary.metrics.total, null));
+  metricCards.appendChild(metricCard('输入（含缓存读取）', obj.summary.metrics.input, null));
+  metricCards.appendChild(metricCard('输出', obj.summary.metrics.output, null));
+  const rate = obj.summary.cache_hit_rate;
+  const rateCard = el('div', 'metric-card');
+  if (rate.state === 'partial') rateCard.classList.add('partial');
+  if (rate.value === null) rateCard.classList.add('unknown');
+  rateCard.appendChild(el('div', 'metric-label', '缓存命中率'));
+  const pctValue = rate.value === null ? null : (typeof rate.value === 'bigint' ? Number(rate.value) : rate.value) * 100;
+  rateCard.appendChild(el('div', 'metric-value', pctValue === null
+    ? (rate.state === 'not_applicable' ? '不适用' : '未知')
+    : (Number.isInteger(pctValue) ? pctValue.toFixed(0) : pctValue.toFixed(3).replace(/0+$/, '')) + '%'));
+  const rateNotes = [];
+  if (rate.value === null) rateNotes.push(rate.state === 'not_applicable' ? '配对输入为 0，命中率不适用（不是 0%）' : '未知：没有输入与缓存读取均已知配对记录');
+  if (rate.state === 'partial') rateNotes.push('部分：仅已知配对子集');
+  rateNotes.push('配对子集 ' + rate.paired_records.toString() + ' 条记录、配对输入 ' + rate.input.toLocaleString('en-US')
+    + '；分母是配对输入（输入与缓存读取均已知的记录子集），不是总输入；缓存读取不重复相加');
+  rateCard.appendChild(el('div', 'metric-note', rateNotes.join('；')));
+  metricCards.appendChild(rateCard);
+  report.appendChild(metricCards);
 
   const trendSection = (() => {
-    const nodes = [el('h2', null, '按日趋势（日范围＝原范围与本地日交集）')];
+    const head = el('div', 'trend-head');
+    head.appendChild(el('h2', null, '日趋势（每个保存日一根柱；日范围＝原范围与本地日交集）'));
     const wrap = el('div');
     const metrics = [['input', '输入'], ['output', '输出'], ['cache_read', '缓存读取'], ['total', '总量']];
     const metricField = document.createElement('fieldset');
+    metricField.className = 'inline-radios';
     metricField.appendChild(el('legend', null, '指标'));
     for (const [key, label] of metrics) {
       const l = el('label', null);
@@ -1298,10 +2937,10 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
       l.appendChild(radio); l.appendChild(document.createTextNode(label));
       metricField.appendChild(l);
     }
-    wrap.appendChild(metricField);
+    head.appendChild(metricField);
     const chartHost = el('div'); chartHost.id = sectionId + '-trend-chart-host'; chartHost.className = 'chart-host';
     wrap.appendChild(chartHost);
-    nodes.push(wrap);
+    const nodes = [head, wrap];
     return { nodes, render };
     function render() {
       const metricKey = document.querySelector('input[name="' + sectionId + ':trend-metric"]:checked').value;
@@ -1309,62 +2948,102 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
       chartHost.textContent = '';
       const days = obj.days || [];
       const unbucketed = obj.unbucketed || { records: 0 };
-      chartHost.appendChild(el('p', 'hint-line', '当前指标：' + metricLabel + '；共 ' + days.length + ' 天'
-        + (unbucketed.records ? '；另有 ' + unbucketed.records.toString() + ' 条无法归桶（见下）' : '') + '。'));
+      // The metric/bucket summary sits under the chart so the plot itself starts higher.
+      const trendHint = el('p', 'hint-line', '当前指标：' + metricLabel + '；共 ' + days.length + ' 个保存日桶（按时间排列，不聚合、不补零桶）；无法归桶 '
+        + unbucketed.records.toString() + ' 条' + (unbucketed.records ? '（说明见下方常显卡片）' : '') + '。');
       if (!days.length) {
+        chartHost.appendChild(trendHint);
         chartHost.appendChild(el('p', 'unavailable', '无可归桶的日期数据；未知不画零，缺口见“来源与缺口”。'));
         return;
       }
       const anyKnown = days.some(d => d.metrics[metricKey].value !== null);
       if (!anyKnown) {
+        chartHost.appendChild(trendHint);
         chartHost.appendChild(el('p', 'unavailable', '图表不可用：该指标无任何已记录数值。'));
         return;
       }
-      const barHeight = 24, labelWidth = 110, valueWidth = 200, gap = 5;
-      const width = Math.min(920, chartHost.clientWidth || 920);
+      const SVGNS = 'http://www.w3.org/2000/svg';
+      const slotW = 48, barW = 30, plotH = 220, topPad = 16, labelH = 64, leftPad = 70, rightPad = 12;
+      const width = leftPad + days.length * slotW + rightPad;
+      const height = topPad + plotH + labelH;  // stable height: long series grow width and scroll
       const valueMax = days.reduce((max, d) => d.metrics[metricKey].value > max ? d.metrics[metricKey].value : max, 0n);
-      const trackWidth = Math.max(120, width - labelWidth - valueWidth - 16);
-      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      const baseline = topPad + plotH;
+      const yFor = v => baseline - (valueMax === 0n ? 0 : Number(v * 10000n / valueMax) / 10000) * plotH;
+      const svg = document.createElementNS(SVGNS, 'svg');
       svg.setAttribute('width', String(width));
-      svg.setAttribute('height', String(days.length * (barHeight + gap) + 4));
+      svg.setAttribute('height', String(height));
       svg.setAttribute('role', 'img');
-      svg.setAttribute('aria-label', '按日' + metricLabel + '条形图');
+      svg.setAttribute('aria-label', '按日' + metricLabel + '柱状图');
+      [[0n, '0', 'trend-axis'], [valueMax / 2n, fmtInt(valueMax / 2n).text, 'trend-grid'], [valueMax, fmtInt(valueMax).text, 'trend-grid']].forEach(pair => {
+        const y = yFor(pair[0]);
+        const line = document.createElementNS(SVGNS, 'line');
+        line.setAttribute('x1', String(leftPad)); line.setAttribute('x2', String(width - rightPad));
+        line.setAttribute('y1', String(y)); line.setAttribute('y2', String(y));
+        line.setAttribute('class', pair[2]);
+        svg.appendChild(line);
+        const gridLabel = document.createElementNS(SVGNS, 'text');
+        gridLabel.setAttribute('x', String(leftPad - 6)); gridLabel.setAttribute('y', String(y + 3));
+        gridLabel.setAttribute('text-anchor', 'end'); gridLabel.setAttribute('class', 'trend-grid-label');
+        gridLabel.textContent = pair[1];
+        svg.appendChild(gridLabel);
+      });
       days.forEach((day, i) => {
-        const y = i * (barHeight + gap) + 2;
+        const x = leftPad + i * slotW;
         const metric = day.metrics[metricKey];
-        const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        const group = document.createElementNS(SVGNS, 'g');
+        group.setAttribute('class', 'trend-day');
+        const title = document.createElementNS(SVGNS, 'title');
+        title.textContent = day.date + '：' + metricLabel + ' '
+          + (metric.value === null ? '未知（' + ((metric.reasons || []).join('；') || '来源未报告') + '）'
+             : metric.value.toLocaleString('en-US') + (metric.state !== 'known' ? '（部分）' : ''));
+        group.appendChild(title);
         if (onDayClick) {
-          group.style.cursor = 'pointer';
+          group.setAttribute('tabindex', '0');
+          group.setAttribute('role', 'button');
+          group.setAttribute('aria-label', '日期 ' + day.date + '，' + metricLabel
+            + (metric.value === null ? ' 未知' : ' ' + metric.value.toLocaleString('en-US')) + '；回车查看当日分布');
           group.addEventListener('click', () => onDayClick(day));
+          group.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onDayClick(day); }
+          });
         }
-        const labelNode = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        labelNode.setAttribute('x', String(labelWidth - 6)); labelNode.setAttribute('y', String(y + 16));
-        labelNode.setAttribute('text-anchor', 'end'); labelNode.setAttribute('class', 'bar-label');
+        const hit = document.createElementNS(SVGNS, 'rect');
+        hit.setAttribute('x', String(x + 2)); hit.setAttribute('y', String(topPad));
+        hit.setAttribute('width', String(slotW - 4)); hit.setAttribute('height', String(plotH));
+        hit.setAttribute('class', 'trend-hit');
+        group.appendChild(hit);
+        if (metric.value !== null) {
+          const columnHeight = metric.value === 0n ? 0 : Math.max(2, Math.round(baseline - yFor(metric.value)));
+          if (columnHeight > 0) {
+            const bar = document.createElementNS(SVGNS, 'rect');
+            bar.setAttribute('x', String(x + (slotW - barW) / 2)); bar.setAttribute('y', String(baseline - columnHeight));
+            bar.setAttribute('width', String(barW)); bar.setAttribute('height', String(columnHeight));
+            bar.setAttribute('class', 'trend-bar' + (metric.state !== 'known' ? ' partial' : ''));
+            group.appendChild(bar);
+          }
+          // Exact values stay on the per-day tooltip/title; inline labels would collide
+          // at this slot width.
+        } else {
+          const unknown = document.createElementNS(SVGNS, 'text');
+          unknown.setAttribute('x', String(x + slotW / 2)); unknown.setAttribute('y', String(baseline - 6));
+          unknown.setAttribute('text-anchor', 'middle'); unknown.setAttribute('class', 'trend-unknown');
+          unknown.textContent = '未知';
+          group.appendChild(unknown);
+        }
+        const labelNode = document.createElementNS(SVGNS, 'text');
+        const lx = x + slotW / 2, ly = baseline + 12;
+        labelNode.setAttribute('x', String(lx)); labelNode.setAttribute('y', String(ly));
+        labelNode.setAttribute('text-anchor', 'end'); labelNode.setAttribute('class', 'trend-label');
+        labelNode.setAttribute('transform', 'rotate(-45 ' + lx + ' ' + ly + ')');
         labelNode.textContent = day.date;
         group.appendChild(labelNode);
-        const track = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        track.setAttribute('x', String(labelWidth)); track.setAttribute('y', String(y));
-        track.setAttribute('width', String(trackWidth)); track.setAttribute('height', String(barHeight));
-        track.setAttribute('class', 'bar-track');
-        group.appendChild(track);
-        if (metric.value !== null) {
-          const scaled = valueMax === 0n ? 0 : Number(metric.value * 10000n / valueMax) / 10000;
-          const fill = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-          fill.setAttribute('x', String(labelWidth)); fill.setAttribute('y', String(y));
-          fill.setAttribute('width', String(Math.round(scaled * trackWidth))); fill.setAttribute('height', String(barHeight));
-          fill.setAttribute('class', 'bar-fill' + (metric.state !== 'known' ? ' partial' : ''));
-          group.appendChild(fill);
-        }
-        const valueNode = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        valueNode.setAttribute('x', String(labelWidth + trackWidth + 8)); valueNode.setAttribute('y', String(y + 16));
-        valueNode.setAttribute('class', 'bar-value');
-        valueNode.textContent = metric.value === null ? '未知（无数值条）'
-          : metric.value.toLocaleString('en-US') + (metric.state !== 'known' ? '（部分）' : '');
-        group.appendChild(valueNode);
         svg.appendChild(group);
       });
-      chartHost.appendChild(svg);
-      if (onDayClick) chartHost.appendChild(el('p', 'hint-line', '点选日期条形查看当日模型/会话分布（只切换视图，不重新读取来源）。'));
+      const scroll = el('div', 'trend-scroll');
+      scroll.appendChild(svg);
+      chartHost.appendChild(scroll);
+      chartHost.appendChild(trendHint);
+      if (onDayClick) chartHost.appendChild(el('p', 'hint-line', '点选日期柱查看当日模型/会话分布（键盘：Tab 聚焦日期柱后 Enter/空格；只切换视图，不重新读取来源）。'));
     }
   })();
   card(...trendSection.nodes);
@@ -1373,9 +3052,9 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
   });
   trendSection.render();
 
-  card((() => {
+  (() => {
     const unbucketed = obj.unbucketed || { records: 0 };
-    if (!unbucketed.records) return el('p', null, '');
+    if (!unbucketed.records) return;  // zero case stays visible as a count in the trend summary line
     const m = unbucketed.metrics || {};
     const known = ['input', 'output', 'cache_read', 'total'].filter(k => m[k] && m[k].value !== null)
       .map(k => ({ input: '输入', output: '输出', cache_read: '缓存读取', total: '总量' })[k]
@@ -1383,13 +3062,14 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
     const p = el('p', null, '无法归桶：' + unbucketed.records.toString() + ' 条（已计入总览、未计入任何一天；'
       + (unbucketed.reasons || []).join('；') + '）。' + (known.length ? '已记录：' + known.join('、') + '。' : '无可记录量。'));
     p.className = 'notes';
-    return p;
-  })());
+    card(el('h2', null, '无法归桶量对账（常显）'), p);
+  })();
 
   const rankingSection = (() => {
     const nodes = [el('h2', null, '模型 / 会话排行（同一结果的独立视图，不加入合计；未知不归零；按所选指标降序）')];
     const metrics = [['input', '输入'], ['output', '输出'], ['cache_read', '缓存读取'], ['total', '总量']];
     const metricField = document.createElement('fieldset');
+    metricField.className = 'inline-radios';
     metricField.appendChild(el('legend', null, '排行指标与排序'));
     for (const [key, label] of metrics) {
       const l = el('label', null);
@@ -1444,12 +3124,18 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
           }
         }
         t.appendChild(tbody);
-        frag.appendChild(t);
+        frag.appendChild(tableScroll(t));
         return frag;
       };
-      host.appendChild(table('模型排行', obj.rankings.model));
-      host.appendChild(el('p', 'hint-line', '会话行为该会话自身记录的小计；单会话报告默认含可靠归属后代，口径不同。'));
-      host.appendChild(table('会话排行', obj.rankings.session));
+      const grid = el('div', 'ranking-grid');
+      const modelBlock = el('div', 'ranking-block');
+      modelBlock.appendChild(table('模型排行', obj.rankings.model));
+      const sessionBlock = el('div', 'ranking-block');
+      sessionBlock.appendChild(table('会话排行', obj.rankings.session));
+      sessionBlock.appendChild(el('p', 'hint-line', '会话行为该会话自身记录的小计；单会话报告默认含可靠归属后代，口径不同。'));
+      grid.appendChild(modelBlock);
+      grid.appendChild(sessionBlock);
+      host.appendChild(grid);
     }
   })();
   card(...rankingSection.nodes);
@@ -1458,24 +3144,49 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
   });
   rankingSection.render();
 
+  report.appendChild(evidenceCard('分组用量（互斥分组，与 CLI 同值）', [(() => {
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    ['分组', '输入', '输出', '缓存读取', '缓存命中率', '总量'].forEach(h => headRow.appendChild(el('th', null, h)));
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    for (const row of obj.rows) addRow(tbody, GROUP_LABELS[row.group] || row.group, row, false);
+    addRow(tbody, '已记录小计', obj.summary, true);
+    table.appendChild(tbody);
+    const note = el('p', null, '输入包含缓存读取；缓存与已包含的推理输出不再相加。缓存命中率的分母是配对输入'
+      + '（输入与缓存读取均已知的记录子集），不是总输入。调用数：'
+      + (obj.summary.call_count === null ? '未知' : obj.summary.call_count.toString())
+      + '；其中已识别 ' + (obj.summary.known_call_count === null ? '未知' : obj.summary.known_call_count.toString()) + ' 次。');
+    note.className = 'hint-line';
+    const wrap = document.createDocumentFragment();
+    wrap.appendChild(tableScroll(table));
+    wrap.appendChild(note);
+    return wrap;
+  })()]));
+
+  card(...buildCostSection(obj));
+  card(...buildPerformanceSection(obj));
+
   const ovRecords = buildRecordsDetail(obj);
   if (ovRecords) {
-    card(...ovRecords.nodes);
+    report.appendChild(evidenceCard('调用明细', ovRecords.nodes));
     overviewLocate = ovRecords.locate;
     if (typeof state !== 'undefined' && state.overview && state.overview.report === obj) state.overview.locate = overviewLocate;
     rankingSection.render();  // rewire ranking locate buttons
   }
   if (obj.explanation && Array.isArray(obj.explanation.turns)) {
-    card(el('h2', null, '整体轮次时间线与按会话耗时'), buildTimelineCard(obj, overviewLocate));
+    report.appendChild(evidenceCard('整体轮次时间线与按会话耗时', [buildTimelineCard(obj, overviewLocate)]));
   }
   if (obj.explanation && ((Array.isArray(obj.explanation.internal) && obj.explanation.internal.length)
       || (Array.isArray(obj.explanation.relations) && obj.explanation.relations.length)
       || (Array.isArray(obj.explanation.excluded) && obj.explanation.excluded.length))) {
-    card(el('h2', null, '内部分布、后代关系与未计量证据'), buildInternalRelationsCard(obj, overviewLocate));
+    report.appendChild(evidenceCard('内部分布、后代关系与未计量证据', [buildInternalRelationsCard(obj, overviewLocate)]));
   }
 
   if (Array.isArray(obj.session_index) && obj.session_index.length) {
-    card(el('h2', null, '会话索引（范围内会话的白名单元数据）'), (() => {
+    report.appendChild(evidenceCard('会话索引（范围内会话的白名单元数据）', [(() => {
       const table = document.createElement('table');
       const headRow = document.createElement('tr');
       ['会话', '开始', '最近轮次结束', '轮次数', 'usage 记录', '已识别调用', '关系'].forEach(h => headRow.appendChild(el('th', null, h)));
@@ -1494,8 +3205,8 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
         tbody.appendChild(tr);
       }
       table.appendChild(tbody);
-      return table;
-    })());
+      return tableScroll(table);
+    })()]));
   }
 
   const extra = [];
@@ -1513,10 +3224,10 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
     const ul = document.createElement('ul');
     ul.className = 'notes';
     extra.forEach(x => ul.appendChild(el('li', null, x)));
-    card(el('h2', null, '独立证据（不并入小计）'), ul);
+    report.appendChild(evidenceCard('独立证据（不并入小计）', [ul]));
   }
 
-  card(el('h2', null, '定位证据'), (() => {
+  report.appendChild(evidenceCard('定位证据', [(() => {
     const frag = document.createDocumentFragment();
     if (obj.localization) {
       const dl = document.createElement('dl');
@@ -1530,9 +3241,9 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
       frag.appendChild(el('p', null, '旧报告未保存定位证据。'));
     }
     return frag;
-  })());
+  })()]));
 
-  card(el('h2', null, '内部来源支持'), (() => {
+  report.appendChild(evidenceCard('内部来源支持', [(() => {
     if (!obj.internal_support) return el('p', null, '报告未保存内部来源支持说明。');
     const ul = document.createElement('ul');
     ul.className = 'notes';
@@ -1541,34 +3252,35 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
       ul.appendChild(el('li', null, SUPPORT_LABELS[key] + '：' + (SUPPORT_STATES[item.status] || item.status) + '。' + item.summary));
     }
     return ul;
-  })());
+  })()]));
 
   card(el('h2', null, '来源与缺口'), (() => {
     const frag = document.createDocumentFragment();
-    const sources = document.createElement('ul');
-    sources.className = 'notes';
-    for (const path of obj.source_files) {
-      const li = el('li', null, '来源（仅展示路径，不自动读取）：');
-      li.appendChild(el('span', 'path', path));
-      sources.appendChild(li);
-    }
-    frag.appendChild(sources);
     if (obj.issues && obj.issues.length) {
       const grouped = {};
       for (const issue of obj.issues) grouped[issue.reason] = (grouped[issue.reason] || 0) + 1;
       const ul = document.createElement('ul');
       ul.className = 'notes';
       for (const reason of Object.keys(grouped)) ul.appendChild(el('li', null, '缺口：' + reason + '（' + grouped[reason] + ' 处）'));
-      frag.appendChild(el('p', null, '缺口说明：'));
+      frag.appendChild(el('p', null, '缺口说明（始终可见，不折叠）：'));
       frag.appendChild(ul);
     } else {
       frag.appendChild(el('p', null, '无已记录缺口（不代表证明完整覆盖）。'));
     }
+    const sourcesDetails = el('details', 'evidence-inner');
+    sourcesDetails.appendChild(el('summary', null, '来源文件列表（' + obj.source_files.length + ' 个；仅展示路径，不自动读取）'));
+    const sources = document.createElement('ul');
+    sources.className = 'notes';
+    for (const path of obj.source_files) {
+      const li = el('li');
+      li.appendChild(el('span', 'path', path));
+      sources.appendChild(li);
+    }
+    sourcesDetails.appendChild(sources);
+    frag.appendChild(sourcesDetails);
     return frag;
   })());
 
-  const loaded = el('p', null, footerText);
-  loaded.style.fontSize = '.82rem';
-  loaded.style.color = '#6b7280';
+  const loaded = el('p', 'hint-line', footerText);
   report.appendChild(loaded);
 }
