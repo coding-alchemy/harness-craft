@@ -8,9 +8,40 @@ let baselineVersion = 0;
 let selectionVersion = 0;
 let inflight = false;
 const state = { harness: null, session: null, selectedTurns: [], lastTurnIndex: -1, context: null,
-                sessionsListing: [], sessionChecks: null, sessionsView: null, overview: null };
+                sessionsListing: [], sessionChecks: null, sessionsView: null, overview: null,
+                pricing: { text: null, name: null } };
+// Pricing file reads are serialized by this epoch: the input is disabled while a read is
+// in flight and an earlier read can never overwrite a newer selection.
+let pricingReadVersion = 0;
 
 function $(id) { return document.getElementById(id); }
+// In-page tabs only toggle visibility: no request, no statistics, no state reset.
+const TAB_IDS = ['overview', 'sessions', 'saved'];
+function selectTab(name) {
+  for (const t of TAB_IDS) {
+    $('tab-' + t).setAttribute('aria-selected', String(t === name));
+    $('panel-' + t).hidden = t !== name;
+  }
+}
+for (const name of TAB_IDS) {
+  $('tab-' + name).addEventListener('click', () => selectTab(name));
+}
+document.querySelector('.tabs').addEventListener('keydown', event => {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+  const current = TAB_IDS.findIndex(t => $('tab-' + t).getAttribute('aria-selected') === 'true');
+  const next = (current + (event.key === 'ArrowRight' ? 1 : TAB_IDS.length - 1)) % TAB_IDS.length;
+  event.preventDefault();
+  selectTab(TAB_IDS[next]);
+  $('tab-' + TAB_IDS[next]).focus();
+});
+// The fresh-result trio is shared by session statistics and recompute/update; moving the
+// existing nodes into the initiating tab keeps their event bindings and content intact.
+function moveFreshTo(panelId) {
+  const panel = $(panelId);
+  panel.appendChild($('fresh-report'));
+  panel.appendChild($('fresh-actions'));
+  panel.appendChild($('fresh-report-empty'));
+}
 function setStatus(message, isError) {
   const node = $('status');
   node.textContent = message || '';
@@ -213,7 +244,7 @@ function renderSessions(listing) {
       });
       tbody.appendChild(tr);
     }
-    tableHost.appendChild(table);
+    tableHost.appendChild(tableScroll(table));
     if (notes.length || unmatched.length) {
       const ul = document.createElement('ul'); ul.className = 'notes';
       for (const note of notes.slice(0, 5)) ul.appendChild(el('li', null, note));
@@ -285,7 +316,7 @@ function renderTurns(listing, keepSelection) {
     });
     tbody.appendChild(tr);
   });
-  host.appendChild(table);
+  host.appendChild(tableScroll(table));
   $('turns-card').hidden = false;
 }
 
@@ -311,7 +342,7 @@ function renderRequests(listing) {
     cell.appendChild(button);
     tbody.appendChild(tr);
   }
-  host.appendChild(table);
+  host.appendChild(tableScroll(table));
   if (!items.length) host.appendChild(el('p', 'hint-line', '该会话无可用的用户请求候选；请使用显式时间或截至现在。'));
   $('requests-card').hidden = false;
 }
@@ -331,9 +362,13 @@ function cutoffValue() {
 function refreshScopeSummary() {
   const summary = $('scope-summary');
   $('clear-turns').hidden = state.selectedTurns.length === 0;
+  // setBusy only re-evaluates enablement around requests; keep the clear control in sync
+  // with selection changes that happen between requests.
+  if (!inflight) $('clear-turns').disabled = !state.session || state.selectedTurns.length === 0;
   if (!state.session) { summary.textContent = ''; return; }
   const parts = ['会话 ' + short(state.session, 24)];
   parts.push(state.selectedTurns.length ? '轮次集合（' + state.selectedTurns.length + ' 个，按列表顺序）' : '轮次：整个会话（turns=null）');
+  parts.push(state.pricing.text ? '价格配置 ' + state.pricing.name + '（随统计提交快照）' : '价格：未配置（结果不含费用估算）');
   try {
     const from = timeValue('from');
     const to = timeValue('cutoff');
@@ -361,8 +396,13 @@ async function runReport(overrides) {
   Object.assign(payload, overrides || {});
   if (payload.use_context) payload.session = null;  // The startup association is the identity; an explicit session alongside it is rejected as混用.
   if (payload.to && payload.request_id) { setStatus('请求起点与显式截止点不能同时使用', true); return; }
+  // A drill-down carries the parent overall report itself so the service reuses its saved
+  // pricing snapshot; the page's pending pricing config never substitutes for it there.
+  if (!payload.parent_report_text && state.pricing.text) payload.pricing_text = state.pricing.text;  // The actual snapshot loaded into the pending conditions.
   const data = await call('report', payload);
   if (data.busy || data.fatal || data.stale) return;
+  moveFreshTo('panel-sessions');
+  selectTab('sessions');
   if (!data.ok) { const message = data.error || '统计失败'; setStatus(message, true); failFresh(message); return; }
   showFreshResult(data.report, '网页统计结果（明确读取当前来源生成；format_version=2）。实际采用范围与截止点见“报告范围与状态”；已加载基准（如有）不受影响。');
   setStatus('统计完成；状态：' + (STATES[data.report.status] || data.report.status)
@@ -474,6 +514,72 @@ $('clear-turns').addEventListener('click', () => {
   setStatus('已清除轮次选择；将统计整个会话。');
 });
 
+function loadPricingFile(file) {
+  if (!file) return;
+  // Loading a pricing file only changes the pending query conditions: no source read, no
+  // automatic query, and no change to any already-rendered report. The session and overall
+  // forms share one pending pricing condition; both inputs stay disabled while a read is
+  // in flight and an earlier read can never overwrite a newer selection.
+  const owner = ++pricingReadVersion;
+  const inputs = [$('pricing-file'), $('ov-pricing-file')];
+  const summaryNodes = [$('pricing-summary'), $('ov-pricing-summary')];
+  for (const input of inputs) input.disabled = true;
+  for (const node of summaryNodes) node.textContent = '正在读取所选价格配置（不读取来源、不自动统计）……';
+  const refresh = () => { refreshScopeSummary(); refreshOverviewSummary(); };
+  const reader = new FileReader();
+  reader.onerror = () => {
+    if (owner !== pricingReadVersion) return;
+    state.pricing = { text: null, name: null };
+    for (const input of inputs) input.disabled = false;
+    for (const node of summaryNodes) node.textContent = '价格配置读取失败：无法读取所选文件；当前待提交条件不含价格。';
+    refresh();
+    setStatus('价格配置读取失败，待提交条件已还原为不含价格。', true);
+  };
+  reader.onload = () => {
+    if (owner !== pricingReadVersion) return;  // A newer selection superseded this read.
+    for (const input of inputs) input.disabled = false;
+    const failLoad = message => {
+      state.pricing = { text: null, name: null };
+      for (const node of summaryNodes) node.textContent = message + '；当前待提交条件不含价格。';
+      refresh();
+      setStatus(message + '。', true);
+    };
+    const text = String(reader.result);
+    let parsed;
+    try {
+      // Display-only peek at version/rule summary; authoritative validation runs on the
+      // service before any source read when the query is explicitly submitted.
+      parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('顶层必须是配置对象');
+    } catch (error) {
+      failLoad('价格配置不是有效 JSON 对象：' + (error && error.message ? error.message : String(error)));
+      return;
+    }
+    const rules = Array.isArray(parsed.rules) ? parsed.rules : [];
+    const currencies = [...new Set(rules.map(r => r && typeof r === 'object' ? r.currency : null).filter(c => typeof c === 'string' && c))];
+    state.pricing = { text, name: file.name };
+    for (const node of summaryNodes) node.textContent = '已选择 ' + file.name + '（schema v' + String(parsed.schema_version)
+      + '，修订 ' + String(parsed.revision === undefined ? '未标注' : parsed.revision)
+      + '，规则 ' + rules.length + ' 条' + (currencies.length ? '，币种 ' + currencies.join('、') : '')
+      + '）；仅随“统计”/“查询整体用量”明确提交，结构、版本、时间与单价在提交时由服务校验，非法配置在读源前拒绝。';
+    refresh();
+    setStatus('已加载价格配置（未读取来源，未改变已显示结果）；点击“统计”或“查询整体用量”才随本次查询提交。');
+  };
+  reader.readAsText(file);
+}
+
+$('pricing-file').addEventListener('change', event => {
+  const file = event.target.files[0];
+  event.target.value = '';
+  loadPricingFile(file);
+});
+
+$('ov-pricing-file').addEventListener('change', event => {
+  const file = event.target.files[0];
+  event.target.value = '';
+  loadPricingFile(file);
+});
+
 function selectContext() {
   const context = state.context;
   if (!context) return;
@@ -490,10 +596,14 @@ $('context-request-run').addEventListener('click', async () => {
   const context = state.context;
   if (!context || !context.request_id) return;
   selectContext();
-  const data = await call('report', { harness: context.harness, session: null, use_context: true,
-                                      request_id: context.request_id,
-                                      main_only: document.querySelector('input[name=agents]:checked').value === 'main' });
+  const payload = { harness: context.harness, session: null, use_context: true,
+                    request_id: context.request_id,
+                    main_only: document.querySelector('input[name=agents]:checked').value === 'main' };
+  if (state.pricing.text) payload.pricing_text = state.pricing.text;
+  const data = await call('report', payload);
   if (data.busy || data.fatal || data.stale) return;
+  moveFreshTo('panel-sessions');
+  selectTab('sessions');
   if (!data.ok) { setStatus(data.error || '转交请求统计失败', true); failFresh(data.error || '转交请求统计失败'); return; }
   showFreshResult(data.report, '转交请求统计结果（明确读取当前来源生成；format_version=2）。截止点为该请求自身的创建/入队时间；实际范围见“报告范围与状态”。');
   setStatus('转交请求统计完成；状态：' + (STATES[data.report.status] || data.report.status));
@@ -535,6 +645,7 @@ function refreshOverviewSummary() {
   parts.push('显示时区 ' + ($('ov-tz').value.trim() || defaultOffset()));
   parts.push('会话集合：来源全部会话（可在后续版本按列表缩小）');
   parts.push('代理：' + (document.querySelector('input[name=ov-agents]:checked').value === 'main' ? '仅主代理常规调用' : '默认完整范围'));
+  parts.push(state.pricing.text ? '价格配置 ' + state.pricing.name + '（随查询提交快照）' : '价格：未配置（结果不含费用估算）');
   $('ov-scope-summary').textContent = '将提交的整体范围：' + parts.join('；');
 }
 for (const id of ('ov-from-local,ov-from-tz,ov-to-local,ov-to-tz,ov-tz').split(',')) {
@@ -548,9 +659,14 @@ refreshOverviewSummary();
 function showOverviewResult(reportObj) {
   const host = $('overview-result');
   host.hidden = false;
+  selectTab('overview');
+  $('empty').hidden = true;  // An overview result replaces the initial "nothing has run" placeholder.
   try {
     validateReport(reportObj);
     renderOverviewReport(reportObj, '整体用量结果（format_version=3）。日趋势、模型/会话排行与总览来自同一次读取；点选日期只切换视图，不重新读取来源。', 'overview-result', onOverviewDayClick);
+    // Result delivered: fold the query form to its one-line entry so the dashboard owns the
+    // first screen; expanding it restores the full form for the next explicit query.
+    $('ov-query-collapse').open = false;
     refreshOverviewDrill();
     const actions = $('overview-actions');
     actions.hidden = false;
@@ -561,6 +677,8 @@ function showOverviewResult(reportObj) {
     card.appendChild(el('h2', null, '整体结果未取得'));
     card.appendChild(el('p', null, '返回的报告未通过合同校验：' + (error && error.message ? error.message : String(error))));
     host.appendChild(card);
+    // Same failure contract as a rejected query: the form reopens next to the error.
+    $('ov-query-collapse').open = true;
   }
 }
 
@@ -577,9 +695,15 @@ function runOverviewQuery(overrides) {
     return Promise.resolve();
   }
   Object.assign(payload, overrides || {});
+  if (state.pricing.text) payload.pricing_text = state.pricing.text;  // The actual snapshot loaded into the pending conditions.
   return call('overview', payload).then(data => {
     if (data.busy || data.fatal || data.stale) return;
-    if (!data.ok) { setStatus(data.error || '整体查询失败', true); return; }
+    if (!data.ok) {
+      setStatus(data.error || '整体查询失败', true);
+      // A failed query reopens the form so the pending conditions stay editable next to the error.
+      $('ov-query-collapse').open = true;
+      return;
+    }
     state.overview = { report: data.report, drill: { date: null } };
     showOverviewResult(data.report);
     setStatus('整体查询完成；状态：' + (STATES[data.report.status] || data.report.status)
@@ -617,7 +741,7 @@ function refreshOverviewDrill() {
   }
   panel.appendChild(el('p', 'hint-line', '返回不会丢弃整体结果、查询条件与固定截止点；每层显示实际范围。'));
   if (!drill.date) {
-    panel.appendChild(el('p', null, '点选上方趋势图中的日期条形，查看该日（原范围与该日交集）的模型/会话分布。'));
+    panel.appendChild(el('p', null, '点选上方趋势图中的日期柱，查看该日（原范围与该日交集）的模型/会话分布。'));
     $('overview-result').appendChild(panel);
     return;
   }
@@ -630,6 +754,16 @@ function refreshOverviewDrill() {
   panel.appendChild(el('p', 'notes', '日期 ' + day.date + '：会话 ' + day.sessions + ' 个；调用数 '
     + (day.call_count === null ? '未知' : day.call_count.toString()) + '；日范围＝原范围与该日交集：'
     + (day.from && day.to ? day.from + ' ~ ' + day.to : '未保存')));
+  const costProjections = report.analysis && report.analysis.cost && report.analysis.cost.projections;
+  if (costProjections) {
+    // The drill consumes only the saved day cost member; no source read, no recomputation.
+    const dayCost = (costProjections.day || []).find(m => m.date === drill.date);
+    const dayCurrencies = dayCost ? Object.keys(dayCost.currencies).sort() : [];
+    panel.appendChild(el('p', 'hint-line', dayCurrencies.length
+      ? '当日已定价金额（保存投影）：' + dayCurrencies.map(c => c + ' ' + displayAmount(dayCost.currencies[c].amount)
+        + '（精确 ' + dayCost.currencies[c].amount + '）').join('；') + '；不与无法归日项相加。'
+      : '当日无已定价金额（未定价原因见费用区；未知不画零）。'));
+  }
   const distTable = (title, rows, onRow) => {
     panel.appendChild(el('h3', null, title));
     if (!rows.length) { panel.appendChild(el('p', 'unavailable', '无可显示行。')); return; }
@@ -641,10 +775,15 @@ function refreshOverviewDrill() {
     const ovLocate = state.overview && state.overview.locate;
     for (const row of rows) {
       const tr = document.createElement('tr');
-      const labelCell = el('td', onRow ? 'expandable' : null, row.label);
+      const labelCell = el('td', null);
       if (onRow) {
-        labelCell.title = '点击进入该会话当日统计（既有单会话流程）';
-        labelCell.addEventListener('click', () => onRow(row));
+        const enterBtn = el('button', 'linklike', row.label);
+        enterBtn.type = 'button';
+        enterBtn.title = '点击进入该会话当日统计（既有单会话流程）';
+        enterBtn.addEventListener('click', () => onRow(row));
+        labelCell.appendChild(enterBtn);
+      } else {
+        labelCell.textContent = row.label;
       }
       tr.appendChild(labelCell);
       for (const key of ['input', 'output', 'cache_read']) {
@@ -670,12 +809,14 @@ function refreshOverviewDrill() {
       tbody.appendChild(tr);
     }
     table.appendChild(tbody);
-    panel.appendChild(table);
+    panel.appendChild(tableScroll(table));
   };
   distTable('当日模型分布', day.by_model || [], null);
   panel.appendChild(el('p', 'hint-line', '会话行为该会话自身记录的已记录小计；点击进入的既有单会话报告默认含可靠归属后代，口径不同，结果页会同时显示实际范围。'));
   distTable('当日会话分布', day.by_session || [], row => enterSessionFromDrill(row.id, drill.date));
   $('overview-result').appendChild(panel);
+  // The panel is appended below the evidence blocks; bring it into view after a day pick.
+  panel.scrollIntoView({ block: 'nearest' });
 }
 
 function enterSessionFromDrill(sessionId, date) {
@@ -693,12 +834,17 @@ function enterSessionFromDrill(sessionId, date) {
   // The day row carries the kernel-computed intersection of the original scope with this
   // local day (both bounds keep their own precision and timezone spelling); backfilling the
   // existing time controls keeps later turn/task statistics on the same range until edited.
+  // The parent report itself rides along so the session report is priced by the parent's
+  // saved pricing snapshot (or stays unpriced when the parent saved none) — never by the
+  // page's current pending pricing config.
+  const priced = Boolean(report.analysis && report.analysis.cost);
   selectSession(sessionId, '已从整体结果进入会话 ' + short(sessionId, 20) + '（日期 ' + date
-    + '，范围 ' + day.from + ' ~ ' + day.to + '）；将按既有单会话流程统计。');
+    + '，范围 ' + day.from + ' ~ ' + day.to + '）；将按既有单会话流程统计，'
+    + (priced ? '费用沿用该整体报告保存的价格规则快照，不采用当前待提交价格。' : '该整体报告未保存价格配置，当日统计不含费用估算。'));
   applyBoundControls('from', day.from);
   applyBoundControls('cutoff', day.to);
   refreshScopeSummary();
-  runReport({ session: sessionId, from: day.from, to: day.to });
+  runReport({ session: sessionId, from: day.from, to: day.to, parent_report_text: losslessText(report) });
 }
 
 function applyBoundControls(prefix, iso) {
@@ -725,6 +871,10 @@ loadCapabilities();
 
 /* ---- 04：保存报告复用、更新与导出 ---- */
 const baseline = { text: null, obj: null, name: null };
+// Explicit reprice channel for recompute/update only: a separately loaded local pricing
+// text. Absent means the saved snapshot is reused; loading it never reprices by itself.
+const savedPricing = { text: null, name: null };
+let savedPricingReadVersion = 0;
 
 function losslessText(obj) {
   // Lossless round-trip keeps report integers exact for export submission.
@@ -759,12 +909,26 @@ function showFreshResult(reportObj, footerText) {
   }
 }
 
+const SAVED_PRICING_DEFAULT = '未选择新价格：重算/更新沿用报告保存的价格快照（含未命中规则）；明确选择合法新配置并点击重算/提交更新才换价。加载、展示与导出不接受价格，也不读取当前价格文件。';
+
 function clearBaseline() {
   // A failed load leaves no loaded report at all: previous baseline, fresh result and
   // every operation binding on them are cleared so nothing can masquerade or stay operable.
+  // Superseding the reprice read too keeps an in-flight pricing FileReader from completing
+  // after the swap and binding its old result to the new basis.
+  savedPricingReadVersion++;
+  // The superseded read can no longer restore the input itself (its early return keeps a
+  // newer reprice read's disabled state intact), so the basis swap re-enables it directly.
+  $('saved-pricing-file').disabled = false;
   baseline.text = null;
   baseline.obj = null;
   baseline.name = null;
+  savedPricing.text = null;
+  savedPricing.name = null;
+  $('saved-pricing-summary').textContent = SAVED_PRICING_DEFAULT;
+  const capMissing = $('saved-cap-missing');
+  capMissing.hidden = true;
+  capMissing.textContent = '';
   $('saved-name').textContent = '';
   $('baseline-card').hidden = true;
   $('update-form').hidden = true;
@@ -872,8 +1036,10 @@ function refreshUpdateDiff() {
   diff.textContent = '原范围：' + describeScope(oldScope)
     + '\n新范围：' + describeScope(newScope)
     + '\n差异：' + scopeDiff(oldScope, newScope)
-    + (values.to ? '' : '（截止点留空，将更新到本次网页请求入口时间）');
-  diff.style.whiteSpace = 'pre-wrap';
+    + (values.to ? '' : '（截止点留空，将更新到本次网页请求入口时间）')
+    + '\n价格：' + (savedPricing.text
+      ? '明确换价为新配置 ' + savedPricing.name + '（提交时由服务校验；换价不改变上述范围差异）'
+      : '沿用保存报告的价格快照（未选择新价格；范围内新增记录无匹配规则时保持未定价）');
 }
 
 function loadSavedFile(file) {
@@ -903,6 +1069,11 @@ function loadSavedFile(file) {
         renderReport(obj, version, footer, 'report');
       }
       $('baseline-scope').textContent = '保存范围：' + describeScope(obj.scope) + '；保存读取时间 ' + obj.read_at;
+      const capMissing = $('saved-cap-missing');
+      capMissing.textContent = (version === 1 || !obj.analysis)
+        ? '该报告未保存费用/性能分析能力（旧报告合同，不补零、不自动升级原文件）；明确重算可生成新分析，未提交价格时不猜价。旧版本工具可能忽略或丢失扩展，不承诺保留三期结果。'
+        : '该报告含费用/性能扩展（内部 schema v1）：旧版本工具可能忽略或丢失该扩展；本工具完整保留并在加载时逐侧校验。';
+      capMissing.hidden = false;
       $('baseline-card').hidden = false;
       $('update-form').hidden = true;
       setStatus('已加载保存报告（未读取来源）。可原范围重算、编辑新范围更新或导出。');
@@ -918,14 +1089,80 @@ $('saved-file').addEventListener('change', event => {
   event.target.value = '';
 });
 
+function loadSavedPricingFile(file) {
+  if (!file) return;
+  // Same FileReader contract as the query forms, but this config is only an explicit
+  // recompute/update condition: selecting it never reads a source or changes results.
+  const owner = ++savedPricingReadVersion;
+  const input = $('saved-pricing-file');
+  const summary = $('saved-pricing-summary');
+  input.disabled = true;
+  summary.textContent = '正在读取所选新价格配置（不读取来源、不重算）……';
+  const reader = new FileReader();
+  const restore = () => { input.disabled = false; refreshUpdateDiff(); };
+  reader.onerror = () => {
+    if (owner !== savedPricingReadVersion) return;
+    savedPricing.text = null;
+    savedPricing.name = null;
+    restore();
+    summary.textContent = '新价格配置读取失败：无法读取所选文件；重算/更新仍沿用保存快照。';
+    setStatus('新价格配置读取失败，重算/更新仍沿用保存快照。', true);
+  };
+  reader.onload = () => {
+    if (owner !== savedPricingReadVersion) return;  // A newer selection superseded this read.
+    restore();
+    const failLoad = message => {
+      savedPricing.text = null;
+      savedPricing.name = null;
+      summary.textContent = message + '；重算/更新仍沿用保存快照。';
+      setStatus(message + '。', true);
+    };
+    const text = String(reader.result);
+    try {
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('顶层必须是配置对象');
+    } catch (error) {
+      failLoad('新价格配置不是有效 JSON 对象：' + (error && error.message ? error.message : String(error)));
+      return;
+    }
+    savedPricing.text = text;
+    savedPricing.name = file.name;
+    summary.textContent = '已选择新价格配置 ' + file.name + '：点击“按原范围重算”或“提交更新”才换价（结构、版本、时间与单价在提交时由服务校验，非法配置在读源前拒绝）；不点击则不改变任何结果。';
+    setStatus('已加载新价格配置（未读取来源，未改变基准与已显示结果）；点击“按原范围重算”或“提交更新”才换价。');
+  };
+  reader.readAsText(file);
+}
+
+$('saved-pricing-file').addEventListener('change', event => {
+  const file = event.target.files[0];
+  event.target.value = '';
+  loadSavedPricingFile(file);
+});
+
+function pricingBasisNote(reportObj, submittedPricing) {
+  // Distinguish which rules produced this result so old and new stay auditable side by side.
+  const cost = reportObj.analysis && reportObj.analysis.cost;
+  if (submittedPricing.text && cost) return '价格：本次明确提交的新配置 ' + submittedPricing.name + '（修订 ' + cost.config.revision + '，已换价）';
+  if (cost) return '价格：沿用保存报告的价格快照（修订 ' + cost.config.revision + '，含未命中规则）';
+  return '价格：保存报告无价格快照且本次未提交新配置，结果不含费用估算（不猜价）';
+}
+
 $('recompute-run').addEventListener('click', async () => {
   if (!baseline.text) return;
-  const data = await call('recompute', { report_text: baseline.text });
+  const payload = { report_text: baseline.text };
+  const submittedPricing = { text: savedPricing.text, name: savedPricing.name };
+  // Only an explicitly loaded new config reprices; omitting it reuses the saved snapshot
+  // and never touches the update contract (scope/cutoff stay the saved ones).
+  if (submittedPricing.text) payload.pricing_text = submittedPricing.text;
+  const data = await call('recompute', payload);
   if (data.busy || data.fatal || data.stale) return;
+  moveFreshTo('panel-saved');
+  selectTab('saved');
   if (!data.ok) { setStatus(data.error || '原范围重算失败', true); failFresh(data.error || '原范围重算失败'); return; }
-  showFreshResult(data.report, '原范围重算结果（format_version=' + data.report.format_version + '）。保持保存的范围、代理策略与截止点，读取当前来源生成；基准仍可对照。');
+  showFreshResult(data.report, '原范围重算结果（format_version=' + data.report.format_version + '）。保持保存的范围、代理策略与截止点，读取当前来源生成；基准仍可对照。'
+    + pricingBasisNote(data.report, submittedPricing) + '。原文件未改写。');
   setStatus('原范围重算完成；状态：' + (STATES[data.report.status] || data.report.status)
-    + (data.exit_code === 2 ? '（有效部分结果）' : data.exit_code === 3 ? '（不可统计）' : ''));
+    + (data.exit_code === 2 ? '（有效部分结果）' : data.exit_code === 3 ? '（不可统计）' : '') + '；' + pricingBasisNote(data.report, submittedPricing));
 });
 
 $('update-toggle').addEventListener('click', () => {
@@ -960,6 +1197,7 @@ $('update-run').addEventListener('click', async () => {
   const agents = document.querySelector('input[name=update-agents]:checked').value;
   const overall = baseline.obj.scope.kind === 'overall';
   const payload = { report_text: baseline.text, update: true, to: values.to };
+  const submittedPricing = { text: savedPricing.text, name: savedPricing.name };
   if (overall) {
     if (values.sessions) payload.sessions = values.sessions;
     if (values.tz) payload.tz = values.tz;
@@ -969,11 +1207,17 @@ $('update-run').addEventListener('click', async () => {
   // Omit an untouched lower bound; explicit null remains the web CLEAR contract.
   if (values.from !== baseline.obj.scope.from) payload.from = values.from;
   if (agents !== 'keep') payload.main_only = agents === 'main';
+  // Pricing stays a separate explicit choice: it never implies a scope update, and an
+  // update without a new config keeps the saved snapshot (new records price by it or stay unpriced).
+  if (submittedPricing.text) payload.pricing_text = submittedPricing.text;
   const data = await call('recompute', payload);
   if (data.busy || data.fatal || data.stale) return;
+  moveFreshTo('panel-saved');
+  selectTab('saved');
   if (!data.ok) { setStatus(data.error || '更新失败', true); failFresh(data.error || '更新失败'); return; }
-  showFreshResult(data.report, '明确更新结果（format_version=' + data.report.format_version + '）。实际采用范围与截止点见上方；与保存基准的差异已在提交前显示。');
-  setStatus('明确更新完成；状态：' + (STATES[data.report.status] || data.report.status));
+  showFreshResult(data.report, '明确更新结果（format_version=' + data.report.format_version + '）。实际采用范围与截止点见上方；与保存基准的差异已在提交前显示。'
+    + pricingBasisNote(data.report, submittedPricing) + '。原文件未改写。');
+  setStatus('明确更新完成；状态：' + (STATES[data.report.status] || data.report.status) + '；' + pricingBasisNote(data.report, submittedPricing));
 });
 
 async function exportReport(reportText, sourceLabel) {

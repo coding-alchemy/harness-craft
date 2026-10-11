@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 from .core import now
 from .formats import export, read_decoded, render
@@ -35,6 +36,7 @@ def main(argv=None):
     parser.add_argument('--detail', choices=['model','agent','turn'], help='独立明细视图，不重复加入合计')
     parser.add_argument('--format', choices=['table', 'markdown', 'json', 'csv'], default='table', help='标准输出格式；不写文件')
     parser.add_argument('--saved', help='已保存的 JSON 报告')
+    parser.add_argument('--pricing', help='本地价格配置 JSON 文件；仅用于 report/overview/recompute 的明确费用查询')
     parser.add_argument('--update', action='store_true', help='明确更新保存范围；未指定上界时更新到命令开始')
     parser.add_argument('--export', choices=['markdown','csv','json'], help='显式导出；同时提供 --output')
     parser.add_argument('--output', help='导出目标文件')
@@ -49,6 +51,16 @@ def main(argv=None):
             saved = read_decoded(args.saved)
         elif args.saved or args.update:
             raise ValueError('--saved 和 --update 只用于展示或重算已保存报告')
+        pricing = None
+        if args.pricing:
+            if args.operation not in ('report', 'overview', 'recompute'):
+                raise ValueError('--pricing 仅用于 report/overview/recompute 的明确费用查询；候选列举与 show 不接受价格')
+            try:
+                pricing = json.loads(Path(args.pricing).read_text())
+            except json.JSONDecodeError as exc:
+                raise ValueError('价格配置不是有效 JSON') from exc
+            if pricing is None:
+                raise ValueError('价格配置为 null；未选择配置请省略 --pricing')
         # Baseline CLI saved-scope merge treated --from '' as omitted. New reports
         # keep the original empty string; HTTP explicit null remains CLEAR.
         since = None if saved is not None and args.since == '' else args.since
@@ -70,12 +82,13 @@ def main(argv=None):
                             to=args.to, since=since, turns=args.turn,
                             request_start=args.request_start, request_id=args.request_id,
                             main_only=args.main_only, detail=args.detail, saved=saved,
-                            update=args.update))
+                            update=args.update, pricing=pricing))
         if outcome['kind'] == 'listing':
             print(json.dumps(outcome['payload'], ensure_ascii=False, indent=2))
             return 0
         if args.export:
-            export(outcome['report'],args.export,args.output,[args.saved] if args.saved else [])
+            protected = ([args.saved] if args.saved else []) + ([args.pricing] if args.pricing else [])
+            export(outcome['report'],args.export,args.output,protected)
         print(render(outcome['report'],args.format),end='')
         return outcome['exit']
     except (ValueError, OSError) as exc:

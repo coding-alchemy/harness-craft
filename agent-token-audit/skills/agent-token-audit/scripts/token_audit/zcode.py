@@ -1,12 +1,11 @@
 """ZCode rollout/log adapter and read-only existing telemetry database reader."""
-import datetime as dt
 import json
 from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
 from .codex import discover
-from .core import aggregate, cell, deduplicate, normalize, source_lines
+from .core import aggregate, cell, deduplicate, iso_ms, normalize, source_lines
 
 MAPPING = {'input': 'inputTokens', 'output': 'outputTokens', 'cache_read': 'cacheReadTokens',
            'cache_write': 'cacheWriteTokens', 'reasoning': 'reasoningTokens'}
@@ -75,15 +74,22 @@ def classify(query):
     return 'internal' if query in ('compact', 'session_title', 'web_fetch_processing', 'web_search_tool') else 'unknown'
 
 
+TOOL_EVENTS = ('tool.call.started', 'tool.call.completed', 'tool.call.failed')
+
+
 def read(roots, guard=None):
     paths = discover(roots, guard)
     sessions, records, issues, counts, events = {}, [], [], {}, []
+    tool_by_key = {}
     for path, line, obj, error in source_lines(paths):
         loc = {'path': path, 'line': line}
         if error:
             issues.append({'reason': error, 'source': loc}); continue
         sid = obj.get('sessionId')
         if not isinstance(sid, str):
+            if obj.get('event') in TOOL_EVENTS:
+                # No trace/time-based attribution for tool events without a session identity.
+                issues.append({'reason': '工具事件无会话身份，不按 trace 或时间猜归属；未纳入', 'source': loc})
             continue
         item = sessions.setdefault(sid, session(sid, obj.get('startedAt') or obj.get('timestamp')))
         if path not in item['paths']:
@@ -106,6 +112,50 @@ def read(roots, guard=None):
             if turn and ctx.get('turnNumber') is not None:
                 turn_candidate(item, turn, event)['display_number'] = ctx.get('turnNumber')
         rid, attempt = ctx.get('requestId'), ctx.get('attempt')
+        if event in TOOL_EVENTS:
+            # Stable identity = full session + real tool_call_id; started copies merge with
+            # the completion copy into ONE event. Command arguments and output are never read.
+            cid = obj.get('toolCallId')
+            if not isinstance(cid, str) or not cid:
+                issues.append({'reason': '工具事件缺少真实 tool_call_id；未纳入', 'source': loc, 'session': sid})
+                continue
+            key = 'zcode-tool:' + sid + ':' + cid
+            existing = tool_by_key.get(key)
+            if existing is None:
+                existing = {'key': key, 'call_id': cid, 'session': sid, 'turn': obj.get('turnId'),
+                            'root_turn': None,
+                            'category': ctx.get('toolName') if isinstance(ctx.get('toolName'), str) and ctx.get('toolName') else '工具类别未知',
+                            'group': classify(ctx.get('querySource')),
+                            'status': 'running', 'completed_at': None, 'sources': [loc],
+                            'duration_ns': None, 'duration_precision': 'ms', 'zero_unconfirmed': False,
+                            'exec_start': None, 'exec_end': None, 'dispatch_start': None, 'dispatch_end': None,
+                            'conflict': None}
+                tool_by_key[key] = existing
+            else:
+                if loc not in existing['sources']:
+                    existing['sources'].append(loc)
+            if event == 'tool.call.started':
+                # The executor's own start event is the actual execution start; copies merge.
+                if existing['exec_start'] is None:
+                    existing['exec_start'] = obj.get('timestamp')
+                elif existing['exec_start'] != obj.get('timestamp'):
+                    existing['conflict'] = '同一工具身份的多个开始事件时间冲突'
+                continue
+            # Completion/failure copies must agree on time, duration and status to count once.
+            finished = 'completed' if event == 'tool.call.completed' else 'failed'
+            raw = obj.get('durationMs')
+            if raw is not None and (type(raw) is not int or raw < 0):
+                existing['conflict'] = '原生 durationMs 为负数、布尔值或非整数，不能作为有效耗时'
+                raw = None
+            if existing['completed_at'] is None:
+                existing['completed_at'] = obj.get('timestamp')
+                existing['exec_end'] = obj.get('timestamp')
+                existing['status'] = finished
+                existing['duration_ns'] = raw * 1000000 if raw is not None else None
+            elif (existing['completed_at'] != obj.get('timestamp') or existing['status'] != finished
+                  or (raw is not None and existing['duration_ns'] is not None and existing['duration_ns'] != raw * 1000000)):
+                existing['conflict'] = '同一工具身份的完成副本在时间、状态或耗时上冲突，不能只计一次'
+            continue
         if not rid or not isinstance(attempt, int):
             continue
         key = f'zcode:{sid}:{rid}:{attempt}'
@@ -144,6 +194,7 @@ def read(roots, guard=None):
             issues.append({'reason': '未知模型字段格式；模型归为未知', 'source': loc, 'session': sid})
             model_id = None
         base['model'] = model_id or '模型未知'
+        base['provider'] = provider if isinstance(provider, str) else None
         if isinstance(usage, dict) and any(isinstance(v, int) and not isinstance(v, bool) for v in usage.values()):
             base['metrics'] = metrics(usage, provider)
             if obj.get('usage') is not None and obj['usage'] != usage:
@@ -161,11 +212,8 @@ def read(roots, guard=None):
             records.append(dict(value, model='模型未知', granularity='unknown',
                                 metrics=metrics({}, 'builtin:bigmodel-coding-plan')))
     return {'harness': 'zcode', 'sessions': sessions, 'records': records, 'issues': issues,
-            'source_files': [str(p) for p in paths], 'events': events}
-
-
-def iso_ms(value):
-    return dt.datetime.fromtimestamp(value / 1000, dt.timezone.utc).isoformat() if value is not None else None
+            'source_files': [str(p) for p in paths], 'events': events,
+            'tool_events': list(tool_by_key.values())}
 
 
 def read_database(path, guard=None):
@@ -227,7 +275,14 @@ def read_database(path, guard=None):
                                      forked_from=row['parent_id'] if row['parent_id'] and not child else None,
                                      paths=[str(source)])
             records, issues = [], []
+            # First-token evidence columns exist only on newer writers; the column check is
+            # the verified "source does not provide" conclusion for older schemas.
+            usage_columns = {row['name'] for row in db.execute('PRAGMA table_info(model_usage)')}
+            optional = [name for name in ('first_token_at', 'time_to_first_token_ms', 'tool_call_count')
+                        if name in usage_columns]
             fields = 'id,logical_request_id,attempt_index,session_id,turn_id,query_source,provider_id,model_id,status,started_at,completed_at,duration_ms,retry_count,raw_usage_json'
+            if optional:
+                fields += ',' + ','.join(optional)
             for row in db.execute('SELECT ' + fields + ' FROM model_usage ORDER BY started_at,id'):
                 loc = {'path': str(source), 'table': 'model_usage', 'id': row['id']}
                 try:
@@ -239,9 +294,13 @@ def read_database(path, guard=None):
                     turn_candidate(sessions[row['session_id']], turn_id, 'model_usage')
                 records.append({'key': 'zcode-db:' + row['id'], 'call_id': f"{row['logical_request_id']}:{row['attempt_index']}", 'session': row['session_id'],
                                 'agent': row['session_id'], 'turn': turn_id, 'root_turn': None,
-                                'group': classify(row['query_source']), 'model': row['model_id'],
+                                'group': classify(row['query_source']), 'model': row['model_id'], 'provider': row['provider_id'],
                                 'start': iso_ms(row['started_at']), 'time': iso_ms(row['completed_at']),
                                 'duration_ms': row['duration_ms'], 'sources': [loc],
+                                'first_token_at': iso_ms(row['first_token_at']) if 'first_token_at' in optional else None,
+                                'native_ttft_ms': row['time_to_first_token_ms'] if 'time_to_first_token_ms' in optional else None,
+                                'tool_call_count': row['tool_call_count'] if 'tool_call_count' in optional else None,
+                                'retry_count': row['retry_count'],
                                 'granularity': 'logical_request', 'time_kind': 'completion_time',
                                 'source_status': row['status'] or 'unknown',
                                 'metrics': metrics(usage, row['provider_id']),
@@ -265,6 +324,51 @@ def read_database(path, guard=None):
                         candidate['end'] = iso_ms(row['completed_at'])
                         candidate['end_source'] = 'turn_usage'
             tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            tool_events = []
+            # tool_usage carries session/turn, tool_call_id, status, a native duration and the
+            # dispatch-to-completion times. The writer may default a missing duration to 0, so
+            # a bare zero stays unconfirmed until an independent completion log verifies it.
+            tool_required = {'id','session_id','turn_id','tool_call_id','tool_name','status','started_at','completed_at','duration_ms'}
+            tool_table_ok = False
+            if 'tool_usage' in tables:
+                tool_columns = {row['name'] for row in db.execute('PRAGMA table_info(tool_usage)')}
+                tool_table_ok = tool_required <= tool_columns
+            if tool_table_ok:
+                seen_tool_keys = {}
+                for row in db.execute('SELECT id,session_id,turn_id,tool_call_id,tool_name,status,started_at,completed_at,duration_ms FROM tool_usage'):
+                    loc = {'path': str(source), 'table': 'tool_usage', 'id': row['id']}
+                    sid, cid = row['session_id'], row['tool_call_id']
+                    if not isinstance(sid, str) or not isinstance(cid, str) or not cid:
+                        issues.append({'reason': '数据库工具行缺少完整会话/tool_call_id；未纳入', 'source': loc})
+                        continue
+                    key = 'zcode-db-tool:' + sid + ':' + cid
+                    if key in seen_tool_keys:
+                        seen_tool_keys[key]['conflict'] = '数据库同一会话内 tool_call_id 重复，无法唯一合并'
+                        continue
+                    raw = row['duration_ms']
+                    duration_ns, zero_unconfirmed, conflict = None, False, None
+                    if raw is not None:
+                        if type(raw) is not int or raw < 0:
+                            conflict = '数据库原生 duration_ms 为负数、布尔值或非整数，不能作为有效耗时'
+                        elif raw == 0:
+                            zero_unconfirmed = True
+                        else:
+                            duration_ns = raw * 1000000
+                    status = {'completed': 'completed', 'error': 'failed'}.get(
+                        row['status'], row['status'] if isinstance(row['status'], str) else 'unknown')
+                    seen_tool_keys[key] = {'key': key, 'call_id': cid, 'session': sid, 'turn': row['turn_id'],
+                        'root_turn': None,
+                        'category': row['tool_name'] if isinstance(row['tool_name'], str) and row['tool_name'] else '工具类别未知',
+                        'group': 'unknown',  # tool_usage has no query_source; a merged log event may classify
+                        'status': status, 'completed_at': iso_ms(row['completed_at']),
+                        'sources': [loc], 'duration_ns': duration_ns, 'duration_precision': 'ms',
+                        'zero_unconfirmed': zero_unconfirmed,
+                        'exec_start': None, 'exec_end': None,
+                        # Dispatch-to-completion span: different semantics from the native
+                        # execution duration, saved separately, never judged as a conflict.
+                        'dispatch_start': iso_ms(row['started_at']), 'dispatch_end': iso_ms(row['completed_at']),
+                        'conflict': conflict}
+                tool_events = list(seen_tool_keys.values())
             message_by_id = {}
             if 'message' in tables:
                 fields = "id,session_id,coalesce(json_extract(data,'$.time.created'),time_created) AS created, json_extract(data,'$.synthetic') AS synthetic, json_extract(data,'$.visibility') AS visibility, json_extract(data,'$.source') AS message_source"
@@ -312,6 +416,42 @@ def read_database(path, guard=None):
     log_data = read([relation_logs], guard) if relation_logs.is_dir() else {'events': [], 'source_files': []}
     for event in log_data['events']:
         apply_turn_event(sessions, event)
+    # DB tool rows and adjacent logs merge ONLY on a complete, unique session/tool_call_id
+    # match (fills the true execution start and verifies zeros); anything unmatched stays a
+    # separately listed supplement and is never counted into tool durations.
+    log_tools = {(e['session'], e['call_id']): e for e in log_data.get('tool_events', [])}
+    tool_supplements = []
+    if tool_table_ok:
+        for event in tool_events:
+            match = log_tools.pop((event['session'], event['call_id']), None)
+            if match is None:
+                continue
+            event['sources'] += [s for s in match['sources'] if s not in event['sources']]
+            event['exec_start'], event['exec_end'] = match['exec_start'], match['exec_end']
+            if event['group'] == 'unknown' and match['group'] != 'unknown':
+                event['group'] = match['group']
+            if match['conflict']:
+                event['conflict'] = event['conflict'] or match['conflict']
+            log_ns = match['duration_ns']
+            if event['conflict'] or log_ns is None:
+                continue
+            if event['zero_unconfirmed']:
+                if log_ns == 0:
+                    # An independent completion log with zero duration confirms the zero.
+                    event['zero_unconfirmed'] = False
+                    event['duration_ns'] = 0
+                else:
+                    event['conflict'] = '数据库 duration 为 0 与日志原生 durationMs 矛盾（同语义证据冲突）'
+            elif event['duration_ns'] is None:
+                event['duration_ns'] = log_ns
+            elif event['duration_ns'] != log_ns:
+                event['conflict'] = '数据库 duration_ms 与日志原生 durationMs 矛盾（同语义证据冲突）'
+    supplement_reason = ('相邻日志工具事件与数据库 tool_usage 无完整会话/tool_call_id 唯一匹配；单列，不重复计入工具耗时'
+                         if tool_table_ok else
+                         '数据库缺少 tool_usage 表或已核查列；相邻日志工具事件无法唯一合并，单列不重复计入工具耗时')
+    for leftover in log_tools.values():
+        tool_supplements.append({'key': leftover['key'], 'session': leftover['session'],
+                                 'reason': supplement_reason, 'source': leftover['sources'][0]})
     rollout_root = source.parent.parent / 'rollout' if source.parent.name == 'db' else source.parent / 'rollout'
     alternates = []
     if rollout_root.is_dir():
@@ -329,4 +469,8 @@ def read_database(path, guard=None):
     return {'harness': 'zcode', 'sessions': sessions, 'records': records, 'issues': issues,
             'source_files': [str(source)] + [str(p) for p in (paths[1],Path(str(source)+'-shm')) if p.exists()] + log_data['source_files'], 'events': log_data['events'],
             'alternate_sources': alternates,
+            'performance_evidence': {'columns': {name: name in usage_columns
+                                                 for name in ('first_token_at', 'time_to_first_token_ms', 'tool_call_count')},
+                                     'tool_usage': tool_table_ok},
+            'tool_events': tool_events, 'tool_supplements': tool_supplements,
             'ledger': 'model_usage 为计量来源；rollout 无调用级身份桥接，可读值独立展示不并入小计', 'requests':requests}
