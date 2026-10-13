@@ -1,0 +1,390 @@
+{
+  "schema_version": 2,
+  "revision": "official-20261011T0850Z",
+  "price_basis": "current_official_estimate",
+  "sources": [
+    {
+      "url": "https://developers.openai.com/api/docs/pricing.md",
+      "fetched_at": "2026-10-11T09:03:00+00:00",
+      "digest": "sha256:22faab843592cda6bd0a17a6b4c9ee549ef8441ef59474f6fbb70af600a23b98",
+      "summary": "OpenAI API 官方价格页 Markdown：Standard 表按短/长上下文双档列出输入、缓存读、缓存写、输出单价（USD/1M tokens），并注明 Short context ≤272K、Long context >272K input tokens；GPT-5.6 Sol 促销价至少延续至 2026-11-21。"
+    },
+    {
+      "url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol.md",
+      "fetched_at": "2026-10-11T09:05:00+00:00",
+      "digest": "sha256:0b0cc7354a87c4a0b0908f8fd1eb1185dd3ce8f6ee2cc5cc91f80cc0370acdd3",
+      "summary": "gpt-6.1-sol 官方模型页：Model ID gpt-6.1-sol；上下文窗口 1,050,000、最大输入 922,000、最大输出 128,000（十进制精确整数，用作同站 K 单位交叉核对）；价格注记与价格页一致（>272K 输入整请求 2x 输入与缓存、1.5x 输出）。"
+    },
+    {
+      "url": "https://developers.openai.com/api/docs/guides/prompt-caching.md",
+      "fetched_at": "2026-10-11T08:58:00+00:00",
+      "digest": "sha256:f7d58c2ffe584fd1a340bffae4f692f58742c08614ddee2cc66501c13204fa15",
+      "summary": "OpenAI 提示缓存官方指南：cached_tokens 为输入子集；写缓存与读缓存是两次独立动作，缓存写不是换取后续缓存读的费用；三分区（未缓存输入/缓存读/缓存写）互斥。"
+    },
+    {
+      "url": "https://docs.bigmodel.cn/cn/guide/start/pricing.md",
+      "fetched_at": "2026-10-11T09:00:00+00:00",
+      "digest": "sha256:7224d9566404ed86a97dbfb41cf1703f1f31a25d2b4e91953018ceb5be638d0b",
+      "summary": "BigModel 官方 API 定价页（直接 HTTP 字节级读取）：调用费用 = 未命中缓存的输入费用 + 缓存命中费用 + 输出费用 + 缓存存储费用；GLM-5.3/GLM-5.2 输入 8、缓存命中 2、输出 28，GLM-5.3-Flash 输入 0.8、缓存命中 0.23、输出 2.8（元/百万 Tokens）；缓存存储列限时免费（元/百万 Tokens/小时），非单次请求计价维度。"
+    }
+  ],
+  "rules": [
+    {
+      "id": "openai/gpt-6-astra/standard/short",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "currency": "USD",
+      "conditions": {
+        "service_tier": "standard",
+        "input_max": 272000,
+        "input_max_inclusive": true,
+        "basis": "官网原文：Short context: ≤272K input tokens（短档含边界）。272K 的整数形式官网未公布；本规则采用双侧保守整数阈值，≤272000 在 272K 的任何单位读法（272,000 或 272×1024=278,528）下都必然属于短档，(272000, 278528] 区间不发布可用规则。同站交叉核对：模型页对上下文/输出上限使用十进制精确整数（1,050,000/922,000/128,000），价格页仅在二进制场合显式定义单位（GB=2^30）。"
+      },
+      "input": {
+        "kind": "split_cache_read_write",
+        "other_input_per_million": "10.00",
+        "cache_read_per_million": "1.00",
+        "cache_write_per_million": "12.50",
+        "basis": "缓存三分区互斥（未缓存输入/缓存读/缓存写，来自官方缓存指南）；缓存写不是换取缓存读的费用，输出已含推理不重复计价。"
+      },
+      "output": {"kind": "total_output", "price_per_million": "50.00"}
+    },
+    {
+      "id": "openai/gpt-6-astra/standard/long",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "currency": "USD",
+      "conditions": {
+        "service_tier": "standard",
+        "input_min": 278528,
+        "input_min_inclusive": false,
+        "basis": "官网原文：Long context: >272K input tokens，长档不含边界，且长档价适用于整请求（非超出部分）。272K 整数形式官网未公布；本规则下界 >278528 在任何单位读法（272,000 或 278,528）下都必然属于长档。"
+      },
+      "input": {
+        "kind": "split_cache_read_write",
+        "other_input_per_million": "20.00",
+        "cache_read_per_million": "2.00",
+        "cache_write_per_million": "25.00",
+        "basis": "缓存三分区互斥（未缓存输入/缓存读/缓存写，来自官方缓存指南）；缓存写不是换取缓存读的费用，输出已含推理不重复计价。"
+      },
+      "output": {"kind": "total_output", "price_per_million": "75.00"}
+    },
+    {
+      "id": "openai/gpt-6.1-sol/standard/short",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "provider": "openai",
+      "model": "gpt-6.1-sol",
+      "currency": "USD",
+      "conditions": {
+        "service_tier": "standard",
+        "input_max": 272000,
+        "input_max_inclusive": true,
+        "basis": "官网原文：Short context: ≤272K input tokens（短档含边界）。272K 的整数形式官网未公布；本规则采用双侧保守整数阈值，≤272000 在任何单位读法（272,000 或 278,528）下都必然属于短档，(272000, 278528] 区间不发布可用规则。"
+      },
+      "input": {
+        "kind": "split_cache_read_write",
+        "other_input_per_million": "2.00",
+        "cache_read_per_million": "0.10",
+        "cache_write_per_million": "2.50",
+        "basis": "缓存三分区互斥（未缓存输入/缓存读/缓存写，来自官方缓存指南）；模型页交叉核对：缓存读为未缓存输入价的 5%、缓存写为 1.25x。"
+      },
+      "output": {"kind": "total_output", "price_per_million": "10.00"}
+    },
+    {
+      "id": "openai/gpt-6.1-sol/standard/long",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "provider": "openai",
+      "model": "gpt-6.1-sol",
+      "currency": "USD",
+      "conditions": {
+        "service_tier": "standard",
+        "input_min": 278528,
+        "input_min_inclusive": false,
+        "basis": "官网原文：Long context: >272K input tokens，长档不含边界，长档价适用于整请求；模型页：more than 272K input tokens are priced at 2x input and cache rates and 1.5x output for the full request。272K 整数形式官网未公布；本规则下界 >278528 在任何单位读法下都必然属于长档。"
+      },
+      "input": {
+        "kind": "split_cache_read_write",
+        "other_input_per_million": "4.00",
+        "cache_read_per_million": "0.20",
+        "cache_write_per_million": "5.00",
+        "basis": "缓存三分区互斥（未缓存输入/缓存读/缓存写，来自官方缓存指南）。"
+      },
+      "output": {"kind": "total_output", "price_per_million": "15.00"}
+    },
+    {
+      "id": "openai/gpt-6-sol/standard/short",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "provider": "openai",
+      "model": "gpt-6-sol",
+      "currency": "USD",
+      "conditions": {
+        "service_tier": "standard",
+        "input_max": 272000,
+        "input_max_inclusive": true,
+        "basis": "官网原文：Short context: ≤272K input tokens（短档含边界）。272K 的整数形式官网未公布；本规则采用双侧保守整数阈值，≤272000 在任何单位读法（272,000 或 278,528）下都必然属于短档，(272000, 278528] 区间不发布可用规则。"
+      },
+      "input": {
+        "kind": "split_cache_read_write",
+        "other_input_per_million": "2.00",
+        "cache_read_per_million": "0.20",
+        "cache_write_per_million": "2.50",
+        "basis": "缓存三分区互斥（未缓存输入/缓存读/缓存写，来自官方缓存指南）。"
+      },
+      "output": {"kind": "total_output", "price_per_million": "10.00"}
+    },
+    {
+      "id": "openai/gpt-6-sol/standard/long",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "provider": "openai",
+      "model": "gpt-6-sol",
+      "currency": "USD",
+      "conditions": {
+        "service_tier": "standard",
+        "input_min": 278528,
+        "input_min_inclusive": false,
+        "basis": "官网原文：Long context: >272K input tokens，长档不含边界，长档价适用于整请求。272K 整数形式官网未公布；本规则下界 >278528 在任何单位读法下都必然属于长档。"
+      },
+      "input": {
+        "kind": "split_cache_read_write",
+        "other_input_per_million": "4.00",
+        "cache_read_per_million": "0.40",
+        "cache_write_per_million": "5.00",
+        "basis": "缓存三分区互斥（未缓存输入/缓存读/缓存写，来自官方缓存指南）。"
+      },
+      "output": {"kind": "total_output", "price_per_million": "15.00"}
+    },
+    {
+      "id": "openai/gpt-5.6-sol/standard/short",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "currency": "USD",
+      "conditions": {
+        "service_tier": "standard",
+        "input_max": 272000,
+        "input_max_inclusive": true,
+        "basis": "官网原文：Short context: ≤272K input tokens（短档含边界）。272K 的整数形式官网未公布；本规则采用双侧保守整数阈值，≤272000 在任何单位读法（272,000 或 278,528）下都必然属于短档，(272000, 278528] 区间不发布可用规则。注：官网注明 GPT-5.6 Sol 促销价至少延续至 2026-11-21（at least through，非确定截止，不落 effective_to）。"
+      },
+      "input": {
+        "kind": "split_cache_read_write",
+        "other_input_per_million": "4.00",
+        "cache_read_per_million": "0.40",
+        "cache_write_per_million": "5.00",
+        "basis": "缓存三分区互斥（未缓存输入/缓存读/缓存写，来自官方缓存指南）。"
+      },
+      "output": {"kind": "total_output", "price_per_million": "20.00"}
+    },
+    {
+      "id": "openai/gpt-5.6-sol/standard/long",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "currency": "USD",
+      "conditions": {
+        "service_tier": "standard",
+        "input_min": 278528,
+        "input_min_inclusive": false,
+        "basis": "官网原文：Long context: >272K input tokens，长档不含边界，长档价适用于整请求。272K 整数形式官网未公布；本规则下界 >278528 在任何单位读法下都必然属于长档。注：官网注明 GPT-5.6 Sol 促销价至少延续至 2026-11-21（at least through，非确定截止，不落 effective_to）。"
+      },
+      "input": {
+        "kind": "split_cache_read_write",
+        "other_input_per_million": "8.00",
+        "cache_read_per_million": "0.80",
+        "cache_write_per_million": "10.00",
+        "basis": "缓存三分区互斥（未缓存输入/缓存读/缓存写，来自官方缓存指南）。"
+      },
+      "output": {"kind": "total_output", "price_per_million": "30.00"}
+    },
+    {
+      "id": "openai/gpt-5.6-terra/standard/short",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "provider": "openai",
+      "model": "gpt-5.6-terra",
+      "currency": "USD",
+      "conditions": {
+        "service_tier": "standard",
+        "input_max": 272000,
+        "input_max_inclusive": true,
+        "basis": "官网原文：Short context: ≤272K input tokens（短档含边界）。272K 的整数形式官网未公布；本规则采用双侧保守整数阈值，≤272000 在任何单位读法（272,000 或 278,528）下都必然属于短档，(272000, 278528] 区间不发布可用规则。"
+      },
+      "input": {
+        "kind": "split_cache_read_write",
+        "other_input_per_million": "2.00",
+        "cache_read_per_million": "0.20",
+        "cache_write_per_million": "2.50",
+        "basis": "缓存三分区互斥（未缓存输入/缓存读/缓存写，来自官方缓存指南）。"
+      },
+      "output": {"kind": "total_output", "price_per_million": "12.00"}
+    },
+    {
+      "id": "openai/gpt-5.6-terra/standard/long",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "provider": "openai",
+      "model": "gpt-5.6-terra",
+      "currency": "USD",
+      "conditions": {
+        "service_tier": "standard",
+        "input_min": 278528,
+        "input_min_inclusive": false,
+        "basis": "官网原文：Long context: >272K input tokens，长档不含边界，长档价适用于整请求。272K 整数形式官网未公布；本规则下界 >278528 在任何单位读法下都必然属于长档。"
+      },
+      "input": {
+        "kind": "split_cache_read_write",
+        "other_input_per_million": "4.00",
+        "cache_read_per_million": "0.40",
+        "cache_write_per_million": "5.00",
+        "basis": "缓存三分区互斥（未缓存输入/缓存读/缓存写，来自官方缓存指南）。"
+      },
+      "output": {"kind": "total_output", "price_per_million": "18.00"}
+    },
+    {
+      "id": "bigmodel/GLM-5.3/standard",
+      "source": {"reference": "https://docs.bigmodel.cn/cn/guide/start/pricing.md", "version": "2026-10-11T09:00:00+00:00"},
+      "provider": "bigmodel",
+      "model": "GLM-5.3",
+      "currency": "CNY",
+      "conditions": {
+        "service_tier": "standard",
+        "basis": "官网价格表未按单请求输入长度分档，标准 API 价直接适用；调用费用 = 未命中缓存的输入费用 + 缓存命中费用 + 输出费用 + 缓存存储费用，缓存存储（元/百万 Tokens/小时，限时免费）非单次请求计价维度，不进入规则。"
+      },
+      "input": {"kind": "split_cache_read", "non_cache_read_per_million": "8", "cache_read_per_million": "2"},
+      "output": {"kind": "total_output", "price_per_million": "28"}
+    },
+    {
+      "id": "bigmodel/GLM-5.3-Flash/standard",
+      "source": {"reference": "https://docs.bigmodel.cn/cn/guide/start/pricing.md", "version": "2026-10-11T09:00:00+00:00"},
+      "provider": "bigmodel",
+      "model": "GLM-5.3-Flash",
+      "currency": "CNY",
+      "conditions": {
+        "service_tier": "standard",
+        "basis": "官网价格表未按单请求输入长度分档，标准 API 价直接适用；缓存存储（元/百万 Tokens/小时，限时免费）非单次请求计价维度，不进入规则。"
+      },
+      "input": {"kind": "split_cache_read", "non_cache_read_per_million": "0.8", "cache_read_per_million": "0.23"},
+      "output": {"kind": "total_output", "price_per_million": "2.8"}
+    },
+    {
+      "id": "bigmodel/GLM-5.2/standard",
+      "source": {"reference": "https://docs.bigmodel.cn/cn/guide/start/pricing.md", "version": "2026-10-11T09:00:00+00:00"},
+      "provider": "bigmodel",
+      "model": "GLM-5.2",
+      "currency": "CNY",
+      "conditions": {
+        "service_tier": "standard",
+        "basis": "官网价格表未按单请求输入长度分档，标准 API 价直接适用；缓存存储（元/百万 Tokens/小时，限时免费）非单次请求计价维度，不进入规则。"
+      },
+      "input": {"kind": "split_cache_read", "non_cache_read_per_million": "8", "cache_read_per_million": "2"},
+      "output": {"kind": "total_output", "price_per_million": "28"}
+    }
+  ],
+  "mappings": [
+    {
+      "id": "openai-http/gpt-6.1-sol",
+      "source": {"reference": "https://developers.openai.com/api/docs/models/gpt-6.1-sol.md", "version": "2026-10-11T09:05:00+00:00"},
+      "from": {"provider": "openai_http", "model": "gpt-6.1-sol"},
+      "to": {"provider": "openai", "model": "gpt-6.1-sol"},
+      "basis": "openai_http 为本仓库 Codex 源适配器标识（官方 HTTP API 路径），非官网声明的供应商别名；模型名与官方 Model ID 逐字一致（gpt-6.1-sol 模型页核对），按一次精确映射转到 OpenAI 官方身份。"
+    },
+    {
+      "id": "openai-http/gpt-6-sol",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "from": {"provider": "openai_http", "model": "gpt-6-sol"},
+      "to": {"provider": "openai", "model": "gpt-6-sol"},
+      "basis": "openai_http 为本仓库 Codex 源适配器标识；gpt-6-sol 见于官方价格表 Standard 与 Long 表，模型名与官方条目逐字一致，按一次精确映射转到 OpenAI 官方身份。"
+    },
+    {
+      "id": "openai-http/gpt-6-astra",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "from": {"provider": "openai_http", "model": "gpt-6-astra"},
+      "to": {"provider": "openai", "model": "gpt-6-astra"},
+      "basis": "openai_http 为本仓库 Codex 源适配器标识；gpt-6-astra 见于官方价格表，模型名与官方条目逐字一致，按一次精确映射转到 OpenAI 官方身份。"
+    },
+    {
+      "id": "openai-http/gpt-5.6-sol",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "from": {"provider": "openai_http", "model": "gpt-5.6-sol"},
+      "to": {"provider": "openai", "model": "gpt-5.6-sol"},
+      "basis": "openai_http 为本仓库 Codex 源适配器标识；gpt-5.6-sol 见于官方价格表，模型名与官方条目逐字一致，按一次精确映射转到 OpenAI 官方身份。"
+    },
+    {
+      "id": "openai-http/gpt-5.6-terra",
+      "source": {"reference": "https://developers.openai.com/api/docs/pricing.md", "version": "2026-10-11T09:03:00+00:00"},
+      "from": {"provider": "openai_http", "model": "gpt-5.6-terra"},
+      "to": {"provider": "openai", "model": "gpt-5.6-terra"},
+      "basis": "openai_http 为本仓库 Codex 源适配器标识；gpt-5.6-terra 见于官方价格表，模型名与官方条目逐字一致，按一次精确映射转到 OpenAI 官方身份。"
+    },
+    {
+      "id": "bigmodel-plan/account-individual/GLM-5.3",
+      "source": {"reference": "https://docs.bigmodel.cn/cn/guide/start/pricing.md", "version": "2026-10-11T09:00:00+00:00"},
+      "from": {"provider": "account:bigmodel-individual-coding-plan", "model": "GLM-5.3"},
+      "to": {"provider": "bigmodel", "model": "GLM-5.3"},
+      "basis": "ZCode 套餐来源按 BigModel 官方 API 价等价估值的产品规则：不声称实际服务档、扣费或套餐剩余额度已验证；provider 身份由产品源码路径核实（官网不替本地 provider ID 证明身份），模型名与官方价格表逐字一致。"
+    },
+    {
+      "id": "bigmodel-plan/account-individual/GLM-5.3-Flash",
+      "source": {"reference": "https://docs.bigmodel.cn/cn/guide/start/pricing.md", "version": "2026-10-11T09:00:00+00:00"},
+      "from": {"provider": "account:bigmodel-individual-coding-plan", "model": "GLM-5.3-Flash"},
+      "to": {"provider": "bigmodel", "model": "GLM-5.3-Flash"},
+      "basis": "ZCode 套餐来源按 BigModel 官方 API 价等价估值的产品规则：不声称实际服务档、扣费或套餐剩余额度已验证；provider 身份由产品源码路径核实，模型名与官方价格表逐字一致。"
+    },
+    {
+      "id": "bigmodel-plan/account-individual/GLM-5.2",
+      "source": {"reference": "https://docs.bigmodel.cn/cn/guide/start/pricing.md", "version": "2026-10-11T09:00:00+00:00"},
+      "from": {"provider": "account:bigmodel-individual-coding-plan", "model": "GLM-5.2"},
+      "to": {"provider": "bigmodel", "model": "GLM-5.2"},
+      "basis": "ZCode 套餐来源按 BigModel 官方 API 价等价估值的产品规则：不声称实际服务档、扣费或套餐剩余额度已验证；provider 身份由产品源码路径核实，模型名与官方价格表逐字一致。"
+    },
+    {
+      "id": "bigmodel-plan/account-start/GLM-5.3-Flash",
+      "source": {"reference": "https://docs.bigmodel.cn/cn/guide/start/pricing.md", "version": "2026-10-11T09:00:00+00:00"},
+      "from": {"provider": "account:bigmodel-start-plan", "model": "GLM-5.3-Flash"},
+      "to": {"provider": "bigmodel", "model": "GLM-5.3-Flash"},
+      "basis": "ZCode 套餐来源按 BigModel 官方 API 价等价估值的产品规则：不声称实际服务档、扣费或套餐剩余额度已验证；provider 身份由产品源码路径核实，模型名与官方价格表逐字一致。"
+    },
+    {
+      "id": "bigmodel-plan/builtin-coding/GLM-5.3",
+      "source": {"reference": "https://docs.bigmodel.cn/cn/guide/start/pricing.md", "version": "2026-10-11T09:00:00+00:00"},
+      "from": {"provider": "builtin:bigmodel-coding-plan", "model": "GLM-5.3"},
+      "to": {"provider": "bigmodel", "model": "GLM-5.3"},
+      "basis": "ZCode 套餐来源按 BigModel 官方 API 价等价估值的产品规则：不声称实际服务档、扣费或套餐剩余额度已验证；provider 身份由产品源码路径核实，模型名与官方价格表逐字一致。"
+    },
+    {
+      "id": "bigmodel-plan/builtin-coding/GLM-5.3-Flash",
+      "source": {"reference": "https://docs.bigmodel.cn/cn/guide/start/pricing.md", "version": "2026-10-11T09:00:00+00:00"},
+      "from": {"provider": "builtin:bigmodel-coding-plan", "model": "GLM-5.3-Flash"},
+      "to": {"provider": "bigmodel", "model": "GLM-5.3-Flash"},
+      "basis": "ZCode 套餐来源按 BigModel 官方 API 价等价估值的产品规则：不声称实际服务档、扣费或套餐剩余额度已验证；provider 身份由产品源码路径核实，模型名与官方价格表逐字一致。"
+    },
+    {
+      "id": "bigmodel-plan/builtin-start/GLM-5.3-Flash",
+      "source": {"reference": "https://docs.bigmodel.cn/cn/guide/start/pricing.md", "version": "2026-10-11T09:00:00+00:00"},
+      "from": {"provider": "builtin:bigmodel-start-plan", "model": "GLM-5.3-Flash"},
+      "to": {"provider": "bigmodel", "model": "GLM-5.3-Flash"},
+      "basis": "ZCode 套餐来源按 BigModel 官方 API 价等价估值的产品规则：不声称实际服务档、扣费或套餐剩余额度已验证；provider 身份由产品源码路径核实，模型名与官方价格表逐字一致。"
+    }
+  ],
+  "uncovered": [
+    {
+      "provider": "openai",
+      "model": "codex-auto-review",
+      "reason": "官方模型目录与价格页均未列该 ID；Auto-review 文档只证明使用独立 reviewer agent，未披露底层模型或独立标价；不套主模型价、不按最低价、不当免费。"
+    },
+    {
+      "provider": "openai_http",
+      "model": "codex-auto-review",
+      "reason": "官方模型目录与价格页均未列该 ID；Auto-review 文档只证明使用独立 reviewer agent，未披露底层模型或独立标价；不套主模型价、不按最低价、不当免费。"
+    },
+    {
+      "provider": "openai_http",
+      "model": "模型未知",
+      "reason": "记录缺失完整模型身份，无法建立价格身份。"
+    },
+    {
+      "provider": null,
+      "model": "模型未知",
+      "reason": "记录缺失供应商与完整模型身份，无法建立价格身份。"
+    }
+  ]
+}

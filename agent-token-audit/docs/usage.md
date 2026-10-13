@@ -1,6 +1,6 @@
 # agent-token-audit 使用指南
 
-agent-token-audit 读取 Codex、ZCode 已有的本地记录，按会话、任务或时间范围展示输入、输出、缓存读取、命中率和数据缺口；可另按用户明确加载的本地价格规则估算已记录部分的费用，并展示来源支持的模型性能（TTFT、吞吐）与工具执行耗时。普通查询只展示，明确导出才保存。结果不估算缺失用量，费用是按所选规则的估算而非账单，也不评价工作质量。当前支持与验收边界见[模块说明](../README.md#3-开发与验收)。
+agent-token-audit 读取 Codex、ZCode 已有的本地记录，按会话、任务或时间范围展示输入、输出、缓存读取、命中率和数据缺口；新查询默认按随包官网价格快照估算已记录部分的费用，也可改用用户明确加载的本地价格规则或只查 token，并展示来源支持的模型性能（TTFT、吞吐）与工具执行耗时。普通查询只展示，明确导出才保存。结果不估算缺失用量，费用是按所选规则的估算而非账单，也不评价工作质量。当前支持与验收边界见[模块说明](../README.md#3-开发与验收)。
 
 ## 1. 快速开始
 
@@ -163,6 +163,14 @@ python3 skills/agent-token-audit/scripts/audit.py overview \
 
 默认纳入来源全部会话，可追加 `--session SESSION_ID --session OTHER_SESSION_ID` 缩小集合。`overview` 不支持 `--current`；请求 ID 只确定截止点，不缩小会话集合。
 
+整体查询也可用快捷时间范围（仅独立新查询，与 `--from` 互斥）：
+
+```bash
+python3 skills/agent-token-audit/scripts/audit.py overview   --harness codex --time-preset last_7d --tz Asia/Shanghai
+```
+
+`--time-preset` 可选 `today`（所选时区本日 00:00）、`week`（本周一 00:00）、`month`（本月 1 日 00:00）、`last_1d`/`last_3d`/`last_7d`/`last_30d`（同一固定截止点向前 24/72/168/720 小时）与 `all`（无下界）。自然边界按所选时区真实日界/DST 解析；解析在本次请求的固定截止点（显式 `--to` 或可信请求起点）上一次完成，报告保存绝对 `from/to`，重载与原范围重算不随当前日期移动。与显式 `--to`/`--request-id`/`--request-start` 组合时以其为锚。
+
 `--tz` 控制日界，可用 IANA 名称或 `±HH:MM`（例如 `--tz "+08:00"`），省略时使用系统本地时区。无法可靠分日的跨日累计区间单列，日趋势之和可能小于总览。
 
 整体查询在一份去重记录上汇总，不能用多个会话报告相加替代。会话排行只列自身小计；单会话报告默认含可靠后代，两者口径可能不同。
@@ -195,9 +203,18 @@ python3 skills/agent-token-audit/scripts/audit.py report \
 
 `--database` 仅用于 ZCode，不能与 `--source` 同用。数据库入口会核对相邻 rollout，其可读用量以“补充来源”独立展示：跨源重叠未知、未并入小计，也未按报告范围筛选。不要把补充来源加到任务总量；显式 `--source` 则以 rollout 为计量来源。
 
-### 4.6 按明确价格规则估算费用
+### 4.6 费用估算：默认官网快照、自定义配置与仅 token
 
-`report`、`overview` 和 `recompute` 可追加 `--pricing <本地JSON文件>`，按明确价格配置对已记录用量估算费用；`sessions`、`turns`、`requests`、`show` 与导出不接受价格配置。未提供 `--pricing` 时结果与原来一致，不含费用估算。
+`report`、`overview` 和 `recompute` 的价格有三种模式（互斥）：
+
+| 参数 | 作用 |
+| --- | --- |
+| （省略） | 独立新查询默认使用随包官网价格快照（当前官网标准 API 价等价估算）；`recompute` 默认沿用保存报告的快照，原无价仍无价 |
+| `--pricing <本地JSON文件>` | 自定义价格配置，优先于默认快照 |
+| `--default-pricing` | 显式使用随包官网快照（例如给无价旧报告换价重算） |
+| `--no-pricing` | 仅 token 与性能，不加载价格；只用于独立的新查询 |
+
+`sessions`、`turns`、`requests`、`show` 与导出不接受任何价格参数；随包快照缺失或损坏时明确报错，可改用 `--no-pricing` 继续。
 
 ```bash
 python3 skills/agent-token-audit/scripts/audit.py report \
@@ -235,6 +252,18 @@ python3 skills/agent-token-audit/scripts/audit.py report \
 
 网页整体查询与会话统计一样可在查询表单选择价格配置（FileReader 读取本地 JSON，只改待提交条件，明确查询才提交）。整体结果的费用区在 token 总览之后给出逐币种小计、模型/会话费用排行、日期费用分布与未定价摘要；点选日期只读保存分布，从日期进入“该会话当日统计”时新查询自动沿用该整体报告保存的价格快照与保存日交集，不采用当前待提交的价格配置。
 
+随包快照覆盖首轮八款可核价模型（OpenAI gpt-6-astra/gpt-6.1-sol/gpt-6-sol/gpt-5.6-sol/gpt-5.6-terra 短/长上下文档位、BigModel GLM-5.3/GLM-5.3-Flash/GLM-5.2），按源 provider＋完整模型身份精确匹配（含 `openai_http` 与 ZCode 套餐来源的一次精确映射）；`codex-auto-review` 与身份缺失记录保持未定价并说明原因。OpenAI 短/长档位按可证明的完整单请求输入量判定（累计区间、含重试的逻辑请求不猜档）；272K 边界整数官网未公布，(272000, 278528] 区间不发布可用规则。结果标明币种、每百万单位、快照修订与逐来源读取时间；费用是等价估算，不声称实际服务档、扣费或套餐额度已验证。
+
+更新默认价格（用户明确要求时；查询与安装不联网、不自动更新）：
+
+```bash
+# 1. 用本环境网页能力真实读取固定官网来源（OpenAI 价格页/模型说明/缓存说明、BigModel 价格页及官方 Markdown）
+# 2. 按读取结果形成 schema v2 候选（新快照身份、逐来源真实 fetched_at、目录八款模型规则或已核查无价原因）
+python3 skills/agent-token-audit/scripts/audit.py pricing-update --candidate /tmp/candidate.json
+```
+
+候选先保存为历史快照；固定目录每款模型有可核查规则或已核查无价原因时才原子切换默认引用并报告“更新成功”，否则保留为未启用候选、原默认不变；含白名单外来源或身份冲突时整单拒绝。更新作用于实际加载的 Skill 资源副本，历史读取记录保留在同目录 `pricing/snapshots/`。完整流程见 SKILL.md「更新默认官网价格」。
+
 ### 4.7 查看 TTFT、吞吐与工具耗时（无需价格配置）
 
 `report`、`overview` 和 `recompute` 每次都在报告的 `analysis` 扩展中保存模型性能部分，未配置价格也可查看；无有效性能样本不阻断原 token 查询。ZCode 数据库来源给出 TTFT（同一逻辑请求首个可观察文本/推理 token 时间 − 请求起点；原生延迟列存在时与时间差互相核对，缺该可选列时仍按可信起点与首 token 时间求差）与来源观测区间吞吐（已知输出 ÷ 首 token→completed_at 区间；终点含完成事件处理开销，不是服务端纯生成速率）。两指标独立入样：缺输出仍可有 TTFT，截止前未结束可留 TTFT 并注明；含工具参数输出却无法证明最早 token、重试配对不明、缺字段、零/负区间、时间冲突的记录分别排除并显示原因；聚合吞吐为同一有效集合输出和 ÷ 区间时长和，不平均逐行速率；比值保存精确分子/分母，显示两位小数四舍五入。
@@ -242,6 +271,8 @@ python3 skills/agent-token-audit/scripts/audit.py report \
 Codex JSONL 当前未提供可与逐调用 usage 唯一配对的请求起点/首 token/生成终点三元组（轮次 `task_complete.time_to_first_token_ms` 不冒充 TTFT），ZCode rollout/log 无首 token 事件：两者在报告与网页中显示经核查的“来源未提供”原因，不生成全未知图表。网页性能区位于费用区之后，显示样本、按模型/会话分组、日分布、有效/缺失/冲突计数与排除原因；分组行与日条可沿保存样本键定位到样本明细与来源位置，筛选与切换不改变计数与合计。离线查看器展示同一保存值，零网络。
 
 ### 4.8 查看工具执行耗时（独立通道，不要求模型 usage）
+
+仅有一侧执行或调度端点时，该组保存为未知（两侧 null），不会丢弃可信原生耗时或阻断有效 token 结果；完整区间保留，不从 duration 反推墙钟。性能日图与长表在卡片内横向滚动，数据和键盘定位保持完整。
 
 同一性能区的“工具执行耗时”指标覆盖 Codex `CommandExecution`/`McpToolCall`（原生 secs/nanos 精确换算为纳秒，不截整数毫秒）、ZCode 数据库 `tool_usage`（原生 duration 与调度至完成跨度分列；单凭 DB 零值保持未知，有独立执行完成日志才确认零）与 ZCode rollout/log 的 `tool.call.*` 事件（按完整会话/tool_call_id 合并起止与完成副本只计一次；无会话身份不猜归属）。工具样本是独立通道：不要求模型 usage、不进入 token 合计，与仅报 token 累计的“仅工具报告”分开。执行耗时和按精确纳秒保存与求和；调度/执行跨度包络（串行/并行关系）分列展示，不加入耗时和、不冒充墙钟——两次各 10 秒工具串行为包络 20 秒、耗时和 20 秒，区间 [0,10] 与 [5,15] 并行为包络 15 秒、耗时和仍 20 秒。已完成失败执行保留真实耗时与失败状态，未完成只给状态；分叉继承副本排除、新身份重执行计入、仅主代理策略说明排除原因；日分布按完成事件与保存时区。网页与离线查看器沿同一保存键查看类别/会话分组、日图与样本明细（含执行起止、调度跨度、原生/推导依据、精度与来源行号）；导出不含命令参数、输出正文或认证信息。
 

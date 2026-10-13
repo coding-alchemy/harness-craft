@@ -6,7 +6,7 @@
 
 - 目标：看清三个入口如何共用读取、token 计量和费用/独立性能分析，以及保存展示如何绕过来源与计算。三层是源码职责分组，不表示独立部署。
 - 结构：沿用上下三层泳道、层内从左到右，费用/性能节点续接 token 内核的报告骨架与独立候选；连接由共同操作层编排，不表示 core 直接调用 analysis。外部来源和保存 JSON 仍单列。
-- 接入：Skill/CLI 和 HTTP 汇入 Query；显式本地价格转成 pricing，operations 验证或复用保存快照，固定身份/范围/截止点。候选查询在读取/绑定后返回，不进入计量与分析。
+- 接入：Skill/CLI 和 HTTP 汇入 Query；新查询默认随包官网快照，或显式本地价格转成 pricing，operations 验证或复用保存快照，固定身份/范围/截止点。候选查询在读取/绑定后返回，不进入计量与分析。
 - 计算：只读来源 → codex/zcode 适配 → relations.bind → core.report/overview → analysis.build_performance/build_analysis → 同一 v2/v3。analysis 无 I/O，费用按明确配置、性能按独立样本计算，不改变 token 小计。
 - 消费：同一报告分别由 formats 与 shared.js/lossless-json 校验、输出或呈现；双环境独立校验保留。服务页提供三标签和显式查询，离线页只消费保存 JSON。
 - 保存旁路：JSON 直接进入输出层，不读源、不重新计价；只有明确重算/更新经 operations 回源，默认沿保存规则与时区。箭头展示主要处理/消费关系，不展开全部函数调用。

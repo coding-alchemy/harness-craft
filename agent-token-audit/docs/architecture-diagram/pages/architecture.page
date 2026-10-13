@@ -1121,7 +1121,7 @@
         75
       ],
       "content": {
-        "text": "范围 / 时间 / pricing\n显式加载本地价格 JSON",
+        "text": "范围 / 时间 / pricing\n默认官网价或本地 JSON",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"
@@ -1871,7 +1871,7 @@
         37
       ],
       "content": {
-        "text": "职责分层 · 价格由用户明确配置 · 分析不改变 token 小计 · 离线页只展示保存值",
+        "text": "职责分层 · 默认随包官网价或用户明确配置 · 分析不改变 token 小计 · 离线页只展示保存值",
         "fontFamily": {
           "latin": "Arial",
           "ea": "Hiragino Sans GB"

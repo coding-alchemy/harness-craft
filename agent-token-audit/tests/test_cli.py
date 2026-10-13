@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from fractions import Fraction
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 ENTRY = Path(__file__).resolve().parents[1] / 'skills/agent-token-audit/scripts/audit.py'
@@ -2011,10 +2012,10 @@ class PerformanceCLI(unittest.TestCase):
         self.assertEqual((perf['throughput']['aggregate']['numerator'], perf['throughput']['aggregate']['denominator']), (200, 10000))
 
     def test_p3_a4_ttft_and_aggregate_throughput(self):
-        result = self.report()
+        result = self.report('--no-pricing')
         # 独立预期（手算）：TTFT 1 秒、2 秒；聚合吞吐 200 ÷ (1000+9000) = 20 token/秒（不平均逐行速率）。
         perf = result['analysis']['performance']
-        self.assertNotIn('cost', result['analysis'])  # 未配置价格也可计算性能
+        self.assertNotIn('cost', result['analysis'])  # 仅 token 模式不加载价格也可计算性能
         self.assertEqual(perf['harness'], 'zcode')
         self.assertEqual(perf['source_kind'], 'zcode_database')
         ttft = perf['metrics']['ttft']
@@ -2111,7 +2112,7 @@ class PerformanceCLI(unittest.TestCase):
 
     def test_saved_show_recompute_and_tampered_performance_rejected(self):
         saved = self.root / 'saved.json'
-        first = self.report('--export', 'json', '--output', str(saved))
+        first = self.report('--no-pricing', '--export', 'json', '--output', str(saved))
         self.assertEqual(json.loads(saved.read_text()), first)
         shown = json.loads(self.run_cli('show', '--saved', str(saved), '--format', 'json').stdout)
         self.assertEqual(shown, first)
@@ -2257,6 +2258,52 @@ class ToolDurationCLI(unittest.TestCase):
 
     def tool_metric(self, result):
         return result['analysis']['performance']['metrics']['tool_duration']
+
+    def test_completed_only_native_tool_report_reloads(self):
+        self.write([tool_log_event('s', 'alone', 'tool.call.completed', T1, duration=1000)])
+        result = self.report('--harness', 'zcode', '--no-pricing')
+        metric = self.tool_metric(result)
+        sample = metric['samples'][0]
+        self.assertEqual((sample['exec_start'], sample['exec_end']), (None, None))
+        self.assertEqual((sample['value'], sample['native_duration_ns'], sample['basis']),
+                         (1000000000, 1000000000, 'native'))
+        self.assertEqual(sample['completed_at'], T1)
+        self.assertEqual(metric['aggregate']['wall']['state'], 'unknown')
+        saved = self.root / 'saved.json'
+        saved.write_text(json.dumps(result))
+        shown = self.run_cli('show', '--saved', str(saved), '--format', 'json')
+        self.assertEqual(json.loads(shown.stdout), result)
+
+    def test_tool_endpoint_pairs_preserve_independent_intervals(self):
+        # Exercise the generation boundary for both native and derived paths.
+        scripts = str(ENTRY.parent)
+        with patch.object(sys, 'path', [scripts] + sys.path):
+            from token_audit.analysis import _tool_outcome, _tool_wall, timestamp
+        base = {'key': 'k', 'session': 's', 'category': 'shell', 'status': 'completed',
+                'duration_ns': 1000000000, 'duration_precision': 'ms',
+                'completed_at': T1, 'sources': [{'path': 'fixture.jsonl', 'line': 1}]}
+        pairs = [(None, None), (T0, None), (None, T1), (T0, T1)]
+        for execution in pairs:
+            for dispatch in pairs:
+                for native in (1000000000, None):
+                    with self.subTest(execution=execution, dispatch=dispatch, native=native):
+                        event = dict(base, exec_start=execution[0], exec_end=execution[1],
+                                     dispatch_start=dispatch[0], dispatch_end=dispatch[1],
+                                     duration_ns=native)
+                        kind, _, sample = _tool_outcome(event, None, timestamp(END))
+                        if native is None and execution != (T0, T1):
+                            self.assertEqual(kind, 'missing')
+                            self.assertIsNone(sample)
+                            continue
+                        self.assertIsNone(kind)
+                        self.assertEqual((sample['exec_start'], sample['exec_end']),
+                                         execution if all(execution) else (None, None))
+                        self.assertEqual((sample['dispatch_start'], sample['dispatch_end']),
+                                         dispatch if all(dispatch) else (None, None))
+                        self.assertEqual(sample['value'], native if native is not None else 60000000000)
+                        self.assertEqual(sample['basis'], 'native' if native is not None else 'derived')
+                        wall = _tool_wall([sample])
+                        self.assertEqual(wall['state'], 'known' if (all(execution) or all(dispatch)) else 'unknown')
 
     def test_p3_a4_serial_and_parallel_wall_vs_sum(self):
         # 需求 P3-A4 样例：两次各 10 秒工具；串行墙钟 20 秒、耗时和 20 秒；[0,10] 与 [5,15] 并行墙钟 15 秒、和 20 秒。
@@ -2666,7 +2713,7 @@ class SavedReuseCLI(unittest.TestCase):
     def test_csv_note_rows_for_unpriced_query_and_v1_report(self):
         self.write([meta(), usage()])
         unpriced = self.run_cli('report', '--source', str(self.log), '--session', 's', '--to', END,
-                                '--format', 'csv').stdout
+                                '--no-pricing', '--format', 'csv').stdout
         notes = [row['label'] for row in csv.DictReader(io.StringIO(unpriced))
                  if row['category'] == 'analysis_note']
         self.assertTrue(any('未配置价格' in note for note in notes))
@@ -2697,3 +2744,315 @@ class SavedReuseCLI(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DefaultPricingCLI(PricingCLI):
+    """Ticket 01: bundled official default snapshot, token-only mode and flag guards."""
+
+    def test_new_query_defaults_to_bundled_snapshot(self):
+        # gpt-6.1-sol short tier with provable single-call input 100000:
+        # (100K-40K)×$2 + 40K×$0.10 + 10K×$10 per 1M; the record has no cache-write tokens.
+        self.write([pmeta(), tctx(), usage(inp=100000, cache=40000, output=10000)])
+        result = json.loads(self.run_cli('report', '--source', str(self.log), '--session', 's',
+                                         '--to', END, '--format', 'json').stdout)
+        cost = result['analysis']['cost']
+        self.assertEqual(result['analysis']['schema_version'], 2)
+        self.assertEqual(cost['config']['schema_version'], 2)
+        self.assertEqual(cost['config']['price_basis'], 'current_official_estimate')
+        self.assertTrue(cost['config']['sources'])
+        entry = cost['records'][0]
+        self.assertEqual(entry['matched']['rule_id'], 'openai/gpt-6.1-sol/standard/short')
+        self.assertEqual(entry['matched']['input_tokens'], 100000)
+        self.assertEqual(entry['currency'], 'USD')
+        # Without cache-write tokens both cache_write and the dependent other_input stay
+        # unpriced; the priceable parts are 40000×0.1 + 10000×10 (per 1M) = 0.104 USD.
+        self.assertEqual(cost['summary']['currencies']['USD']['amount'], '0.104')
+        self.assertEqual({item['component'] for item in entry['unpriced']}, {'other_input', 'cache_write'})
+
+    def test_long_tier_and_gap_use_bundled_conditions(self):
+        # 1M input (> 278528 under either unit reading) is the long tier; its cache-write
+        # tokens stay unknown so the amount keeps only the priced components.
+        self.write([pmeta(), tctx(), usage(inp=1000000, cache=400000, output=100000)])
+        result = json.loads(self.run_cli('report', '--source', str(self.log), '--session', 's',
+                                         '--to', END, '--format', 'json').stdout)
+        entry = result['analysis']['cost']['records'][0]
+        self.assertEqual(entry['matched']['rule_id'], 'openai/gpt-6.1-sol/standard/long')
+        # Cache-write tokens unknown: 400000×0.2 + 100000×15 (per 1M) = 1.58 USD priced.
+        self.assertEqual(result['analysis']['cost']['summary']['currencies']['USD']['amount'], '1.58')
+        # The unverified 272K integer band keeps its gap: no rule covers 275000.
+        self.write([pmeta(), tctx(), usage(inp=275000, cache=0, output=1)])
+        gap = json.loads(self.run_cli('report', '--source', str(self.log), '--session', 's',
+                                      '--to', END, '--format', 'json').stdout)
+        gap_entry = gap['analysis']['cost']['records'][0]
+        self.assertEqual(gap_entry['status'], 'unpriced')
+        self.assertIn('档位边界', gap_entry['unpriced'][0]['reason'])
+
+    def test_no_pricing_and_flag_guards(self):
+        self.write([pmeta(), tctx(), usage()])
+        token_only = json.loads(self.run_cli('report', '--source', str(self.log), '--session', 's',
+                                             '--to', END, '--no-pricing', '--format', 'json').stdout)
+        self.assertEqual(token_only['analysis'].get('cost'), None)
+        self.assertIn('performance', token_only['analysis'])
+        saved = self.root / 'saved.json'
+        self.run_cli('report', '--source', str(self.log), '--session', 's', '--to', END,
+                     '--export', 'json', '--output', str(saved))
+        self.run_cli('recompute', '--saved', str(saved), '--no-pricing', codes=(4,))
+        self.run_cli('sessions', '--source', str(self.log), '--default-pricing', codes=(4,))
+        self.run_cli('report', '--source', str(self.log), '--session', 's', '--to', END,
+                     '--pricing', str(self.write_pricing(pricing_cfg([pricing_rule('r')]))),
+                     '--default-pricing', codes=(2,))
+        self.run_cli('report', '--source', str(self.log), '--session', 's', '--to', END,
+                     '--pricing', str(self.write_pricing(pricing_cfg([pricing_rule('r')]))),
+                     '--no-pricing', codes=(2,))
+
+    def test_recompute_reuses_saved_v2_snapshot_and_default_reprices(self):
+        self.write([pmeta(), tctx(), usage()])
+        saved = self.root / 'saved.json'
+        self.run_cli('report', '--source', str(self.log), '--session', 's', '--to', END,
+                     '--export', 'json', '--output', str(saved))
+        current_default = json.loads((ENTRY.parents[1] / 'pricing/default.json').read_text())['snapshot']
+        recomputed = json.loads(self.run_cli('recompute', '--saved', str(saved), '--format', 'json').stdout)
+        self.assertEqual(recomputed['analysis']['cost']['config']['revision'], current_default)
+        # An explicitly unpriced saved report stays unpriced on recompute.
+        unpriced = self.root / 'unpriced.json'
+        self.run_cli('report', '--source', str(self.log), '--session', 's', '--to', END,
+                     '--no-pricing', '--export', 'json', '--output', str(unpriced))
+        again = json.loads(self.run_cli('recompute', '--saved', str(unpriced), '--format', 'json').stdout)
+        self.assertNotIn('cost', again['analysis'])
+
+    def test_v2_config_validation_rejects_bad_forms(self):
+        snapshot = ENTRY.parents[1] / 'pricing' / 'snapshots' / 'official-20261011T0850Z.json'
+        good = json.loads(snapshot.read_text())
+        def bad(mutate):
+            cfg = json.loads(json.dumps(good))
+            mutate(cfg)
+            proc = self.run_cli('report', '--source', str(self.log), '--session', 's', '--to', END,
+                                '--pricing', str(self.write_pricing(cfg)), '--format', 'json', codes=(4,))
+            return proc.stderr
+        self.assertIn('价格口径', bad(lambda c: c.__setitem__('price_basis', 'other')))
+        self.assertIn('标准档', bad(lambda c: c['rules'][0]['conditions'].__setitem__('service_tier', 'flex')))
+        self.assertIn('等值点', bad(lambda c: c['rules'][0]['conditions'].pop('input_max_inclusive')))
+        self.assertIn('重叠', bad(lambda c: c['rules'][0]['conditions'].__setitem__('input_max', 400000)))
+        self.assertIn('链式推断', bad(lambda c: c['mappings'].append(dict(
+            id='chain', source=c['rules'][0]['source'],
+            **{'from': {'provider': 'bigmodel', 'model': 'GLM-5.3'},
+               'to': {'provider': 'other', 'model': 'GLM-5.3'}}, basis='链'))))
+        self.assertIn('未覆盖项', bad(lambda c: c['uncovered'][0].pop('reason')))
+        self.assertIn('来源', bad(lambda c: c['sources'][0].pop('fetched_at')))
+
+
+class PricingUpdateCLI(unittest.TestCase):
+    """Ticket 02: pricing-update candidate validation, history and atomic enablement."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='token-audit-update-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        # Run against an isolated copy so the shipped resource stays untouched.
+        self.skill = self.root / 'skill'
+        shutil_copy = __import__('shutil').copytree
+        shutil_copy(Path(ENTRY).parents[1], self.skill)
+        self.entry = self.entry_of(self.skill)
+        self.base_candidate = json.loads((self.skill / 'pricing/default.json').read_text())
+        self.base_candidate = json.loads((self.skill / 'pricing/snapshots' / (self.base_candidate['snapshot'] + '.json')).read_text())
+        self.initial_default = self.base_candidate['revision']
+
+    def entry_of(self, skill):
+        return skill / 'scripts/audit.py'
+
+    def run_update(self, *args, codes=(0, 2, 3, 4)):
+        proc = subprocess.run([sys.executable, '-B', str(self.entry), 'pricing-update', *args],
+                              capture_output=True, text=True, cwd=self.root,
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+        self.assertIn(proc.returncode, codes, proc.stderr)
+        return proc
+
+    def candidate(self, name, mutate=None):
+        cfg = json.loads(json.dumps(self.base_candidate))
+        cfg['revision'] = 'test-' + name
+        if mutate:
+            mutate(cfg)
+        path = self.root / (name + '.json')
+        path.write_text(json.dumps(cfg, ensure_ascii=False))
+        return path
+
+    def default_id(self):
+        return json.loads((self.skill / 'pricing/default.json').read_text())['snapshot']
+
+    def test_complete_candidate_enables_and_preserves_history(self):
+        proc = self.run_update('--candidate', str(self.candidate('complete')))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('更新成功', proc.stdout)
+        self.assertIn(self.initial_default, proc.stdout)  # 旧身份可核
+        self.assertEqual(self.default_id(), 'test-complete')
+        # History preserved; same-price re-read still gets a new identity and enables.
+        proc2 = self.run_update('--candidate', str(self.candidate('reread')))
+        self.assertEqual(proc2.returncode, 0)
+        self.assertEqual(self.default_id(), 'test-reread')
+        self.assertTrue((self.skill / 'pricing/snapshots/official-20261011T0850Z.json').exists())
+        self.assertTrue((self.skill / 'pricing/snapshots/test-complete.json').exists())
+        self.assertIn('规则变化：新增 0、移除 0、变更 0', proc2.stdout)
+
+    def test_partial_candidate_saved_but_not_enabled(self):
+        def drop_one_target(cfg):
+            cfg['rules'] = [r for r in cfg['rules'] if r['id'] != 'bigmodel/GLM-5.2/standard']
+        proc = self.run_update('--candidate', str(self.candidate('partial', drop_one_target)), codes=(2,))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn('未启用', proc.stdout)
+        self.assertIn('bigmodel/GLM-5.2', proc.stdout)
+        self.assertEqual(self.default_id(), self.initial_default)
+        self.assertTrue((self.skill / 'pricing/snapshots/test-partial.json').exists())
+
+    def test_unknown_source_and_identity_collision_rejected(self):
+        def bad_source(cfg):
+            old, new = cfg['sources'][0]['url'], 'https://example.com/pricing'
+            cfg['sources'][0]['url'] = new
+            # Keep the references tied to the (now unknown) source so this test still
+            # exercises the whitelist rejection, not the dangling-reference check.
+            for rule in cfg['rules'] + cfg['mappings']:
+                if rule['source']['reference'] == old:
+                    rule['source']['reference'] = new
+        proc = self.run_update('--candidate', str(self.candidate('badsrc', bad_source)), codes=(4,))
+        self.assertIn('白名单', proc.stderr)
+        self.assertFalse((self.skill / 'pricing/snapshots/test-badsrc.json').exists())
+        self.assertEqual(self.default_id(), self.initial_default)
+        # Same identity, different content: rejected, default intact.
+        first = self.candidate('clash')
+        self.run_update('--candidate', str(first))
+        clash = json.loads(first.read_text())
+        clash['rules'][0]['currency'] = 'XXX'
+        clash_path = self.root / 'clash2.json'
+        clash_path.write_text(json.dumps(clash))
+        proc = self.run_update('--candidate', str(clash_path), codes=(4,))
+        self.assertIn('新身份', proc.stderr)
+
+    def test_v1_candidate_and_misc_guards(self):
+        v1 = {'schema_version': 1, 'revision': 'v1c', 'rules': [], 'aliases': []}
+        path = self.root / 'v1.json'
+        path.write_text(json.dumps(v1))
+        proc = self.run_update('--candidate', str(path), codes=(4,))
+        self.assertIn('schema v2', proc.stderr)
+        proc = self.run_update(codes=(4,))
+        self.assertIn('--candidate', proc.stderr)
+        proc = self.run_update('--candidate', str(self.candidate('mix')), '--update', codes=(4,))
+        self.assertIn('不与', proc.stderr)
+        # Normal queries never trigger updates; candidate file only for pricing-update.
+        proc = subprocess.run([sys.executable, '-B', str(self.entry), 'sessions', '--harness', 'codex',
+                               '--source', str(self.root), '--candidate', str(self.candidate('x'))],
+                              capture_output=True, text=True, cwd=self.root,
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+        self.assertEqual(proc.returncode, 4)
+        self.assertIn('--candidate 只用于', proc.stderr)
+
+    def test_snapshots_symlink_escape_rejected_and_default_kept(self):
+        # Ticket 08 S06: a snapshots directory linked outside the resource root must be
+        # rejected outright — the old default and every existing snapshot stay, nothing
+        # lands outside, and restoring the real directory lets the update proceed.
+        real = self.skill / 'pricing' / 'snapshots'
+        aside = self.skill / 'pricing' / 'snapshots.real'
+        real.rename(aside)
+        external = self.root / 'outside-prices'
+        external.mkdir()
+        (self.skill / 'pricing' / 'snapshots').symlink_to(external, target_is_directory=True)
+        proc = self.run_update('--candidate', str(self.candidate('escape')), codes=(4,))
+        self.assertIn('越界', proc.stderr)
+        self.assertEqual(self.default_id(), self.initial_default)
+        self.assertEqual(list(external.iterdir()), [])
+        self.assertTrue((aside / (self.initial_default + '.json')).exists())
+        (self.skill / 'pricing' / 'snapshots').unlink()
+        aside.rename(real)
+        proc = self.run_update('--candidate', str(self.candidate('escape2')))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.default_id(), 'test-escape2')
+
+    def test_default_pointer_and_snapshot_reads_reject_symlink_escape(self):
+        # Ticket 08 S06 read side: the default pointer and one snapshot file linked
+        # outside the resource root are rejected at load, before any pricing use.
+        pointer = self.skill / 'pricing' / 'default.json'
+        outside_pointer = self.root / 'outside-pointer.json'
+        outside_pointer.write_text(pointer.read_text(encoding='utf-8'), encoding='utf-8')
+        snapshot = self.skill / 'pricing' / 'snapshots' / (self.initial_default + '.json')
+        outside_snapshot = self.root / 'outside-snapshot.json'
+        outside_snapshot.write_text(snapshot.read_text(encoding='utf-8'), encoding='utf-8')
+        snapshot.unlink()
+        snapshot.symlink_to(outside_snapshot)
+        pointer.unlink()
+        pointer.symlink_to(outside_pointer)
+        probe = ("import sys; sys.path.insert(0, %r)\n"
+                 "from token_audit import pricing\n"
+                 "results = []\n"
+                 "try:\n"
+                 "    pricing.load_default(); results.append('LOADED')\n"
+                 "except ValueError as exc:\n"
+                 "    results.append('REJECTED:' + str(exc))\n"
+                 "try:\n"
+                 "    pricing.read_snapshot(%r); results.append('READ')\n"
+                 "except ValueError as exc:\n"
+                 "    results.append('REJECTED:' + str(exc))\n"
+                 "print('\\n'.join(results))") % (str(self.skill / 'scripts'), self.initial_default)
+        proc = subprocess.run([sys.executable, '-B', '-c', probe], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('REJECTED:价格资源路径越界', proc.stdout)
+        self.assertNotIn('LOADED', proc.stdout)
+        self.assertNotIn('\nREAD', proc.stdout)
+
+    def test_dangling_source_reference_rejected(self):
+        # Ticket 08 S07: rules may only cite sources this very candidate read; dropping
+        # the OpenAI reads while keeping OpenAI rules must fail naming the missing URL.
+        def drop_openai_sources(cfg):
+            cfg['sources'] = [s for s in cfg['sources'] if 'openai' not in s['url']]
+        proc = self.run_update('--candidate', str(self.candidate('dangling', drop_openai_sources)), codes=(4,))
+        self.assertIn('未读取的来源', proc.stderr)
+        self.assertFalse((self.skill / 'pricing/snapshots/test-dangling.json').exists())
+        self.assertEqual(self.default_id(), self.initial_default)
+
+
+class TimePresetCLI(PricingCLI):
+    """Ticket 04: quick time ranges resolve once against the request's fixed cutoff."""
+
+    def setUp(self):
+        super().setUp()
+        self.write([pmeta(), tctx(), usage(time=T1)])
+
+    def saved_scope(self, path):
+        return json.loads(self.run_cli('overview', '--source', str(self.log), '--to', END,
+                                       '--time-preset', 'last_7d', '--format', 'json').stdout)['scope']
+
+    def test_preset_resolves_absolute_bounds_and_recompute_keeps_them(self):
+        # END anchors the preset; last_7d = END - 168h.
+        result = json.loads(self.run_cli('overview', '--source', str(self.log), '--to', END,
+                                         '--time-preset', 'last_7d', '--tz', '+08:00', '--format', 'json').stdout)
+        scope = result['scope']
+        self.assertEqual(scope['to'], END)
+        expected_from = (datetime.fromisoformat(END.replace('Z', '+00:00')) - timedelta(hours=168)).isoformat()
+        self.assertEqual(scope['from'], expected_from)
+        saved = self.root / 'ov.json'
+        self.run_cli('overview', '--source', str(self.log), '--to', END,
+                     '--time-preset', 'last_7d', '--export', 'json', '--output', str(saved))
+        recomputed = json.loads(self.run_cli('recompute', '--saved', str(saved), '--format', 'json').stdout)
+        # Recompute keeps the SAVED absolute bounds; it does not reinterpret the preset.
+        self.assertEqual(recomputed['scope']['from'], expected_from)
+        self.assertEqual(recomputed['scope']['to'], END)
+
+    def test_natural_presets_follow_selected_timezone(self):
+        # END is 2026-09-02T00:00:00Z, a Wednesday; +08 local is Wednesday 08:00, so the
+        # week's Monday-00:00 local (2026-08-31 00:00+08) is 2026-08-30T16:00:00Z.
+        result = json.loads(self.run_cli('overview', '--source', str(self.log), '--to', END,
+                                         '--time-preset', 'week', '--tz', '+08:00', '--format', 'json').stdout)
+        self.assertEqual(result['scope']['from'], '2026-08-30T16:00:00+00:00')
+        result = json.loads(self.run_cli('overview', '--source', str(self.log), '--to', END,
+                                         '--time-preset', 'today', '--tz=-05:00', '--format', 'json').stdout)
+        self.assertEqual(result['scope']['from'], '2026-09-01T05:00:00+00:00')
+        result = json.loads(self.run_cli('overview', '--source', str(self.log), '--to', END,
+                                         '--time-preset', 'all', '--format', 'json').stdout)
+        self.assertIsNone(result['scope']['from'])
+
+    def test_preset_guards(self):
+        self.run_cli('overview', '--source', str(self.log), '--to', END,
+                     '--time-preset', 'last_7d', '--from', '2026-01-01T00:00:00+00:00', codes=(4,))
+        self.run_cli('report', '--source', str(self.log), '--session', 's', '--to', END,
+                     '--time-preset', 'today', codes=(4,))
+        saved = self.root / 'ov.json'
+        self.run_cli('overview', '--source', str(self.log), '--to', END, '--export', 'json', '--output', str(saved))
+        self.run_cli('recompute', '--saved', str(saved), '--time-preset', 'today', codes=(4,))
+        self.run_cli('overview', '--source', str(self.log), '--to', END, '--time-preset', 'bogus', codes=(2,))

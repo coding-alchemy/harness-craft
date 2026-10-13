@@ -4,10 +4,12 @@ No argparse, HTTP, terminal rendering or subprocess here; entry points parse the
 inputs, pass a Query and decide how to present the returned outcome.
 """
 import dataclasses
+import datetime as dt
 import os
 from pathlib import Path
 from . import analysis, codex, zcode
-from .core import known, local_timezone_name, overview, report, timestamp
+from . import pricing as pricing_resources
+from .core import known, local_timezone_name, overview, report, timestamp, timezone_of
 from .formats import validate_report
 from .relations import bind
 
@@ -17,10 +19,17 @@ from .relations import bind
 CLEAR = object()
 
 
-def read_input(harness, descriptor, guard=None):
+def read_input(harness, descriptor, guard=None, parse_cache=None):
     if descriptor['kind'] == 'zcode_database':
+        if parse_cache is not None:
+            data = parse_cache.cached_database(descriptor['paths'][0], guard,
+                                               zcode.database_snapshot, zcode.companion_captures, zcode.parse_database)
+            return bind(data)
         return bind(zcode.read_database(descriptor['paths'][0], guard))
-    return bind((codex if harness == 'codex' else zcode).read(descriptor['paths'], guard))
+    adapter = codex if harness == 'codex' else zcode
+    if parse_cache is not None:
+        return bind(parse_cache.cached_jsonl(harness, descriptor['paths'], guard, adapter.discover, adapter.read_captured))
+    return bind(adapter.read(descriptor['paths'], guard))
 
 
 def cutoff_evidence(source):
@@ -124,6 +133,7 @@ class Query:
     session: str = None
     sessions: list = None
     tz: str = None
+    time_preset: str = None
     label: str = None
     use_current: bool = False
     current_identities: dict = None
@@ -137,8 +147,10 @@ class Query:
     saved: dict = None
     update: bool = False
     pricing: object = None
+    pricing_mode: str = None
     descriptor: dict = None
     guard: object = None
+    parse_cache: object = None
 
 
 def resolve_overview_request_cutoff(data, request_id):
@@ -154,6 +166,37 @@ def resolve_overview_request_cutoff(data, request_id):
     cutoff = times.pop()
     timestamp(cutoff)
     return cutoff, matches[0]['time_source']
+
+
+TIME_PRESETS = ('today', 'week', 'month', 'last_1d', 'last_3d', 'last_7d', 'last_30d', 'all')
+_PRESET_HOURS = {'last_1d': 24, 'last_3d': 72, 'last_7d': 168, 'last_30d': 720}
+
+
+def resolve_time_preset(preset, tz_name, cutoff_text):
+    """The one shared quick-range resolution: preset + timezone + fixed cutoff → absolute from.
+
+    Natural ranges (today/week/month) follow the selected timezone's real calendar day
+    boundaries (DST-aware), rolling ranges are elapsed hours back from the same cutoff,
+    and 'all' keeps no lower bound. Returns None for no bound; the caller reports the
+    absolute bounds and never re-interprets the preset later.
+    """
+    if preset not in TIME_PRESETS:
+        raise ValueError('时间快捷必须是 ' + '、'.join(TIME_PRESETS) + ' 之一：' + str(preset))
+    zone = timezone_of(tz_name)
+    cutoff = timestamp(cutoff_text)
+    if preset == 'all':
+        return None
+    if preset in _PRESET_HOURS:
+        return (cutoff - dt.timedelta(hours=_PRESET_HOURS[preset])).isoformat()
+    local = cutoff.astimezone(zone)
+    if preset == 'today':
+        start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif preset == 'week':
+        start = (local.replace(hour=0, minute=0, second=0, microsecond=0)
+                 - dt.timedelta(days=local.weekday()))
+    else:  # month
+        start = local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start.astimezone(dt.timezone.utc).isoformat()
 
 
 def _performance_extension(query, data, result, descriptor, tz_name, tz_evidence):
@@ -211,25 +254,66 @@ def run_overview(query, data, cutoff, cutoff_source, descriptor, pricing=None):
     return {'kind': 'report', 'report': result, 'exit': exit_code}
 
 
-def run(query):
-    saved = validate_report(query.saved) if query.saved is not None else None
-    # Pricing is validated before any source read; listings, show and export never take
-    # a new pricing config, and a saved report's own snapshot is the recompute default.
-    pricing = None
+def _resolve_pricing(query, saved):
+    """Pick this operation's pricing snapshot, fully captured before any source read.
+
+    Explicit choices are 'default' (the bundled official snapshot), 'custom' (requires
+    a submitted config) and 'none' (token-only, independent new queries only). With no
+    explicit choice a recompute reuses the saved snapshot when the saved report priced
+    one and stays unpriced otherwise, while a new report/overview takes the bundled
+    default. Drill-down queries carry the parent snapshot as their submitted config.
+    """
+    mode = query.pricing_mode
+    if mode == 'parent':
+        # Drill-down semantics: the parent overall report's own snapshot prices the
+        # child; an unpriced parent keeps the child unpriced, never the bundled default.
+        if query.pricing is None:
+            return None
+        return analysis.validate_pricing_config(query.pricing)
     if query.pricing is not None:
+        if mode not in (None, 'custom'):
+            raise ValueError('价格模式与提交的配置冲突：自定义配置不得同时声明默认价或仅 token 模式')
         if query.operation not in ('report', 'overview', 'recompute'):
             raise ValueError('价格配置仅用于明确的 report/overview 查询或重算；候选列举、show 与导出不接受价格')
-        pricing = analysis.validate_pricing_config(query.pricing)
-    if query.operation == 'recompute' and pricing is None and saved is not None:
+        return analysis.validate_pricing_config(query.pricing)
+    if mode == 'custom':
+        raise ValueError('自定义价格模式需要提交价格配置文本')
+    if mode == 'none':
+        if query.operation not in ('report', 'overview') or saved is not None:
+            raise ValueError('仅 token 模式只用于独立的新查询；重算与保存报告下钻沿用保存价格或明确换价')
+        return None
+    if mode == 'default':
+        if query.operation not in ('report', 'overview', 'recompute'):
+            raise ValueError('默认价格仅用于明确的 report/overview 查询或重算；候选列举、show 与导出不接受价格')
+        return pricing_resources.load_default()
+    if mode is not None:
+        raise ValueError('未知的价格模式：' + str(mode))
+    if query.operation == 'recompute' and saved is not None:
         saved_analysis = saved.get('analysis')
         # Performance-only saved extensions carry no pricing snapshot; the recompute then
         # stays unpriced like a query without a config.
         if saved_analysis is not None and 'cost' in saved_analysis:
-            pricing = analysis.validate_pricing_config(saved_analysis['cost']['config'])
+            return analysis.validate_pricing_config(saved_analysis['cost']['config'])
+        return None
+    if query.operation in ('report', 'overview'):
+        return pricing_resources.load_default()
+    return None
+
+
+def run(query):
+    if query.time_preset is not None and query.operation != 'overview':
+        raise ValueError('时间快捷只用于独立的新整体查询（overview）')
+    saved = validate_report(query.saved) if query.saved is not None else None
+    # Pricing is resolved and validated before any source read: an explicit custom
+    # config, the bundled official default, or token-only; listings, show and export
+    # never take a pricing selection, and a saved report's own snapshot is the
+    # recompute default (a saved unpriced report stays unpriced).
+    pricing = _resolve_pricing(query, saved)
     if query.operation == 'show':
         if any((query.sources, query.database, query.turns, query.since, query.to, query.request_start,
                 query.request_id, query.use_current, query.update, query.session, query.harness,
-                query.label, query.detail)) or query.main_only is not None or query.pricing is not None:
+                query.label, query.detail)) or query.main_only is not None or query.pricing is not None \
+                or query.pricing_mode is not None:
             raise ValueError('show 只展示原报告；修改范围请使用 recompute --update')
         return {'kind': 'report', 'report': saved, 'exit': 0}
     if sum(bool(v) for v in (query.to, query.request_start, query.request_id)) > 1:
@@ -292,7 +376,7 @@ def run(query):
     if saved and not any(Path(p).exists() for p in descriptor['paths']):
         data = {'harness': harness, 'sessions': {}, 'records': [], 'issues': [], 'source_files': descriptor['paths']}
     else:
-        data = read_input(harness, descriptor, query.guard)
+        data = read_input(harness, descriptor, query.guard, query.parse_cache)
     if saved and saved_overall and not any(Path(p).exists() for p in descriptor['paths']):
         for sid in query.sessions:
             data['sessions'][sid] = {'id': sid, 'harness': harness, 'start': None, 'version': None,
@@ -309,6 +393,15 @@ def run(query):
     if query.operation == 'overview' or saved_overall and query.operation == 'recompute':
         if query.request_id:
             cutoff, cutoff_source = resolve_overview_request_cutoff(data, query.request_id)
+        if query.time_preset is not None:
+            if query.operation != 'overview' or saved is not None:
+                raise ValueError('时间快捷只用于独立的新整体查询；重算沿用保存的绝对边界')
+            if query.since is not None:
+                raise ValueError('时间快捷与自定义时间下界互斥；需要精确下界请使用自定义范围')
+            # The preset anchors on this request's own fixed cutoff (explicit to, trusted
+            # request identity, or the operation-entry time) and resolves once, here.
+            query.tz = query.tz or local_timezone_name()
+            query.since = resolve_time_preset(query.time_preset, query.tz, cutoff)
         return run_overview(query, data, cutoff, cutoff_source, descriptor, pricing)
     if not query.session:
         raise ValueError('report 需要明确 --session；先用 sessions 查看候选')

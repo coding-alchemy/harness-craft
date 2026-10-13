@@ -16,6 +16,8 @@ from decimal import Decimal, ROUND_HALF_UP, localcontext
 from .core import known, timestamp, timezone_of
 
 SCHEMA_VERSION = 1
+V2_SCHEMA_VERSION = 2
+PRICE_BASIS = 'current_official_estimate'
 PRICE_TEXT = re.compile(r'(0|[1-9]\d*)(\.\d+)?$')
 COMPONENT_LABELS = {'input': '总输入', 'non_cache_read': '非缓存读取输入', 'cache_read': '缓存读取',
                     'other_input': '其他输入', 'cache_write': '缓存写入', 'output': '输出',
@@ -131,6 +133,10 @@ def validate_pricing_config(value):
 
     Any structural, type, version, rule-id, time or price-format problem is a config
     error raised before any source read; a missing partition price is not defaulted.
+    Schema v1 keeps time-interval rules with one-hop aliases; schema v2 is the
+    current-official-estimate snapshot: every read recorded with its fetch time, rules
+    keyed by conditions instead of billing time, one-hop exact mappings and explicit
+    uncovered identities (never zero prices).
     """
     if isinstance(value, str):
         if not value.strip():
@@ -141,8 +147,15 @@ def validate_pricing_config(value):
             raise ValueError('价格配置不是有效 JSON') from None
     if not isinstance(value, dict):
         raise ValueError('价格配置必须是 JSON 对象')
-    if value.get('schema_version') != SCHEMA_VERSION or isinstance(value.get('schema_version'), bool):
-        raise ValueError('价格配置无效：不支持的价格配置 schema 版本')
+    version = value.get('schema_version')
+    if version == SCHEMA_VERSION and not isinstance(version, bool):
+        return _validate_v1(value)
+    if version == V2_SCHEMA_VERSION and not isinstance(version, bool):
+        return _validate_v2(value)
+    raise ValueError('价格配置无效：不支持的价格配置 schema 版本')
+
+
+def _validate_v1(value):
     if set(value) - {'schema_version', 'revision', 'rules', 'aliases'}:
         raise ValueError('价格配置无效：含未知字段')
     if 'revision' not in value or 'rules' not in value:
@@ -179,19 +192,25 @@ def validate_pricing_config(value):
                 raise ValueError('价格配置无效：' + label + '分区缺失')
             entry[section] = _check_partition(rule[section], kinds, label)
         config['rules'].append(entry)
-    aliases = value.get('aliases', [])
-    if not isinstance(aliases, list):
-        raise ValueError('价格配置无效：别名必须是数组')
-    sources = {}
-    for i, alias in enumerate(aliases):
-        what = '别名 ' + str(i)
-        if not isinstance(alias, dict) or set(alias) != {'id', 'source', 'from', 'to', 'basis'}:
+    config['aliases'] = _check_identity_links(value.get('aliases', []), '别名')
+    return config
+
+
+def _check_identity_links(items, label):
+    """One-hop exact provider+model links (v1 aliases, v2 mappings): unique source
+    identities, no self loops, never chained."""
+    if not isinstance(items, list):
+        raise ValueError('价格配置无效：' + label + '必须是数组')
+    canonical, sources = [], {}
+    for i, item in enumerate(items):
+        what = label + ' ' + str(i)
+        if not isinstance(item, dict) or set(item) != {'id', 'source', 'from', 'to', 'basis'}:
             raise ValueError('价格配置无效：' + what + '结构未知')
-        entry = {'id': _require_text(alias.get('id'), what + ' 稳定 ID', 128),
-                 'source': _check_source_ref(alias.get('source'), what),
-                 'basis': _require_text(alias.get('basis'), what + ' 映射依据', 512)}
+        entry = {'id': _require_text(item.get('id'), what + ' 稳定 ID', 128),
+                 'source': _check_source_ref(item.get('source'), what),
+                 'basis': _require_text(item.get('basis'), what + ' 映射依据', 512)}
         for endpoint in ('from', 'to'):
-            point = alias.get(endpoint)
+            point = item.get(endpoint)
             if not isinstance(point, dict) or set(point) != {'provider', 'model'}:
                 raise ValueError('价格配置无效：' + what + ' ' + endpoint + ' 须含完整供应商与模型身份')
             entry[endpoint] = {'provider': _require_text(point.get('provider'), what + ' ' + endpoint + ' 供应商', 128),
@@ -200,12 +219,154 @@ def validate_pricing_config(value):
             raise ValueError('价格配置无效：' + what + ' 源与目标身份相同（循环映射）')
         key = (entry['from']['provider'], entry['from']['model'])
         if key in sources:
-            raise ValueError('价格配置无效：' + what + ' 与其他别名的源身份冲突')
+            raise ValueError('价格配置无效：' + what + ' 与其他' + label + '的源身份冲突')
         sources[key] = entry
-        config['aliases'].append(entry)
-    targets = {(a['to']['provider'], a['to']['model']) for a in config['aliases']}
-    if targets & set(sources):
-        raise ValueError('价格配置无效：别名只允许一次精确映射，不支持链式推断')
+        canonical.append(entry)
+    if {(e['to']['provider'], e['to']['model']) for e in canonical} & set(sources):
+        raise ValueError('价格配置无效：' + label + '只允许一次精确映射，不支持链式推断')
+    return canonical
+
+
+def _require_positive_int(value, what):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError('价格配置无效：' + what + '必须为正整数')
+    return value
+
+
+def _check_conditions(value, what):
+    """v2 rule conditions: the estimate tier plus optional integer bounds that each
+    state endpoint inclusivity explicitly, and the official basis they came from."""
+    if not isinstance(value, dict) or set(value) - {'service_tier', 'input_min', 'input_min_inclusive',
+                                                    'input_max', 'input_max_inclusive', 'basis'}:
+        raise ValueError('价格配置无效：' + what + '价格条件结构未知')
+    if value.get('service_tier') != 'standard':
+        raise ValueError('价格配置无效：' + what + '价格条件必须是官网标准档（service_tier=standard）')
+    entry = {'service_tier': 'standard'}
+    for side, label in (('min', '输入下界'), ('max', '输入上界')):
+        bound, flag = 'input_' + side, 'input_' + side + '_inclusive'
+        if bound in value:
+            if not isinstance(value.get(flag), bool):
+                raise ValueError('价格配置无效：' + what + label + '必须明确是否含等值点')
+            entry[bound] = _require_positive_int(value[bound], what + label)
+            entry[flag] = value[flag]
+    if 'input_min' in entry and 'input_max' in entry:
+        if entry['input_min'] > entry['input_max'] or (
+                entry['input_min'] == entry['input_max']
+                and not (entry['input_min_inclusive'] and entry['input_max_inclusive'])):
+            raise ValueError('价格配置无效：' + what + '输入条件区间为空')
+    entry['basis'] = _require_text(value.get('basis'), what + '档位条件依据', 512)
+    return entry
+
+
+def _conditions_match(conditions, tokens):
+    if 'input_min' in conditions and (tokens < conditions['input_min']
+                                      or (tokens == conditions['input_min'] and not conditions['input_min_inclusive'])):
+        return False
+    if 'input_max' in conditions and (tokens > conditions['input_max']
+                                      or (tokens == conditions['input_max'] and not conditions['input_max_inclusive'])):
+        return False
+    return True
+
+
+def _conditions_overlap(a, b):
+    """Whether any integer token count satisfies both condition sets."""
+    lows = [c['input_min'] for c in (a, b) if 'input_min' in c]
+    highs = [c['input_max'] for c in (a, b) if 'input_max' in c]
+    if not lows or not highs:
+        return True  # At least one side unbounded where the other also extends: some x fits both.
+    lower, upper = max(lows), min(highs)
+    if lower != upper:
+        return lower < upper
+    return _conditions_match(a, lower) and _conditions_match(b, lower)
+
+
+def _validate_v2(value):
+    if set(value) - {'schema_version', 'revision', 'price_basis', 'sources', 'rules', 'mappings', 'uncovered'}:
+        raise ValueError('价格配置无效：含未知字段')
+    for field in ('revision', 'sources', 'rules', 'mappings', 'uncovered'):
+        if field not in value:
+            raise ValueError('价格配置无效：缺少 ' + field)
+    if value.get('price_basis') != PRICE_BASIS:
+        raise ValueError('价格配置无效：v2 快照的价格口径必须是 ' + PRICE_BASIS)
+    config = {'schema_version': V2_SCHEMA_VERSION,
+              'revision': _require_text(value.get('revision'), '修订标识'),
+              'price_basis': PRICE_BASIS, 'sources': [], 'rules': [], 'mappings': [], 'uncovered': []}
+    sources = value['sources']
+    if not isinstance(sources, list) or not sources:
+        raise ValueError('价格配置无效：快照来源必须是非空数组')
+    for i, source in enumerate(sources):
+        what = '来源 ' + str(i)
+        if not isinstance(source, dict) or set(source) - {'url', 'fetched_at', 'digest', 'summary'} \
+                or not {'url', 'fetched_at', 'summary'} <= set(source):
+            raise ValueError('价格配置无效：' + what + '须含官方 URL、带时区读取时间与所读内容摘要')
+        entry = {'url': _require_text(source.get('url'), what + '官方 URL', 512),
+                 'fetched_at': _require_time(source.get('fetched_at'), what + '读取时间')}
+        entry['fetched_at'] = source['fetched_at']
+        if 'digest' in source:
+            entry['digest'] = _require_text(source.get('digest'), what + '内容摘要标识', 128)
+        entry['summary'] = _require_text(source.get('summary'), what + '所读内容摘要', 1024)
+        config['sources'].append(entry)
+    rules = value['rules']
+    if not isinstance(rules, list) or not rules:
+        raise ValueError('价格配置无效：规则必须是非空数组')
+    seen = set()
+    by_identity = {}
+    for i, rule in enumerate(rules):
+        what = '规则 ' + str(i)
+        if not isinstance(rule, dict) or set(rule) - {'id', 'source', 'provider', 'model', 'currency',
+                                                      'input', 'output', 'conditions',
+                                                      'official_effective_from', 'official_effective_to'}:
+            raise ValueError('价格配置无效：' + what + '结构未知')
+        entry = {'id': _require_text(rule.get('id'), what + ' 稳定 ID', 128),
+                 'source': _check_source_ref(rule.get('source'), what),
+                 'provider': _require_text(rule.get('provider'), what + ' 供应商', 128),
+                 'model': _require_text(rule.get('model'), what + ' 完整模型身份', 256)}
+        if entry['id'] in seen:
+            raise ValueError('价格配置无效：规则 ID 重复 ' + entry['id'])
+        seen.add(entry['id'])
+        if rule.get('official_effective_from') is not None:
+            start = _require_time(rule['official_effective_from'], what + ' 官网生效起点')
+            entry['official_effective_from'] = rule['official_effective_from']
+            if rule.get('official_effective_to') is not None:
+                end = _require_time(rule['official_effective_to'], what + ' 官网生效终点')
+                if end <= start:
+                    raise ValueError('价格配置无效：' + what + ' 官网生效区间必须满足 from < to')
+                entry['official_effective_to'] = rule['official_effective_to']
+        elif rule.get('official_effective_to') is not None:
+            raise ValueError('价格配置无效：' + what + '官网生效终点缺少起点')
+        entry['currency'] = _require_text(rule.get('currency'), what + ' 币种', 32)
+        for section, kinds, label in (('input', INPUT_KINDS, what + ' 输入'), ('output', OUTPUT_KINDS, what + ' 输出')):
+            if section not in rule:
+                raise ValueError('价格配置无效：' + label + '分区缺失')
+            entry[section] = _check_partition(rule[section], kinds, label)
+        entry['conditions'] = _check_conditions(rule.get('conditions'), what)
+        key = (entry['provider'], entry['model'])
+        for other in by_identity.get(key, []):
+            if _conditions_overlap(other['conditions'], entry['conditions']):
+                raise ValueError('价格配置无效：' + what + '与规则 ' + other['id'] + ' 在同一身份与档位下条件区间重叠')
+        by_identity.setdefault(key, []).append(entry)
+        config['rules'].append(entry)
+    config['mappings'] = _check_identity_links(value['mappings'], '映射')
+    uncovered = value['uncovered']
+    if not isinstance(uncovered, list):
+        raise ValueError('价格配置无效：未覆盖项必须是数组')
+    for i, item in enumerate(uncovered):
+        what = '未覆盖项 ' + str(i)
+        if not isinstance(item, dict) or set(item) != {'provider', 'model', 'reason'}:
+            raise ValueError('价格配置无效：' + what + '结构未知')
+        provider = item['provider']
+        if provider is not None and (not isinstance(provider, str) or not provider.strip()):
+            raise ValueError('价格配置无效：' + what + '供应商为空请用 null')
+        config['uncovered'].append({'provider': provider,
+                                    'model': _require_text(item.get('model'), what + ' 完整模型身份', 256),
+                                    'reason': _require_text(item.get('reason'), what + '原因', 512)})
+    # v2 reference integrity: a whitelisted URL proves a source MAY be read, not that this
+    # snapshot read it. Rules and mappings may only cite sources listed in this snapshot.
+    source_urls = {entry['url'] for entry in config['sources']}
+    dangling = ({rule['source']['reference'] for rule in config['rules']}
+                | {item['source']['reference'] for item in config['mappings']}) - source_urls
+    if dangling:
+        raise ValueError('价格配置无效：规则/映射引用了本快照未读取的来源：' + '、'.join(sorted(dangling)))
     return config
 
 
@@ -266,16 +427,43 @@ def _component_tokens(name, metrics):
 def price_records(records, config):
     """Per-record pricing + per-currency summary for the report `analysis` extension.
 
-    Matching is exact on source provider + full model identity (one optional explicit
-    alias hop) over the record's billing time; overlapping rules are a per-record
-    conflict, never a silent pick, and other identities keep their priced results.
+    v1 matches exact source provider + full model identity (one optional alias hop)
+    over the record's billing time. v2 matches the mapped official identity against
+    rule conditions instead of billing time: a bound on the complete single-request
+    input is judged only from provable per-request evidence, never from interval
+    sums. Overlapping rules are a per-record conflict, never a silent pick, and
+    other identities keep their priced results.
     """
-    aliases = {(a['from']['provider'], a['from']['model']): a for a in config['aliases']}
-    entries = []
+    if config['schema_version'] == V2_SCHEMA_VERSION:
+        entries = _price_records_v2(records, config)
+    else:
+        entries = _price_records_v1(records, config)
     summary = {'records': 0, 'priced': 0, 'partially_priced': 0, 'unpriced': 0, 'rule_conflicts': 0,
                'currencies': {}, 'unpriced_reasons': {},
                'display': {'decimals': 2, 'rounding': 'half_up',
                            'note': '金额显示默认两位小数四舍五入；各 amount 字段保存未舍入的规范十进制值'}}
+    for entry in entries:
+        summary['records'] += 1
+        summary[{'priced': 'priced', 'partially_priced': 'partially_priced',
+                 'unpriced': 'unpriced', 'rule_conflict': 'rule_conflicts'}[entry['status']]] += 1
+        for item in entry['unpriced']:
+            summary['unpriced_reasons'][item['reason']] = summary['unpriced_reasons'].get(item['reason'], 0) + 1
+        if not entry['components']:
+            continue
+        bucket = summary['currencies'].setdefault(entry['currency'], {
+            'amount': '0', 'components': {}, 'priced_records': 0, 'partially_priced_records': 0})
+        bucket[{'priced': 'priced_records', 'partially_priced': 'partially_priced_records'}[entry['status']]] += 1
+        for component in entry['components']:
+            cell = bucket['components'].setdefault(component['name'], {'tokens': 0, 'amount': '0'})
+            cell['tokens'] += component['tokens']
+            cell['amount'] = canon_decimal(exact_decimal_add(cell['amount'], component['amount']))
+            bucket['amount'] = canon_decimal(exact_decimal_add(bucket['amount'], component['amount']))
+    return {'config': config, 'records': entries, 'summary': summary}
+
+
+def _price_records_v1(records, config):
+    aliases = {(a['from']['provider'], a['from']['model']): a for a in config['aliases']}
+    entries = []
     for record in records:
         entry = {'record_key': record['key'], 'identity': None, 'status': 'unpriced',
                  'currency': None, 'matched': None, 'components': [], 'unpriced': []}
@@ -332,23 +520,101 @@ def price_records(records, config):
                                         'amount': component_amount(tokens, price_text)})
         total = len(rule_component_prices(rule))
         entry['status'] = 'priced' if len(entry['components']) == total else 'partially_priced' if entry['components'] else 'unpriced'
-    for entry in entries:
-        summary['records'] += 1
-        summary[{'priced': 'priced', 'partially_priced': 'partially_priced',
-                 'unpriced': 'unpriced', 'rule_conflict': 'rule_conflicts'}[entry['status']]] += 1
-        for item in entry['unpriced']:
-            summary['unpriced_reasons'][item['reason']] = summary['unpriced_reasons'].get(item['reason'], 0) + 1
-        if not entry['components']:
+    return entries
+
+
+def _provable_single_request_input(record):
+    """Complete single-request input tokens, or None when the record cannot prove them.
+
+    Only usage that is one request's own usage can judge a tier bound: per-call usage
+    and the usage of a unique reply qualify; a logical request qualifies only without
+    retries (the saved usage is then the single attempt's own); cumulative intervals
+    and unknown granularities never qualify — their input sums are not one request's.
+    """
+    granularity = record.get('granularity')
+    if granularity == 'logical_request':
+        retry = record.get('retry_count')
+        if retry is None or isinstance(retry, bool) or not isinstance(retry, int) or retry != 0:
+            return None
+    elif granularity not in ('model_call', 'reply_usage'):
+        return None
+    metric = (record.get('metrics') or {}).get('input')
+    if metric is None or not known(metric):
+        return None
+    return metric['value']
+
+
+def _price_records_v2(records, config):
+    mappings = {(m['from']['provider'], m['from']['model']): m for m in config['mappings']}
+    uncovered = {(item['provider'], item['model']): item['reason'] for item in config['uncovered']}
+    entries = []
+    for record in records:
+        entry = {'record_key': record['key'], 'identity': None, 'status': 'unpriced',
+                 'currency': None, 'matched': None, 'components': [], 'unpriced': []}
+        entries.append(entry)
+        identity = _identity_of(record)
+        if identity is None:
+            entry['unpriced'].append({'component': None, 'reason': '缺少有依据的供应商与完整模型身份，不按名称猜测'})
             continue
-        bucket = summary['currencies'].setdefault(entry['currency'], {
-            'amount': '0', 'components': {}, 'priced_records': 0, 'partially_priced_records': 0})
-        bucket[{'priced': 'priced_records', 'partially_priced': 'partially_priced_records'}[entry['status']]] += 1
-        for component in entry['components']:
-            cell = bucket['components'].setdefault(component['name'], {'tokens': 0, 'amount': '0'})
-            cell['tokens'] += component['tokens']
-            cell['amount'] = canon_decimal(exact_decimal_add(cell['amount'], component['amount']))
-            bucket['amount'] = canon_decimal(exact_decimal_add(bucket['amount'], component['amount']))
-    return {'config': config, 'records': entries, 'summary': summary}
+        entry['identity'] = identity
+        key = (identity['provider'], identity['model'])
+        mapping = mappings.get(key)
+        mapped = {'provider': mapping['to']['provider'], 'model': mapping['to']['model']} if mapping is not None \
+            else identity
+        matched, unprovable, out_of_bounds = [], False, False
+        for rule in config['rules']:
+            if (rule['provider'], rule['model']) != (mapped['provider'], mapped['model']):
+                continue
+            conditions = rule['conditions']
+            if 'input_min' in conditions or 'input_max' in conditions:
+                tokens = _provable_single_request_input(record)
+                if tokens is None:
+                    unprovable = True
+                    continue
+                if not _conditions_match(conditions, tokens):
+                    out_of_bounds = True
+                    continue
+                matched.append((rule, tokens))
+            else:
+                matched.append((rule, None))
+        if len(matched) > 1:
+            entry['status'] = 'rule_conflict'
+            entry['conflicts'] = sorted(rule['id'] for rule, _ in matched)
+            entry['unpriced'].append({'component': None,
+                                      'reason': '同一身份与档位命中多条价格规则（' + '、'.join(entry['conflicts'])
+                                                + '），不按文件顺序/最新/币种静默选价'})
+            continue
+        if not matched:
+            reason = uncovered.get(key) or uncovered.get((mapped['provider'], mapped['model']))
+            if reason is None and unprovable:
+                reason = ('存在按单请求输入分档的价格规则，但该记录粒度（' + (record.get('granularity') or 'unknown')
+                          + '）无法证明完整单请求输入量，不拿累计输入猜档位')
+            elif reason is None and out_of_bounds:
+                reason = '单请求输入量不满足该身份任何已发布规则的输入条件（档位边界见规则条件依据），保持未定价'
+            elif reason is None:
+                reason = '无匹配的价格规则（供应商＋完整模型身份精确匹配）'
+            entry['unpriced'].append({'component': None, 'reason': reason})
+            continue
+        rule, judged = matched[0]
+        entry['currency'] = rule['currency']
+        matched_evidence = {'rule_id': rule['id'],
+                            'mapping_id': mapping['id'] if mapping is not None else None,
+                            'input_tokens': judged,
+                            'condition_basis': rule['conditions']['basis']}
+        if judged is not None and record.get('granularity') == 'logical_request':
+            matched_evidence['retry_count'] = record.get('retry_count')
+        entry['matched'] = matched_evidence
+        for name, price_text in rule_component_prices(rule):
+            tokens, reason = _component_tokens(name, record.get('metrics') or {})
+            if tokens is None:
+                entry['unpriced'].append({'component': name,
+                                          'reason': '分项 ' + COMPONENT_LABELS[name] + ' 缺少已知 token（' + reason + '）'})
+                continue
+            entry['components'].append({'name': name, 'tokens': tokens, 'price_per_million': price_text,
+                                        'amount': component_amount(tokens, price_text)})
+        total = len(rule_component_prices(rule))
+        entry['status'] = 'priced' if len(entry['components']) == total else 'partially_priced' if entry['components'] else 'unpriced'
+    return entries
 
 
 def overview_projections(entries, records, buckets):
@@ -391,14 +657,17 @@ def overview_projections(entries, records, buckets):
 
 
 def build_analysis(records, config=None, buckets=None, performance=None):
-    """The v2/v3 report extension (internal schema version 1).
+    """The v2/v3 report extension (internal schema version 1, or 2 for v2 snapshots).
 
     The performance section is always saved for new reports (no pricing needed); the
-    cost section only for a priced query. Overall (v3) queries pass the kernel's saved
-    day buckets/unbucketed set so a priced extension also saves the model/session/day
-    cost projections; single-session (v2) never carries cost projections.
+    cost section only for a priced query, and a schema-v2 pricing snapshot upgrades
+    the extension to schema 2 (per-record matched identity/rule/condition evidence).
+    Overall (v3) queries pass the kernel's saved day buckets/unbucketed set so a
+    priced extension also saves the model/session/day cost projections; single-session
+    (v2) never carries cost projections.
     """
-    ext = {'schema_version': SCHEMA_VERSION}
+    ext = {'schema_version': V2_SCHEMA_VERSION if config is not None and config['schema_version'] == V2_SCHEMA_VERSION
+           else SCHEMA_VERSION}
     if config is not None:
         cost = price_records(records, config)
         if buckets is not None:
@@ -511,14 +780,20 @@ def _tool_outcome(event, start, end):
         return 'missing', '缺少可信完成事件，无法判断范围', None
     if completed >= end or (start is not None and completed < start):
         return 'range', '完成事件不在范围 [from,to) 内（恰在截止点或界外事件排除）', None
+    exec_start, exec_end = event.get('exec_start'), event.get('exec_end')
+    if exec_start is None or exec_end is None:
+        exec_start = exec_end = None
+    dispatch_start, dispatch_end = event.get('dispatch_start'), event.get('dispatch_end')
+    if dispatch_start is None or dispatch_end is None:
+        dispatch_start = dispatch_end = None
     sample = {'key': event['key'], 'record_key': None,
               'session': event['session'], 'turn': event.get('turn'),
               'owner_session': event.get('owner_session', event['session']), 'owner_turn': event.get('owner_turn'),
               'category': event['category'], 'status': status,
               'value': value, 'basis': basis, 'precision': event['duration_precision'],
               'native_duration_ns': event['duration_ns'] if basis == 'native' else None,
-              'exec_start': event.get('exec_start'), 'exec_end': event.get('exec_end'),
-              'dispatch_start': event.get('dispatch_start'), 'dispatch_end': event.get('dispatch_end'),
+              'exec_start': exec_start, 'exec_end': exec_end,
+              'dispatch_start': dispatch_start, 'dispatch_end': dispatch_end,
               'completed_at': event['completed_at'], 'source': event['sources'][0]}
     return None, None, sample
 

@@ -523,10 +523,14 @@ def build_overview_turns(data, family, selected, end, start):
 def build_overview_activity(turn_rows, selected, end, family):
     """Per-session wall clocks over the SAME admitted turn set the timeline used;
     no second scan of every source turn, no cross-session total."""
+    rows_by_session = {}
+    for row in turn_rows:
+        if row['kind'] == 'turn':
+            rows_by_session.setdefault(row['session'], []).append(row)
     sessions = {}
     for sid in sorted(family):
         mine = [{'id': r['turn'], 'start': r['start'], 'end': r['end'], 'status': r['status']}
-                for r in turn_rows if r['kind'] == 'turn' and r['session'] == sid]
+                for r in rows_by_session.get(sid, [])]
         sessions[sid] = _wall_entry(mine, end, '该会话自身轮次最早可信起点至最晚可信终点；不扣除间隔；不跨会话合并')
     return {'sessions': sessions, 'durations': _durations_payload(_duration_groups(selected)),
             'note': '墙钟按会话分列，不生成跨会话墙钟总量；调用/请求耗时之和允许并行重叠'}
@@ -551,27 +555,40 @@ def normalize(usage, mapping, cache_write_zero_uncertain=False):
     return metrics
 
 
-def source_lines(paths):
-    """Read each finite file snapshot; never copy raw records into diagnostics."""
+def capture(paths):
+    """One finite read per path; a read failure is carried as an error entry, not raised.
+
+    The content signature and the parse consume this same captured content, so a
+    source swapped or relinked between the two can never enter a cached entry.
+    Raw bytes live in request memory only.
+    """
+    captured = []
     for path in paths:
-        path = Path(path).resolve()
         try:
-            with path.open('rb') as stream:
-                snapshot = stream.read(os.fstat(stream.fileno()).st_size)
+            with Path(path).open('rb') as stream:
+                captured.append((str(path), stream.read(os.fstat(stream.fileno()).st_size), None))
         except OSError as exc:
-            yield str(path), 0, None, '读取失败：' + type(exc).__name__
+            captured.append((str(path), None, '读取失败：' + type(exc).__name__))
+    return captured
+
+
+def captured_lines(captured):
+    """Line-record iterator over capture() output; never copies raw records into diagnostics."""
+    for path, snapshot, error in captured:
+        if error is not None:
+            yield path, 0, None, error
             continue
         for line_no, line in enumerate(snapshot.splitlines(keepends=True), 1):
             if not line.endswith(b'\n'):
-                yield str(path), line_no, None, '末行未完成；未纳入'
+                yield path, line_no, None, '末行未完成；未纳入'
                 continue
             try:
                 record = json.loads(line)
                 if not isinstance(record, dict):
                     raise ValueError()
-                yield str(path), line_no, record, None
+                yield path, line_no, record, None
             except (ValueError, UnicodeError):
-                yield str(path), line_no, None, '损坏或非对象记录；未纳入'
+                yield path, line_no, None, '损坏或非对象记录；未纳入'
 
 
 def _same_moment(old, new):
@@ -1041,6 +1058,17 @@ def overview(data, session_ids, cutoff, since=None, tz='UTC', main_only=False,
             issues.append({'reason': '调用缺少可信时间，无法判断截止点；未计入任何合计', 'source': r['sources'][0],
                            'session': r['session']})
     day_records, unbucketed = {}, []
+    # One index pass over the selected records feeds every later grouping (per session,
+    # per group, per turn) and reuses each record's already-parsed completion time; the
+    # aggregation semantics, ordering and gap handling are unchanged, only the repeated
+    # full-list filters are gone.
+    selected_by_session = {}
+    selected_by_group = {}
+    parsed_times = {}
+    for r in selected:
+        selected_by_session.setdefault(r['session'], []).append(r)
+        selected_by_group.setdefault(r['group'], []).append(r)
+        parsed_times[r['key']] = timestamp(r['time'])
     # Tool candidates: independent channel, same session/descendant/agent-policy filters;
     # policy failures stay visible as exclusions instead of silent drops.
     tool_candidates = []
@@ -1052,7 +1080,7 @@ def overview(data, session_ids, cutoff, since=None, tz='UTC', main_only=False,
         tool_candidates.append(e)
     tool_supplements = [s for s in data.get('tool_supplements', []) if s['session'] in family]
     for r in selected:
-        at = timestamp(r['time'])
+        at = parsed_times[r['key']]
         date = at.astimezone(zone).date().isoformat()
         day_start_utc = day_bounds(date, zone)[2]
         lower = max(day_start_utc, start) if start else day_start_utc
@@ -1090,7 +1118,7 @@ def overview(data, session_ids, cutoff, since=None, tz='UTC', main_only=False,
     for sid in sorted(family):
         item = data['sessions'][sid]
         ends = [t['end'] for t in item['turns'].values() if t.get('end')]
-        mine = [r for r in selected if r['session'] == sid]
+        mine = selected_by_session.get(sid, [])
         index.append({'id': sid, 'start': item.get('start'), 'last_turn_end': max(ends) if ends else None,
                       'turn_count': len(item['turns']), 'parent': item.get('parent'),
                       'forked_from': item.get('forked_from'), 'usage_records': len(mine),
@@ -1113,8 +1141,8 @@ def overview(data, session_ids, cutoff, since=None, tz='UTC', main_only=False,
     zero_proven = bool(turns) and every_session_proven and ended \
         and all(t.get('model_request_count') == 0 for t in turns) \
         and not selected and not issues and not tools
-    rows = [dict(group=g, record_keys=[r['key'] for r in selected if r['group'] == g],
-                 **aggregate([r for r in selected if r['group'] == g])) for g in GROUPS if any(r['group'] == g for r in selected)]
+    rows = [dict(group=g, record_keys=[r['key'] for r in selected_by_group[g]],
+                 **aggregate(selected_by_group[g])) for g in GROUPS if g in selected_by_group]
     views = {'model': dimension_view(selected, model_identity, keys=True),
              'agent': dimension_view(selected, agent_identity, keys=True),
              'turn': {'available': False, 'reason': '整体范围为跨会话视图，轮次维度不可用；请进入单会话流程查看轮次分布',
@@ -1197,9 +1225,22 @@ def cost_lines(result):
     cost = ext['cost']
     config = cost['config']
     summary = cost['summary']
-    lines = ['费用估算（明确本地价格规则；各币种分别小计，不做汇率换算；不是账单结论）：'
-             '配置 schema v%d，修订 %s，规则 %d 条、别名 %d 条（快照随 JSON 保存，含未命中规则）'
-             % (ext['schema_version'], config['revision'], len(config['rules']), len(config['aliases']))]
+    if config['schema_version'] == 2:
+        lines = ['费用估算（当前官网标准 API 价等价快照；各币种分别小计，不做汇率换算；不声称实际服务档、扣费或套餐额度已验证）：'
+                 '配置 schema v%d，修订 %s，规则 %d 条、映射 %d 条、未覆盖 %d 项（快照随 JSON 保存，含未命中规则与缺口）'
+                 % (ext['schema_version'], config['revision'], len(config['rules']),
+                    len(config['mappings']), len(config['uncovered']))]
+        for source in config['sources']:
+            lines.append('价格快照来源：%s（读取时间 %s%s）'
+                         % (source['url'], source['fetched_at'],
+                            '，' + source['digest'] if 'digest' in source else ''))
+        for item in config['uncovered']:
+            lines.append('快照未覆盖：%s — %s' % ((item['provider'] + '/' if item['provider'] is not None else '')
+                                               + item['model'], item['reason']))
+    else:
+        lines = ['费用估算（明确本地价格规则；各币种分别小计，不做汇率换算；不是账单结论）：'
+                 '配置 schema v%d，修订 %s，规则 %d 条、别名 %d 条（快照随 JSON 保存，含未命中规则）'
+                 % (ext['schema_version'], config['revision'], len(config['rules']), len(config['aliases']))]
     currencies = summary['currencies']
     if currencies:
         lines += ['| 币种 | 已定价小计（精确） | 显示（两位小数四舍五入） | 完整计价 | 部分计价 |',

@@ -2,7 +2,7 @@
 from pathlib import Path
 import datetime as dt
 import json
-from .core import deduplicate, iso_ms, normalize, source_lines, timestamp
+from .core import capture, captured_lines, deduplicate, iso_ms, normalize, timestamp
 
 MAPPING = {'input': 'input_tokens', 'output': 'output_tokens', 'cache_read': 'cached_input_tokens',
            'cache_write': 'cache_write_input_tokens', 'reasoning': 'reasoning_output_tokens'}
@@ -28,10 +28,15 @@ def discover(roots, guard=None):
 
 
 def read(roots, guard=None):
-    paths = discover(roots, guard)
+    return read_captured(capture(discover(roots, guard)))
+
+
+def read_captured(captured):
+    """Parse one guarded capture() snapshot; the plain path and the parse cache share it,
+    so the digested content and the parsed content are the same finite read."""
     sessions, records, issues, contexts, requests, compactions = {}, [], [], {}, [], []
     tool_events = []
-    for path, line, obj, error in source_lines(paths):
+    for path, line, obj, error in captured_lines(captured):
         loc = {'path': path, 'line': line}
         if error:
             issues.append({'reason': error, 'source': loc})
@@ -326,5 +331,5 @@ def read(roots, guard=None):
         if event['conflict']:
             old['conflict'] = old['conflict'] or event['conflict']
     return {'harness': 'codex', 'sessions': sessions, 'records': deduplicate(records, issues),
-            'issues': issues, 'source_files': [str(p) for p in paths], 'requests': list(unique_requests.values()) + unkeyed_requests,
+            'issues': issues, 'source_files': [item[0] for item in captured], 'requests': list(unique_requests.values()) + unkeyed_requests,
             'tool_events': list(unique_tools.values())}
