@@ -84,6 +84,25 @@ bucket.amount = '18.8'; bucket.components.non_cache_read = {tokens:1600000n, amo
 assert.throws(() => validateReport(obj), /计价分区/);`, context);
 """, saved)
 
+    def test_browser_v2_reference_integrity(self):
+        # Ticket 08 S07 browser side: a whitelisted-but-unread source URL proves nothing;
+        # rules and mappings must cite sources this very snapshot actually read.
+        skill = VIEWER.parent
+        pointer = json.loads((skill / 'pricing' / 'default.json').read_text(encoding='utf-8'))
+        snapshot_path = skill / 'pricing' / 'snapshots' / (pointer['snapshot'] + '.json')
+        self.node(r"""
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const context = vm.createContext({assert, snapText: fs.readFileSync(process.argv[3], 'utf8')});
+vm.runInContext(fs.readFileSync(process.argv[2] + '/lossless-json.umd.js', 'utf8'), context);
+vm.runInContext(fs.readFileSync(process.argv[2] + '/shared.js', 'utf8'), context);
+vm.runInContext(`
+const snap = LosslessJSON.parse(snapText, undefined, LosslessJSON.parseNumberAndBigInt);
+checkPricingConfig(snap);  // the shipped default snapshot stays valid as-is
+snap.sources = snap.sources.filter(s => !s.url.includes('openai'));
+assert.throws(() => checkPricingConfig(snap), /不在本快照读取来源内/);
+console.log('V2-REF-OK');`, context);
+""", snapshot_path)
+
     def test_recompute_and_update_use_submitted_price_snapshot(self):
         self.node(r"""
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
@@ -92,12 +111,22 @@ const start = source.indexOf('function pricingBasisNote(');
 const end = source.indexOf('async function exportReport(', start);
 (async () => {
   for (const id of ['recompute-run', 'update-run']) {
-    for (const initiallyPriced of [false, true]) {
+    for (const mode of ['custom-loaded', 'keep']) {
       const handlers = {}, nodes = new Map(); let submitted, footer, status;
-      const savedPricing = {text: initiallyPriced ? 'price-a' : null, name: initiallyPriced ? 'a.json' : null};
+      const loaded = mode === 'custom-loaded';
+      const savedPricing = {text: loaded ? 'price-a' : null, name: loaded ? 'a.json' : null};
+      let savedPricingMode = loaded ? 'custom' : 'keep';
       const context = vm.createContext({
-        savedPricing, baseline: {text:'base',obj:{scope:{kind:'session',from:null}}},
+        savedPricing, savedPricingMode, baseline: {text:'base',obj:{scope:{kind:'session',from:null}}},
         STATES:{partial:'partial'},
+        applySavedPricingChoice: payload => {
+          if (savedPricingMode === 'keep') return true;
+          if (savedPricingMode === 'default') { payload.pricing_mode = 'default'; return true; }
+          if (!savedPricing.text) return false;
+          payload.pricing_mode = 'custom';
+          payload.pricing_text = savedPricing.text;
+          return true;
+        },
         $: key => { if (!nodes.has(key)) nodes.set(key, {value:'keep',addEventListener:(event,cb)=>{handlers[key]=cb;}}); return nodes.get(key); },
         document:{querySelector:()=>({value:'keep'}),querySelectorAll:()=>[]},
         updateFormValues:()=>({from:null,to:'cutoff',turns:[]}), refreshUpdateDiff:()=>{},
@@ -105,7 +134,7 @@ const end = source.indexOf('async function exportReport(', start);
           submitted = payload;
           savedPricing.text = 'price-b'; savedPricing.name = 'b.json';
           return {ok:true,exit_code:2,report:{format_version:2,status:'partial',analysis:
-            initiallyPriced ? {cost:{config:{revision:'rev-a'}}} : {performance:{}}}};
+            loaded ? {cost:{config:{revision:'rev-a'}}} : {performance:{}}}};
         },
         moveFreshTo:()=>{},selectTab:()=>{},failFresh:()=>{},
         showFreshResult:(_,text)=>{footer=text;},setStatus:text=>{status=text;}
@@ -114,11 +143,12 @@ const end = source.indexOf('async function exportReport(', start);
       await handlers[id]();
       assert(footer && status, 'successful response must render');
       assert(!footer.includes('b.json') && !status.includes('b.json'));
-      if (initiallyPriced) {
+      if (loaded) {
+        assert.equal(submitted.pricing_mode,'custom');
         assert.equal(submitted.pricing_text,'price-a');
         assert(footer.includes('a.json') && status.includes('rev-a'));
       } else {
-        assert(!Object.hasOwn(submitted,'pricing_text'));
+        assert(!Object.hasOwn(submitted,'pricing_text') && !Object.hasOwn(submitted,'pricing_mode'));
         assert(footer.includes('不含费用估算'));
       }
     }
@@ -190,3 +220,139 @@ if(obj.records[0].metrics.cache_write.state==='unknown') {
   assert.equal(entry.status,'partially_priced'); assert(!components.has('other_input'));
 } else { assert.equal(entry.status,'priced'); assert.equal(components.get('other_input'),500000n); }`,context);
 """, saved)
+
+
+DOM_STUB = r'''
+class Node { constructor(){ this.childNodes = []; } get textContent(){ return (this._text || '') + this.childNodes.map(c => c.textContent).join(''); } set textContent(v){ this.childNodes = []; this._text = String(v); } }
+class ClassList { constructor(){ this.set = new Set(); } add(...cs){ cs.forEach(c => this.set.add(c)); } remove(...cs){ cs.forEach(c => this.set.delete(c)); } contains(c){ return this.set.has(c); } }
+class Element extends Node {
+  constructor(tag){ super(); this.tagName = tag.toUpperCase(); this.attributes = {}; this.classList = new ClassList(); this._listeners = {}; this.hidden = false; this.open = false; this.disabled = false; this.value = ''; this.checked = false; this.tabIndex = -1; this.title = ''; this.id = ''; this.className = ''; this.type = ''; this.name = ''; this._text = ''; }
+  get firstChild(){ return this.childNodes[0] || null; }
+  get firstElementChild(){ return this.childNodes.find(c => c instanceof Element) || null; }
+  get lastChild(){ return this.childNodes[this.childNodes.length - 1] || null; }
+  get parentElement(){ return this.parentNode instanceof Element ? this.parentNode : null; }
+  appendChild(node){ if (node.__fragment) { for (const child of [...node.childNodes]) this.appendChild(child); node.childNodes = []; return node; } this.removeChild(node); node.parentNode = this; this.childNodes.push(node); return node; }
+  insertBefore(node, ref){ node.parentNode = this; const i = this.childNodes.indexOf(ref); if (i < 0) this.childNodes.push(node); else this.childNodes.splice(i, 0, node); return node; }
+  removeChild(node){ const i = this.childNodes.indexOf(node); if (i >= 0) this.childNodes.splice(i, 1); node.parentNode = null; return node; }
+  remove(){ if (this.parentNode) this.parentNode.removeChild(this); }
+  after(node){ const parent = this.parentNode; if (!parent) return; const i = parent.childNodes.indexOf(this); parent.childNodes.splice(i + 1, 0, node); node.parentNode = parent; }
+  setAttribute(key, value){ this.attributes[key] = String(value); if (key === 'id') this.id = String(value); }
+  getAttribute(key){ return Object.prototype.hasOwnProperty.call(this.attributes, key) ? this.attributes[key] : null; }
+  addEventListener(kind, fn){ (this._listeners[kind] = this._listeners[kind] || []).push(fn); }
+  removeEventListener(kind, fn){ this._listeners[kind] = (this._listeners[kind] || []).filter(f => f !== fn); }
+  dispatchEvent(event){ event.target = event.target || this; for (const fn of (this._listeners[event.type] || [])) fn(event); return true; }
+  click(){ this.dispatchEvent({ type: 'click', target: this }); }
+  scrollIntoView(){}
+  querySelector(sel){ return this.querySelectorAll(sel)[0] || null; }
+  querySelectorAll(sel){ const out = []; const walk = node => { if (node instanceof Element && domMatches(node, sel)) out.push(node); node.childNodes.forEach(walk); }; this.childNodes.forEach(walk); return out; }
+}
+class Fragment extends Node { constructor(){ super(); this.__fragment = true; } appendChild(node){ node.parentNode = this; this.childNodes.push(node); return node; } }
+function domMatches(el, sel){
+  sel = String(sel);
+  let m;
+  if ((m = /^input\[name="([^"]+)"\]:checked$/.exec(sel))) return el.tagName === 'INPUT' && (el.getAttribute('name') === m[1] || el.name === m[1]) && el.checked;
+  if ((m = /^input\[name="([^"]+)"\]$/.exec(sel))) return el.tagName === 'INPUT' && (el.getAttribute('name') === m[1] || el.name === m[1]);
+  if ((m = /^#([\w-]+)$/.exec(sel))) return el.id === m[1];
+  if ((m = /^\.([\w-]+)$/.exec(sel))) return el.classList.contains(m[1]) || el.className.split(/\s+/).includes(m[1]);
+  if ((m = /^([a-zA-Z]+)$/.exec(sel))) return el.tagName === m[1].toUpperCase();
+  return false;
+}
+const document = {
+  _root: new Element('div'),
+  createElement(tag){ return new Element(tag); },
+  createElementNS(ns, tag){ return new Element(tag); },
+  createTextNode(text){ const node = new Node(); node._text = String(text); return node; },
+  createDocumentFragment(){ return new Fragment(); },
+  getElementById(id){ return this._root.querySelectorAll('#' + id)[0] || null; },
+  querySelector(sel){ return this.querySelectorAll(sel)[0] || null; },
+  querySelectorAll(sel){ return this._root.querySelectorAll(sel); },
+  addEventListener(){}, removeEventListener(){},
+};
+'''
+
+
+@unittest.skipUnless(shutil.which('node'), 'Node.js is required for viewer regressions')
+class RenderSmoke(ViewerRegression):
+    """Ticket 03: render paths (lazy sections, pagination) stay runnable and on-contract."""
+
+    def test_overview_renders_lazy_and_paged(self):
+        # A real overview with enough sessions to force pagination in the session ranking.
+        log = self.root / 'many-sessions.jsonl'
+        rows = [pmeta()]
+        for i in range(28):
+            rows.append({'timestamp': '2026-03-08T12:00:00.0%02dZ' % i, 'type': 'session_meta',
+                         'payload': {'id': 's%d' % i, 'cwd': '/tmp', 'originator': 'x', 'cli_version': '1'}})
+            rows.append(tctx(turn='t%d' % i, model='gpt-6.1-sol'))
+            rows.append(usage(rid='r%d' % i, turn='t%d' % i, sid='s%d' % i, inp=100 * (i + 1), cache=0, output=10 * i))
+        log.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        proc = subprocess.run(['python3', str(ENTRY), 'overview', '--source', str(log), '--to', END,
+                               '--export', 'json', '--output', str(self.root / 'ov.json')],
+                              capture_output=True, text=True)
+        self.assertIn(proc.returncode, (0, 2), proc.stderr)
+        proc = subprocess.run(['python3', str(ENTRY), 'report', '--source', str(log), '--session', 's0',
+                               '--to', END, '--export', 'json', '--output', str(self.root / 'sess.json')],
+                              capture_output=True, text=True)
+        self.assertIn(proc.returncode, (0, 2), proc.stderr)
+        self.node(r'''
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+''' + DOM_STUB + r'''
+const context = vm.createContext({console, assert, document, Node, setTimeout: fn => fn(),
+  reportText: fs.readFileSync(process.argv[3], 'utf8')});
+vm.runInContext(fs.readFileSync(process.argv[2] + '/lossless-json.umd.js', 'utf8'), context);
+vm.runInContext(fs.readFileSync(process.argv[2] + '/shared.js', 'utf8'), context);
+vm.runInContext(`
+const obj = LosslessJSON.parse(reportText, undefined, LosslessJSON.parseNumberAndBigInt);
+validateReport(obj);
+const host = document.createElement('section'); host.id = 'report';
+const empty = document.createElement('div'); empty.id = 'empty';
+empty.appendChild(document.createElement('p'));
+document._root.appendChild(empty);
+document._root.appendChild(host);
+renderReport(obj, obj.format_version, 'footer');
+assert(host.textContent.includes('费用估算'), 'session render missing cost section');
+assert(host.textContent.includes('展开调用明细'), 'session render missing records toggle');
+console.log('SESSION-RENDER-OK');
+`, context);
+''', self.root / 'sess.json')
+        self.node(r'''
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+''' + DOM_STUB + r'''
+const context = vm.createContext({console, assert, document, Node, setTimeout: fn => fn(),
+  reportText: fs.readFileSync(process.argv[3], 'utf8')});
+vm.runInContext(fs.readFileSync(process.argv[2] + '/lossless-json.umd.js', 'utf8'), context);
+vm.runInContext(fs.readFileSync(process.argv[2] + '/shared.js', 'utf8'), context);
+vm.runInContext(`
+const obj = LosslessJSON.parse(reportText, undefined, LosslessJSON.parseNumberAndBigInt);
+validateReport(obj);
+const host = document.createElement('section'); host.id = 'overview-result';
+document._root.appendChild(host);
+renderOverviewReport(obj, 'footer', 'overview-result');
+const text = host.textContent;
+// First screen: scope band, metric cards and trend render eagerly.
+assert(text.includes('结果范围与状态') && text.includes('日趋势'), 'first screen missing');
+// Long sections render lazily: their summaries exist, bodies not yet generated.
+const lazySummaries = host.querySelectorAll('summary').map ? null : null;
+const summaries = document._root.querySelectorAll('summary').map(s => s.textContent);
+const sessionIndex = summaries.find(s => s.includes('会话索引'));
+assert(sessionIndex && sessionIndex.includes('个会话，其中 28 个有 usage'), 'session index summary: ' + sessionIndex);
+const timelineCard = summaries.find(s => s.includes('轮次时间线'));
+assert(timelineCard, 'timeline card missing');
+// Session ranking is session content: folded by default with a count summary,
+// paged body only when its entry is opened (model ranking stays eager).
+assert(text.includes('会话排行：共 28 个会话'), 'ranking summary missing: ' + text.slice(text.indexOf('会话排行'), text.indexOf('会话排行') + 200));
+const allDetails = document._root.querySelectorAll('details');
+const rankCard = allDetails.find(d => d.querySelector('summary') && d.querySelector('summary').textContent.includes('展开会话排行'));
+assert(rankCard, 'session ranking card missing');
+rankCard.open = true; rankCard.dispatchEvent({type: 'toggle'});
+assert(rankCard.textContent.includes('第 1 / 2 页'), 'ranking not paged after open');
+// Opening the lazy session index builds the paged body exactly once.
+const details = document._root.querySelectorAll('details').filter(d => (d.textContent || '').includes('会话索引') || (d.firstChild && d.firstChild.textContent && d.firstChild.textContent.includes('会话索引')));
+const indexCard = details.find(d => d.querySelector('summary') && d.querySelector('summary').textContent.includes('会话索引'));
+indexCard.open = true; indexCard.dispatchEvent({type: 'toggle'});
+assert(indexCard.textContent.includes('第 1 / 2 页'), 'session index body not paged');
+const afterFirst = indexCard.textContent.length;
+indexCard.dispatchEvent({type: 'toggle'});
+assert(indexCard.textContent.length === afterFirst, 'lazy body rebuilt on second open');
+console.log('RENDER-SMOKE-OK');
+`, context);
+''', self.root / 'ov.json')

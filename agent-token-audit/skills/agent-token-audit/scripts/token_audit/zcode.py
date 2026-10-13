@@ -1,11 +1,12 @@
 """ZCode rollout/log adapter and read-only existing telemetry database reader."""
+import contextlib
 import json
 from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
 from .codex import discover
-from .core import aggregate, cell, deduplicate, iso_ms, normalize, source_lines
+from .core import aggregate, capture, captured_lines, cell, deduplicate, iso_ms, normalize
 
 MAPPING = {'input': 'inputTokens', 'output': 'outputTokens', 'cache_read': 'cacheReadTokens',
            'cache_write': 'cacheWriteTokens', 'reasoning': 'reasoningTokens'}
@@ -78,10 +79,14 @@ TOOL_EVENTS = ('tool.call.started', 'tool.call.completed', 'tool.call.failed')
 
 
 def read(roots, guard=None):
-    paths = discover(roots, guard)
+    return read_captured(capture(discover(roots, guard)))
+
+
+def read_captured(captured):
+    """Parse one guarded capture() snapshot; the plain path and the parse cache share it."""
     sessions, records, issues, counts, events = {}, [], [], {}, []
     tool_by_key = {}
-    for path, line, obj, error in source_lines(paths):
+    for path, line, obj, error in captured_lines(captured):
         loc = {'path': path, 'line': line}
         if error:
             issues.append({'reason': error, 'source': loc}); continue
@@ -212,12 +217,19 @@ def read(roots, guard=None):
             records.append(dict(value, model='模型未知', granularity='unknown',
                                 metrics=metrics({}, 'builtin:bigmodel-coding-plan')))
     return {'harness': 'zcode', 'sessions': sessions, 'records': records, 'issues': issues,
-            'source_files': [str(p) for p in paths], 'events': events,
+            'source_files': [item[0] for item in captured], 'events': events,
             'tool_events': list(tool_by_key.values())}
 
 
-def read_database(path, guard=None):
-    """Read a disposable consistent snapshot; source DB/WAL records remain read-only."""
+@contextlib.contextmanager
+def database_snapshot(path, guard=None):
+    """Guard-check the source, then yield a disposable consistent snapshot.
+
+    Yields ``(source, target)`` where target is the copied/BACKUP'd sqlite file
+    inside a temp directory this context manager owns. Source DB/WAL records
+    remain read-only throughout; the adjacent companion files are discovered,
+    guarded and captured separately by the caller (see companion_captures).
+    """
     source = Path(path).expanduser().resolve()
     if guard:
         guard(source)
@@ -261,159 +273,206 @@ def read_database(path, guard=None):
                     break
             else:
                 raise ValueError('源数据库持续变化，未取得一致读取快照，请稍后重试')
-        db = sqlite3.connect(str(target))
-        db.row_factory = sqlite3.Row
-        try:
-            db.execute('PRAGMA query_only=ON')
-            sessions, requests = {}, []
-            for row in db.execute('SELECT id,version,parent_id,time_created,task_type FROM session'):
-                sid = row['id']
-                # task_type records the relation kind: child types are descendants, not forks.
-                child = row['task_type'] in ('subagent_child', 'workflow_child')
-                sessions[sid] = dict(session(sid, iso_ms(row['time_created'])), version=row['version'],
-                                     parent=row['parent_id'] if child else None,
-                                     forked_from=row['parent_id'] if row['parent_id'] and not child else None,
-                                     paths=[str(source)])
-            records, issues = [], []
-            # First-token evidence columns exist only on newer writers; the column check is
-            # the verified "source does not provide" conclusion for older schemas.
-            usage_columns = {row['name'] for row in db.execute('PRAGMA table_info(model_usage)')}
-            optional = [name for name in ('first_token_at', 'time_to_first_token_ms', 'tool_call_count')
-                        if name in usage_columns]
-            fields = 'id,logical_request_id,attempt_index,session_id,turn_id,query_source,provider_id,model_id,status,started_at,completed_at,duration_ms,retry_count,raw_usage_json'
-            if optional:
-                fields += ',' + ','.join(optional)
-            for row in db.execute('SELECT ' + fields + ' FROM model_usage ORDER BY started_at,id'):
-                loc = {'path': str(source), 'table': 'model_usage', 'id': row['id']}
-                try:
-                    usage = json.loads(row['raw_usage_json']) if row['raw_usage_json'] else {}
-                except ValueError:
-                    usage = {}
-                turn_id = None if row['query_source'] == 'session_title' else row['turn_id']
-                if turn_id and row['session_id'] in sessions:
-                    turn_candidate(sessions[row['session_id']], turn_id, 'model_usage')
-                records.append({'key': 'zcode-db:' + row['id'], 'call_id': f"{row['logical_request_id']}:{row['attempt_index']}", 'session': row['session_id'],
-                                'agent': row['session_id'], 'turn': turn_id, 'root_turn': None,
-                                'group': classify(row['query_source']), 'model': row['model_id'], 'provider': row['provider_id'],
-                                'start': iso_ms(row['started_at']), 'time': iso_ms(row['completed_at']),
-                                'duration_ms': row['duration_ms'], 'sources': [loc],
-                                'first_token_at': iso_ms(row['first_token_at']) if 'first_token_at' in optional else None,
-                                'native_ttft_ms': row['time_to_first_token_ms'] if 'time_to_first_token_ms' in optional else None,
-                                'tool_call_count': row['tool_call_count'] if 'tool_call_count' in optional else None,
-                                'retry_count': row['retry_count'],
-                                'granularity': 'logical_request', 'time_kind': 'completion_time',
-                                'source_status': row['status'] or 'unknown',
-                                'metrics': metrics(usage, row['provider_id']),
-                                'call_count': 1 if usage and not row['retry_count'] else None,
-                                **({'internal_kind': 'compaction'} if row['query_source'] == 'compact' else
-                                   {'internal_kind': 'session_aux'} if row['query_source'] == 'session_title' else
-                                   {'origin_kind': 'workflow_child'} if row['query_source'] == 'workflow_child' else {})})
-                if row['retry_count']:
-                    issues.append({'reason': '数据库仅保留逻辑请求结果，重试调用总数及失败用量可能缺失', 'source': loc,
-                                   'session': row['session_id'], 'turn': row['turn_id']})
-            for row in db.execute('SELECT session_id,turn_id,started_at,completed_at,status,model_request_count FROM turn_usage'):
-                if row['session_id'] in sessions:
-                    candidate = turn_candidate(sessions[row['session_id']], row['turn_id'], 'turn_usage')
-                    candidate['status'] = row['status']
-                    candidate['status_source'] = 'turn_usage'
-                    candidate['model_request_count'] = row['model_request_count']
-                    if row['started_at'] is not None:
-                        candidate['start'] = iso_ms(row['started_at'])
-                        candidate['start_source'] = 'turn_usage'
-                    if row['completed_at'] is not None:
-                        candidate['end'] = iso_ms(row['completed_at'])
-                        candidate['end_source'] = 'turn_usage'
-            tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            tool_events = []
-            # tool_usage carries session/turn, tool_call_id, status, a native duration and the
-            # dispatch-to-completion times. The writer may default a missing duration to 0, so
-            # a bare zero stays unconfirmed until an independent completion log verifies it.
-            tool_required = {'id','session_id','turn_id','tool_call_id','tool_name','status','started_at','completed_at','duration_ms'}
-            tool_table_ok = False
-            if 'tool_usage' in tables:
-                tool_columns = {row['name'] for row in db.execute('PRAGMA table_info(tool_usage)')}
-                tool_table_ok = tool_required <= tool_columns
-            if tool_table_ok:
-                seen_tool_keys = {}
-                for row in db.execute('SELECT id,session_id,turn_id,tool_call_id,tool_name,status,started_at,completed_at,duration_ms FROM tool_usage'):
-                    loc = {'path': str(source), 'table': 'tool_usage', 'id': row['id']}
-                    sid, cid = row['session_id'], row['tool_call_id']
-                    if not isinstance(sid, str) or not isinstance(cid, str) or not cid:
-                        issues.append({'reason': '数据库工具行缺少完整会话/tool_call_id；未纳入', 'source': loc})
-                        continue
-                    key = 'zcode-db-tool:' + sid + ':' + cid
-                    if key in seen_tool_keys:
-                        seen_tool_keys[key]['conflict'] = '数据库同一会话内 tool_call_id 重复，无法唯一合并'
-                        continue
-                    raw = row['duration_ms']
-                    duration_ns, zero_unconfirmed, conflict = None, False, None
-                    if raw is not None:
-                        if type(raw) is not int or raw < 0:
-                            conflict = '数据库原生 duration_ms 为负数、布尔值或非整数，不能作为有效耗时'
-                        elif raw == 0:
-                            zero_unconfirmed = True
-                        else:
-                            duration_ns = raw * 1000000
-                    status = {'completed': 'completed', 'error': 'failed'}.get(
-                        row['status'], row['status'] if isinstance(row['status'], str) else 'unknown')
-                    seen_tool_keys[key] = {'key': key, 'call_id': cid, 'session': sid, 'turn': row['turn_id'],
-                        'root_turn': None,
-                        'category': row['tool_name'] if isinstance(row['tool_name'], str) and row['tool_name'] else '工具类别未知',
-                        'group': 'unknown',  # tool_usage has no query_source; a merged log event may classify
-                        'status': status, 'completed_at': iso_ms(row['completed_at']),
-                        'sources': [loc], 'duration_ns': duration_ns, 'duration_precision': 'ms',
-                        'zero_unconfirmed': zero_unconfirmed,
-                        'exec_start': None, 'exec_end': None,
-                        # Dispatch-to-completion span: different semantics from the native
-                        # execution duration, saved separately, never judged as a conflict.
-                        'dispatch_start': iso_ms(row['started_at']), 'dispatch_end': iso_ms(row['completed_at']),
-                        'conflict': conflict}
-                tool_events = list(seen_tool_keys.values())
-            message_by_id = {}
-            if 'message' in tables:
-                fields = "id,session_id,coalesce(json_extract(data,'$.time.created'),time_created) AS created, json_extract(data,'$.synthetic') AS synthetic, json_extract(data,'$.visibility') AS visibility, json_extract(data,'$.source') AS message_source"
-                for row in db.execute("SELECT " + fields + " FROM message WHERE json_valid(data) AND json_extract(data,'$.role')='user'"):
-                    synthetic = row['synthetic'] in (1, True, 'true')
-                    item = {'id': row['id'], 'ids': [row['id']], 'session': row['session_id'], 'turn': None,
-                            'time': iso_ms(row['created']), 'time_source': 'user_message_time',
-                            'classification': 'synthetic_system' if synthetic else 'unknown',
-                            'eligible': not synthetic, 'association': 'unverified',
-                            'sources': [{'path': str(source), 'table': 'message', 'id': row['id']}],
-                            'synthetic_source': row['message_source'], 'visibility': row['visibility']}
-                    message_by_id[(row['session_id'], row['id'])] = item
-            if 'session_input' in tables:
-                columns = {row['name'] for row in db.execute('PRAGMA table_info(session_input)')}
-                kind = 'kind' if 'kind' in columns else 'NULL'
-                promoted = 'promoted_message_id' if 'promoted_message_id' in columns else 'NULL'
-                for row in db.execute(f'SELECT id,session_id,delivery,time_created,{kind} AS kind,{promoted} AS promoted_message_id FROM session_input'):
-                    input_kind = row['kind']
-                    eligible = input_kind in (None, 'sendText')
-                    classification = 'confirmed_user_input' if input_kind == 'sendText' else 'unknown' if input_kind is None else 'non_user_input'
-                    item = {'id': row['id'], 'ids': [row['id']], 'session': row['session_id'], 'turn': None,
-                            'time': iso_ms(row['time_created']), 'delivery': row['delivery'],
-                            'time_source': 'input_admission_time', 'classification': classification,
-                            'eligible': eligible, 'association': 'unverified',
-                            'sources': [{'path': str(source), 'table': 'session_input', 'id': row['id']}]}
-                    linked = message_by_id.get((row['session_id'], row['promoted_message_id']))
-                    if linked:
-                        item['ids'].append(linked['id'])
-                        item['sources'].extend(linked['sources'])
-                        item['association'] = 'promoted_message_id'
-                        message_by_id.pop((row['session_id'], linked['id']))
-                    if linked and not eligible:
-                        item['rejection_reason'] = '该入队记录已确认不是用户输入，不能作为用户请求截止点'
-                    elif linked and not linked['eligible']:
-                        item['eligible'] = False
-                        item['classification'] = 'ambiguous'
-                        item['rejection_reason'] = '入队记录关联到已确认的合成消息，不能作为用户请求截止点'
-                    requests.append(item)
-            requests.extend(message_by_id.values())
-        except sqlite3.Error as exc:
-            raise ValueError('不支持或损坏的 ZCode 遥测数据库结构：' + type(exc).__name__) from exc
-        finally:
-            db.close()
-    relation_logs = source.parent.parent / 'log' if source.parent.name == 'db' else source.parent / 'log'
-    log_data = read([relation_logs], guard) if relation_logs.is_dir() else {'events': [], 'source_files': []}
+        yield source, target
+
+
+def discover_companions(source, guard=None):
+    """Guard-checked discovery of EVERY adjacent file the database parser consumes.
+
+    The relation-log set is recursive (the JSONL reader walks subdirectories) and
+    the rollout set is the parser's top-level model-io entries; both are resolved
+    and source-guarded here, before any content read, on hit and miss paths alike.
+    A rollout entry keeps its own filename as the session association — the entry
+    name, not a link target's name, is the identity the parser and the digest key
+    on — while the content is read from the resolved real path only.
+    """
+    base = source.parent.parent if source.parent.name == 'db' else source.parent
+    logs, rollouts = base / 'log', base / 'rollout'
+    log_paths = sorted(entry.resolve() for entry in logs.rglob('*.jsonl')) if logs.is_dir() else []
+    rollout_entries = sorted(rollouts.glob('model-io-*.jsonl')) if rollouts.is_dir() else []
+    rollout_paths = [(entry, entry.resolve()) for entry in rollout_entries]
+    if guard:
+        for real in log_paths + [real for _, real in rollout_paths]:
+            guard(real)
+    return log_paths, rollout_paths
+
+
+def companion_captures(source, guard=None):
+    """One finite capture of the full companion set; digest and parse share these bytes.
+
+    Rollout captures are labeled with the entry filename (the session association
+    and the displayed supplement path); the bytes still come one-per-file from the
+    resolved, guarded real path, so a root-internal link or rename can never
+    re-associate a supplement or read through the entry itself."""
+    log_paths, rollout_paths = discover_companions(source, guard)
+    rollout_capture = [(str(entry), content, error)
+                       for entry, real in rollout_paths
+                       for _, content, error in capture([real])]
+    return capture(log_paths), rollout_capture
+
+
+def read_database(path, guard=None):
+    """Read a disposable consistent snapshot; source DB/WAL records remain read-only."""
+    with database_snapshot(path, guard) as (source, target):
+        log_capture, rollout_capture = companion_captures(source, guard)
+        return parse_database(source, target, log_capture, rollout_capture)
+
+
+def parse_database(source, target, log_capture=None, rollout_capture=None):
+    """Parse one already-copied consistent snapshot (see database_snapshot) plus the
+    captured companion bytes; it performs no further live source reads itself."""
+    db = sqlite3.connect(str(target))
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute('PRAGMA query_only=ON')
+        sessions, requests = {}, []
+        for row in db.execute('SELECT id,version,parent_id,time_created,task_type FROM session'):
+            sid = row['id']
+            # task_type records the relation kind: child types are descendants, not forks.
+            child = row['task_type'] in ('subagent_child', 'workflow_child')
+            sessions[sid] = dict(session(sid, iso_ms(row['time_created'])), version=row['version'],
+                                 parent=row['parent_id'] if child else None,
+                                 forked_from=row['parent_id'] if row['parent_id'] and not child else None,
+                                 paths=[str(source)])
+        records, issues = [], []
+        # First-token evidence columns exist only on newer writers; the column check is
+        # the verified "source does not provide" conclusion for older schemas.
+        usage_columns = {row['name'] for row in db.execute('PRAGMA table_info(model_usage)')}
+        optional = [name for name in ('first_token_at', 'time_to_first_token_ms', 'tool_call_count')
+                    if name in usage_columns]
+        fields = 'id,logical_request_id,attempt_index,session_id,turn_id,query_source,provider_id,model_id,status,started_at,completed_at,duration_ms,retry_count,raw_usage_json'
+        if optional:
+            fields += ',' + ','.join(optional)
+        for row in db.execute('SELECT ' + fields + ' FROM model_usage ORDER BY started_at,id'):
+            loc = {'path': str(source), 'table': 'model_usage', 'id': row['id']}
+            try:
+                usage = json.loads(row['raw_usage_json']) if row['raw_usage_json'] else {}
+            except ValueError:
+                usage = {}
+            turn_id = None if row['query_source'] == 'session_title' else row['turn_id']
+            if turn_id and row['session_id'] in sessions:
+                turn_candidate(sessions[row['session_id']], turn_id, 'model_usage')
+            records.append({'key': 'zcode-db:' + row['id'], 'call_id': f"{row['logical_request_id']}:{row['attempt_index']}", 'session': row['session_id'],
+                            'agent': row['session_id'], 'turn': turn_id, 'root_turn': None,
+                            'group': classify(row['query_source']), 'model': row['model_id'], 'provider': row['provider_id'],
+                            'start': iso_ms(row['started_at']), 'time': iso_ms(row['completed_at']),
+                            'duration_ms': row['duration_ms'], 'sources': [loc],
+                            'first_token_at': iso_ms(row['first_token_at']) if 'first_token_at' in optional else None,
+                            'native_ttft_ms': row['time_to_first_token_ms'] if 'time_to_first_token_ms' in optional else None,
+                            'tool_call_count': row['tool_call_count'] if 'tool_call_count' in optional else None,
+                            'retry_count': row['retry_count'],
+                            'granularity': 'logical_request', 'time_kind': 'completion_time',
+                            'source_status': row['status'] or 'unknown',
+                            'metrics': metrics(usage, row['provider_id']),
+                            'call_count': 1 if usage and not row['retry_count'] else None,
+                            **({'internal_kind': 'compaction'} if row['query_source'] == 'compact' else
+                               {'internal_kind': 'session_aux'} if row['query_source'] == 'session_title' else
+                               {'origin_kind': 'workflow_child'} if row['query_source'] == 'workflow_child' else {})})
+            if row['retry_count']:
+                issues.append({'reason': '数据库仅保留逻辑请求结果，重试调用总数及失败用量可能缺失', 'source': loc,
+                               'session': row['session_id'], 'turn': row['turn_id']})
+        for row in db.execute('SELECT session_id,turn_id,started_at,completed_at,status,model_request_count FROM turn_usage'):
+            if row['session_id'] in sessions:
+                candidate = turn_candidate(sessions[row['session_id']], row['turn_id'], 'turn_usage')
+                candidate['status'] = row['status']
+                candidate['status_source'] = 'turn_usage'
+                candidate['model_request_count'] = row['model_request_count']
+                if row['started_at'] is not None:
+                    candidate['start'] = iso_ms(row['started_at'])
+                    candidate['start_source'] = 'turn_usage'
+                if row['completed_at'] is not None:
+                    candidate['end'] = iso_ms(row['completed_at'])
+                    candidate['end_source'] = 'turn_usage'
+        tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        tool_events = []
+        # tool_usage carries session/turn, tool_call_id, status, a native duration and the
+        # dispatch-to-completion times. The writer may default a missing duration to 0, so
+        # a bare zero stays unconfirmed until an independent completion log verifies it.
+        tool_required = {'id','session_id','turn_id','tool_call_id','tool_name','status','started_at','completed_at','duration_ms'}
+        tool_table_ok = False
+        if 'tool_usage' in tables:
+            tool_columns = {row['name'] for row in db.execute('PRAGMA table_info(tool_usage)')}
+            tool_table_ok = tool_required <= tool_columns
+        if tool_table_ok:
+            seen_tool_keys = {}
+            for row in db.execute('SELECT id,session_id,turn_id,tool_call_id,tool_name,status,started_at,completed_at,duration_ms FROM tool_usage'):
+                loc = {'path': str(source), 'table': 'tool_usage', 'id': row['id']}
+                sid, cid = row['session_id'], row['tool_call_id']
+                if not isinstance(sid, str) or not isinstance(cid, str) or not cid:
+                    issues.append({'reason': '数据库工具行缺少完整会话/tool_call_id；未纳入', 'source': loc})
+                    continue
+                key = 'zcode-db-tool:' + sid + ':' + cid
+                if key in seen_tool_keys:
+                    seen_tool_keys[key]['conflict'] = '数据库同一会话内 tool_call_id 重复，无法唯一合并'
+                    continue
+                raw = row['duration_ms']
+                duration_ns, zero_unconfirmed, conflict = None, False, None
+                if raw is not None:
+                    if type(raw) is not int or raw < 0:
+                        conflict = '数据库原生 duration_ms 为负数、布尔值或非整数，不能作为有效耗时'
+                    elif raw == 0:
+                        zero_unconfirmed = True
+                    else:
+                        duration_ns = raw * 1000000
+                status = {'completed': 'completed', 'error': 'failed'}.get(
+                    row['status'], row['status'] if isinstance(row['status'], str) else 'unknown')
+                seen_tool_keys[key] = {'key': key, 'call_id': cid, 'session': sid, 'turn': row['turn_id'],
+                    'root_turn': None,
+                    'category': row['tool_name'] if isinstance(row['tool_name'], str) and row['tool_name'] else '工具类别未知',
+                    'group': 'unknown',  # tool_usage has no query_source; a merged log event may classify
+                    'status': status, 'completed_at': iso_ms(row['completed_at']),
+                    'sources': [loc], 'duration_ns': duration_ns, 'duration_precision': 'ms',
+                    'zero_unconfirmed': zero_unconfirmed,
+                    'exec_start': None, 'exec_end': None,
+                    # Dispatch-to-completion span: different semantics from the native
+                    # execution duration, saved separately, never judged as a conflict.
+                    'dispatch_start': iso_ms(row['started_at']), 'dispatch_end': iso_ms(row['completed_at']),
+                    'conflict': conflict}
+            tool_events = list(seen_tool_keys.values())
+        message_by_id = {}
+        if 'message' in tables:
+            fields = "id,session_id,coalesce(json_extract(data,'$.time.created'),time_created) AS created, json_extract(data,'$.synthetic') AS synthetic, json_extract(data,'$.visibility') AS visibility, json_extract(data,'$.source') AS message_source"
+            for row in db.execute("SELECT " + fields + " FROM message WHERE json_valid(data) AND json_extract(data,'$.role')='user'"):
+                synthetic = row['synthetic'] in (1, True, 'true')
+                item = {'id': row['id'], 'ids': [row['id']], 'session': row['session_id'], 'turn': None,
+                        'time': iso_ms(row['created']), 'time_source': 'user_message_time',
+                        'classification': 'synthetic_system' if synthetic else 'unknown',
+                        'eligible': not synthetic, 'association': 'unverified',
+                        'sources': [{'path': str(source), 'table': 'message', 'id': row['id']}],
+                        'synthetic_source': row['message_source'], 'visibility': row['visibility']}
+                message_by_id[(row['session_id'], row['id'])] = item
+        if 'session_input' in tables:
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(session_input)')}
+            kind = 'kind' if 'kind' in columns else 'NULL'
+            promoted = 'promoted_message_id' if 'promoted_message_id' in columns else 'NULL'
+            for row in db.execute(f'SELECT id,session_id,delivery,time_created,{kind} AS kind,{promoted} AS promoted_message_id FROM session_input'):
+                input_kind = row['kind']
+                eligible = input_kind in (None, 'sendText')
+                classification = 'confirmed_user_input' if input_kind == 'sendText' else 'unknown' if input_kind is None else 'non_user_input'
+                item = {'id': row['id'], 'ids': [row['id']], 'session': row['session_id'], 'turn': None,
+                        'time': iso_ms(row['time_created']), 'delivery': row['delivery'],
+                        'time_source': 'input_admission_time', 'classification': classification,
+                        'eligible': eligible, 'association': 'unverified',
+                        'sources': [{'path': str(source), 'table': 'session_input', 'id': row['id']}]}
+                linked = message_by_id.get((row['session_id'], row['promoted_message_id']))
+                if linked:
+                    item['ids'].append(linked['id'])
+                    item['sources'].extend(linked['sources'])
+                    item['association'] = 'promoted_message_id'
+                    message_by_id.pop((row['session_id'], linked['id']))
+                if linked and not eligible:
+                    item['rejection_reason'] = '该入队记录已确认不是用户输入，不能作为用户请求截止点'
+                elif linked and not linked['eligible']:
+                    item['eligible'] = False
+                    item['classification'] = 'ambiguous'
+                    item['rejection_reason'] = '入队记录关联到已确认的合成消息，不能作为用户请求截止点'
+                requests.append(item)
+        requests.extend(message_by_id.values())
+    except sqlite3.Error as exc:
+        raise ValueError('不支持或损坏的 ZCode 遥测数据库结构：' + type(exc).__name__) from exc
+    finally:
+        db.close()
+    log_data = read_captured(log_capture or [])
     for event in log_data['events']:
         apply_turn_event(sessions, event)
     # DB tool rows and adjacent logs merge ONLY on a complete, unique session/tool_call_id
@@ -452,22 +511,20 @@ def read_database(path, guard=None):
     for leftover in log_tools.values():
         tool_supplements.append({'key': leftover['key'], 'session': leftover['session'],
                                  'reason': supplement_reason, 'source': leftover['sources'][0]})
-    rollout_root = source.parent.parent / 'rollout' if source.parent.name == 'db' else source.parent / 'rollout'
     alternates = []
-    if rollout_root.is_dir():
-        # Filename gives a session-level association only; rollout requestIds live in another
-        # identity space than database logical_request_id, so no call-level bridge exists and
-        # readable values stay out of the metered subtotal.
-        for path in sorted(rollout_root.glob('model-io-*.jsonl')):
-            sid = path.name[len('model-io-'):-len('.jsonl')]
-            if sid not in sessions:
-                continue
-            rollout_records = [r for r in read([path], guard)['records'] if r['session'] == sid]
-            alternates.append(dict({'kind': 'rollout', 'path': str(path), 'session': sid,
-                                    'records': len(rollout_records),
-                                    'note': '跨源重叠未知，未并入小计；为该会话全量可读值，未按报告范围筛选'}, **aggregate(rollout_records)))
+    # Filename gives a session-level association only; rollout requestIds live in another
+    # identity space than database logical_request_id, so no call-level bridge exists and
+    # readable values stay out of the metered subtotal.
+    for path_text, blob, read_error in (rollout_capture or []):
+        sid = Path(path_text).name[len('model-io-'):-len('.jsonl')]
+        if sid not in sessions:
+            continue
+        rollout_records = [r for r in read_captured([(path_text, blob, read_error)])['records'] if r['session'] == sid]
+        alternates.append(dict({'kind': 'rollout', 'path': path_text, 'session': sid,
+                                'records': len(rollout_records),
+                                'note': '跨源重叠未知，未并入小计；为该会话全量可读值，未按报告范围筛选'}, **aggregate(rollout_records)))
     return {'harness': 'zcode', 'sessions': sessions, 'records': records, 'issues': issues,
-            'source_files': [str(source)] + [str(p) for p in (paths[1],Path(str(source)+'-shm')) if p.exists()] + log_data['source_files'], 'events': log_data['events'],
+            'source_files': [str(source)] + [str(p) for p in (Path(str(source) + '-wal'), Path(str(source) + '-shm')) if p.exists()] + log_data['source_files'], 'events': log_data['events'],
             'alternate_sources': alternates,
             'performance_evidence': {'columns': {name: name in usage_columns
                                                  for name in ('first_token_at', 'time_to_first_token_ms', 'tool_call_count')},

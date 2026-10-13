@@ -4,7 +4,7 @@
 
 ## 1. 30 秒总览：一份计量结果，多个入口
 
-系统有两条路径：明确统计时读取来源并生成报告；展示保存报告时只校验、渲染，不经过来源。自然语言 Skill、CLI、本地 HTTP 都调用同一 Python 操作层；离线查看器只消费 JSON。新查询可显式加载本地价格；每份新报告保存来源可支持的独立性能证据，未配置价格仍可查 token/性能。图源见[Kimi 可编辑架构图](./architecture-diagram/architecture.pptd)。
+系统有两条路径：明确统计时读取来源并生成报告；展示保存报告时只校验、渲染，不经过来源。自然语言 Skill、CLI、本地 HTTP 都调用同一 Python 操作层；离线查看器只消费 JSON。新查询默认按随包官网价格快照计价（可显式自定义或仅 token）；每份新报告保存来源可支持的独立性能证据。Skill 维护者可通过 `pricing-update` 以真实读取形成的候选更新默认快照；本地服务持有有界解析缓存加速重复查询。图源见[Kimi 可编辑架构图](./architecture-diagram/architecture.pptd)。
 
 ![Agent Token Audit 分层与内部流程图](./architecture-diagram/architecture.png)
 
@@ -29,12 +29,14 @@ agent-token-audit/
 | --- | --- | --- |
 | 自然语言入口 | [SKILL.md](../skills/agent-token-audit/SKILL.md) | 用户意图/可信上下文→明确范围和脚本调用；不心算、不替用户选歧义候选 |
 | CLI | [cli.py](../skills/agent-token-audit/scripts/token_audit/cli.py)，`main/current_identities` | argparse→Query→候选JSON或报告文本、退出码；命令入口时间先固定 |
-| 共同操作层 | [operations.py](../skills/agent-token-audit/scripts/token_audit/operations.py)，`run/read_input/run_overview` | Query→操作结果；来源描述、定位、保存范围三态合并、短路/分派 |
+| 共同操作层 | [operations.py](../skills/agent-token-audit/scripts/token_audit/operations.py)，`run/read_input/run_overview/resolve_time_preset/resolve_pricing` | Query→操作结果；来源描述、定位、保存范围三态合并、快捷时间与价格模式（默认/自定义/仅token）唯一解析、短路/分派 |
 | Codex Adapter | [codex.py](../skills/agent-token-audit/scripts/token_audit/codex.py)，`discover/read` | JSONL→会话、请求、逐调用/唯一回复/累计区间和缺口；直接与累计择一 |
-| ZCode Adapter | [zcode.py](../skills/agent-token-audit/scripts/token_audit/zcode.py)，`read/read_database` | rollout/log或只读DB快照→逻辑请求/attempt/轮次/请求证据；补充来源独立 |
+| ZCode Adapter | [zcode.py](../skills/agent-token-audit/scripts/token_audit/zcode.py)，`read/read_database/database_snapshot/parse_database` | rollout/log或只读DB快照→逻辑请求/attempt/轮次/请求证据；补充来源独立；快照与解析两阶段供缓存复用 |
 | 关系绑定 | [relations.py](../skills/agent-token-audit/scripts/token_audit/relations.py)，`bind` | 来源data→owner_session/owner_turn、后代、继承排除、独立工具报告 |
-| 费用与性能分析 | [analysis.py](../skills/agent-token-audit/scripts/token_audit/analysis.py)，`validate_pricing_config/price_records/build_analysis/build_performance` | 已确定候选+价格配置→分项计价、TTFT/吞吐/工具耗时独立样本与投影；无 I/O，不重新发现或绑定会话 |
-| 计量与解释 | [core.py](../skills/agent-token-audit/scripts/token_audit/core.py)，`report/overview/aggregate/dimension_view` | 归属记录→范围selected→互斥组、独立视图、日桶、排行和解释；report/overview 不读源（读文件辅助函数 source_lines 也位于 core） |
+| 价格资源 | [pricing.py](../skills/agent-token-audit/scripts/token_audit/pricing.py)，`load_default/snapshot_path/update_from_candidate` | `pricing/` 资源→默认快照读取校验与 pricing-update 候选校验/原子启用；唯一 I/O 边界，分析模块保持无 I/O |
+| 解析缓存 | [parsecache.py](../skills/agent-token-audit/scripts/token_audit/parsecache.py)，`ParseCache/cached_jsonl/cached_database` | 服务重复查询→复用经内容签名核对的适配器解析（pickle 隔离副本、有界、每请求重新守卫+读当前内容；命中按本次输入重建 WAL/SHM 等易变来源元数据）；CLI 不使用 |
+| 费用与性能分析 | [analysis.py](../skills/agent-token-audit/scripts/token_audit/analysis.py)，`validate_pricing_config/price_records/build_analysis/build_performance` | 已确定候选+价格配置（v1 历史区间/v2 官网快照）→分项计价、TTFT/吞吐/工具耗时独立样本与投影；无 I/O，不重新发现或绑定会话；工具样本边界分别收敛执行/调度不完整端点，保留可信 native |
+| 计量与解释 | [core.py](../skills/agent-token-audit/scripts/token_audit/core.py)，`report/overview/aggregate/dimension_view` | 归属记录→范围selected→互斥组、独立视图、日桶、排行和解释；report/overview 不读源（读文件辅助函数 capture/captured_lines 也位于 core） |
 | 报告边界与输出 | [formats.py](../skills/agent-token-audit/scripts/token_audit/formats.py)，`validate_report/render/export` | 不可信保存对象→校验投影；同一结果→JSON/CSV/Markdown或受保护文件写入 |
 | HTTP 边界 | [webapp.py](../skills/agent-token-audit/scripts/token_audit/webapp.py)，`SourceGuard/Handler/serve` | 启动配置/HTTP→受限Query或纯导出；回环、凭据、Host/Origin及静态白名单 |
 | 页面操作状态 | [web.js](../skills/agent-token-audit/viewer/web.js)，`call/loadSavedFile/runReport/runOverviewQuery` | 用户动作→HTTP/本地FileReader→对应结果区；单飞、文件及选择世代防陈旧响应 |

@@ -45,14 +45,32 @@
           </fieldset>
           <button id="run-overview" class="primary">查询整体用量</button>
         </div>
-        <fieldset>
-          <legend>价格配置（可选；只读本地 JSON 文本，仅随“查询整体用量”明确提交）</legend>
-          <div class="form-grid">
-            <label for="ov-pricing-file">价格配置文件：</label>
-            <input type="file" id="ov-pricing-file" accept=".json,application/json">
-          </div>
-          <div class="tz-line" id="ov-pricing-summary">未选择价格配置：整体结果不含费用估算，token 统计不受影响；配置只改变待提交条件，不自动查询。</div>
+        <fieldset class="segmented">
+          <legend>时间范围（查询时按显示时区解析为一次固定绝对边界；切换只改待提交条件，不自动查询）</legend>
+          <label><input type="radio" name="ov-time-mode" value="today"> 今天</label>
+          <label><input type="radio" name="ov-time-mode" value="week"> 本周</label>
+          <label><input type="radio" name="ov-time-mode" value="month"> 本月</label>
+          <label><input type="radio" name="ov-time-mode" value="last_1d"> 最近1天</label>
+          <label><input type="radio" name="ov-time-mode" value="last_3d"> 最近3天</label>
+          <label><input type="radio" name="ov-time-mode" value="last_7d" checked> 最近7天</label>
+          <label><input type="radio" name="ov-time-mode" value="last_30d"> 最近1个月</label>
+          <label><input type="radio" name="ov-time-mode" value="all"> 全部时间</label>
+          <label><input type="radio" name="ov-time-mode" value="custom"> 自定义</label>
         </fieldset>
+      <fieldset>
+        <legend>价格（默认随包官网价格快照；不预联网读取，仅随“查询整体用量”明确提交）</legend>
+        <fieldset class="segmented">
+          <legend>价格模式</legend>
+          <label><input type="radio" name="ov-pricing-mode" value="default" checked> 官网默认价格（随包快照）</label>
+          <label><input type="radio" name="ov-pricing-mode" value="custom"> 自定义配置文件</label>
+          <label><input type="radio" name="ov-pricing-mode" value="none"> 仅 token 性能（不加载价格）</label>
+        </fieldset>
+        <div class="form-grid" id="ov-pricing-file-row" hidden>
+          <label for="ov-pricing-file">价格配置文件：</label>
+          <input type="file" id="ov-pricing-file" accept=".json,application/json">
+        </div>
+        <div class="tz-line" id="ov-pricing-summary">价格：官网默认价格（随包快照；结果中显示实际采用的快照与各来源读取时间）。</div>
+      </fieldset>
         <details class="advanced" id="ov-advanced">
         <summary>完整时间边界与显示时区（默认：下界不限、截止点为本次网页请求入口、浏览器时区）</summary>
         <fieldset>
@@ -138,12 +156,18 @@
         <label><input type="radio" name="agents" value="main"> 仅主代理常规调用</label>
       </fieldset>
       <fieldset>
-        <legend>价格配置（可选；只读本地 JSON 文本，仅随“统计”明确提交）</legend>
-        <div class="form-grid">
+        <legend>价格（默认随包官网价格快照；不预联网读取，仅随“统计”明确提交）</legend>
+        <fieldset class="segmented">
+          <legend>价格模式</legend>
+          <label><input type="radio" name="pricing-mode" value="default" checked> 官网默认价格（随包快照）</label>
+          <label><input type="radio" name="pricing-mode" value="custom"> 自定义配置文件</label>
+          <label><input type="radio" name="pricing-mode" value="none"> 仅 token 性能（不加载价格）</label>
+        </fieldset>
+        <div class="form-grid" id="pricing-file-row" hidden>
           <label for="pricing-file">价格配置文件：</label>
           <input type="file" id="pricing-file" accept=".json,application/json">
         </div>
-        <div class="tz-line" id="pricing-summary">未选择价格配置：统计结果不含费用估算，token 统计不受影响；配置只改变待提交条件，不自动查询。</div>
+        <div class="tz-line" id="pricing-summary">价格：官网默认价格（随包快照；结果中显示实际采用的快照与各来源读取时间）。</div>
       </fieldset>
       <div class="scope-summary" id="scope-summary"></div>
       <button id="run-report" class="primary">统计</button>
@@ -169,12 +193,18 @@
       <button id="baseline-export">导出该结果…</button>
       <p class="hint-line">展示旧报告不读取来源；重算按保存的会话、轮次/时间、代理策略与截止点读取当前来源并生成新报告，不写回原文件。更新前先显示原范围与新范围差异，提交完整集合后才读取。</p>
       <fieldset>
-        <legend>重算价格（可选；不选择则沿用报告保存的价格快照，含未命中规则）</legend>
-        <div class="form-grid">
+        <legend>重算价格（默认沿用报告保存的价格快照，含未命中规则；明确换价不改变范围差异）</legend>
+        <fieldset class="segmented">
+          <legend>价格来源</legend>
+          <label><input type="radio" name="saved-pricing-mode" value="keep" checked> 沿用保存规则</label>
+          <label><input type="radio" name="saved-pricing-mode" value="default"> 换为官网默认价格</label>
+          <label><input type="radio" name="saved-pricing-mode" value="custom"> 换为自定义配置</label>
+        </fieldset>
+        <div class="form-grid" id="saved-pricing-file-row" hidden>
           <label for="saved-pricing-file">新价格配置文件：</label>
           <input type="file" id="saved-pricing-file" accept=".json,application/json">
         </div>
-        <div class="tz-line" id="saved-pricing-summary">未选择新价格：重算/更新沿用报告保存的价格快照（含未命中规则）；明确选择合法新配置并点击重算/提交更新才换价。加载、展示与导出不接受价格，也不读取当前价格文件。</div>
+        <div class="tz-line" id="saved-pricing-summary">未选择换价：重算/更新沿用报告保存的价格快照（含未命中规则）；保存报告无价格时重算仍不含费用。加载、展示与导出不接受价格，也不读取当前价格文件。</div>
       </fieldset>
       <div id="update-form" hidden>
         <h3>更新表单</h3>

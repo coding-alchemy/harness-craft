@@ -345,15 +345,44 @@ function checkExplanationBlock(exp, obj) {
 
 function checkPricingConfig(config) {
   // The browser independently validates the saved pricing snapshot (structure, version,
-  // rule ids, times, price formats); it never matches rules or recomputes prices for display.
+  // rule ids, times or conditions, price formats); it never matches rules or recomputes
+  // prices for display. Schema v2 adds the official-estimate contract: read sources with
+  // fetch times, condition-keyed rules, mappings and uncovered identities.
   const what = '价格配置快照';
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error(what + '必须是对象');
+  if (typeof config.schema_version !== 'bigint' || ![1n, 2n].includes(config.schema_version)) throw new Error(what + '版本不支持');
+  const v2 = config.schema_version === 2n;
+  let sourceUrls = null;
+  const topKeys = v2 ? ['schema_version', 'revision', 'price_basis', 'sources', 'rules', 'mappings', 'uncovered']
+    : ['schema_version', 'revision', 'rules', 'aliases'];
   for (const key of Object.keys(config)) {
-    if (!['schema_version', 'revision', 'rules', 'aliases'].includes(key)) throw new Error(what + '含未知字段：' + key);
+    if (!topKeys.includes(key)) throw new Error(what + '含未知字段：' + key);
   }
-  if (typeof config.schema_version !== 'bigint' || config.schema_version !== 1n) throw new Error(what + '版本不支持');
   if (typeof config.revision !== 'string' || !config.revision.trim()) throw new Error(what + '缺少修订标识');
-  if (!Array.isArray(config.rules)) throw new Error(what + '规则必须是数组');
+  if (v2) {
+    if (config.price_basis !== 'current_official_estimate') throw new Error(what + '价格口径无效');
+    if (!Array.isArray(config.sources) || !config.sources.length) throw new Error(what + '快照来源必须是非空数组');
+    config.sources.forEach((source, i) => {
+      const name = '来源 ' + i;
+      if (!source || typeof source !== 'object'
+          || Object.keys(source).some(k => !['url', 'fetched_at', 'digest', 'summary'].includes(k))
+          || typeof source.url !== 'string' || !source.url.trim()
+          || typeof source.summary !== 'string' || !source.summary.trim()) throw new Error(what + name + '结构无效');
+      if (!validTime(source.fetched_at)) throw new Error(what + name + '读取时间无效');
+    });
+    // v2 reference integrity: rules and mappings may only cite sources this very
+    // snapshot actually read; a whitelisted-but-unread URL proves nothing here.
+    sourceUrls = new Set(config.sources.map(source => source.url));
+    if (!Array.isArray(config.uncovered)) throw new Error(what + '未覆盖项必须是数组');
+    config.uncovered.forEach((item, i) => {
+      const name = '未覆盖项 ' + i;
+      if (!item || typeof item !== 'object' || Object.keys(item).sort().join(',') !== 'model,provider,reason'
+          || (item.provider !== null && typeof item.provider !== 'string')
+          || typeof item.model !== 'string' || !item.model.trim()
+          || typeof item.reason !== 'string' || !item.reason.trim()) throw new Error(what + name + '结构无效');
+    });
+  }
+  if (!Array.isArray(config.rules) || (v2 && !config.rules.length)) throw new Error(what + '规则必须是非空数组');
   const textOf = (value, name, max) => {
     if (typeof value !== 'string' || !value.trim() || value.length > (max || 256)) throw new Error(what + name + '必须是非空字符串');
     return value;
@@ -371,58 +400,121 @@ function checkPricingConfig(config) {
     for (const [, priceKey] of RULE_COMPONENTS[value.kind]) priceOf(value[priceKey], name + '单价 ' + priceKey);
     if (['split_cache_read_write', 'split_reasoning'].includes(value.kind)) textOf(value.basis, name + '互斥/包含依据', 512);
   };
+  const conditionsMatch = (conditions, tokens) => {
+    if ('input_min' in conditions && (tokens < conditions.input_min
+        || (tokens === conditions.input_min && !conditions.input_min_inclusive))) return false;
+    if ('input_max' in conditions && (tokens > conditions.input_max
+        || (tokens === conditions.input_max && !conditions.input_max_inclusive))) return false;
+    return true;
+  };
   const rules = new Map();
+  const ruleKeys = v2 ? ['id', 'source', 'provider', 'model', 'currency', 'input', 'output', 'conditions',
+                         'official_effective_from', 'official_effective_to']
+    : ['id', 'source', 'provider', 'model', 'effective_from', 'effective_to', 'currency', 'input', 'output'];
+  const byIdentity = new Map();
   config.rules.forEach((rule, i) => {
     const name = '规则 ' + i;
     if (!rule || typeof rule !== 'object') throw new Error(what + name + '结构无效');
     for (const key of Object.keys(rule)) {
-      if (!['id', 'source', 'provider', 'model', 'effective_from', 'effective_to', 'currency', 'input', 'output'].includes(key)) {
-        throw new Error(what + name + '含未知字段：' + key);
-      }
+      if (!ruleKeys.includes(key)) throw new Error(what + name + '含未知字段：' + key);
     }
     textOf(rule.id, name + ' 稳定 ID', 128);
     if (rules.has(rule.id)) throw new Error(what + '规则 ID 重复 ' + rule.id);
     sourceOf(rule.source, name);
+    if (v2 && !sourceUrls.has(rule.source.reference)) {
+      throw new Error(what + name + '来源引用不在本快照读取来源内：' + rule.source.reference);
+    }
     textOf(rule.provider, name + ' 供应商', 128);
     textOf(rule.model, name + ' 完整模型身份');
     textOf(rule.currency, name + ' 币种', 32);
-    if (!validTime(rule.effective_from)) throw new Error(what + name + ' 生效起点无效');
-    if (rule.effective_to !== undefined && rule.effective_to !== null) {
-      if (!validTime(rule.effective_to)) throw new Error(what + name + ' 生效终点无效');
-      if (!(instantMicros(rule.effective_from) < instantMicros(rule.effective_to))) throw new Error(what + name + ' 生效区间无效');
+    if (v2) {
+      const conditions = rule.conditions;
+      if (!conditions || typeof conditions !== 'object'
+          || Object.keys(conditions).some(k => !['service_tier', 'input_min', 'input_min_inclusive',
+                                                 'input_max', 'input_max_inclusive', 'basis'].includes(k))
+          || conditions.service_tier !== 'standard') throw new Error(what + name + '价格条件结构无效');
+      for (const side of ['min', 'max']) {
+        if (('input_' + side) in conditions) {
+          if (typeof conditions['input_' + side] !== 'bigint' || conditions['input_' + side] <= 0n
+              || typeof conditions['input_' + side + '_inclusive'] !== 'boolean') {
+            throw new Error(what + name + '输入条件必须为正整数并明确等值点');
+          }
+        }
+      }
+      if ('input_min' in conditions && 'input_max' in conditions) {
+        if (conditions.input_min > conditions.input_max
+            || (conditions.input_min === conditions.input_max
+                && !(conditions.input_min_inclusive && conditions.input_max_inclusive))) {
+          throw new Error(what + name + '输入条件区间为空');
+        }
+      }
+      textOf(conditions.basis, name + '档位条件依据', 512);
+      if (rule.official_effective_from !== undefined && rule.official_effective_from !== null
+          && !validTime(rule.official_effective_from)) throw new Error(what + name + ' 官网生效起点无效');
+      if (rule.official_effective_to !== undefined && rule.official_effective_to !== null
+          && !validTime(rule.official_effective_to)) throw new Error(what + name + ' 官网生效终点无效');
+      const key = rule.provider + '\u0001' + rule.model;
+      const peers = byIdentity.get(key) || [];
+      for (const other of peers) {
+        const lows = [other.conditions, conditions].filter(c => 'input_min' in c).map(c => c.input_min);
+        const highs = [other.conditions, conditions].filter(c => 'input_max' in c).map(c => c.input_max);
+        let overlap;
+        if (!lows.length || !highs.length) overlap = true;
+        else {
+          const lower = lows.reduce((a, b) => a > b ? a : b), upper = highs.reduce((a, b) => a < b ? a : b);
+          overlap = lower !== upper ? lower < upper
+            : conditionsMatch(other.conditions, lower) && conditionsMatch(conditions, lower);
+        }
+        if (overlap) throw new Error(what + name + '与规则 ' + other.id + ' 在同一身份与档位下条件区间重叠');
+      }
+      peers.push(rule);
+      byIdentity.set(key, peers);
+    } else {
+      if (!validTime(rule.effective_from)) throw new Error(what + name + ' 生效起点无效');
+      if (rule.effective_to !== undefined && rule.effective_to !== null) {
+        if (!validTime(rule.effective_to)) throw new Error(what + name + ' 生效终点无效');
+        if (!(instantMicros(rule.effective_from) < instantMicros(rule.effective_to))) throw new Error(what + name + ' 生效区间无效');
+      }
     }
     partitionOf(rule.input, ['total_input', 'split_cache_read', 'split_cache_read_write'], name + ' 输入');
     partitionOf(rule.output, ['total_output', 'split_reasoning'], name + ' 输出');
     rules.set(rule.id, rule);
   });
-  const aliases = new Map();
-  const aliasFrom = new Map();
-  (Array.isArray(config.aliases) ? config.aliases : []).forEach((alias, i) => {
-    const name = '别名 ' + i;
-    if (!alias || typeof alias !== 'object'
-        || !['id', 'source', 'from', 'to', 'basis'].every(k => k in alias)
-        || Object.keys(alias).length !== 5) throw new Error(what + name + '结构未知');
-    textOf(alias.id, name + ' 稳定 ID', 128);
-    sourceOf(alias.source, name);
-    textOf(alias.basis, name + ' 映射依据', 512);
+  const items = v2 ? config.mappings : (config.aliases || []);
+  if (!Array.isArray(items)) throw new Error(what + (v2 ? '映射' : '别名') + '必须是数组');
+  const links = new Map();
+  const linkFrom = new Map();
+  items.forEach((item, i) => {
+    const name = (v2 ? '映射 ' : '别名 ') + i;
+    if (!item || typeof item !== 'object'
+        || !['id', 'source', 'from', 'to', 'basis'].every(k => k in item)
+        || Object.keys(item).length !== 5) throw new Error(what + name + '结构未知');
+    textOf(item.id, name + ' 稳定 ID', 128);
+    sourceOf(item.source, name);
+    if (v2 && !sourceUrls.has(item.source.reference)) {
+      throw new Error(what + name + '来源引用不在本快照读取来源内：' + item.source.reference);
+    }
+    textOf(item.basis, name + ' 映射依据', 512);
     for (const endpoint of ['from', 'to']) {
-      const point = alias[endpoint];
+      const point = item[endpoint];
       if (!point || typeof point !== 'object') throw new Error(what + name + ' ' + endpoint + ' 身份无效');
       textOf(point.provider, name + ' ' + endpoint + ' 供应商', 128);
       textOf(point.model, name + ' ' + endpoint + ' 完整模型身份');
     }
-    if (alias.from.provider === alias.to.provider && alias.from.model === alias.to.model) {
+    if (item.from.provider === item.to.provider && item.from.model === item.to.model) {
       throw new Error(what + name + ' 源与目标身份相同（循环映射）');
     }
-    const key = alias.from.provider + '\u0001' + alias.from.model;
-    if (aliasFrom.has(key)) throw new Error(what + name + ' 与其他别名的源身份冲突');
-    aliasFrom.set(key, alias);
-    aliases.set(alias.id, alias);
+    const key = item.from.provider + '\u0001' + item.from.model;
+    if (linkFrom.has(key)) throw new Error(what + name + ' 与其他' + (v2 ? '映射' : '别名') + '的源身份冲突');
+    linkFrom.set(key, item);
+    links.set(item.id, item);
   });
-  for (const alias of aliases.values()) {
-    if (aliasFrom.has(alias.to.provider + '\u0001' + alias.to.model)) throw new Error(what + '别名只允许一次精确映射，不支持链式推断');
+  for (const item of links.values()) {
+    if (linkFrom.has(item.to.provider + '\u0001' + item.to.model)) {
+      throw new Error(what + (v2 ? '映射' : '别名') + '只允许一次精确映射，不支持链式推断');
+    }
   }
-  return { rules, aliases };
+  return { rules, links, v2, conditionsMatch };
 }
 
 function costTotals(entries) {
@@ -474,8 +566,10 @@ function checkCostProjections(obj, entries, projections) {
     if (!member || typeof member !== 'object') throw new Error('费用投影成员结构无效：' + what);
     const savedKeys = member.record_keys;
     if (!Array.isArray(savedKeys) || savedKeys.some(k => typeof k !== 'string')) throw new Error('费用投影成员记录引用无效：' + what);
-    if (new Set(savedKeys).size !== savedKeys.length || savedKeys.length !== keys.length
-        || keys.some(k => !savedKeys.includes(k))) throw new Error('费用投影成员记录集合不一致：' + what);
+    // One Set per member replaces the per-key includes scan over the same list.
+    const savedKeySet = new Set(savedKeys);
+    if (savedKeySet.size !== savedKeys.length || savedKeys.length !== keys.length
+        || keys.some(k => !savedKeySet.has(k))) throw new Error('费用投影成员记录集合不一致：' + what);
     checkProjectionCurrencies(member.currencies, costTotals(savedKeys.map(k => entryByKey.get(k))), what);
   };
   const modelGroups = new Map();
@@ -786,6 +880,9 @@ function checkToolDurationBlock(obj, metric, tzName) {
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(sample.key);
     }
+    // Per-label sample-key Sets let the numerator re-sum stay O(samples) per member
+    // check instead of scanning the whole sample list per label.
+    const groupSets = new Map([...groups].map(([label, keys]) => [label, new Set(keys)]));
     if (!Array.isArray(members) || members.length !== groups.size) throw new Error('工具投影成员集合与样本重算不一致：' + what);
     const seen = new Set();
     members.forEach(member => {
@@ -803,7 +900,7 @@ function checkToolDurationBlock(obj, metric, tzName) {
         throw new Error('工具投影成员样本集合与重算不一致：' + what);
       }
       let numerator = 0n;
-      for (const sample of samples) if (groups.get(label).includes(sample.key)) numerator += sample.value;
+      for (const sample of samples) if (groupSets.get(label).has(sample.key)) numerator += sample.value;
       if (member.numerator !== numerator || member.denominator !== BigInt(groups.get(label).length)) {
         throw new Error('工具投影成员分子/分母与样本重算不一致：' + what);
       }
@@ -925,6 +1022,8 @@ function checkPerformanceBlock(obj, perf) {
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(sample.key);
       }
+      // Per-label key Sets keep the numerator/denominator re-sum linear in samples.
+      const groupSets = new Map([...groups].map(([key, keys]) => [key, new Set(keys)]));
       if (!Array.isArray(members) || members.length !== groups.size) throw new Error('性能投影成员集合与样本重算不一致：' + what);
       const seen = new Set();
       members.forEach(member => {
@@ -942,7 +1041,7 @@ function checkPerformanceBlock(obj, perf) {
         }
         let n = 0n, d = 0n;
         for (const sample of samples) {
-          if (!groups.get(key).includes(sample.key)) continue;
+          if (!groupSets.get(key).has(sample.key)) continue;
           const parts = partOf(sample);
           n += parts[0];
           d += parts[1];
@@ -977,20 +1076,26 @@ function checkAnalysisBlock(obj) {
   const ext = obj.analysis;
   if (!ext || typeof ext !== 'object' || Array.isArray(ext)) throw new Error('未知的分析扩展版本或结构');
   const extKeys = Object.keys(ext);
-  if (typeof ext.schema_version !== 'bigint' || ext.schema_version !== 1n
+  if (typeof ext.schema_version !== 'bigint' || ![1n, 2n].includes(ext.schema_version)
       || extKeys.some(k => !['schema_version', 'cost', 'performance'].includes(k))
       || (!ext.cost && !ext.performance)) throw new Error('未知的分析扩展版本或结构');
-  if (ext.cost) checkCostBlock(obj, ext.cost);
+  if (ext.schema_version === 2n && !ext.cost) throw new Error('分析扩展版本 2 必须携带 v2 价格快照费用区');
+  if (ext.cost) checkCostBlock(obj, ext.cost, ext.schema_version);
   if (ext.performance) checkPerformanceBlock(obj, ext.performance);
 }
 
-function checkCostBlock(obj, cost) {
+function checkCostBlock(obj, cost, extSchema) {
   const overall = (typeof obj.format_version === 'bigint' ? Number(obj.format_version) : obj.format_version) === 3;
   // Projections are required on overall (v3) reports and forbidden on single-session ones.
   const expectedCostKeys = overall ? 'config,projections,records,summary' : 'config,records,summary';
   if (typeof cost !== 'object' || Array.isArray(cost)
       || Object.keys(cost).sort().join(',') !== expectedCostKeys) throw new Error('费用分析扩展结构无效');
-  const { rules, aliases } = checkPricingConfig(cost.config);
+  const { rules, v2, conditionsMatch } = checkPricingConfig(cost.config);
+  if (v2 !== (extSchema === 2n)) throw new Error('分析扩展版本与价格快照版本不一致');
+  const linkField = v2 ? 'mapping_id' : 'alias_id';
+  // Link ids are not guaranteed unique in saved configs (the writer only enforces unique
+  // source identities), so lookups search the list instead of an id-keyed map.
+  const linkItems = v2 ? cost.config.mappings : (cost.config.aliases || []);
   if (!Array.isArray(cost.records)) throw new Error('费用分析逐记录计价必须是数组');
   const meteredByKey = new Map((obj.records || []).map(record => [record.key, record]));
   const keys = [];
@@ -1018,26 +1123,57 @@ function checkCostBlock(obj, cost) {
       if (typeof matched !== 'object' || typeof matched.rule_id !== 'string') throw new Error('逐记录计价命中结构无效：' + what);
       rule = rules.get(matched.rule_id);
       if (!rule) throw new Error('逐记录计价引用了配置中不存在的规则：' + what);
-      if (matched.alias_id !== null && matched.alias_id !== undefined && !aliases.has(matched.alias_id)) {
-        throw new Error('逐记录计价引用了配置中不存在的别名：' + what);
+      if (matched[linkField] !== null && matched[linkField] !== undefined
+          && !linkItems.some(l => l.id === matched[linkField])) {
+        throw new Error('逐记录计价引用了配置中不存在的映射：' + what);
       }
       const record = meteredByKey.get(entry.record_key), identity = entry.identity;
       if (!identity || !record || identity.provider !== record.provider || identity.model !== record.model) {
         throw new Error('计价身份与引用计量记录不一致：' + what);
       }
       let ruleIdentity = identity;
-      if (matched.alias_id !== null && matched.alias_id !== undefined) {
-        const alias = (cost.config.aliases || []).find(a => a.id === matched.alias_id
-          && a.from.provider === identity.provider && a.from.model === identity.model);
-        if (!alias) {
-          throw new Error('计价别名来源身份与引用计量记录不一致：' + what);
+      if (matched[linkField] !== null && matched[linkField] !== undefined) {
+        const link = linkItems.find(l => l.id === matched[linkField]
+          && l.from.provider === identity.provider && l.from.model === identity.model);
+        if (!link) {
+          throw new Error('计价映射来源身份与引用计量记录不一致：' + what);
         }
-        ruleIdentity = alias.to;
+        ruleIdentity = link.to;
       }
       if (ruleIdentity.provider !== rule.provider || ruleIdentity.model !== rule.model) {
-        throw new Error('命中价格规则身份与引用计量记录或别名目标不一致：' + what);
+        throw new Error('命中价格规则身份与引用计量记录或映射目标不一致：' + what);
       }
       if (entry.currency !== rule.currency) throw new Error('逐记录计价币种与命中规则不一致：' + what);
+      if (v2) {
+        // v2 matched evidence carries the judged tier conditions; the browser re-checks
+        // them against the record's own granularity and input without pricing anything.
+        const conditions = rule.conditions;
+        const bounded = 'input_min' in conditions || 'input_max' in conditions;
+        const allowed = ['rule_id', linkField, 'input_tokens', 'condition_basis'];
+        const granularity = (record.explanation || {}).granularity;
+        if (bounded && granularity === 'logical_request') allowed.push('retry_count');
+        for (const key of Object.keys(matched)) {
+          if (!allowed.includes(key)) throw new Error('逐记录计价命中结构无效：' + what);
+        }
+        if (matched.condition_basis !== conditions.basis) throw new Error('计价命中条件依据与规则不一致：' + what);
+        if (bounded) {
+          if (typeof matched.input_tokens !== 'bigint' || matched.input_tokens < 0n
+              || !conditionsMatch(conditions, matched.input_tokens)) {
+            throw new Error('计价命中的单请求输入量不满足规则输入条件：' + what);
+          }
+          const metric = (record.metrics || {}).input;
+          if (!metric || metric.value !== matched.input_tokens) {
+            throw new Error('计价命中的单请求输入量与记录输入不一致：' + what);
+          }
+          if (granularity === 'logical_request') {
+            if (matched.retry_count !== 0n) throw new Error('逻辑请求档位判定须携带 retry_count=0 证据：' + what);
+          } else if (!['model_call', 'reply_usage'].includes(granularity)) {
+            throw new Error('该记录粒度不能证明完整单请求输入量，档位判定证据不足：' + what);
+          }
+        } else if (matched.input_tokens !== null && matched.input_tokens !== undefined) {
+          throw new Error('规则无输入条件时命中证据不得携带输入量：' + what);
+        }
+      }
     }
     if (!Array.isArray(entry.components)) throw new Error('逐记录计价分项无效：' + what);
     const expected = rule ? new Map(ruleComponentPrices(rule)) : new Map();
@@ -1358,6 +1494,70 @@ function evidenceCard(title, nodes) {
   details.appendChild(body);
   return details;
 }
+
+function lazyEvidenceCard(title, build) {
+  // Same collapsed contract as evidenceCard, but the body is generated on the first
+  // open only: long tables cost nothing until the user actually asks for them.
+  const details = el('details', 'card evidence');
+  const summary = document.createElement('summary');
+  summary.textContent = title;
+  details.appendChild(summary);
+  const body = el('div', 'evidence-body');
+  details.appendChild(body);
+  details.addEventListener('toggle', () => {
+    if (details.open && !body.firstChild) {
+      try {
+        build(body);
+      } catch (error) {
+        body.appendChild(el('p', 'unavailable', '本区生成失败：' + (error && error.message ? error.message : String(error))));
+      }
+    }
+  });
+  return details;
+}
+
+function pagedBody(headRow, rows, drawRow, opts) {
+  // A table body that shows rows in pages of 20 with prev/next controls. Locate flows
+  // narrow the visible row set itself, so the located targets are always on view.
+  const pageSize = 20;
+  const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+  let page = 0;
+  const frag = document.createDocumentFragment();
+  const table = document.createElement('table');
+  if (opts && opts.className) table.className = opts.className;
+  const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
+  const tbody = document.createElement('tbody'); table.appendChild(tbody);
+  const bar = el('p', 'hint-line pager');
+  const draw = () => {
+    tbody.textContent = '';
+    const start = page * pageSize;
+    for (const row of rows.slice(start, start + pageSize)) drawRow(row, tbody);
+    bar.textContent = '';
+    bar.appendChild(document.createTextNode(rows.length
+      ? '第 ' + (page + 1) + ' / ' + pageCount + ' 页（' + (start + 1) + '–' + Math.min(start + pageSize, rows.length)
+        + '，共 ' + rows.length + ' 行；完整数据在报告中，翻页只改变可见行）'
+      : '共 0 行。'));
+    if (pageCount > 1) {
+      bar.appendChild(document.createTextNode(' '));
+      const prev = el('button', null, '上一页');
+      prev.type = 'button';
+      prev.disabled = page === 0;
+      prev.addEventListener('click', () => { page -= 1; draw(); });
+      bar.appendChild(prev);
+      bar.appendChild(document.createTextNode(' '));
+      const next = el('button', null, '下一页');
+      next.type = 'button';
+      next.disabled = page >= pageCount - 1;
+      next.addEventListener('click', () => { page += 1; draw(); });
+      bar.appendChild(next);
+    }
+    if (opts && opts.note) bar.appendChild(document.createTextNode(' ' + opts.note));
+  };
+  frag.appendChild(tableScroll(table));
+  frag.appendChild(bar);
+  draw();
+  return frag;
+}
 function metricCell(tableCell, value, state) {
   const info = cellInt(value, state);
   tableCell.textContent = info.text;
@@ -1531,15 +1731,29 @@ function buildRecordsDetail(obj) {
       host.textContent = '';
       if (escapeHandler) { document.removeEventListener('keydown', escapeHandler); escapeHandler = null; }
       const located = locatedKeys !== null;
+      const locatedSet = located ? new Set(locatedKeys) : null;
+      const records = located ? obj.records.filter(r => locatedSet.has(r.key)) : obj.records;
       const bar = el('p', 'hint-line', '');
-      const table = document.createElement('table');
-      table.className = 'records-table';
+      if (located) {
+        escapeHandler = event => {
+          if (event.key === 'Escape') { locatedKeys = null; drawRecordsTable(); }
+        };
+        document.addEventListener('keydown', escapeHandler);
+        bar.textContent = '';
+        const back = el('button', null, '返回全部明细');
+        back.type = 'button';
+        back.addEventListener('click', () => { locatedKeys = null; drawRecordsTable(); });
+        bar.appendChild(back);
+        bar.appendChild(document.createTextNode(' 已定位 ' + records.length + ' 条记录' + (records.length === 1 ? '：' + String(records[0].key) : '')
+          + '。定位只改变可见明细，合计、分母、范围与截止点不变；按 Esc 也可返回。'));
+      } else {
+        bar.textContent = '共 ' + obj.records.length + ' 条。点击“定位”只看选中记录（Esc 或“返回全部明细”恢复）；点击“详情”或聚焦行后回车展开完整解释。'
+          + (hasExplanation ? '' : '旧报告未保存记录级解释，仅展示已保存字段。');
+      }
+      host.appendChild(bar);
       const headRow = document.createElement('tr');
       ['操作', '分组', '模型', '代理/会话', '轮次', '时间', '输入', '输出', '缓存读取', '调用数', '性质'].forEach(h => headRow.appendChild(el('th', null, h)));
-      const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
-      const tbody = document.createElement('tbody'); table.appendChild(tbody);
-      const records = located ? obj.records.filter(r => locatedKeys.includes(r.key)) : obj.records;
-      for (const record of records) {
+      host.appendChild(pagedBody(headRow, records, (record, tbody) => {
         const tr = document.createElement('tr');
         tr.tabIndex = 0;
         const opCell = tr.appendChild(document.createElement('td'));
@@ -1577,25 +1791,7 @@ function buildRecordsDetail(obj) {
           if (event.key === 'Escape' && locatedKeys !== null) { locatedKeys = null; drawRecordsTable(); }
         });
         tbody.appendChild(tr);
-      }
-      if (located) {
-        escapeHandler = event => {
-          if (event.key === 'Escape') { locatedKeys = null; drawRecordsTable(); }
-        };
-        document.addEventListener('keydown', escapeHandler);
-        bar.textContent = '';
-        const back = el('button', null, '返回全部明细');
-        back.type = 'button';
-        back.addEventListener('click', () => { locatedKeys = null; drawRecordsTable(); });
-        bar.appendChild(back);
-        bar.appendChild(document.createTextNode(' 已定位 ' + records.length + ' 条记录' + (records.length === 1 ? '：' + String(records[0].key) : '')
-          + '。定位只改变可见明细，合计、分母、范围与截止点不变；按 Esc 也可返回。'));
-      } else {
-        bar.textContent = '共 ' + obj.records.length + ' 条。点击“定位”只看选中记录（Esc 或“返回全部明细”恢复）；点击“详情”或聚焦行后回车展开完整解释。'
-          + (hasExplanation ? '' : '旧报告未保存记录级解释，仅展示已保存字段。');
-      }
-      host.appendChild(bar);
-      host.appendChild(tableScroll(table));
+      }, { className: 'records-table' }));
       host.appendChild(el('p', 'hint-line', '明细只展示报告已保存的白名单元数据（身份、时间、指标状态与来源定位）；不在浏览器重新归属或计量，不读取来源文件。'));
     }
 
@@ -1676,17 +1872,13 @@ function buildTimelineCard(obj, locate) {
       }
       frag.appendChild(dl);
       frag.appendChild(el('p', 'hint-line', (activity.note || '') + ' 时间线为实际执行轮次；归属贡献见分布视图，两者不相加。'));
-      const table = document.createElement('table');
-      table.className = 'timeline-table';
       const headRow = document.createElement('tr');
       ['会话', '轮次/区间', '生命周期', '状态（来源所读/截止点）', '原生轮次耗时', '记录数', '输入', '总量', '操作'].forEach(h => headRow.appendChild(el('th', null, h)));
-      const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
-      const tbody = document.createElement('tbody'); table.appendChild(tbody);
       const spanLabels = { in_range: '范围内', extends_before: '起点早于下界（范围外上下文）', extends_after: '终点晚于截止点（范围外上下文）',
                            extends_both: '跨出筛选范围（范围外上下文）', conflict: '起止冲突', unknown: '时间未知', interval: '累计区间' };
       const cutoffLabels = { ended_before_cutoff: '截止点前已结束', ended_after_cutoff: '截止点后才结束',
                              not_confirmed_ended_at_cutoff: '截至该边界未确认结束', unknown_at_cutoff: '截止点状态未知' };
-      for (const row of obj.explanation.turns) {
+      frag.appendChild(pagedBody(headRow, obj.explanation.turns, (row, tbody) => {
         const tr = document.createElement('tr');
         tr.appendChild(el('td', 'path', short(row.session, 18)));
         if (row.kind === 'turn') {
@@ -1722,9 +1914,7 @@ function buildTimelineCard(obj, locate) {
         }
         opCell.appendChild(locateBtn);
         tbody.appendChild(tr);
-      }
-      table.appendChild(tbody);
-      frag.appendChild(tableScroll(table));
+      }, { className: 'timeline-table' }));
       if (!obj.explanation.turns.length) {
         frag.appendChild(el('p', 'unavailable', '本报告未保存轮次时间线行（旧报告或范围内无轮次证据）。'));
       }
@@ -1747,8 +1937,22 @@ function buildCostSection(obj) {
   const cost = ext.cost;
   const summary = cost.summary;
   const config = cost.config;
-  nodes.push(el('p', 'hint-line', '价格配置快照：schema v' + ext.schema_version.toString() + '，修订 ' + config.revision
-    + '；规则 ' + config.rules.length + ' 条、别名 ' + config.aliases.length + ' 条（含未命中规则，依据见下方展开区）。'));
+  if (config.schema_version === 2n) {
+    nodes.push(el('p', 'hint-line', '价格快照：当前官网标准 API 价等价估算（schema v2，修订 ' + config.revision
+      + '；规则 ' + config.rules.length + ' 条、映射 ' + config.mappings.length + ' 条、未覆盖 '
+      + config.uncovered.length + ' 项）。不声称实际服务档、扣费或套餐额度已验证；各币种分别小计，不做汇率换算。'));
+    for (const source of config.sources) {
+      nodes.push(el('p', 'hint-line', '来源读取：' + source.url + '（' + source.fetched_at
+        + (source.digest ? '；' + source.digest : '') + '）。' + source.summary));
+    }
+    for (const item of config.uncovered) {
+      nodes.push(el('p', 'hint-line', '快照未覆盖：' + (item.provider ? item.provider + '/' : '') + item.model
+        + ' — ' + item.reason));
+    }
+  } else {
+    nodes.push(el('p', 'hint-line', '价格配置快照：schema v' + ext.schema_version.toString() + '，修订 ' + config.revision
+      + '；规则 ' + config.rules.length + ' 条、别名 ' + config.aliases.length + ' 条（含未命中规则，依据见下方展开区）。'));
+  }
   const currencies = Object.keys(summary.currencies).sort();
   if (currencies.length) {
     const table = document.createElement('table');
@@ -1859,21 +2063,33 @@ function buildCostSection(obj) {
   nodes.push(el('p', 'hint-line', '显示精度：' + summary.display.note + '。'));
   nodes.push(evidenceCard('价格配置与规则依据（本次完整快照）', [(() => {
     const frag = document.createDocumentFragment();
+    const v2 = config.schema_version === 2n;
     const table = document.createElement('table');
     const headRow = document.createElement('tr');
-    ['规则 ID', '供应商', '完整模型身份', '生效区间（左闭右开）', '币种', '输入分区', '输出分区', '来源'].forEach(h => headRow.appendChild(el('th', null, h)));
+    const columns = v2
+      ? ['规则 ID', '供应商', '完整模型身份', '价格条件（标准档）', '币种', '输入分区', '输出分区', '来源']
+      : ['规则 ID', '供应商', '完整模型身份', '生效区间（左闭右开）', '币种', '输入分区', '输出分区', '来源'];
+    columns.forEach(h => headRow.appendChild(el('th', null, h)));
     const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
     const tbody = document.createElement('tbody'); table.appendChild(tbody);
     const partitionText = partition => {
       const pairs = RULE_COMPONENTS[partition.kind].map(([name, key]) => (COST_COMPONENT_LABELS[name] || name) + ' ' + partition[key] + '/百万');
       return pairs.join('；') + (partition.basis ? '（依据：' + partition.basis + '）' : '');
     };
+    const conditionText = conditions => {
+      const bounds = [];
+      if ('input_min' in conditions) bounds.push((conditions.input_min_inclusive ? '≥ ' : '> ') + conditions.input_min.toString());
+      if ('input_max' in conditions) bounds.push((conditions.input_max_inclusive ? '≤ ' : '< ') + conditions.input_max.toString());
+      const span = bounds.length ? '单请求输入 ' + bounds.join(' 且 ') : '无输入档位条件';
+      return span + '（依据：' + conditions.basis + '）';
+    };
     for (const rule of config.rules) {
       const tr = document.createElement('tr');
       tr.appendChild(el('td', null, rule.id));
       tr.appendChild(el('td', null, rule.provider));
       tr.appendChild(el('td', null, rule.model));
-      tr.appendChild(el('td', null, rule.effective_from + ' ~ ' + (rule.effective_to || '无上限')));
+      tr.appendChild(el('td', null, v2 ? conditionText(rule.conditions)
+        : rule.effective_from + ' ~ ' + (rule.effective_to || '无上限')));
       tr.appendChild(el('td', null, rule.currency));
       tr.appendChild(el('td', null, partitionText(rule.input)));
       tr.appendChild(el('td', null, partitionText(rule.output)));
@@ -1882,41 +2098,48 @@ function buildCostSection(obj) {
     }
     if (!config.rules.length) frag.appendChild(el('p', 'unavailable', '配置不含任何规则；全部记录保持未定价。'));
     else frag.appendChild(tableScroll(table));
-    if (config.aliases.length) {
+    const links = v2 ? config.mappings : (config.aliases || []);
+    if (links.length) {
       const ul = document.createElement('ul');
       ul.className = 'notes';
-      for (const alias of config.aliases) {
-        ul.appendChild(el('li', null, '别名 ' + alias.id + '：' + alias.from.provider + '/' + alias.from.model
-          + ' → ' + alias.to.provider + '/' + alias.to.model + '（一次精确映射；依据：' + alias.basis
-          + '；来源：' + alias.source.reference + ' ' + alias.source.version + '）'));
+      for (const link of links) {
+        ul.appendChild(el('li', null, (v2 ? '映射 ' : '别名 ') + link.id + '：' + link.from.provider + '/' + link.from.model
+          + ' → ' + link.to.provider + '/' + link.to.model + '（一次精确映射；依据：' + link.basis
+          + '；来源：' + link.source.reference + ' ' + link.source.version + '）'));
       }
       frag.appendChild(ul);
     }
+    if (v2) {
+      for (const item of config.uncovered) {
+        frag.appendChild(el('p', 'hint-line', '快照未覆盖：' + (item.provider ? item.provider + '/' : '') + item.model
+          + ' — ' + item.reason));
+      }
+    }
     return frag;
   })()]));
-  nodes.push(evidenceCard('逐记录计价（引用本报告计量记录稳定键）', [(() => {
-    const table = document.createElement('table');
+  nodes.push(lazyEvidenceCard('逐记录计价（引用本报告计量记录稳定键；' + cost.records.length + ' 条，按需生成并分页）', body => {
+    if (!cost.records.length) { body.appendChild(el('p', 'unavailable', '范围内无计量记录；无记录不自动视为费用零。')); return; }
     const headRow = document.createElement('tr');
     ['记录', '价格身份（供应商/模型）', '状态', '命中规则', '计价分项（token × 单价/百万 = 金额）', '未定价原因'].forEach(h => headRow.appendChild(el('th', null, h)));
-    const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
-    const tbody = document.createElement('tbody'); table.appendChild(tbody);
-    for (const entry of cost.records) {
+    body.appendChild(pagedBody(headRow, cost.records, (entry, tbody) => {
       const tr = document.createElement('tr');
       const keyCell = tr.appendChild(el('td', 'path', short(entry.record_key, 28)));
       keyCell.title = entry.record_key;
       tr.appendChild(el('td', null, entry.identity ? entry.identity.provider + ' / ' + entry.identity.model : '未知'));
       tr.appendChild(el('td', null, COST_STATUS_LABELS[entry.status] || entry.status));
       tr.appendChild(el('td', null, entry.matched
-        ? entry.matched.rule_id + (entry.matched.alias_id ? '（经别名 ' + entry.matched.alias_id + '）' : '')
+        ? entry.matched.rule_id
+          + (entry.matched.mapping_id ? '（经映射 ' + entry.matched.mapping_id + '）' : '')
+          + (entry.matched.alias_id ? '（经别名 ' + entry.matched.alias_id + '）' : '')
+          + (entry.matched.input_tokens !== null && entry.matched.input_tokens !== undefined
+            ? '（判定输入 ' + entry.matched.input_tokens.toLocaleString('en-US') + '）' : '')
         : entry.status === 'rule_conflict' ? '冲突：' + entry.conflicts.join('、') : '—'));
       tr.appendChild(el('td', null, entry.components.map(c => (COST_COMPONENT_LABELS[c.name] || c.name)
         + ' ' + c.tokens.toLocaleString('en-US') + ' × ' + c.price_per_million + ' = ' + c.amount).join('；') || '—'));
       tr.appendChild(el('td', null, entry.unpriced.map(item => (item.component ? (COST_COMPONENT_LABELS[item.component] || item.component) + '：' : '') + item.reason).join('；') || '—'));
       tbody.appendChild(tr);
-    }
-    if (!cost.records.length) return el('p', 'unavailable', '范围内无计量记录；无记录不自动视为费用零。');
-    return tableScroll(table);
-  })()]));
+    }));
+  }));
   return nodes;
 }
 
@@ -1983,15 +2206,13 @@ function buildPerfMetricBlock(perf, name) {
   const drawSamples = () => {
     samplesHost.textContent = '';
     const located = locatedKeys !== null;
+    const locatedSet = located ? new Set(locatedKeys) : null;
     const bar = el('p', 'hint-line', '');
-    const table = document.createElement('table');
     const headRow = document.createElement('tr');
     const valueHead = name === 'ttft' ? 'TTFT（ms）' : '输出 ÷ 区间（ms）';
     ['操作', '样本键', '会话', '轮次', '模型', '粒度', name === 'ttft' ? '完成状态' : '输出', valueHead, '依据', 'token 记录'].forEach(h => headRow.appendChild(el('th', null, h)));
-    const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
-    const tbody = document.createElement('tbody'); table.appendChild(tbody);
-    const shown = located ? metric.samples.filter(s => locatedKeys.includes(s.key)) : metric.samples;
-    for (const sample of shown) {
+    const shown = located ? metric.samples.filter(s => locatedSet.has(s.key)) : metric.samples;
+    samplesHost.appendChild(pagedBody(headRow, shown, (sample, tbody) => {
       const tr = document.createElement('tr');
       tr.tabIndex = 0;
       const opCell = tr.appendChild(document.createElement('td'));
@@ -2024,7 +2245,8 @@ function buildPerfMetricBlock(perf, name) {
         if (event.key === 'Escape' && locatedKeys !== null) { locatedKeys = null; drawSamples(); }
       });
       tbody.appendChild(tr);
-    }
+    }));
+    samplesHost.appendChild(bar);
     if (located) {
       const back = el('button', null, '返回全部样本');
       back.type = 'button';
@@ -2034,8 +2256,6 @@ function buildPerfMetricBlock(perf, name) {
     } else {
       bar.textContent = '共 ' + metric.samples.length + ' 条有效样本。点击“定位”只看选中样本（Esc 或“返回全部样本”恢复）；点击“详情”或聚焦行后回车展开事件时间与来源定位。';
     }
-    samplesHost.appendChild(bar);
-    samplesHost.appendChild(tableScroll(table));
   };
   const toggleSampleDetail = (sample, tr, tbody) => {
     const next = tr.nextSibling;
@@ -2068,15 +2288,25 @@ function buildPerfMetricBlock(perf, name) {
     cell.appendChild(dl);
     tbody.insertBefore(detailRow, tr.nextSibling);
   };
-  const locateSamples = keys => {
-    locatedKeys = keys.slice();
-    drawSamples();
+  const revealSamples = () => {
     let ancestor = samplesHost.parentElement;
     while (ancestor) {
       if (ancestor.tagName === 'DETAILS') ancestor.open = true;
       ancestor = ancestor.parentElement;
     }
     samplesHost.scrollIntoView({ block: 'nearest' });
+  };
+  const locateSamples = keys => {
+    locatedKeys = keys.slice();
+    if (samplesHost.parentElement !== null) {
+      drawSamples();
+      revealSamples();
+      return;
+    }
+    // First locate before the lazy sample card ever opened: opening it queues the
+    // mount build (which draws the located subset); the reveal runs after that lands.
+    samplesCard.open = true;
+    setTimeout(revealSamples, 0);
   };
 
   const groupTable = (title, labelOf, members) => {
@@ -2109,7 +2339,30 @@ function buildPerfMetricBlock(perf, name) {
   block.appendChild(groupTable('按模型分组（完整供应商＋模型身份）',
     m => (m.identity.provider === null ? '供应商未知' : m.identity.provider) + ' / ' + m.identity.model,
     metric.projections.model));
-  block.appendChild(groupTable('按会话分组', m => m.session, metric.projections.session));
+  // Session content renders on demand only: a count summary stays visible and the
+  // member table is built (paged) when the entry is opened. Model groups stay eager.
+  const sessionMembers = metric.projections.session;
+  block.appendChild(el('p', 'hint-line', '按会话分组：共 ' + sessionMembers.length
+    + ' 个会话；默认收起，展开后按 20 行分页（成员值由该组精确分子/分母重新生成，定位直达样本）。'));
+  block.appendChild(lazyEvidenceCard('展开按会话分组（' + sessionMembers.length + ' 个会话）', body => {
+    const headRow = document.createElement('tr');
+    ['行', '值（' + displayUnit + '，两位小数）', '精确分子 ÷ 分母', '样本数', '操作'].forEach(h => headRow.appendChild(el('th', null, h)));
+    body.appendChild(pagedBody(headRow, sessionMembers, (member, tbody) => {
+      const tr = document.createElement('tr');
+      const labelCell = tr.appendChild(el('td', 'path', short(member.session, 40)));
+      labelCell.title = member.session;
+      tr.appendChild(el('td', null, memberValue(member)));
+      tr.appendChild(el('td', null, member.numerator.toString() + ' ÷ ' + member.denominator.toString()));
+      tr.appendChild(el('td', null, String(member.sample_keys.length)));
+      const op = tr.appendChild(document.createElement('td'));
+      const btn = el('button', null, '定位');
+      btn.type = 'button';
+      btn.title = '沿保存样本键定位该组成员样本（不改变范围与合计）';
+      btn.addEventListener('click', () => locateSamples(member.sample_keys));
+      op.appendChild(btn);
+      tbody.appendChild(tr);
+    }));
+  }));
 
   // Day chart: one bar per saved day member, scaled by exact ratio comparison.
   const days = metric.projections.day;
@@ -2159,12 +2412,17 @@ function buildPerfMetricBlock(perf, name) {
       group.appendChild(valueNode);
       svg.appendChild(group);
     });
-    block.appendChild(svg);
+    const chartHost = el('div', 'chart-host');
+    chartHost.appendChild(svg);
+    block.appendChild(chartHost);
     block.appendChild(el('p', 'hint-line', '点选日期条定位当日样本（键盘：Tab 聚焦后 Enter/空格；只切换视图，不改变计数与合计）。'));
   }
-  const samplesCard = evidenceCard('有效样本明细（' + metric.samples.length + ' 条；稳定样本键＝完整会话＋源调用/逻辑请求身份）', [samplesHost]);
+  const samplesCard = lazyEvidenceCard('有效样本明细（' + metric.samples.length + ' 条；稳定样本键＝完整会话＋源调用/逻辑请求身份——按需生成并分页）',
+    body => {
+      body.appendChild(samplesHost);
+      drawSamples();
+    });
   block.appendChild(samplesCard);
-  drawSamples();
   return block;
 }
 
@@ -2228,14 +2486,12 @@ function buildToolMetricBlock(perf) {
   const drawSamples = () => {
     samplesHost.textContent = '';
     const located = locatedKeys !== null;
+    const locatedSet = located ? new Set(locatedKeys) : null;
     const bar = el('p', 'hint-line', '');
-    const table = document.createElement('table');
     const headRow = document.createElement('tr');
     ['操作', '样本键', '会话', '轮次', '类别', '状态', '耗时（ms）', '依据', '精度'].forEach(h => headRow.appendChild(el('th', null, h)));
-    const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
-    const tbody = document.createElement('tbody'); table.appendChild(tbody);
-    const shown = located ? metric.samples.filter(s => locatedKeys.includes(s.key)) : metric.samples;
-    for (const sample of shown) {
+    const shown = located ? metric.samples.filter(s => locatedSet.has(s.key)) : metric.samples;
+    samplesHost.appendChild(pagedBody(headRow, shown, (sample, tbody) => {
       const tr = document.createElement('tr');
       tr.tabIndex = 0;
       const opCell = tr.appendChild(document.createElement('td'));
@@ -2262,7 +2518,8 @@ function buildToolMetricBlock(perf) {
         if (event.key === 'Escape' && locatedKeys !== null) { locatedKeys = null; drawSamples(); }
       });
       tbody.appendChild(tr);
-    }
+    }));
+    samplesHost.appendChild(bar);
     if (located) {
       const back = el('button', null, '返回全部样本');
       back.type = 'button';
@@ -2272,8 +2529,6 @@ function buildToolMetricBlock(perf) {
     } else {
       bar.textContent = '共 ' + metric.samples.length + ' 条有效样本。点击“定位”只看选中样本（Esc 或“返回全部样本”恢复）；点击“详情”或聚焦行后回车展开事件时间与来源定位。';
     }
-    samplesHost.appendChild(bar);
-    samplesHost.appendChild(tableScroll(table));
   };
   const toggleSampleDetail = (sample, tr, tbody) => {
     const next = tr.nextSibling;
@@ -2301,15 +2556,25 @@ function buildToolMetricBlock(perf) {
     cell.appendChild(dl);
     tbody.insertBefore(detailRow, tr.nextSibling);
   };
-  const locateSamples = keys => {
-    locatedKeys = keys.slice();
-    drawSamples();
+  const revealSamples = () => {
     let ancestor = samplesHost.parentElement;
     while (ancestor) {
       if (ancestor.tagName === 'DETAILS') ancestor.open = true;
       ancestor = ancestor.parentElement;
     }
     samplesHost.scrollIntoView({ block: 'nearest' });
+  };
+  const locateSamples = keys => {
+    locatedKeys = keys.slice();
+    if (samplesHost.parentElement !== null) {
+      drawSamples();
+      revealSamples();
+      return;
+    }
+    // First locate before the lazy sample card ever opened: opening it queues the
+    // mount build (which draws the located subset); the reveal runs after that lands.
+    samplesCard.open = true;
+    setTimeout(revealSamples, 0);
   };
 
   const groupTable = (title, members) => {
@@ -2340,7 +2605,30 @@ function buildToolMetricBlock(perf) {
     return frag;
   };
   block.appendChild(groupTable('按工具类别分组', metric.projections.category));
-  block.appendChild(groupTable('按会话分组', metric.projections.session));
+  // Session content renders on demand only (same contract as the model metrics);
+  // category groups stay eager.
+  const sessionMembers = metric.projections.session;
+  block.appendChild(el('p', 'hint-line', '按会话分组：共 ' + sessionMembers.length
+    + ' 个会话；默认收起，展开后按 20 行分页（成员值由该组精确耗时之和重新生成，定位直达样本）。'));
+  block.appendChild(lazyEvidenceCard('展开按会话分组（' + sessionMembers.length + ' 个会话）', body => {
+    const headRow = document.createElement('tr');
+    ['行', '耗时和（ms，两位小数）', '精确耗时之和（ns）', '样本数', '操作'].forEach(h => headRow.appendChild(el('th', null, h)));
+    body.appendChild(pagedBody(headRow, sessionMembers, (member, tbody) => {
+      const tr = document.createElement('tr');
+      const labelCell = tr.appendChild(el('td', 'path', short(member.session, 40)));
+      labelCell.title = member.session;
+      tr.appendChild(el('td', null, nsToMsText(member.numerator)));
+      tr.appendChild(el('td', null, member.numerator.toString()));
+      tr.appendChild(el('td', null, String(member.sample_keys.length)));
+      const op = tr.appendChild(document.createElement('td'));
+      const btn = el('button', null, '定位');
+      btn.type = 'button';
+      btn.title = '沿保存样本键定位该组成员样本（不改变范围与合计）';
+      btn.addEventListener('click', () => locateSamples(member.sample_keys));
+      op.appendChild(btn);
+      tbody.appendChild(tr);
+    }));
+  }));
 
   // Day chart: one bar per saved day member, scaled by exact integer comparison of sums.
   const days = metric.projections.day;
@@ -2390,12 +2678,17 @@ function buildToolMetricBlock(perf) {
       group.appendChild(valueNode);
       svg.appendChild(group);
     });
-    block.appendChild(svg);
+    const chartHost = el('div', 'chart-host');
+    chartHost.appendChild(svg);
+    block.appendChild(chartHost);
     block.appendChild(el('p', 'hint-line', '点选日期条定位当日样本（键盘：Tab 聚焦后 Enter/空格；只切换视图，不改变计数与合计）。'));
   }
-  const samplesCard = evidenceCard('有效工具样本明细（' + metric.samples.length + ' 条；稳定样本键＝完整会话＋真实 item/tool_call_id）', [samplesHost]);
+  const samplesCard = lazyEvidenceCard('有效工具样本明细（' + metric.samples.length + ' 条；稳定样本键＝完整会话＋真实 item/tool_call_id——按需生成并分页）',
+    body => {
+      body.appendChild(samplesHost);
+      drawSamples();
+    });
   block.appendChild(samplesCard);
-  drawSamples();
   return block;
 }
 
@@ -2859,15 +3152,22 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
   sessionsSummary.appendChild(document.createTextNode(scope.sessions.length + ' 个（' + scope.sessions.slice(0, 5).map(s => short(s, 16)).join('、')
     + (scope.sessions.length > 5 ? ' …' : '') + '）'));
   const fullSet = el('details', 'inline-details');
-  fullSet.appendChild(el('summary', null, '核对完整会话集合（' + scope.sessions.length + ' 个稳定身份）'));
-  const sessionList = document.createElement('ul');
-  sessionList.className = 'notes';
-  for (const sid of scope.sessions) {
-    const li = el('li');
-    li.appendChild(el('span', 'path', sid));
-    sessionList.appendChild(li);
-  }
-  fullSet.appendChild(sessionList);
+  fullSet.appendChild(el('summary', null, '核对完整会话集合（' + scope.sessions.length + ' 个稳定身份；按 20 行分页）'));
+  // Session content builds on demand: nothing is constructed until this disclosure
+  // is first opened, then the identities render through the shared pager.
+  let fullSetBuilt = false;
+  fullSet.addEventListener('toggle', () => {
+    if (!fullSet.open || fullSetBuilt) return;
+    fullSetBuilt = true;
+    const headRow = document.createElement('tr');
+    headRow.appendChild(el('th', null, '会话身份'));
+    fullSet.appendChild(pagedBody(headRow, scope.sessions, (sid, tbody) => {
+      const tr = document.createElement('tr');
+      const cell = tr.appendChild(el('td', 'path', sid));
+      cell.title = sid;
+      tbody.appendChild(tr);
+    }));
+  });
   sessionsSummary.appendChild(fullSet);
   bandAdd('会话集合', sessionsSummary);
   bandAdd('时间范围', (scope.from || '未指定') + '（含）→ ' + scope.to + '（不含）');
@@ -3046,7 +3346,8 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
       if (onDayClick) chartHost.appendChild(el('p', 'hint-line', '点选日期柱查看当日模型/会话分布（键盘：Tab 聚焦日期柱后 Enter/空格；只切换视图，不重新读取来源）。'));
     }
   })();
-  card(...trendSection.nodes);
+  const trendCard = card(...trendSection.nodes);
+  trendCard.id = sectionId + '-trend-card';
   document.querySelectorAll('input[name="' + sectionId + ':trend-metric"]').forEach(radio => {
     radio.addEventListener('change', () => trendSection.render());
   });
@@ -3096,19 +3397,20 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
       });
       const table = (title, view) => {
         const frag = document.createDocumentFragment();
+        const sorted = byMetric(view.rows);
+        const unknownCount = sorted.filter(row => row.metrics[metricKey].value === null).length;
         frag.appendChild(el('h3', null, title + '（按' + metricLabel + '降序）'));
-        if (!view.rows.length) {
+        if (!sorted.length) {
           frag.appendChild(el('p', 'unavailable', '无可排行行。'));
           return frag;
         }
-        const t = document.createElement('table');
+        frag.appendChild(el('p', 'hint-line', '共 ' + sorted.length + ' 行，其中该指标未知 ' + unknownCount
+          + ' 行（未知不归零、排序置底，缺口常显于此摘要；行内状态在展开页可见）——按 20 行分页展示。'));
         const headRow = document.createElement('tr');
         ['行', '输入', '输出', '缓存读取', '缓存命中率', '总量', '调用数', '操作'].forEach(h => headRow.appendChild(el('th', null, h)));
-        const thead = document.createElement('thead'); thead.appendChild(headRow); t.appendChild(thead);
-        const tbody = document.createElement('tbody'); t.appendChild(tbody);
-        // Bind each rendered row to its own saved identity at draw time; the sorted
-        // order never re-indexes into the unsorted view rows.
-        for (const row of byMetric(view.rows)) {
+        frag.appendChild(pagedBody(headRow, sorted, (row, tbody) => {
+          // Bind each rendered row to its own saved identity at draw time; the sorted
+          // order never re-indexes into the unsorted view rows.
           addRow(tbody, row.label, row, false);
           const tr = tbody.lastChild;
           const op = tr.appendChild(document.createElement('td'));
@@ -3122,16 +3424,21 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
           } else {
             op.appendChild(el('span', 'hint-line', '旧报告未保存行级引用'));
           }
-        }
-        t.appendChild(tbody);
-        frag.appendChild(tableScroll(t));
+        }));
         return frag;
       };
       const grid = el('div', 'ranking-grid');
       const modelBlock = el('div', 'ranking-block');
       modelBlock.appendChild(table('模型排行', obj.rankings.model));
       const sessionBlock = el('div', 'ranking-block');
-      sessionBlock.appendChild(table('会话排行', obj.rankings.session));
+      // Session content renders on demand only: the count summary stays visible and
+      // the paged table is built when the entry is opened. Model ranking stays eager.
+      const sortedSessions = byMetric(obj.rankings.session.rows);
+      const unknownSessions = sortedSessions.filter(row => row.metrics[metricKey].value === null).length;
+      sessionBlock.appendChild(el('p', 'hint-line', '会话排行：共 ' + sortedSessions.length + ' 个会话，该指标未知 '
+        + unknownSessions + ' 个（未知不归零、排序置底）；默认收起，展开后按 20 行分页。'));
+      sessionBlock.appendChild(lazyEvidenceCard('展开会话排行（按' + metricLabel + '降序）',
+        body => body.appendChild(table('会话排行', obj.rankings.session))));
       sessionBlock.appendChild(el('p', 'hint-line', '会话行为该会话自身记录的小计；单会话报告默认含可靠归属后代，口径不同。'));
       grid.appendChild(modelBlock);
       grid.appendChild(sessionBlock);
@@ -3177,22 +3484,23 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
     rankingSection.render();  // rewire ranking locate buttons
   }
   if (obj.explanation && Array.isArray(obj.explanation.turns)) {
-    report.appendChild(evidenceCard('整体轮次时间线与按会话耗时', [buildTimelineCard(obj, overviewLocate)]));
+    report.appendChild(lazyEvidenceCard('整体轮次时间线与按会话耗时（' + obj.explanation.turns.length + ' 行，按需生成并分页）',
+      body => body.appendChild(buildTimelineCard(obj, overviewLocate))));
   }
   if (obj.explanation && ((Array.isArray(obj.explanation.internal) && obj.explanation.internal.length)
       || (Array.isArray(obj.explanation.relations) && obj.explanation.relations.length)
       || (Array.isArray(obj.explanation.excluded) && obj.explanation.excluded.length))) {
-    report.appendChild(evidenceCard('内部分布、后代关系与未计量证据', [buildInternalRelationsCard(obj, overviewLocate)]));
+    report.appendChild(lazyEvidenceCard('内部分布、后代关系与未计量证据（按需生成）',
+      body => body.appendChild(buildInternalRelationsCard(obj, overviewLocate))));
   }
 
   if (Array.isArray(obj.session_index) && obj.session_index.length) {
-    report.appendChild(evidenceCard('会话索引（范围内会话的白名单元数据）', [(() => {
-      const table = document.createElement('table');
+    const withUsage = obj.session_index.filter(item => item.usage_records || item.known_calls).length;
+    report.appendChild(lazyEvidenceCard('会话索引（范围内会话的白名单元数据；' + obj.session_index.length
+      + ' 个会话，其中 ' + withUsage + ' 个有 usage 记录或已识别调用——按需生成并分页）', body => {
       const headRow = document.createElement('tr');
       ['会话', '开始', '最近轮次结束', '轮次数', 'usage 记录', '已识别调用', '关系'].forEach(h => headRow.appendChild(el('th', null, h)));
-      const thead = document.createElement('thead'); thead.appendChild(headRow); table.appendChild(thead);
-      const tbody = document.createElement('tbody'); table.appendChild(tbody);
-      for (const item of obj.session_index) {
+      body.appendChild(pagedBody(headRow, obj.session_index, (item, tbody) => {
         const tr = document.createElement('tr');
         tr.appendChild(el('td', 'path', short(item.id, 40)));
         tr.appendChild(el('td', null, short(item.start, 26)));
@@ -3203,10 +3511,8 @@ function renderOverviewReport(obj, footerText, sectionId, onDayClick) {
         tr.appendChild(el('td', null, item.parent ? '后代（父 ' + short(item.parent, 12) + '）'
           : item.forked_from ? '分叉自 ' + short(item.forked_from, 12) : '独立会话'));
         tbody.appendChild(tr);
-      }
-      table.appendChild(tbody);
-      return tableScroll(table);
-    })()]));
+      }));
+    }));
   }
 
   const extra = [];

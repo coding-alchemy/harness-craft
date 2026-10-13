@@ -9,6 +9,7 @@ import json
 import secrets
 from pathlib import Path
 from . import operations
+from . import parsecache
 from .core import now
 from .formats import render, validate_report
 
@@ -76,6 +77,9 @@ class WebApp:
         self.sources = sources
         self.guard = guard_for(sources.values())
         self.context = context or {}
+        # Bounded in-process parse reuse for repeat queries in THIS service; every
+        # request still re-discovers guarded paths and re-reads current content.
+        self.parse_cache = parsecache.ParseCache()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -197,20 +201,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if action != 'export' and harness not in self.app.sources:
             raise ValueError('未知或本次启动未配置的 Harness：' + str(harness))
         pricing = None
+        pricing_mode = request.get('pricing_mode')
+        if pricing_mode is not None and pricing_mode not in ('default', 'custom', 'none'):
+            raise ValueError('价格模式必须是 default、custom 或 none')
         if 'parent_report_text' in request:
             # Drill-down semantics: the day→session query carries the parent overall
             # report itself, so its saved pricing snapshot (not the page's pending config)
-            # prices the new single-session report. Mutually exclusive with pricing_text.
+            # prices the new single-session report. Mutually exclusive with any new
+            # pricing selection.
             if action != 'report':
                 raise ValueError('只有整体下钻的会话统计接受父报告价格快照')
-            if 'pricing_text' in request:
-                raise ValueError('下钻价格来源只能是一个：父报告保存的价格快照或新提交的价格配置')
+            if 'pricing_text' in request or pricing_mode is not None:
+                raise ValueError('下钻价格来源只能是一个：父报告保存的价格快照，不接受新价格选择')
             parent = validate_report(self._decoded_report(request['parent_report_text']))
             if parent.get('format_version') != 3:
                 raise ValueError('下钻价格快照只接受整体报告（v3）；请从整体结果进入会话当日统计')
             if harness is not None and harness != parent['harness']:
                 raise ValueError('下钻会话统计与父报告 Harness 不一致；请切回父报告来源再查询')
             parent_analysis = parent.get('analysis')
+            pricing_mode = 'parent'  # The parent snapshot (or the parent's saved absence) decides.
             if parent_analysis is not None and 'cost' in parent_analysis:
                 pricing = operations.analysis.validate_pricing_config(parent_analysis['cost']['config'])
         if 'pricing_text' in request:
@@ -219,6 +228,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # submit local file text (never a path, URL or command).
             if action not in ('report', 'overview', 'recompute'):
                 raise ValueError('该操作不接受价格配置；价格仅用于明确统计、整体查询或重算')
+            if pricing_mode == 'default' or pricing_mode == 'none':
+                raise ValueError('默认价与仅 token 模式不得夹带价格配置文本')
+            if pricing_mode is None:
+                pricing_mode = 'custom'
             pricing_text = request['pricing_text']
             if not isinstance(pricing_text, str) or not pricing_text.strip():
                 raise ValueError('价格配置文本缺失或为空；未选择配置请省略 pricing_text 字段')
@@ -228,13 +241,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError('价格配置不是有效 JSON') from None
             if pricing is None:
                 raise ValueError('价格配置为 null；未选择配置请省略 pricing_text 字段')
+        if pricing_mode == 'custom' and 'pricing_text' not in request and 'parent_report_text' not in request:
+            raise ValueError('自定义价格模式需要提交价格配置文本')
+        if pricing_mode == 'none' and action not in ('report', 'overview'):
+            raise ValueError('仅 token 模式只用于独立的新统计或整体查询；重算请沿用保存价格或明确换价')
+        if pricing_mode is not None and action == 'export':
+            raise ValueError('导出只使用保存报告自身的价格快照，不接受新价格选择')
         context_session = self.app.context.get('session') if self.app.context.get('harness') == harness else None
+        # Quick time ranges exist only for independent new overview queries; reject them
+        # before any source read instead of silently ignoring the field on other actions.
+        if request.get('time_preset') is not None and action != 'overview':
+            raise ValueError('时间快捷只用于独立的新整体查询（overview）')
         query = operations.Query(operation=action if action != 'export' else 'report',
                                  started=entry, started_source='web_request_start',
                                  harness=harness, descriptor=self.app.sources.get(harness),
                                  guard=self.app.guard, session=request.get('session'),
                                  saved=saved_obj if action == 'recompute' else None,
-                                 pricing=pricing)
+                                 pricing=pricing, pricing_mode=pricing_mode,
+                                 parse_cache=self.app.parse_cache)
         if request.get('use_context'):
             # The startup chain declared this identity; operations re-verifies the unique source match.
             if not context_session:
@@ -265,6 +289,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 query.request_id = request_id
         elif action == 'overview':
             query.main_only = bool(request.get('main_only'))
+            time_preset = request.get('time_preset')
+            if time_preset is not None:
+                if time_preset not in operations.TIME_PRESETS:
+                    raise ValueError('时间快捷必须是 ' + '、'.join(operations.TIME_PRESETS) + ' 之一')
+                if request.get('from') is not None or request.get('to') is not None:
+                    raise ValueError('时间快捷与自定义时间边界互斥；需要精确边界请省略 time_preset')
+            query.time_preset = time_preset
             sessions = request.get('sessions')
             if sessions is not None:
                 if not isinstance(sessions, list) or not sessions or not all(isinstance(s, str) and s for s in sessions):

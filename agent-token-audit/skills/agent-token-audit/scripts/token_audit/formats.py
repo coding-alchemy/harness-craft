@@ -7,7 +7,7 @@ import os
 from decimal import Decimal
 from pathlib import Path
 import tempfile
-from .analysis import canon_decimal, component_amount, display_amount, exact_decimal_add, rule_component_prices, validate_pricing_config, _component_tokens, PRICE_TEXT
+from .analysis import canon_decimal, component_amount, display_amount, exact_decimal_add, rule_component_prices, validate_pricing_config, _component_tokens, PRICE_TEXT, _conditions_match
 from .core import GRANULARITIES, INTERNAL_CATEGORIES, METRICS, aggregate, explanation_lines, markdown, timestamp, timezone_of, _perf_ratio
 
 
@@ -811,23 +811,57 @@ def check_performance(obj, perf):
 
 
 def check_analysis(obj):
-    """v2/v3 optional `analysis` extension (internal schema version 1): an always-saved
-    performance section plus, for priced queries, the config snapshot, per-record pricing
-    and per-currency summary, all cross-checked against this report's own metered records.
+    """v2/v3 optional `analysis` extension (internal schema version 1, or 2 for
+    current-official-estimate pricing snapshots): an always-saved performance section
+    plus, for priced queries, the config snapshot, per-record pricing and per-currency
+    summary, all cross-checked against this report's own metered records.
     Unknown versions or damaged/conflicting structures are rejected outright; amounts and
     unit prices are validated from their decimal strings."""
     ext = obj['analysis']
-    if not isinstance(ext, dict) or type(ext.get('schema_version')) is not int or ext['schema_version'] != 1 \
+    if not isinstance(ext, dict) or type(ext.get('schema_version')) is not int or ext['schema_version'] not in (1, 2) \
             or not set(ext) <= {'schema_version', 'cost', 'performance'} \
             or not {'cost', 'performance'} & set(ext):
         raise ValueError('未知的分析扩展版本或结构')
+    if ext['schema_version'] == 2 and 'cost' not in ext:
+        raise ValueError('分析扩展版本 2 必须携带 v2 价格快照费用区')
     if 'cost' in ext:
-        check_cost(obj, ext['cost'])
+        check_cost(obj, ext['cost'], ext['schema_version'])
     if 'performance' in ext:
         check_performance(obj, ext['performance'])
 
 
-def check_cost(obj, cost):
+def _check_matched_v2(matched, rule, key, identity, record, what):
+    """v2 matched evidence: rule + one mapping hop + the judged tier conditions."""
+    conditions = rule['conditions']
+    bounded = 'input_min' in conditions or 'input_max' in conditions
+    allowed = {'rule_id', 'mapping_id', 'input_tokens', 'condition_basis'}
+    if bounded and record is not None and (record.get('explanation') or {}).get('granularity') == 'logical_request':
+        allowed.add('retry_count')
+    if not isinstance(matched, dict) or set(matched) - allowed:
+        raise ValueError('逐记录计价命中结构无效：' + what)
+    if matched.get('condition_basis') != conditions['basis']:
+        raise ValueError('计价命中条件依据与规则不一致：' + what)
+    if bounded:
+        tokens = matched.get('input_tokens')
+        if type(tokens) is not int or tokens < 0 or not _conditions_match(conditions, tokens):
+            raise ValueError('计价命中的单请求输入量不满足规则输入条件：' + what)
+        if record is None:
+            raise ValueError('计价命中引用悬空：' + what)
+        metric = (record.get('metrics') or {}).get('input')
+        if metric is None or metric.get('value') != tokens:
+            raise ValueError('计价命中的单请求输入量与记录输入不一致：' + what)
+        granularity = (record.get('explanation') or {}).get('granularity')
+        if granularity == 'logical_request':
+            retry = matched.get('retry_count')
+            if type(retry) is not int or retry != 0:
+                raise ValueError('逻辑请求档位判定须携带 retry_count=0 证据：' + what)
+        elif granularity not in ('model_call', 'reply_usage'):
+            raise ValueError('该记录粒度不能证明完整单请求输入量，档位判定证据不足：' + what)
+    elif matched.get('input_tokens') is not None:
+        raise ValueError('规则无输入条件时命中证据不得携带输入量：' + what)
+
+
+def check_cost(obj, cost, ext_schema):
     overall = obj['format_version'] == 3
     # Projections are required on overall (v3) reports and forbidden on single-session ones.
     expected_cost_keys = {'config', 'records', 'summary', 'projections'} if overall \
@@ -836,7 +870,11 @@ def check_cost(obj, cost):
         raise ValueError('费用分析扩展结构无效')
     config = validate_pricing_config(cost['config'])
     rules = {rule['id']: rule for rule in config['rules']}
-    aliases = {alias['id'] for alias in config['aliases']}
+    v2 = config['schema_version'] == 2
+    if v2 != (ext_schema == 2):
+        raise ValueError('分析扩展版本与价格快照版本不一致')
+    links = config['mappings'] if v2 else config['aliases']
+    link_ids = {link['id'] for link in links}
     entries = cost['records']
     if not isinstance(entries, list):
         raise ValueError('费用分析逐记录计价必须是数组')
@@ -861,28 +899,36 @@ def check_cost(obj, cost):
         matched = entry.get('matched')
         rule = None
         if matched is not None:
-            if not isinstance(matched, dict) or set(matched) != {'rule_id', 'alias_id'}:
-                raise ValueError('逐记录计价命中结构无效：' + what)
-            rule = rules.get(matched['rule_id'])
+            record = metered_by_key.get(key)
+            if v2:
+                if not isinstance(matched, dict) or 'rule_id' not in matched:
+                    raise ValueError('逐记录计价命中结构无效：' + what)
+                link_field = 'mapping_id'
+            else:
+                if not isinstance(matched, dict) or set(matched) != {'rule_id', 'alias_id'}:
+                    raise ValueError('逐记录计价命中结构无效：' + what)
+                link_field = 'alias_id'
+            rule = rules.get(matched.get('rule_id'))
             if rule is None:
                 raise ValueError('逐记录计价引用了配置中不存在的规则：' + what)
-            if matched['alias_id'] is not None and matched['alias_id'] not in aliases:
-                raise ValueError('逐记录计价引用了配置中不存在的别名：' + what)
-            record = metered_by_key.get(key)
+            if matched.get(link_field) is not None and matched[link_field] not in link_ids:
+                raise ValueError('逐记录计价引用了配置中不存在的映射：' + what)
             if identity is None or record is None \
                     or identity != {'provider': record.get('provider'), 'model': record.get('model')}:
                 raise ValueError('计价身份与引用计量记录不一致：' + what)
             rule_identity = identity
-            if matched['alias_id'] is not None:
-                alias = next((a for a in config['aliases']
-                              if a['id'] == matched['alias_id'] and a['from'] == identity), None)
-                if alias is None:
-                    raise ValueError('计价别名来源身份与引用计量记录不一致：' + what)
-                rule_identity = alias['to']
+            if matched.get(link_field) is not None:
+                link = next((l for l in links
+                             if l['id'] == matched[link_field] and l['from'] == identity), None)
+                if link is None:
+                    raise ValueError('计价映射来源身份与引用计量记录不一致：' + what)
+                rule_identity = link['to']
             if rule_identity != {'provider': rule['provider'], 'model': rule['model']}:
-                raise ValueError('命中价格规则身份与引用计量记录或别名目标不一致：' + what)
+                raise ValueError('命中价格规则身份与引用计量记录或映射目标不一致：' + what)
             if entry.get('currency') != rule['currency']:
                 raise ValueError('逐记录计价币种与命中规则不一致：' + what)
+            if v2:
+                _check_matched_v2(matched, rule, key, identity, record, what)
         components = entry.get('components')
         if not isinstance(components, list):
             raise ValueError('逐记录计价分项无效：' + what)
@@ -1265,10 +1311,14 @@ def _cost_csv_rows(ext):
     cost = ext['cost']
     config = cost['config']
     summary = cost['summary']
+    snapshot = {'schema_version': ext['schema_version'], 'revision': config['revision']}
+    if config['schema_version'] == 2:
+        snapshot.update(price_basis=config['price_basis'], sources=config['sources'],
+                        rules=config['rules'], mappings=config['mappings'], uncovered=config['uncovered'])
+    else:
+        snapshot.update(rules=config['rules'], aliases=config['aliases'])
     rows = [{'category': 'cost_config', 'label': '价格配置快照（含未命中规则，即价格依据）',
-             'cost_detail': json.dumps({'schema_version': ext['schema_version'], 'revision': config['revision'],
-                                        'rules': config['rules'], 'aliases': config['aliases']},
-                                       ensure_ascii=False)}]
+             'cost_detail': json.dumps(snapshot, ensure_ascii=False)}]
     for currency in sorted(summary['currencies']):
         bucket = summary['currencies'][currency]
         rows.append({'category': 'cost_summary', 'label': '币种小计', 'cost_currency': currency,

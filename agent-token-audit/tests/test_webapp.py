@@ -108,6 +108,9 @@ class Guard(unittest.TestCase):
             guard(escape)
 
 
+from datetime import datetime, timedelta
+
+
 class Actions(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='token-audit-web-test-')
@@ -338,7 +341,8 @@ class PricingActions(Actions):
         self.assertEqual(cost['records'][0]['components'][0]['amount'], '0.001')
         self.assertEqual(cost['config']['rules'][0]['id'], 'glm')
         # 同范围不带价格：原 token 结果不变；分析扩展仍保存性能区（无费用区）。
-        status, data = self.post({'action': 'report', 'seq': 2, 'harness': 'zcode', 'session': 's', 'to': END})
+        status, data = self.post({'action': 'report', 'seq': 2, 'harness': 'zcode', 'session': 's', 'to': END,
+                                  'pricing_mode': 'none'})
         self.assertTrue(data['ok'], data)
         self.assertIn('performance', data['report']['analysis'])
         self.assertNotIn('cost', data['report']['analysis'])
@@ -528,7 +532,7 @@ class PricingActions(Actions):
 
     def test_drill_with_unpriced_parent_stays_unpriced(self):
         self.start_db()
-        parent = json.dumps(self.overview_report())
+        parent = json.dumps(self.overview_report({'pricing_mode': 'none'}))
         day = json.loads(parent)['days'][0]
         status, data = self.post({'action': 'report', 'seq': 2, 'harness': 'zcode', 'session': 's',
                                   'from': day['from'], 'to': day['to'], 'parent_report_text': parent})
@@ -542,10 +546,11 @@ class PerformanceActions(Actions):
     def test_report_saves_performance_samples_without_pricing(self):
         database = make_perf_database(self.root / 'perf.sqlite')
         self.start({'kind': 'zcode_database', 'paths': [str(database)]})
-        status, data = self.post({'action': 'report', 'seq': 1, 'harness': 'zcode', 'session': 's', 'to': END})
+        status, data = self.post({'action': 'report', 'seq': 1, 'harness': 'zcode', 'session': 's', 'to': END,
+                                  'pricing_mode': 'none'})
         self.assertTrue(data['ok'], data)
         analysis = data['report']['analysis']
-        self.assertNotIn('cost', analysis)  # 未配置价格也有性能区
+        self.assertNotIn('cost', analysis)  # 仅 token 模式也有性能区
         perf = analysis['performance']
         self.assertEqual(perf['source_kind'], 'zcode_database')
         ttft = perf['metrics']['ttft']
@@ -572,7 +577,7 @@ class PerformanceActions(Actions):
         self.start({'kind': 'zcode_database', 'paths': [str(database)]})
         saved = self.root / 'saved.json'
         self.cli('report', '--harness', 'zcode', '--database', str(database), '--session', 's',
-                 '--to', END, '--format', 'json', '--export', 'json', '--output', str(saved))
+                 '--to', END, '--no-pricing', '--format', 'json', '--export', 'json', '--output', str(saved))
         base = json.loads(saved.read_text())
 
         def reject(mutate, name):
@@ -619,10 +624,11 @@ class ToolActions(Actions):
     def test_report_saves_tool_duration_without_pricing(self):
         database = make_tool_database(self.root / 'db.sqlite')
         self.start({'kind': 'zcode_database', 'paths': [str(database)]})
-        status, data = self.post({'action': 'report', 'seq': 1, 'harness': 'zcode', 'session': 's', 'to': END})
+        status, data = self.post({'action': 'report', 'seq': 1, 'harness': 'zcode', 'session': 's', 'to': END,
+                                  'pricing_mode': 'none'})
         self.assertTrue(data['ok'], data)
         analysis = data['report']['analysis']
-        self.assertNotIn('cost', analysis)  # 未配置价格也有工具耗时区
+        self.assertNotIn('cost', analysis)  # 仅 token 模式也有工具耗时区
         metric = analysis['performance']['metrics']['tool_duration']
         self.assertEqual(metric['support']['status'], 'supported')
         aggregate = metric['aggregate']
@@ -651,7 +657,7 @@ class ToolActions(Actions):
         self.start({'kind': 'zcode_database', 'paths': [str(database)]})
         saved = self.root / 'saved.json'
         self.cli('report', '--harness', 'zcode', '--database', str(database), '--session', 's',
-                 '--to', END, '--format', 'json', '--export', 'json', '--output', str(saved))
+                 '--to', END, '--no-pricing', '--format', 'json', '--export', 'json', '--output', str(saved))
         base = json.loads(saved.read_text())
 
         def reject(mutate, name):
@@ -676,5 +682,364 @@ class ToolActions(Actions):
         self.assertIn('tool_duration', resp['report']['analysis']['performance']['metrics'])
 
 
+class UnifiedCaptureRegressions(unittest.TestCase):
+    """Ticket 08: the independent review's S03/S04/S05 reproductions, kept as regressions
+    for the unified guarded capture (digest and parse consume ONE finite read)."""
+
+    TURN_STARTED = {'event': 'turn.started', 'timestamp': '2026-09-01T00:00:00Z',
+                    'sessionId': 's', 'turnId': 'extra', 'context': {}}
+    TURN_COMPLETED = {'event': 'turn.completed', 'timestamp': '2026-09-01T00:01:00Z',
+                      'sessionId': 's', 'turnId': 'extra', 'context': {}}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='token-audit-capture-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    @staticmethod
+    def rollout_rows(value):
+        return ''.join(json.dumps(r) + '\n' for r in [
+            {'type': 'session_meta', 'timestamp': '2026-09-01T00:00:00Z', 'payload': {'id': 's'}},
+            {'type': 'token_usage_record', 'timestamp': '2026-09-01T00:01:00Z',
+             'payload': {'response_id': 'r', 'thread_id': 's', 'turn_id': 't',
+                         'usage': {'input_tokens': value, 'output_tokens': 1, 'cached_input_tokens': 0}}}])
+
+    def test_jsonl_swap_between_digest_and_parse_never_enters_cache(self):
+        # S03: the signature and the parse consume one captured read, so replacing the
+        # source after the digest can no longer store the new parse under the old key.
+        from token_audit import codex, parsecache
+        log = self.root / 'rollout.jsonl'
+        log.write_text(self.rollout_rows(100))
+        cache = parsecache.ParseCache()
+
+        def swap_then_parse(captured):
+            log.write_text(self.rollout_rows(900))  # mid-request source replacement
+            return codex.read_captured(captured)     # must parse the captured bytes
+
+        first = cache.cached_jsonl('codex', [str(log)], None, codex.discover, swap_then_parse)
+        self.assertEqual(first['records'][0]['metrics']['input']['value'], 100)
+        log.write_text(self.rollout_rows(100))  # restore exactly the digested content
+        warm = cache.cached_jsonl('codex', [str(log)], None, codex.discover, codex.read_captured)
+        fresh = codex.read([str(log)])
+        self.assertEqual(warm['records'][0]['metrics']['input']['value'],
+                         fresh['records'][0]['metrics']['input']['value'])
+
+    def test_nested_companion_append_refreshes_warm_result(self):
+        # S04: the companion signature covers the parser's recursive log discovery.
+        from token_audit import parsecache, webapp, zcode
+        nested = self.root / 'nested'
+        (nested / 'log' / 'archive').mkdir(parents=True)
+        db = make_database(nested / 'data.sqlite')
+        extra = nested / 'log' / 'archive' / 'events.jsonl'
+        extra.write_text(json.dumps(self.TURN_STARTED) + '\n')
+        guard = webapp.guard_for([{'kind': 'zcode_database', 'paths': [str(db)]}])
+        cache = parsecache.ParseCache()
+        cache.cached_database(db, guard, zcode.database_snapshot, zcode.companion_captures, zcode.parse_database)
+        extra.write_text(extra.read_text() + json.dumps(self.TURN_COMPLETED) + '\n')
+        warm = cache.cached_database(db, guard, zcode.database_snapshot, zcode.companion_captures, zcode.parse_database)
+        fresh = zcode.read_database(db, guard)
+        self.assertEqual(warm['sessions']['s']['turns']['extra']['status'],
+                         fresh['sessions']['s']['turns']['extra']['status'])
+        self.assertEqual(len(warm['events']), len(fresh['events']))
+
+    def test_companion_symlink_escape_rejected_on_hit_and_miss(self):
+        # S05: every actually-consumed companion path is guarded BEFORE any content
+        # read, on cache hits exactly like misses; identical external content is no exception.
+        from token_audit import parsecache, webapp, zcode
+        home = self.root / 'symlink'
+        (home / 'log').mkdir(parents=True)
+        db = make_database(home / 'data.sqlite')
+        target = home / 'log' / 'events.jsonl'
+        text = json.dumps(self.TURN_STARTED) + '\n'
+        target.write_text(text)
+        guard = webapp.guard_for([{'kind': 'zcode_database', 'paths': [str(db)]}])
+        cache = parsecache.ParseCache()
+        cache.cached_database(db, guard, zcode.database_snapshot, zcode.companion_captures, zcode.parse_database)
+        external = self.root / 'external.jsonl'
+        external.write_text(text)
+        target.unlink()
+        target.symlink_to(external)
+        with self.assertRaises(ValueError):
+            cache.cached_database(db, guard, zcode.database_snapshot, zcode.companion_captures, zcode.parse_database)
+        with self.assertRaises(ValueError):
+            zcode.read_database(db, guard)
+
+
+class ReReviewSourceEvidenceRegressions(unittest.TestCase):
+    """Ticket 08 re-review (2026-10-12): the rollout entry keeps its filename as
+    the session association (S08) and cache hits rebuild per-request sidecar
+    existence instead of restoring the previous source list (S09)."""
+
+    ROLLOUT_ROW = {'sessionId': 's', 'requestId': 'r', 'attempt': 0,
+                   'completedAt': '2026-09-01T00:01:00Z',
+                   'response': {'usage': {'inputTokens': 700, 'outputTokens': 0, 'cacheReadTokens': 0}},
+                   'model': {'providerId': 'builtin:bigmodel-coding-plan', 'modelId': 'GLM-5.3'}}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='token-audit-rereview-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def _query(self, db, guard, cache):
+        from token_audit import parsecache, zcode
+        return cache.cached_database(db, guard, zcode.database_snapshot,
+                                     zcode.companion_captures, zcode.parse_database)
+
+    def test_rollout_entry_name_keeps_session_association(self):
+        # S08: a root-internal rollout link keeps the ENTRY filename as the session
+        # association; bytes are read once from the resolved, guarded real path and
+        # the supplement stays out of the DB subtotal. A renamed entry changes the
+        # digest, so a warm query can never hit the old association's entry.
+        from token_audit import parsecache, webapp, zcode
+        home = self.root / 'linked'
+        (home / 'rollout').mkdir(parents=True)
+        db = make_database(home / 'data.sqlite')
+        target = home / 'rollout' / 'storage.jsonl'
+        target.write_text(json.dumps(self.ROLLOUT_ROW) + '\n')
+        (home / 'rollout' / 'model-io-s.jsonl').symlink_to(target)
+        guard = webapp.guard_for([{'kind': 'zcode_database', 'paths': [str(db)]}])
+        cache = parsecache.ParseCache()
+        for label in ('cold', 'warm'):
+            data = self._query(db, guard, cache)
+            alternates = data['alternate_sources']
+            self.assertEqual([alt['session'] for alt in alternates], ['s'], label)
+            self.assertEqual(alternates[0]['metrics']['input']['value'], 700, label)
+            self.assertTrue(alternates[0]['path'].endswith('model-io-s.jsonl'), label)
+            # The readable supplement is displayed, never merged into the DB subtotal.
+            self.assertEqual(len(data['records']), 3, label)
+            self.assertEqual(sum(r['metrics']['input']['value'] for r in data['records']), 1300, label)
+        fresh = zcode.read_database(db, guard)
+        self.assertEqual([alt['session'] for alt in fresh['alternate_sources']], ['s'])
+        # Association change: the entry now names a session the DB does not know, so
+        # the digest misses and the warm result matches a fresh parse (no old hit).
+        (home / 'rollout' / 'model-io-s.jsonl').rename(home / 'rollout' / 'model-io-t.jsonl')
+        warm = self._query(db, guard, cache)
+        fresh = zcode.read_database(db, guard)
+        self.assertEqual(warm['alternate_sources'], [])
+        self.assertEqual(warm['alternate_sources'], fresh['alternate_sources'])
+
+    def test_warm_source_list_rebuilds_volatile_sidecars(self):
+        # S09: which -wal/-shm sidecars exist is per-request evidence. Table content
+        # unchanged means the parse is reused, but the warm source list must equal a
+        # fresh parse's — a deleted WAL never re-enters, a later SHM does enter.
+        from token_audit import parsecache, webapp, zcode
+        home = self.root / 'sidecars'
+        home.mkdir()
+        db = make_database(home / 'data.sqlite')
+        # database_snapshot resolves the source (/var → /private/var on macOS), so
+        # the sidecar expectations must use the resolved spelling too.
+        resolved = Path(db).resolve()
+        wal, shm = Path(str(resolved) + '-wal'), Path(str(resolved) + '-shm')
+        wal.write_bytes(b'')
+        guard = webapp.guard_for([{'kind': 'zcode_database', 'paths': [str(db)]}])
+        cache = parsecache.ParseCache()
+        cold = self._query(db, guard, cache)
+        self.assertIn(str(wal), cold['source_files'])
+        wal.unlink()
+        warm = self._query(db, guard, cache)
+        fresh = zcode.read_database(db, guard)
+        self.assertEqual(warm['source_files'], fresh['source_files'])
+        self.assertNotIn(str(wal), warm['source_files'])
+        shm.write_bytes(b'')
+        warm = self._query(db, guard, cache)
+        fresh = zcode.read_database(db, guard)
+        self.assertIn(str(shm), warm['source_files'])
+        self.assertEqual(warm['source_files'], fresh['source_files'])
+
+
 if __name__ == '__main__':
     unittest.main()
+
+
+class PricingModeActions(PricingActions):
+    """Ticket 01: HTTP pricing_mode matrix — default/custom/none and their exclusivity."""
+
+    def test_default_mode_prices_with_bundled_snapshot(self):
+        self.start_db()
+        status, data = self.post({'action': 'report', 'seq': 1, 'harness': 'zcode', 'session': 's',
+                                  'to': END, 'pricing_mode': 'default'})
+        self.assertTrue(data['ok'], data)
+        cost = data['report']['analysis']['cost']
+        self.assertEqual(cost['config']['schema_version'], 2)
+        shipped = json.loads((ENTRY.parents[1] / 'pricing/default.json').read_text())['snapshot']
+        self.assertEqual(cost['config']['revision'], shipped)
+        # make_database rows are GLM-5.3 under builtin:bigmodel-coding-plan: no bounds, no retry needed.
+        self.assertEqual(cost['records'][0]['matched']['rule_id'], 'bigmodel/GLM-5.3/standard')
+        self.assertEqual(cost['records'][0]['matched']['mapping_id'], 'bigmodel-plan/builtin-coding/GLM-5.3')
+        self.assertEqual(cost['summary']['currencies']['CNY']['amount'], '0.0104')
+
+    def test_mode_matrix_rejections(self):
+        self.start_db()
+        cases = [
+            ({'action': 'report', 'harness': 'zcode', 'session': 's', 'to': END,
+              'pricing_mode': 'custom'}, '自定义价格模式需要提交价格配置文本'),
+            ({'action': 'report', 'harness': 'zcode', 'session': 's', 'to': END,
+              'pricing_mode': 'default', 'pricing_text': self.pricing_cfg()}, '不得夹带价格配置文本'),
+            ({'action': 'report', 'harness': 'zcode', 'session': 's', 'to': END,
+              'pricing_mode': 'none', 'pricing_text': self.pricing_cfg()}, '不得夹带价格配置文本'),
+            ({'action': 'sessions', 'harness': 'zcode', 'pricing_mode': 'default'}, '默认价格仅用于'),
+            ({'action': 'sessions', 'harness': 'zcode', 'pricing_mode': 'none'}, '仅 token 模式只用于'),
+            ({'action': 'report', 'harness': 'zcode', 'session': 's', 'to': END,
+              'pricing_mode': 'weird'}, '价格模式必须是'),
+        ]
+        for payload, fragment in cases:
+            status, data = self.post(dict(payload, seq=7))
+            self.assertEqual(status, 400, payload)
+            self.assertIn(fragment, data['error'], payload)
+
+    def test_none_mode_only_for_independent_new_queries(self):
+        self.start_db()
+        status, data = self.post({'action': 'report', 'seq': 1, 'harness': 'zcode', 'session': 's',
+                                  'to': END, 'pricing_mode': 'none'})
+        self.assertTrue(data['ok'], data)
+        self.assertNotIn('cost', data['report']['analysis'])
+        saved = self.root / 'saved.json'
+        self.cli('report', '--harness', 'zcode', '--database', str(self.root / 'db.sqlite'),
+                 '--session', 's', '--to', END, '--format', 'json', '--export', 'json', '--output', str(saved))
+        status, data = self.post({'action': 'recompute', 'seq': 2, 'pricing_mode': 'none',
+                                  'report_text': saved.read_text()})
+        self.assertEqual(status, 400)
+        self.assertIn('仅 token', data['error'])
+        status, data = self.post({'action': 'export', 'seq': 3, 'format': 'json',
+                                  'pricing_mode': 'default', 'report_text': saved.read_text()})
+        self.assertEqual(status, 400)
+        self.assertIn('导出', data['error'])
+
+    def test_drilled_child_uses_parent_snapshot_and_rejects_new_choice(self):
+        self.start_db()
+        parent = json.dumps(self.overview_report())
+        day = json.loads(parent)['days'][0]
+        status, data = self.post({'action': 'report', 'seq': 2, 'harness': 'zcode', 'session': 's',
+                                  'from': day['from'], 'to': day['to'], 'parent_report_text': parent})
+        self.assertTrue(data['ok'], data)
+        shipped = json.loads((ENTRY.parents[1] / 'pricing/default.json').read_text())['snapshot']
+        self.assertEqual(data['report']['analysis']['cost']['config']['revision'], shipped)
+        status, data = self.post({'action': 'report', 'seq': 3, 'harness': 'zcode', 'session': 's',
+                                  'from': day['from'], 'to': day['to'], 'parent_report_text': parent,
+                                  'pricing_mode': 'default'})
+        self.assertEqual(status, 400)
+        self.assertIn('下钻', data['error'])
+        status, data = self.post({'action': 'report', 'seq': 4, 'harness': 'zcode', 'session': 's',
+                                  'from': day['from'], 'to': day['to'], 'parent_report_text': parent,
+                                  'pricing_text': self.pricing_cfg()})
+        self.assertEqual(status, 400)
+        self.assertIn('下钻', data['error'])
+
+
+class TimePresetActions(PricingActions):
+    """Ticket 04: HTTP time_preset matrix on the overview action."""
+
+    def test_preset_overview_and_saved_absolute_bounds(self):
+        self.start_db()
+        # HTTP presets anchor on the service entry time only; the response reports the
+        # resolved absolute bounds, and last_7d is exactly to - 168h.
+        status, data = self.post({'action': 'overview', 'seq': 1, 'harness': 'zcode',
+                                  'time_preset': 'last_7d', 'tz': '+08:00'})
+        self.assertTrue(data['ok'], data)
+        scope = data['report']['scope']
+        expected = (datetime.fromisoformat(scope['to'].replace('Z', '+00:00')) - timedelta(hours=168)).isoformat()
+        self.assertEqual(scope['from'], expected)
+        self.assertEqual(scope['cutoff_source'], 'web_request_start')
+
+    def test_preset_rejections(self):
+        self.start_db()
+        cases = [
+            ({'action': 'overview', 'harness': 'zcode', 'time_preset': 'last_7d',
+              'from': '2026-01-01T00:00:00Z'}, '互斥'),
+            ({'action': 'overview', 'harness': 'zcode', 'time_preset': 'last_7d',
+              'to': END}, '互斥'),  # HTTP presets anchor on the entry time only, never a submitted to
+            ({'action': 'overview', 'harness': 'zcode', 'time_preset': 'nope'}, '时间快捷必须是'),
+            ({'action': 'report', 'harness': 'zcode', 'session': 's', 'time_preset': 'today'}, '只用于独立的新整体查询'),
+        ]
+        for payload, fragment in cases:
+            status, data = self.post(dict(payload, seq=5))
+            if fragment is None:
+                self.assertTrue(data['ok'], data)
+            else:
+                self.assertEqual(status, 400, payload)
+                self.assertIn(fragment, data['error'], payload)
+        saved = self.root / 'ov.json'
+        self.cli('overview', '--harness', 'zcode', '--database', str(self.root / 'db.sqlite'),
+                 '--to', END, '--format', 'json', '--export', 'json', '--output', str(saved))
+        status, data = self.post({'action': 'recompute', 'seq': 6, 'time_preset': 'today',
+                                  'report_text': saved.read_text()})
+        self.assertEqual(status, 400)
+        self.assertIn('只用于独立的新整体查询', data['error'])
+
+
+class ParseCacheActions(PricingActions):
+    """Ticket 06: bounded in-process parse reuse behind the real service."""
+
+    def test_warm_equals_cold_and_isolation_between_queries(self):
+        database = self.start_db()
+        cold = self.post({'action': 'overview', 'seq': 1, 'harness': 'zcode',
+                          'from': '2026-01-01T00:00:00Z', 'to': END, 'tz': '+00:00'})
+        warm = self.post({'action': 'overview', 'seq': 2, 'harness': 'zcode',
+                          'from': '2026-01-01T00:00:00Z', 'to': END, 'tz': '+00:00'})
+        self.assertTrue(cold[1]['ok'] and warm[1]['ok'])
+        a, b = cold[1]['report'], warm[1]['report']
+        self.assertEqual(a['records'], b['records'])
+        self.assertEqual(a['summary'], b['summary'])
+        self.assertNotEqual(a['read_at'], b['read_at'])  # read_at is never reused
+        # Different display timezone on the warm cache re-buckets days (no whole-report
+        # reuse: scope/tz/pricing are applied per request on the isolated copy).
+        shifted = self.post({'action': 'overview', 'seq': 3, 'harness': 'zcode',
+                             'from': '2026-01-01T00:00:00Z', 'to': END, 'tz': '+05:00'})
+        self.assertTrue(shifted[1]['ok'])
+        self.assertEqual(shifted[1]['report']['records'], a['records'])
+        self.assertNotEqual(shifted[1]['report']['days'], a['days'])
+
+    def test_source_change_invalidates_cache(self):
+        import sqlite3 as _sql
+        database = self.start_db()
+        first = self.post({'action': 'overview', 'seq': 1, 'harness': 'zcode',
+                           'from': '2026-01-01T00:00:00Z', 'to': END, 'tz': '+00:00'})
+        # Append one more usage row to the live source (isolated test copy, not user data).
+        with _sql.connect(str(database)) as db:
+            db.execute('INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                       ('zz-extra', 'lr-z', 0, 's', 't1', 'main_turn', 'builtin:bigmodel-coding-plan',
+                        'GLM-5.3', 'completed', T0 + 300, T1 + 400, 60000, 0,
+                        json.dumps({'inputTokens': 111, 'outputTokens': 11, 'cacheReadTokens': 0,
+                                    'totalTokens': 122})))
+        second = self.post({'action': 'overview', 'seq': 2, 'harness': 'zcode',
+                            'from': '2026-01-01T00:00:00Z', 'to': END, 'tz': '+00:00'})
+        self.assertTrue(second[1]['ok'])
+        self.assertEqual(len(second[1]['report']['records']), len(first[1]['report']['records']) + 1)
+
+    def test_jsonl_cache_reuse_and_bounds(self):
+        from test_cli import pmeta, tctx, usage as usage_row
+        log = self.root / 'live.jsonl'
+        log.write_text(''.join(json.dumps(r) + '\n' for r in [pmeta(), tctx(), usage_row()]))
+        # Serve the parent directory under the codex harness (the row format above) so
+        # later content swaps stay inside the guard.
+        self.app = webapp.WebApp({'codex': {'kind': 'jsonl', 'paths': [str(self.root)]}})
+        webapp.Handler.app = self.app
+        from http.server import ThreadingHTTPServer
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), webapp.Handler)
+        self.server.daemon_threads = True
+        self.addCleanup(self.server.server_close)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f'http://127.0.0.1:{self.server.server_address[1]}/api/action'
+        self.headers = {'Content-Type': 'application/json', 'X-Token-Audit-Token': self.app.credential}
+        r1 = self.post({'action': 'overview', 'seq': 1, 'harness': 'codex',
+                        'from': '2026-01-01T00:00:00Z', 'to': END, 'tz': '+00:00'})
+        r2 = self.post({'action': 'overview', 'seq': 2, 'harness': 'codex',
+                        'from': '2026-01-01T00:00:00Z', 'to': END, 'tz': '+00:00'})
+        self.assertTrue(r1[1]['ok'] and r2[1]['ok'])
+        self.assertEqual(r1[1]['report']['records'], r2[1]['report']['records'])
+        # Content change at the same path: the digest misses and the new parse wins.
+        log.write_text(''.join(json.dumps(r) + '\n' for r in [pmeta(), tctx(model='gpt-5.6-terra'), usage_row()]))
+        r3 = self.post({'action': 'overview', 'seq': 3, 'harness': 'codex',
+                        'from': '2026-01-01T00:00:00Z', 'to': END, 'tz': '+00:00'})
+        self.assertTrue(r3[1]['ok'], r3[1])
+        models = {r['model'] for r in r3[1]['report']['records']}
+        self.assertEqual(models, {'gpt-5.6-terra'})
+        # Eviction bound: an over-limit cache still answers correctly via the plain path.
+        self.app.parse_cache._max_entries = 1
+        self.app.parse_cache._max_bytes = 1
+        self.app.parse_cache._entries.clear()
+        self.app.parse_cache._bytes = 0
+        r4 = self.post({'action': 'overview', 'seq': 4, 'harness': 'codex',
+                        'from': '2026-01-01T00:00:00Z', 'to': END, 'tz': '+00:00'})
+        self.assertTrue(r4[1]['ok'])
+        self.assertEqual({r['model'] for r in r4[1]['report']['records']}, {'gpt-5.6-terra'})
