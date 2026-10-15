@@ -29,6 +29,12 @@
                                                           // 匹配的快照；两级同时声明须为同一映射
          "per_stem_map": "docs/source_en.images_display.json",  // 单快照旧写法（有图时关联两级映射）
          "table_conversions": "docs/table_conversions.json",    // 可选逐表转换映射
+         "source_adaptation": "docs/source_adaptation.json",    // 可选：LaTeXML 来源依据
+                                                                // （version:1/format:latexml；
+                                                                //  预检独立核对快照摘要/论文身份/对应；
+                                                                //  单快照用本条目级字段；多快照改由
+                                                                //  每个快照字典各自声明
+                                                                //  "source_adaptation"）
          "covers": ["01_章.md"]}}],               // 该源链覆盖的交付输入
       "checks": [
         {"tool": "verify_pdf",
@@ -70,7 +76,10 @@ JSON；check.report 字段可保留但不影响判断。导出报告与已绑定
 图片资源、映射、环境与样式政策）计算期望上下文，记录的 binding 与期望
 不符或缺失即须重新复核，不自动补签；旧记录的零散绑定字段
 （source_sha256/checker/semantic_args）不构成完整上下文。visual 复核须
-逐项列明报告中的待复核 segment（items）。
+逐项列明报告中的待复核 segment（items）。数字辅助（--numeric-review）
+启用时，同一消费扩展到实际译文输入的 semantic 分类：本次数字差异 ID
+按目标、类别及次数逐项闭合，零差异不省略独立语义复核；统计提示不能
+覆盖公式/代码/标题/图片/脚注/强 token 的硬失败。
 
 发布只切换索引：全部检查与复核通过后，报告（含导出证据副本）写入证据
 目录内一个新的独立批次，重读核对摘要（归档导出报告须与核验前基线版本
@@ -303,25 +312,47 @@ def check_identities(root, record, problems):
 CHECK_SHARED_DEPS = {
     "verify_pdf": ("verify_pdf.py", "export_pdf.py", "_verification.py",
                    "_html_fidelity.py", "_source_reconcile.py",
-                   "_image_binding.py", "_image_preflight.py"),
+                   "_image_binding.py", "_image_preflight.py",
+                   "_latexml_source.py"),
     "verify_translation": ("verify_translation.py", "_verification.py",
-                           "_html_fidelity.py", "_source_reconcile.py"),
+                           "_official_headings.py", "_html_fidelity.py",
+                           "_source_reconcile.py", "_latexml_source.py",
+                           "_numeric_review.py", "_pdf_math.py", "_pdf_source.py",
+                           "recover_work_packages.py"),
     "verify_paginated_translation": ("verify_paginated_translation.py",
-                                     "_verification.py", "_html_fidelity.py",
-                                     "_source_reconcile.py"),
+                                     "_verification.py",
+                                     "_official_headings.py",
+                                     "_html_fidelity.py",
+                                     "_source_reconcile.py",
+                                     "_numeric_review.py"),
     "verify_reference_translation": ("verify_reference_translation.py",
-                                     "_verification.py", "_html_fidelity.py",
-                                     "_source_reconcile.py"),
+                                     "_verification.py",
+                                     "_official_headings.py",
+                                     "_html_fidelity.py",
+                                     "_source_reconcile.py",
+                                     "_latexml_source.py",
+                                     "_numeric_review.py"),
     "verify_api_translation": ("verify_api_translation.py",
-                               "_verification.py", "_html_fidelity.py",
-                               "_source_reconcile.py"),
-    "verify_pdf_source": ("verify_pdf_source.py", "_pdf_source.py",
-                          "_verification.py"),
+                               "_verification.py", "_official_headings.py",
+                               "_html_fidelity.py", "_source_reconcile.py",
+                               "_numeric_review.py"),
+    "verify_pdf_source": ("verify_pdf_source.py", "_pdf_source.py", "_pdf_math.py",
+                          "_verification.py", "_numeric_review.py", "_source_reconcile.py",
+                          "_html_fidelity.py"),
 }
+
+# 术语读取/选择/整合脚本（D6/D7 有限依赖集合）：它们是项目术语口径的
+# 实际判断者，口径变化使依赖项目术语的复核结论失效。各翻译家族检查器
+# 不调用这些脚本，因此不并入其 shared_deps，单独投影进交付身份。
+# R5 收窄：仅交付记录登记了项目术语表文件（实际使用术语）时投影；
+# 未使用术语的交付身份中 glossary 维度为 None，脚本变化不影响其复核。
+GLOSSARY_SHARED_DEPS = ("glossary_markdown.py", "select_glossary.py",
+                        "consolidate_glossaries.py")
 
 # 运行环境版本按复核目标投影（§9.3）：翻译检查覆盖其实际调用的
 # BeautifulSoup/tinycss2/markdown-it-py、图片资源处理所用 Pillow 与
-# Python；PDF 检查另含 pypdf/uniseg。不混入其他目标独有的依赖。
+# Python；PDF 检查另含 pypdf/uniseg 及脚注插件 mdit-py-plugins（导出
+# 渲染与成品核验的脚注结构实际消费者）。不混入其他目标独有的依赖。
 TRANSLATION_ENV_KEYS = ("python", "beautifulsoup4", "tinycss2",
                         "markdown-it-py", "pillow")
 
@@ -351,6 +382,13 @@ def _environment_identity():
     except ImportError:
         versions["markdown-it-py"] = None
     try:
+        import mdit_py_plugins
+
+        versions["mdit-py-plugins"] = getattr(
+            mdit_py_plugins, "__version__", "unknown")
+    except ImportError:
+        versions["mdit-py-plugins"] = None
+    try:
         import pypdf
 
         versions["pypdf"] = getattr(pypdf, "__version__", "unknown")
@@ -375,11 +413,34 @@ def _digest_or_none(path):
     return sha256_file(path) if os.path.isfile(path) else None
 
 
+def _glossary_identity(root, record):
+    """术语口径身份（D6/D7）：术语读取/选择脚本摘要 + 交付根登记为
+    glossary 角色的项目术语表摘要。显式依赖集合，不扫描整个仓库；
+    修改检查器或项目术语表即改变交付身份，须重新复核。
+
+    按实际使用收窄投影（R5）：交付记录未登记项目术语表文件的，不
+    投影术语维度（返回 None）——术语脚本口径变化不影响未使用术语的
+    交付复核有效性。"""
+    files = {}
+    root_abs = os.path.realpath(root)
+    for rel, role in (record.get("files") or {}).items():
+        if role != "glossary":
+            continue
+        path = rel if os.path.isabs(rel) else os.path.normpath(
+            os.path.join(root_abs, rel))
+        files[rel] = _digest_or_none(path)
+    if not files:
+        return None
+    scripts = {name: _digest_or_none(os.path.join(SCRIPTS_DIR, name))
+               for name in GLOSSARY_SHARED_DEPS}
+    return {"scripts": scripts, "files": files}
+
+
 def _source_identity(entry, rooted):
     """单条源链的依赖身份：全部按声明路径重新枚举计算，不沿用缓存值。"""
     if entry.get("family") == PDF_SOURCE_FAMILY:
         return _pdf_source_identity(entry, rooted)
-    return {
+    identity = {
         "parsed_markdown": entry["parsed_markdown"],
         "parsed_sha256": _digest_or_none(rooted(entry["parsed_markdown"])),
         "snapshots": [{
@@ -398,10 +459,21 @@ def _source_identity(entry, rooted):
                 "path": entry["table_conversions"],
                 "sha256": _digest_or_none(rooted(entry["table_conversions"]))}),
     }
+    # LaTeXML 来源依据（D1）：实际适配器及有关检查依赖的当前内容身份；
+    # 逐快照列表与 snapshots 对齐（多快照每份依据的路径+摘要都进统一
+    # 身份，单快照即长度 1）
+    adaptations = [a for a in (entry.get("_source_adaptations") or [])
+                   if a is not None]
+    if adaptations:
+        identity["source_adaptations"] = [
+            {"path": declared,
+             "sha256": _digest_or_none(rooted(declared))}
+            for _payload, declared in adaptations]
+    return identity
 
 
 def _snapshot_source_facts(family, snapshots, rooted, problems=None,
-                           label="源链"):
+                           label="源链", substitutions=None):
     """逐快照枚举实际图片资源事实（§9.3 单一事实来源）。
 
     从每份原始 HTML 的实际家族选区枚举（复用 _source_reconcile 的既有
@@ -419,7 +491,7 @@ def _snapshot_source_facts(family, snapshots, rooted, problems=None,
     from _verification import resource_identity_digest
 
     per_snapshot = []
-    for snap in snapshots or []:
+    for index, snap in enumerate(snapshots or []):
         declared = snap["snapshot"]
         snapshot_path = rooted(declared)
         snapshot_dir = os.path.dirname(snapshot_path)
@@ -444,12 +516,31 @@ def _snapshot_source_facts(family, snapshots, rooted, problems=None,
                                 "资源" % (label, declared))
             per_snapshot.append(record)
             continue
+        # substitutions 为与 snapshots 对齐的逐快照列表（多快照每份依据
+        # 各随快照，§4.6/F7）或单一字典（旧调用口径），两者皆可。
+        if isinstance(substitutions, (list, tuple)):
+            snap_subs = substitutions[index] \
+                if index < len(substitutions) else None
+        else:
+            snap_subs = substitutions
         for fact in facts:
             path, reason = resolve_snapshot_resource(
                 fact["source_ref"], snapshot_dir)
             digest = (resource_identity_digest(path)
                       if path is not None else None)
-            if problems is not None and digest is None:
+            sub = (snap_subs or {}).get(fact["source_ref"])
+            if sub is not None:
+                # 05-4：原资源缺失由已证明的替换关系闭合——逐项重读
+                # PDF/产物重算摘要；不完整即拒绝，不以空摘要放行
+                if digest is not None:
+                    if problems is not None:
+                        problems.append(
+                            "%s 的快照 %s 原资源 %s 可读却声明替换"
+                            % (label, declared, fact["source_ref"]))
+                else:
+                    digest = _substitution_product_digest(sub, problems,
+                                                          label, declared)
+            elif problems is not None and digest is None:
                 problems.append(
                     "%s 的快照 %s 图片资源无法确定身份: %s（%s）"
                     % (label, declared, fact["source_ref"],
@@ -463,6 +554,59 @@ def _snapshot_source_facts(family, snapshots, rooted, problems=None,
             })
         per_snapshot.append(record)
     return per_snapshot
+
+
+def _substitution_product_digest(sub, problems, label, declared):
+    '重算替换产物身份；PDF/产物摘要、页/区域与裁剪口径缺一即拒绝。'
+    import hashlib as _hashlib
+    import os as _os
+    pdf = sub.get("pdf") or {}
+    pdf_path = pdf.get("path")
+    pdf_digest = pdf.get("sha256")
+    if not pdf_path or not pdf_digest:
+        problems.append("%s 的快照 %s 替换缺 PDF 路径/摘要（缺必需摘要）"
+                        % (label, declared))
+        return None
+    if not _os.path.isfile(pdf_path):
+        problems.append("%s 的快照 %s 替换 PDF 不可读: %s"
+                        % (label, declared, pdf_path))
+        return None
+    actual = _hashlib.sha256(open(pdf_path, "rb").read()).hexdigest()
+    if actual != pdf_digest:
+        problems.append("%s 的快照 %s 替换 PDF 版本/身份不符: 声明 %s… vs "
+                        "实际 %s…" % (label, declared, pdf_digest[:12],
+                                     actual[:12]))
+        return None
+    for key in ("page", "rect"):
+        if sub.get(key) is None:
+            problems.append("%s 的快照 %s 替换缺对应 %s（区域不明）"
+                            % (label, declared, key))
+            return None
+    if not ((sub.get("crop") or {}).get("basis")):
+        problems.append("%s 的快照 %s 替换缺裁剪口径" % (label, declared))
+        return None
+    product = sub.get("product") or {}
+    product_path = product.get("path")
+    product_digest = product.get("sha256")
+    if not product_path or not product_digest:
+        problems.append("%s 的快照 %s 替换缺产物路径/摘要" % (label, declared))
+        return None
+    if not _os.path.isfile(product_path):
+        problems.append("%s 的快照 %s 替换产物不可读: %s"
+                        % (label, declared, product_path))
+        return None
+    actual = _hashlib.sha256(open(product_path, "rb").read()).hexdigest()
+    if actual != product_digest:
+        problems.append("%s 的快照 %s 替换产物摘要不符: 声明 %s… vs 实际 %s…"
+                        % (label, declared, product_digest[:12],
+                           actual[:12]))
+        return None
+    for key in ("identity_basis", "visual_basis"):
+        if not (sub.get(key) or "").strip():
+            problems.append("%s 的快照 %s 替换缺 %s（依据不完整）"
+                            % (label, declared, key))
+            return None
+    return product_digest
 
 
 def _snapshot_ranges(snapshots, parsed_path, problems, label):
@@ -526,8 +670,18 @@ def _resource_identities(text, base_dir):
     return identities
 
 
-def _source_entries(record):
-    return record.get("sources") or []
+def _source_list(value, label, problems):
+    """来源声明的有限数组边界；错误不能按空声明取得资格。"""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    problems.append("%s 必须是列表" % label)
+    return []
+
+
+def _source_entries(record, problems):
+    return _source_list(record.get("sources"), "sources", problems)
 
 
 def _load_pdf_checklist(path, label, problems):
@@ -571,6 +725,11 @@ def _pdf_checklist_assets(payload):
     return goldens, images
 
 
+_PDF_SOURCE_FILES = {"pdf": "只读 PDF 源", "checklist": "裁决清单",
+                     "layout_snapshot": "保版面文本快照",
+                     "reading_snapshot": "通读文本快照"}
+
+
 def _check_pdf_source_chain(root, entry, order, problems):
     """PDF 源链预检（§4.6）：字段与必需文件、golden/图片来源证明。
 
@@ -597,9 +756,7 @@ def _check_pdf_source_chain(root, entry, order, problems):
     if not isinstance(version, str) or not version.strip():
         problems.append("%s 缺少 source_version，不能宣称同版本" % label)
         return None
-    required = {"pdf": "只读 PDF 源", "checklist": "裁决清单",
-                "layout_snapshot": "保版面文本快照",
-                "reading_snapshot": "通读文本快照"}
+    required = _PDF_SOURCE_FILES
     missing = [name for name in required if not entry.get(name)]
     if missing:
         problems.append("%s 缺少必需字段: %s（%s）"
@@ -607,8 +764,7 @@ def _check_pdf_source_chain(root, entry, order, problems):
                            "、".join(required[name] for name in missing)))
         return None
     digests = {}
-    for name in ("pdf", "checklist", "layout_snapshot",
-                 "reading_snapshot"):
+    for name in required:
         path = rooted(entry[name])
         if not os.path.isfile(path):
             problems.append("%s 的%s缺失: %s"
@@ -694,6 +850,90 @@ def _check_pdf_source_chain(root, entry, order, problems):
         "_pdf_images": images,
         "_pdf_digests": digests,
     }
+
+
+def source_dependency_paths(root, record, problems, *, entries=None):
+    """辅助输出的来源保护：声明与当前来源事实共用，不授予来源资格。
+
+    不可读来源仍保留已知路径及可读裁决资产；调用方决定拒绝或逐项诊断。
+    PDF 必需文件与准入共用合同，默认映射与裁决资产沿用现有解释。
+    """
+    from pathlib import Path
+    from _verification import (image_references, image_marker_refs,
+                               resource_identity_digest, _clean_reference_target)
+    root = Path(root).resolve()
+    paths, documents = set(), set()
+
+    def add(value, base=root):
+        if isinstance(value, dict):
+            value = value.get('path')
+        if isinstance(value, str) and value:
+            path = (base / value).resolve()
+            paths.add(path)
+            return path
+
+    def resource(path):
+        paths.add(Path(path).resolve())
+        memo = {}
+        resource_identity_digest(str(path), _memo=memo)
+        paths.update(Path(p).resolve() for p in memo)
+
+    for source in _source_entries(record, problems):
+        # 仅投影可解析声明；非对象仍由 check_source_chains 逐项诊断。
+        if not isinstance(source, dict):
+            continue
+        parsed = add(source.get('source_markdown') or source.get('parsed_markdown'))
+        if parsed:
+            documents.add(parsed)
+        for declaration in [source] + _source_list(source.get('snapshots'), 'snapshots', problems):
+            if not isinstance(declaration, dict):
+                continue
+            for field in ('snapshot', 'per_stem_map', 'table_conversions', 'source_adaptation'):
+                add(declaration.get(field))
+        if source.get('family') != PDF_SOURCE_FAMILY:
+            continue
+        for field in _PDF_SOURCE_FILES:
+            add(source.get(field))
+        if parsed:
+            add(source.get('block_map') or str(parsed)+'.blocks.json')
+            add(str(parsed)+'.images_display.json')
+        checklist = add(source.get('checklist'))
+        if checklist:
+            payload = _load_pdf_checklist(str(checklist), '来源保护', problems)
+            if payload is not None:
+                goldens, images = _pdf_checklist_assets(payload)
+                for item in goldens:
+                    add(item['path'], checklist.parent)
+                for item in images:
+                    resource(add(item['path'], checklist.parent))
+    if entries is None:
+        try:
+            entries = check_source_chains(str(root), record, problems, source_only=True)
+        except (OSError, ValueError) as exc:
+            problems.append('来源依赖预读失败: %s' % exc)
+            entries = []
+    for entry in entries:
+        documents.add(add(entry['_parsed_abs']))
+        for adaptation in entry.get('_source_adaptations', []) or []:
+            if adaptation:
+                add(adaptation[1])
+        for facts in entry.get('_source_facts', []) or []:
+            for item in (facts or {}).get('images', []):
+                if item.get('path'):
+                    resource(item['path'])
+    for document in documents:
+        if not document.is_file():
+            continue
+        try:
+            text = document.read_text(encoding='utf-8')
+        except (OSError, ValueError) as exc:
+            problems.append('来源依赖正文不可读: %s（%s）' % (document, exc))
+            continue
+        for _, ref in image_references(text) + image_marker_refs(text):
+            path = _clean_reference_target(ref, str(document.parent))
+            if path:
+                resource(path)
+    return paths
 
 
 def _check_pdf_parse_map(root, entry, problems):
@@ -814,7 +1054,7 @@ def _run_pdf_source_reconcile(root, entry, problems):
                                     problems)
     diffs = []
     if checklist is not None:
-        with open(rooted(entry["parsed_markdown"]), encoding="utf-8") as fh:
+        with open(rooted(entry["parsed_markdown"]), encoding="utf-8", newline='') as fh:
             md_text = fh.read()
         with open(rooted(entry["block_map"]), encoding="utf-8") as fh:
             payload = json.load(fh)
@@ -840,7 +1080,7 @@ def _run_pdf_source_reconcile(root, entry, problems):
     }
 
 
-def check_source_chains(root, record, problems):
+def check_source_chains(root, record, problems, *, source_only=False):
     """源链预检（§4.7）：解析 Markdown → 同版本快照、家族/版本与选区。
 
     每份实际英文输入都须关联快照与选区；选区不存在、快照缺失、
@@ -859,7 +1099,7 @@ def check_source_chains(root, record, problems):
             os.path.join(root_abs, rel))
 
     declared_markdowns = []
-    for order, entry in enumerate(_source_entries(record), start=1):
+    for order, entry in enumerate(_source_entries(record, problems), start=1):
         label = "源链 #%d" % order
         if not isinstance(entry, dict):
             problems.append("%s 必须是对象" % label)
@@ -892,7 +1132,8 @@ def check_source_chains(root, record, problems):
             continue
         snapshots = []
         snap_map_decls = []
-        for snap in entry.get("snapshots") or []:
+        snap_adapt_decls = []
+        for snap in _source_list(entry.get("snapshots"), label + " 的 snapshots", problems):
             if not isinstance(snap, dict) or not isinstance(
                     snap.get("snapshot"), str):
                 problems.append("%s 的 snapshots 项需要 snapshot 路径" % label)
@@ -907,6 +1148,11 @@ def check_source_chains(root, record, problems):
                 problems.append("%s 的 section_id 无效: %r"
                                 % (label, section_id))
                 continue
+            adapt_decl = snap.get("source_adaptation")
+            if adapt_decl is not None and not isinstance(adapt_decl, str):
+                problems.append("%s 的快照 %s 的 source_adaptation 无效: %r"
+                                % (label, snap["snapshot"], adapt_decl))
+                continue
             map_decl = snap.get("per_stem_map")
             if map_decl is not None and not isinstance(map_decl, str):
                 problems.append("%s 的快照 %s 的 per_stem_map 无效: %r"
@@ -919,6 +1165,7 @@ def check_source_chains(root, record, problems):
                 "range": snap.get("range"),
             })
             snap_map_decls.append(map_decl)
+            snap_adapt_decls.append(adapt_decl)
         if not snapshots:
             problems.append("%s 未声明任何快照" % label)
             continue
@@ -1070,9 +1317,32 @@ def check_source_chains(root, record, problems):
                             bound_index].pop("_payload")
         for snap_dict, map_info in zip(snapshots, snap_maps):
             snap_dict["per_stem_map"] = map_info
-        # 逐快照枚举实际图片资源事实（原始引用与资源上下文）
+        # 逐快照枚举实际图片资源事实（原始引用与资源上下文）；声明了
+        # 来源依据时读取 resource_substitutions（05：原资源缺失由已证明
+        # 的替换关系闭合，不以空摘要放行）。依据口径随快照声明方式：
+        # 单快照沿用条目级 source_adaptation；多快照每份依据各随快照
+        # 字典声明（资源基点各随快照目录，§4.6/F7）。
+        def _load_subs(decl):
+            try:
+                with open(rooted(decl), encoding="utf-8") as handle:
+                    _adapt_payload = json.load(handle)
+                return {e.get("original_ref"): e for e in
+                        (_adapt_payload.get("resource_substitutions") or [])
+                        if isinstance(e, dict)} or None
+            except (OSError, ValueError):
+                return None  # 依据不可读由来源预检另行定位
+
+        if len(snapshots) == 1:
+            _decl = entry.get("source_adaptation")
+            _subs_list = [_load_subs(_decl)
+                          if isinstance(_decl, str) and _decl else None]
+        else:
+            _subs_list = [_load_subs(decl)
+                          if isinstance(decl, str) and decl else None
+                          for decl in snap_adapt_decls]
         per_snapshot_facts = _snapshot_source_facts(
-            family, snapshots, rooted, problems, label)
+            family, snapshots, rooted, problems, label,
+            substitutions=_subs_list)
         # 独立来源证明（§9.6）：绑定映射的条目须按 source_node 与快照
         # 实际图片出现一一对应，携带的资源身份须一致；有图快照的映射
         # 缺来源身份字段或条目不对应即缺证明拒绝；无图快照的映射不得
@@ -1112,7 +1382,7 @@ def check_source_chains(root, record, problems):
                         "%s 的条目 %s 资源身份与快照实际资源不符（错源/"
                         "版本错配）" % (snap_label, item["source_node"]))
         # 选区存在性：选区声明属于快照，逐快照核对
-        for snap in entry.get("snapshots") or []:
+        for snap in snapshots:
             section_id = snap.get("section_id")
             if not section_id:
                 continue
@@ -1122,9 +1392,119 @@ def check_source_chains(root, record, problems):
             if soup.find(id=section_id) is None:
                 problems.append("%s 指定选区在快照中不存在: %s（%s）"
                                 % (label, section_id, snap["snapshot"]))
+        # LaTeXML 来源依据（D1/§4.6 源链预检）：读取依据，独立核对原始
+        # 快照摘要、论文身份与选区；缺依据、缺必需摘要或身份错配即拒绝
+        # （不自动换站点/版本，不降级为普通来源）。单快照沿用条目级
+        # source_adaptation（行为不变）；多快照每份快照字典各声明自己的
+        # source_adaptation（路径解析与其他路径字段同规则，相对交付根），
+        # 条目级字段与多快照并存属于二义（F7/§4.6：多快照每份均有自身
+        # 对应与资源基点，不用首个页面替全部来源）。逐快照核对结果以
+        # (payload, 声明路径) 列表挂在 _source_adaptations（与 snapshots
+        # 对齐，单快照即长度 1）。
+        adaptation_decl = entry.get("source_adaptation")
+        if adaptation_decl is not None or any(
+                decl is not None for decl in snap_adapt_decls):
+            from _latexml_source import (load_adaptation,
+                                         validate_adaptation)
+            adaptations = [None] * len(snapshots)
+            if len(snapshots) == 1:
+                if not isinstance(adaptation_decl, str) or not adaptation_decl:
+                    problems.append("%s 的 source_adaptation 无效: %r"
+                                    % (label, adaptation_decl))
+                    entries.append({
+                        "order": order, "family": family,
+                        "source_version": version, "parsed_markdown": parsed,
+                        "parsed_sha256": sha256_file(parsed_path),
+                        "snapshots": snapshots, "ranges": None,
+                        "covers": list(entry.get("covers") or []),
+                        "table_conversions": entry.get("table_conversions"),
+                        "_parsed_abs": os.path.realpath(parsed_path),
+                        "_source_facts": per_snapshot_facts,
+                    })
+                    continue
+                adaptation_path = rooted(adaptation_decl)
+                if not os.path.isfile(adaptation_path):
+                    problems.append(
+                        "%s 的来源依据缺失: %s（不自动搜索邻近文件）"
+                        % (label, adaptation_decl))
+                else:
+                    try:
+                        payload = load_adaptation(adaptation_path)
+                    except ValueError as exc:
+                        problems.append("%s 的来源依据无效: %s"
+                                        % (label, exc))
+                        payload = None
+                    if payload is not None:
+                        snap_path = rooted(snapshots[0]["snapshot"])
+                        try:
+                            snap_raw = open(snap_path,
+                                            encoding="utf-8").read()
+                        except OSError:
+                            snap_raw = None
+                        for item in validate_adaptation(
+                                payload, raw_html=snap_raw,
+                                snapshot_path=snap_path):
+                            problems.append("%s 的来源依据核对失败: %s"
+                                            % (label, item))
+                        adaptations[0] = (payload, adaptation_decl)
+            else:
+                if adaptation_decl is not None:
+                    problems.append(
+                        "%s 的条目级 source_adaptation 与多快照来源并存"
+                        "（二义）: 多快照 LaTeXML 来源须由每个快照字典各自"
+                        "声明 source_adaptation，条目级字段只用于单快照"
+                        % label)
+                for index, snap_decl in enumerate(snap_adapt_decls):
+                    if not isinstance(snap_decl, str) or not snap_decl:
+                        problems.append(
+                            "%s 的快照 #%d 缺少各自声明的 source_adaptation"
+                            "（多快照 LaTeXML 来源每份均须有自身依据）"
+                            % (label, index + 1))
+                        continue
+                    adaptation_path = rooted(snap_decl)
+                    if not os.path.isfile(adaptation_path):
+                        problems.append(
+                            "%s 的快照 #%d 来源依据缺失: %s（不自动搜索邻近"
+                            "文件）" % (label, index + 1, snap_decl))
+                        continue
+                    try:
+                        payload = load_adaptation(adaptation_path)
+                    except ValueError as exc:
+                        problems.append("%s 的快照 #%d 来源依据无效: %s"
+                                        % (label, index + 1, exc))
+                        continue
+                    snap_path = rooted(snapshots[index]["snapshot"])
+                    try:
+                        snap_raw = open(snap_path, encoding="utf-8").read()
+                    except OSError:
+                        snap_raw = None
+                    for item in validate_adaptation(
+                            payload, raw_html=snap_raw,
+                            snapshot_path=snap_path):
+                        problems.append("%s 的快照 #%d 来源依据核对失败: %s"
+                                        % (label, index + 1, item))
+                    adaptations[index] = (payload, snap_decl)
+            entry["_source_adaptations"] = adaptations
+            # F2/§7.5：记录声明的选区与依据记录的 selection 一致性——
+            # 声明了 section_id 而与依据记录选区不一致即拒绝；未声明时
+            # 回落依据记录的选区（下游逐快照对账与身份按回落值核对）。旧
+            # 格式依据无 selection 键时保持 None（整文行为不变）。
+            for index, adapt in enumerate(adaptations):
+                if adapt is None or 'selection' not in adapt[0]:
+                    continue
+                selection = adapt[0].get('selection')
+                declared_sid = snapshots[index].get("section_id")
+                if declared_sid is not None and selection is not None \
+                        and declared_sid != selection:
+                    problems.append(
+                        "%s 的快照 #%d 声明 section_id %r 与依据记录的选区 "
+                        "%r 不一致（拒绝，不降级）"
+                        % (label, index + 1, declared_sid, selection))
+                elif declared_sid is None:
+                    snapshots[index]["section_id"] = selection
         ranges = _snapshot_ranges(
             snapshots, parsed_path, problems, label)
-        entries.append({
+        record_entry = {
             "order": order,
             "family": family,
             "source_version": version,
@@ -1136,7 +1516,24 @@ def check_source_chains(root, record, problems):
             "table_conversions": entry.get("table_conversions"),
             "_parsed_abs": os.path.realpath(parsed_path),
             "_source_facts": per_snapshot_facts,
-        })
+        }
+        if "_source_adaptations" in entry:
+            record_entry["_source_adaptations"] = entry["_source_adaptations"]
+        entries.append(record_entry)
+    if source_only:
+        # 工作包准备消费相同快照/解析期身份，尚不存在成品及交付级映射。
+        for entry in entries:
+            if entry.get('family') == PDF_SOURCE_FAMILY:
+                from _verification import image_occurrence_count
+                with open(entry['_parsed_abs'], encoding='utf-8') as handle:
+                    has_images = image_occurrence_count(handle.read())
+                if has_images or entry.get('_pdf_images'):
+                    _check_pdf_parse_map(root, entry, problems)
+                continue
+            for snap, facts in zip(entry['snapshots'], entry['_source_facts']):
+                if facts and facts['images'] and snap.get('per_stem_map') is None:
+                    problems.append('来源准备存在实际图片但缺解析期映射: %s' % snap['snapshot'])
+        return entries
     # 覆盖对账：translation 模式下每个交付输入都须被源链覆盖
     if record.get("mode") in ("translation", "translation+pdf"):
         covered = set()
@@ -1243,9 +1640,10 @@ def run_source_reconcile(root, record, source_entries, problems):
 
     合并源按声明的快照行区间（range）核对对应范围，不把每个快照与
     整份解析 Markdown 比较（§8.4）；区间合法性由 `_snapshot_ranges`
-    判定（预检已核，此处直接调用兜底）。含逐表转换映射（声明时）；
-    差异即拒绝。返回逐条目的对账结果摘要，进入本次证据（不读取或
-    补签任何预存对账结果）。
+    判定（预检已核，此处直接调用兜底）。LaTeXML 来源（逐快照依据）同样
+    按 range 逐段对账：每份原始快照只与其声明段比较，差异带快照序号。
+    含逐表转换映射（声明时）；差异即拒绝。返回逐条目的对账结果摘要，
+    进入本次证据（不读取或补签任何预存对账结果）。
     """
     from _source_reconcile import reconcile_html_to_markdown
 
@@ -1261,6 +1659,69 @@ def run_source_reconcile(root, record, source_entries, problems):
             # PDF → 源 Markdown 独立对账：verify_pdf_source 公共核心，
             # 不读取或补签任何预存对账结果。
             results.append(_run_pdf_source_reconcile(root, entry, problems))
+            continue
+        parsed_path = rooted(entry["parsed_markdown"])
+        label = "源链 #%d" % entry["order"]
+        adaptations = entry.get("_source_adaptations") or []
+        if any(adapt is not None for adapt in adaptations):
+            # LaTeXML 来源：原节点对应 + 独立原始快照对账（含论文身份
+            # 与摘要核对），差异即拒绝；不使用普通 HTML 家族分支。多快照
+            # 逐份对账：每份快照原文只与其声明 range 的合并 Markdown 段
+            # 比较（§8.4/§4.6：不用首个页面替全部来源），差异带快照序号。
+            from _source_reconcile import reconcile_latexml_to_markdown
+            try:
+                md_lines = open(parsed_path, encoding="utf-8").read().split(
+                    "\n")
+            except OSError as exc:
+                problems.append("%s 对账读取失败: %s" % (label, exc))
+                md_lines = None
+            ranges = entry.get("ranges")
+            if md_lines is not None and ranges is None:
+                ranges = _snapshot_ranges(entry["snapshots"], parsed_path,
+                                          problems, label)
+            conversions = None
+            if entry.get("table_conversions"):
+                conversion_path = rooted(entry["table_conversions"])
+                try:
+                    conversions = json.load(
+                        open(conversion_path, encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    problems.append(
+                        "%s 的逐表转换映射不可读: %s（%s）"
+                        % (label, entry["table_conversions"], exc))
+                    continue
+            diffs = []
+            if md_lines is not None and ranges is not None:
+                for index, (snap, adapt, (start, end)) in enumerate(zip(
+                        entry["snapshots"], adaptations, ranges)):
+                    if adapt is None:
+                        continue
+                    snapshot_path = rooted(snap["snapshot"])
+                    try:
+                        snap_raw = open(snapshot_path,
+                                        encoding="utf-8").read()
+                    except OSError as exc:
+                        problems.append("%s 对账读取失败: %s"
+                                        % (label, exc))
+                        continue
+                    piece = "\n".join(md_lines[start - 1:end])
+                    for diff in reconcile_latexml_to_markdown(
+                            snap_raw, piece, snap.get("section_id"),
+                            adapt[0], html_label=snapshot_path,
+                            md_label=parsed_path,
+                            table_conversions=conversions):
+                        diffs.append("快照 #%d: %s" % (index + 1, diff))
+            if diffs:
+                problems.append("源链 #%d（%s）LaTeXML 源全量对账失败: %s"
+                                % (entry["order"], entry["parsed_markdown"],
+                                   "；".join(diffs[:3])))
+            results.append({
+                "order": entry["order"],
+                "parsed_markdown": entry["parsed_markdown"],
+                "family": entry["family"],
+                "snapshots": entry["snapshots"],
+                "diffs": diffs,
+            })
             continue
         parsed_path = rooted(entry["parsed_markdown"])
         label = "源链 #%d" % entry["order"]
@@ -1314,7 +1775,7 @@ def run_source_reconcile(root, record, source_entries, problems):
 def compute_delivery_identity(root, record, source_entries=None):
     """完整依赖身份（§4.7/§9.3）：输入/产物、源链（逐快照资源）、两侧
     图片资源、映射、全部实际检查的真实 CLI 语义事实与文件依赖、共享
-    脚本、依赖版本与样式政策的同一计算口径。
+    脚本、术语读取/选择口径、依赖版本与样式政策的同一计算口径。
 
     这是本次运行的值，不是状态库；发布前以同一函数重新枚举计算比对，
     不能只复查预先列出的旧路径。文件摘要缺失记 None；绑定按不完整
@@ -1334,6 +1795,7 @@ def compute_delivery_identity(root, record, source_entries=None):
         "sources": [],
         "checks": [],
         "environment": _environment_identity(),
+        "glossary": _glossary_identity(root, record),
     }
     for rel in record.get("inputs") or []:
         path = rooted(rel)
@@ -1358,9 +1820,32 @@ def compute_delivery_identity(root, record, source_entries=None):
             identity["resources"].setdefault("sources", {})[
                 entry["parsed_markdown"]] = _pdf_source_facts(entry, rooted)
         else:
+            # 资源替换依据逐快照各随其声明（与 snapshots 对齐；缺依据或
+            # 不可读记 None，由预检定位，不静默缩小范围）
+            _subs_list = None
+            _adaptations = entry.get("_source_adaptations")
+            if _adaptations:
+                _subs_list = []
+                for _adapt in _adaptations:
+                    _decl = _adapt[1] if _adapt is not None else None
+                    _subs = None
+                    if _decl:
+                        try:
+                            with open(rooted(_decl),
+                                      encoding="utf-8") as h:
+                                _payload = json.load(h)
+                            _subs = {e.get("original_ref"): e for e in
+                                     (_payload.get("resource_substitutions")
+                                      or []) if isinstance(e, dict)} or None
+                        except (OSError, ValueError):
+                            _subs = None
+                    _subs_list.append(_subs)
+                if not any(_subs_list):
+                    _subs_list = None
             identity["resources"].setdefault("sources", {})[
                 entry["parsed_markdown"]] = _snapshot_source_facts(
-                entry.get("family"), entry["snapshots"], rooted)
+                entry.get("family"), entry["snapshots"], rooted,
+                substitutions=_subs_list)
     for order, check in enumerate(record.get("checks") or [], start=1):
         tool = check.get("tool")
         facts = None
@@ -1381,18 +1866,20 @@ def compute_delivery_identity(root, record, source_entries=None):
 
 
 def align_sources_with_checks(source_entries, input_checks, problems,
-                              mode=None):
+                              mode=None, root=None):
     """检查实际使用的英文输入与声明源链一一对应，双向都不缺不悬空。
 
     检查使用的英文输入必须落在声明源链内（不能按文件名猜快照）；
     声明的解析 Markdown 须被至少一条检查使用——仅翻译模式强制（pdf
     模式不强加英文源，遗留声明只作附加对账证据）。
+    LaTeXML 来源（D1）：使用该源的核验记录必须显式携带与源链声明一致
+    的 --source-adaptation；漏参数或路径不符即拒绝，不降级为普通来源。
     """
     used = {path for checks in (input_checks or {}).values()
             for check in checks
             for path, _digest in check["facts"]["files"]["sources"]}
-    declared = {entry["_parsed_abs"] for entry in source_entries or []}
-    for path in sorted(used - declared):
+    declared = {entry["_parsed_abs"]: entry for entry in source_entries or []}
+    for path in sorted(used - set(declared)):
         problems.append(
             "检查实际使用的英文输入未声明源链（不能按文件名猜快照）: %s"
             % path)
@@ -1402,6 +1889,51 @@ def align_sources_with_checks(source_entries, input_checks, problems,
                 problems.append(
                     "源链 #%d 声明的解析 Markdown 未被任何检查使用: %s"
                     % (entry["order"], entry["parsed_markdown"]))
+    # 来源依据参数核对：使用 LaTeXML 源的每条检查都必须携带相符参数；
+    # 多快照源链声明了逐快照依据清单，给出的 --source-adaptation 须与
+    # 其中一份声明一致（单快照即唯一一份，语义不变）
+    for checks in (input_checks or {}).values():
+        for check in checks:
+            facts = check.get("facts") or {}
+            files = facts.get("files") or {}
+            for path, _digest in files.get("sources") or []:
+                entry = declared.get(path)
+                if not entry:
+                    continue
+                adaptations = [a for a in
+                               (entry.get("_source_adaptations") or [])
+                               if a is not None]
+                if not adaptations:
+                    continue
+
+                def _declared_real(declared_path):
+                    if root is not None and not os.path.isabs(declared_path):
+                        return os.path.realpath(os.path.join(
+                            root, declared_path))
+                    return os.path.realpath(declared_path)
+
+                declared_paths = [declared for _payload, declared in adaptations]
+                declared_reals = {_declared_real(declared)
+                                  for declared in declared_paths}
+                given = files.get("source_adaptation")
+                if given and isinstance(given[0], list):
+                    # 多快照（F7/§7.5）：dep 对按给定顺序的列表；每份都须
+                    # 与源链逐快照声明之一相符（缺参数或任一不符即拒绝）。
+                    # 单依据是 dep 标量对 [路径, 摘要]（首元素为字符串），
+                    # 与多依据的 dep 对列表按首元素类型区分
+                    given_reals = {os.path.realpath(g[0]) for g in given}
+                    given_desc = "、".join(g[0] for g in given)
+                else:
+                    given_reals = {os.path.realpath(given[0])} if given \
+                        else set()
+                    given_desc = given[0] if given else "（缺参数）"
+                if not given_reals or given_reals - declared_reals:
+                    problems.append(
+                        "核验 %s 使用了声明 source_adaptation 的源链，但未"
+                        "提供相符的 --source-adaptation（声明 %s，实际 %s）："
+                        "拒绝，不降级为普通来源"
+                        % (check.get("tool"), "/".join(declared_paths),
+                           given_desc))
 
 
 def _rooted(root, path):
@@ -1410,11 +1942,14 @@ def _rooted(root, path):
         os.path.join(root, path))
 
 
-def _parse_tool_args(tool, args, problems, order):
+def _parse_tool_args(tool, args, problems, order, root_abs=None):
     """按工具真实 CLI 解析记录参数（参数单源）；解析失败记问题。"""
     module = __import__(tool)
     try:
-        parsed = module.parse_args(list(args))
+        if tool in TRANSLATED_PATH_KEYS and tool != "verify_pdf_source":
+            parsed = module.parse_args(list(args), base_dir=root_abs)
+        else:
+            parsed = module.parse_args(list(args))
     except SystemExit:
         problems.append(
             "核验记录 #%d 的参数无法按 %s 真实 CLI 解析（缺值、未知参数或"
@@ -1440,7 +1975,7 @@ def _check_facts(root_abs, tool, args, order, problems=None):
     记录问题）。parsed 仅 verify_pdf 需要（路径已按交付根解释）。
     """
     local_problems = problems if problems is not None else []
-    parsed = _parse_tool_args(tool, args, local_problems, order)
+    parsed = _parse_tool_args(tool, args, local_problems, order, root_abs)
     if parsed is None:
         return None, None
 
@@ -1468,6 +2003,14 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             facts["files"]["provenance"] = dep(parsed.provenance)
         if getattr(parsed, "view_declaration", None):
             facts["files"]["view_declaration"] = dep(parsed.view_declaration)
+        if getattr(parsed, "source_adaptation", None):
+            given_adaptations = list(parsed.source_adaptation)
+            if len(given_adaptations) == 1:
+                facts["files"]["source_adaptation"] = dep(
+                    given_adaptations[0])
+            else:
+                facts["files"]["source_adaptation"] = [
+                    dep(p) for p in given_adaptations]
         facts["files"]["unlink_target"] = [dep(p)
                                            for p in parsed.unlink_target]
         report_path = os.path.realpath(os.path.join(
@@ -1491,10 +2034,14 @@ def _check_facts(root_abs, tool, args, order, problems=None):
         if getattr(parsed, "view_declaration", None):
             parsed.view_declaration = _rooted(
                 root_abs, parsed.view_declaration)
+        if getattr(parsed, "source_adaptation", None):
+            parsed.source_adaptation = [
+                _rooted(root_abs, p) for p in parsed.source_adaptation]
     elif tool == "verify_pdf_source":
         # 受约束 PDF 核验入口（§4.6）：真实参数解析的语义事实；golden、
         # 图片身份与强 token 口径经清单数据进入源链身份，这里登记
-        # 入口实际读写的文件依赖。
+        # 入口实际读写的文件依赖。数字辅助（R5/§4.7）参数与口径文件
+        # 同样进入统一检查事实（未启用时不增加数字字段）。
         facts["files"]["pdf"] = dep(parsed["pdf"])
         if parsed.get("translation"):
             facts["files"]["translated"] = dep(parsed["translation"])
@@ -1502,6 +2049,19 @@ def _check_facts(root_abs, tool, args, order, problems=None):
         if parsed.get("block_map"):
             facts["files"]["block_map"] = dep(parsed["block_map"])
         facts["params"] = {"translation": bool(parsed.get("translation"))}
+        if parsed.get("approved_extra_math"):
+            facts["params"]["approved_extra_math"] = list(parsed["approved_extra_math"])
+        if parsed.get("numeric_review"):
+            facts["params"]["numeric_review"] = True
+            policy = parsed.get("numeric_policy")
+            if policy:
+                facts["files"]["numeric_policy"] = dep(policy)
+                facts["params"]["numeric_policy"] = {
+                    "path": os.path.realpath(_rooted(root_abs, policy))}
+            else:
+                facts["params"]["numeric_policy"] = {
+                    "path": None,
+                    "posture": ("保留原值、报告差异、不自动判换算")}
     else:
         facts["files"]["translated"] = dep(
             parsed[TRANSLATED_PATH_KEYS[tool]])
@@ -1513,6 +2073,20 @@ def _check_facts(root_abs, tool, args, order, problems=None):
                 # 重复传入是不同的检查语义，不折叠
                 sources.append(dep(item))
         facts["files"]["sources"] = sources
+        if parsed.get("source_adaptations"):
+            # LaTeXML 来源依据是检查的显式输入依赖：漏参或路径不符由
+            # align_sources_with_checks 按源链声明核对（不降级）。单依据
+            # 沿用标量依赖事实（行为不变）；多依据为按给定顺序的依赖列表
+            given_adaptations = list(parsed["source_adaptations"])
+            if len(given_adaptations) == 1:
+                facts["files"]["source_adaptation"] = dep(
+                    given_adaptations[0])
+            else:
+                facts["files"]["source_adaptation"] = [
+                    dep(p) for p in given_adaptations]
+        if parsed.get("strong_token_files"):
+            facts["files"]["strong_token_files"] = [
+                dep(path) for path in parsed["strong_token_files"]]
         if parsed.get("image_map"):
             facts["files"]["image_map"] = dep(parsed["image_map"])
         facts["params"] = {
@@ -1521,6 +2095,32 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             "official": list(parsed.get("official", [])),
             "fragment": bool(parsed.get("fragment", False)),
         }
+        if parsed.get('project_context'):
+            import _pdf_math
+            context_path=_rooted(root_abs,parsed['project_context'])
+            facts['files']['project_context']=dep(context_path)
+            payload=json.load(open(context_path,encoding='utf-8'))
+            facts['files']['source_record']=dep(os.path.join(payload['project_root'],payload['source_record']))
+            try:
+                view,_=_pdf_math.translation_view(_rooted(root_abs,parsed['src_path']),context_path)
+                if view:
+                    facts['files']['confirmed_math_source']=[dep(view['pdf'])]
+            except (ValueError,KeyError,TypeError) as exc:
+                problems.append('PDF来源核验准入拒绝: '+str(exc))
+        if parsed.get("numeric_review"):
+            # 数字辅助（R5/§4.7）：真实参数与口径进入统一检查事实；
+            # 口径文件或参数变化使旧复核绑定不符而失效（D3/D4）。
+            # 未启用时不增加任何数字字段，存量记录行为不变。
+            facts["params"]["numeric_review"] = True
+            policy = parsed.get("numeric_policy")
+            if policy:
+                facts["files"]["numeric_policy"] = dep(policy)
+                facts["params"]["numeric_policy"] = {
+                    "path": os.path.realpath(_rooted(root_abs, policy))}
+            else:
+                facts["params"]["numeric_policy"] = {
+                    "path": None,
+                    "posture": ("保留原值、报告差异、不自动判换算")}
         if parsed.get("delivery_root"):
             facts["params"]["delivery_root"] = os.path.realpath(
                 _rooted(root_abs, parsed["delivery_root"]))
@@ -1529,6 +2129,22 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             facts["files"]["toc"] = dep(parsed["toc_path"])
             facts["params"]["site_root"] = os.path.realpath(
                 _rooted(root_abs, parsed["site_root"]))
+        if parsed.get("official_headings_file"):
+            # 官方标题文件作为实际依赖（D5）：规范化路径 + 内容摘要 +
+            # 加载后的有效原题与确认范围口径；同路径改内容使相关旧
+            # 复核失效，只记录参数字符串不算数。相对路径按交付根解释。
+            from _official_headings import (SCOPE_BY_TOOL,
+                                            official_headings_identity)
+            oh_path = parsed["official_headings_file"]
+            oh_abs, oh_digest, oh_titles = official_headings_identity(
+                oh_path, base_dir=root_abs)
+            facts["files"]["official_headings"] = [oh_abs, oh_digest]
+            facts["params"]["official_headings"] = {
+                "path": oh_abs,
+                "sha256": oh_digest,
+                "titles": oh_titles,
+                "scope": SCOPE_BY_TOOL[tool],
+            }
     return facts, parsed
 
 
@@ -1557,6 +2173,50 @@ def _facts_complete(facts):
         return True
 
     return all(pairs(value) for value in (facts.get("files") or {}).values())
+
+
+def _collect_numeric_pending(root_abs, facts, covered, pending_reviews,
+                             problems):
+    """数字辅助最终消费（R5/§4.7）：按当前输入重算共享数字能力。
+
+    最终范围来自本次核验记录的实际有序源输入与译文输入（不从实收包或
+    缺失文件反推）；每个本次差异的定位 ID 进入该译文目标的 semantic
+    待复核分类，由绑定该目标的闭合 semantic 复核逐项列明（items）。
+    读取或口径失败记入 problems（不能取得本次数字事实即不能完成）。
+    """
+    import _numeric_review as numeric
+
+    files = facts.get("files") or {}
+    if not files.get("translated"):
+        problems.append("数字辅助: 核验记录未绑定实际译文输入，不能取得"
+                        "本次数字事实（--numeric-review 需译文参数）")
+        return
+    try:
+        with open(files["translated"][0], encoding="utf-8") as handle:
+            doc_text = handle.read()
+        src_texts = []
+        for path, _digest in files.get("sources") or []:
+            with open(path, encoding="utf-8") as handle:
+                src_texts.append(handle.read())
+    except OSError as exc:
+        problems.append("数字辅助: 最终范围实际输入不可读，不能取得本次"
+                        "数字事实: %s" % exc)
+        return
+    policy = (facts.get("params") or {}).get("numeric_policy") or {}
+    policy_path = policy.get("path")
+    if policy_path is None and files.get("numeric_policy"):
+        policy_path = files["numeric_policy"][0]
+    try:
+        review = numeric.compute_numeric_review(
+            "\n".join(src_texts), doc_text,
+            src_label="ordered-sources", doc_label="translated-input",
+            scope="full", policy_path=policy_path)
+    except ValueError as exc:
+        problems.append("数字辅助: %s" % exc)
+        return
+    by_kind = pending_reviews.setdefault(
+        covered, {}).setdefault(REVIEW_SEMANTIC, Counter())
+    by_kind.update(diff["id"] for diff in review["diffs"])
 
 
 def rerun_checks(root, record, problems):
@@ -1717,6 +2377,12 @@ def rerun_checks(root, record, problems):
                 'shared_deps': facts["shared_deps"],
                 'facts': facts,
             })
+            if facts["params"].get("numeric_review"):
+                # R5/§4.7 最终交付消费：从实际译文输入与本次核验的有序
+                # 源输入在进程内重算同一数字能力（不解析任何自由文本
+                # 输出），差异 ID 进入该目标的 semantic 待复核分类。
+                _collect_numeric_pending(root_abs, facts, covered,
+                                         pending_reviews, problems)
             candidates.append({
                 "order": order, "entry": entry, "verify_report": None,
                 "export_report_path": None})
@@ -1834,7 +2500,19 @@ def expected_review_binding(kind, target, root, record, source_entries,
         target_digest = (identity.get("inputs", {}).get(target))
         if target_digest is None:
             return None
-        return {
+        # 术语口径（D6/D7，R5 收窄）：仅交付实际使用术语（记录登记了
+        # 项目术语表文件）时，术语读取/选择脚本与项目术语表才随语义
+        # 复核绑定；未使用术语的交付不投影术语维度，术语脚本变化不影
+        # 响其旧复核有效性。任一摘要缺失或变化使旧结论失效。
+        glossary = identity.get("glossary")
+        if glossary:
+            if any(digest is None
+                   for digest in (glossary.get("scripts") or {}).values()):
+                return None
+            if any(digest is None
+                   for digest in (glossary.get("files") or {}).values()):
+                return None
+        binding = {
             "target_sha256": target_digest,
             "checks": [{
                 "order": item["order"],
@@ -1849,6 +2527,9 @@ def expected_review_binding(kind, target, root, record, source_entries,
                             for key in TRANSLATION_ENV_KEYS},
             "delivery_entry": delivery_entry,
         }
+        if glossary:
+            binding["glossary"] = glossary
+        return binding
     if kind in (REVIEW_VISUAL, REVIEW_LINK):
         covering = (pdf_checks or {}).get(
             os.path.realpath(os.path.join(root_abs, target)), [])
@@ -2030,31 +2711,77 @@ def check_reviews(record, problems, pending_reviews=None, root=None,
             else:
                 covered_items.setdefault(
                     (kind, target), Counter()).update(items)
+    # 06-7：未启用 --numeric-review 的核验不能声称已完成数字检查——
+    # semantic items 出现机器生成的数字差异 ID（NUM[…] 前缀）而覆盖该
+    # 目标的检查无一启用数字辅助时，按“未检查却声称已检查”拒绝；工具
+    # 不解析 note 推断正确性，items 是数字 ID 的唯一机器可核对通道。
+    numeric_enabled_targets = set()
+    root_abs = os.path.realpath(root) if root else None
+    if root_abs:
+        for rel in record.get("inputs") or []:
+            abs_path = os.path.realpath(os.path.join(root_abs, rel))
+            for check in (input_checks or {}).get(abs_path) or []:
+                params = (check.get("facts") or {}).get("params") or {}
+                if params.get("numeric_review"):
+                    numeric_enabled_targets.add(abs_path)
+    for review in reviews:
+        if review.get("kind") != REVIEW_SEMANTIC \
+                or review.get("status") != "closed":
+            continue
+        items = review.get("items")
+        if not isinstance(items, list):
+            continue
+        numeric_ids = [i for i in items
+                       if isinstance(i, str) and i.startswith("NUM[")]
+        if not numeric_ids:
+            continue
+        target = review.get("target")
+        abs_target = os.path.realpath(os.path.join(root_abs, target)) \
+            if root_abs and target else None
+        if abs_target not in numeric_enabled_targets:
+            problems.append(
+                "复核 %r 登记了数字差异 ID（%d 项），但覆盖该目标的核验"
+                "记录未启用 --numeric-review：未检查不能声称已检查，须"
+                "显式启用数字辅助并按本次差异重新逐项复核"
+                % (target, len(numeric_ids)))
+
     # 每个成品都必须有绑定其摘要的闭合视觉复核（唯一判定点，不再
     # 按模式重复检查同一类别）。
     for target in pdf_outputs:
         if target not in valid_by_kind[REVIEW_VISUAL]:
             problems.append("成品 %s 缺少绑定其摘要的闭合视觉复核" % target)
-    # 逐项对账：核验报告要求人工复核的待复核项必须由绑定该成品的
-    # 闭合视觉复核逐条列明（4.7/4.9：报告所依赖的人工兜底真正闭合；
-    # items 按产物归属，别的成品的复核不能代闭）。
+    # 逐项对账：核验报告要求人工复核的待复核项必须由绑定该产物的
+    # 闭合复核逐条列明（4.7/4.9：报告所依赖的人工兜底真正闭合；
+    # items 按产物归属，别的产物/目标的复核不能代闭；只改 note 或
+    # 历史/其他目标 ID 都不构成闭合——ID 从本次输入重新计算）。
     if pending_reviews:
         root_abs = os.path.realpath(root) if root else None
-        for rel, digest in pdf_outputs.items():
-            abs_path = os.path.realpath(os.path.join(root_abs, rel)) \
-                if root_abs else rel
-            for kind, pending in pending_reviews.get(abs_path, {}).items():
+        rel_of_abs = {}
+        for rel in list(pdf_outputs) + list(record.get("inputs") or []):
+            if root_abs:
+                rel_of_abs[os.path.realpath(
+                    os.path.join(root_abs, rel))] = rel
+        for abs_path, kinds in pending_reviews.items():
+            rel = rel_of_abs.get(abs_path, abs_path)
+            for kind, pending in kinds.items():
                 pending_counts = (pending if isinstance(pending, Counter)
                                   else Counter(pending))
                 uncovered_counts = pending_counts - covered_items.get(
                     (kind, rel), Counter())
                 uncovered = sorted(uncovered_counts.elements())
-                if uncovered:
+                if not uncovered:
+                    continue
+                detail = "；".join(uncovered[:3])
+                if rel in pdf_outputs:
                     problems.append(
                         "成品 %s 的核验报告待处置项未由绑定该成品的 "
                         "%s 复核逐项闭合（%d 项）：%s"
-                        % (rel, kind, len(uncovered),
-                           "；".join(uncovered[:3])))
+                        % (rel, kind, len(uncovered), detail))
+                else:
+                    problems.append(
+                        "交付输入 %s 的待处置项未由绑定该目标的 %s "
+                        "复核逐项闭合（%d 项）：%s"
+                        % (rel, kind, len(uncovered), detail))
     # 按模式核对复核范围：翻译模式中每个输入均需源对账与语义复核。
     if mode in ("translation", "translation+pdf"):
         for target in record.get("inputs") or []:
@@ -2176,6 +2903,13 @@ def _identity_missing_digests(identity):
                            % (check.get("order"), check.get("tool")))
     if (identity.get("delivery_entry") or {}).get("script_sha256") is None:
         missing.append("交付入口脚本")
+    glossary = identity.get("glossary") or {}
+    for name, digest in (glossary.get("scripts") or {}).items():
+        if digest is None:
+            missing.append("术语脚本 %s" % name)
+    for rel, digest in (glossary.get("files") or {}).items():
+        if digest is None:
+            missing.append("项目术语表 %s" % rel)
     for key, digest in (identity.get("style_policy") or {}).items():
         if digest is None:
             missing.append("样式政策 %s" % key)
@@ -2326,6 +3060,8 @@ def _binding_drift_summary(declared_binding, expected_binding):
             drift.append("运行环境版本变化")
         elif key == "delivery_entry":
             drift.append("交付入口脚本身份变化")
+        elif key == "glossary":
+            drift.append("术语读取/选择身份变化（脚本或项目术语表）")
         else:
             drift.append("%s 变化" % key)
     return drift
@@ -2431,11 +3167,47 @@ def check_translation_readiness(root, record, target_inputs):
                    for check in candidates],
         "sources": [{"family": entry.get("family"),
                      "parsed_markdown": entry.get("parsed_markdown"),
-                     "source_version": entry.get("source_version")}
-                    for entry in entries],
+                     "source_version": entry.get("source_version"),
+                     # 二期 02-6：翻译加导出经此投影取得当前来源依据
+                     # （绝对路径），不自动搜索邻近文件。单快照投影唯一
+                     # 依据（行为不变）；多快照依据为逐快照列表，
+                     # source_adaptation 不取首份替全部来源（§4.6/F7）。
+                     **(_readiness_adaptation_projection(entry, root_abs)),
+                     } for entry in entries],
     }
+    approvals={path: next((check["facts"]["params"]["approved_extra_math"]
+        for check in checks if check["facts"]["params"].get("approved_extra_math")), [])
+        for path, checks in input_checks.items()}
+    if any(approvals.values()):projection['approved_extra_math']=approvals
     return True, {"ready": True, "reasons": [],
                   "identity": projection, "inputs": actual}
+
+
+def _readiness_adaptation_projection(entry, root_abs):
+    """来源依据的就绪投影：单快照返回唯一依据路径（绝对路径）；多快照
+    返回逐快照路径列表，单一键不取首份替全部来源（§4.6/F7）。"""
+    if entry.get('family') == PDF_SOURCE_FAMILY:
+        import _pdf_math
+        source = os.path.realpath(os.path.join(root_abs,entry['parsed_markdown']))
+        view = _pdf_math.source_view(entry,root_abs,source)
+        if view is not None:
+            return {'source_adaptation':None,'pdf_source':{
+                'root':root_abs,'pdf':entry['pdf'],'checklist':entry['checklist'],
+                'block_map':entry['block_map'],'source_markdown':source,
+                'identity':_source_identity(entry,lambda path:os.path.join(root_abs,path)),
+                'covers':[os.path.realpath(os.path.join(root_abs,path)) for path in entry['covers']]}}
+    adaptations = [a for a in (entry.get("_source_adaptations") or [])
+                   if a is not None]
+    if not adaptations:
+        return {"source_adaptation": None}
+    paths = [os.path.realpath(
+        declared if os.path.isabs(declared)
+        else os.path.join(root_abs, declared))
+        for _payload, declared in adaptations]
+    if len(paths) == 1:
+        return {"source_adaptation": paths[0]}
+    return {"source_adaptation": None,
+            "source_adaptations": paths}
 
 
 def check_translation_readiness_cli(record_path, target_inputs):
@@ -2478,7 +3250,7 @@ def check_pdf_source_pending(root, record, problems):
         return rel if os.path.isabs(rel) else os.path.normpath(
             os.path.join(root_abs, rel))
 
-    for order, entry in enumerate(_source_entries(record), start=1):
+    for order, entry in enumerate(_source_entries(record, problems), start=1):
         if not isinstance(entry, dict)                 or entry.get("family") != PDF_SOURCE_FAMILY:
             continue
         label = "源链 #%d" % order
@@ -2572,7 +3344,7 @@ def main(argv=None):
         candidates, pending_reviews, input_checks, pdf_checks = rerun_checks(
             root, record, problems)
         align_sources_with_checks(source_entries, input_checks, problems,
-                                  mode=record.get("mode"))
+                                  mode=record.get("mode"), root=root)
         check_reviews(record, problems, pending_reviews, root=root,
                       input_checks=input_checks, pdf_checks=pdf_checks,
                       source_entries=source_entries, identity=baseline)

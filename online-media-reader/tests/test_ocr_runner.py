@@ -161,6 +161,9 @@ def run_ocr_image(work_root, image, stub_source, timeout_seconds=None):
     env["PYTHONPATH"] = str(stub_base) + ":" + env.get("PYTHONPATH", "")
     env["PADDLE_PDX_CACHE_HOME"] = str(work_root / "models-caller")
     original_env = os.environ.copy()
+    original_path = sys.path[:]
+    # The caller's dependency check and the worker must see the same stub.
+    sys.path.insert(0, str(stub_base))
     os.environ.clear()
     os.environ.update(env)
     try:
@@ -170,6 +173,7 @@ def run_ocr_image(work_root, image, stub_source, timeout_seconds=None):
         return ocr_module.ocr_image(str(image), str(work_root / "w"),
                                     str(work_root / "models-caller"), **kwargs)
     finally:
+        sys.path[:] = original_path
         os.environ.clear()
         os.environ.update(original_env)
 

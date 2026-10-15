@@ -325,6 +325,40 @@ class CodeStructuralVerificationTest(unittest.TestCase):
         report = json.loads((work / verifier.VERIFY_NAME).read_text())
         return rc, {f['code'] for f in report['failures']}
 
+    def test_unowned_code_glyph_is_not_excluded_with_adjacent_label(self):
+        from pypdf.generic import (ArrayObject, DictionaryObject, NumberObject)
+        md=self.root/'marked-code.md'
+        md.write_text(self.HEAD+'正文[^1]\n\n[^1]:\n\n    ```python\n    print(x)\n    ```\n')
+        chapter=exporter.Chapter(1,md);exporter.parse_chapter(chapter);exporter.collect_chapter_facts(chapter)
+        self.assertEqual(['print(x)\n'],chapter.code_blocks)
+        for case in ('normal','owned','unmarked','dangling','ancestor-only'):
+            with self.subTest(case=case):
+                writer=PdfWriter();page=writer.add_blank_page(width=600,height=800)
+                font=DictionaryObject({NameObject('/Type'):NameObject('/Font'),NameObject('/Subtype'):NameObject('/Type1'),NameObject('/BaseFont'):NameObject('/Courier')})
+                page[NameObject('/Resources')]=DictionaryObject({NameObject('/Font'):DictionaryObject({NameObject('/F1'):writer._add_object(font)})})
+                def draw(text,x,mcid):
+                    escaped=text.replace('\\','\\\\').replace('(','\\(').replace(')','\\)')
+                    mark='' if mcid is None else '/Span << /MCID %d >> BDC '%mcid
+                    return mark+'BT /F1 12 Tf 1 0 0 1 %.1f 700 Tm (%s) Tj ET '%(x,escaped)+('EMC\n' if mcid is not None else '\n')
+                inserted=case!='normal'
+                content=draw('1.',50,2)+draw('print(x',75,1)
+                if inserted:content+=draw('x',125.4,1 if case=='owned' else None if case=='unmarked' else 999)
+                content+=draw(')',132.6 if inserted else 125.4,1)
+                stream=DecodedStreamObject();stream.set_data(content.encode());page[NameObject('/Contents')]=writer._add_object(stream)
+                tree=DictionaryObject({NameObject('/Type'):NameObject('/StructTreeRoot')});tree_ref=writer._add_object(tree)
+                document=DictionaryObject({NameObject('/Type'):NameObject('/StructElem'),NameObject('/S'):NameObject('/Document'),NameObject('/Pg'):page.indirect_reference,NameObject('/P'):tree_ref});document_ref=writer._add_object(document)
+                children=[]
+                for role,mcid in (('/Lbl',2),('/Div',1)):
+                    element=DictionaryObject({NameObject('/Type'):NameObject('/StructElem'),NameObject('/S'):NameObject(role),NameObject('/Pg'):page.indirect_reference,NameObject('/P'):document_ref,NameObject('/K'):NumberObject(mcid)})
+                    children.append(writer._add_object(element))
+                if case=='ancestor-only':children.append(NumberObject(999))
+                document[NameObject('/K')]=ArrayObject(children);tree[NameObject('/K')]=document_ref;writer._root_object[NameObject('/StructTreeRoot')]=tree_ref
+                pdf=self.root/(case+'-marked.pdf');writer.write(pdf)
+                facts=verifier.PdfFacts(pdf);failures=[];relaxed=[]
+                verifier.check_code_blocks_per_line([chapter],facts,[(chapter,0,1)],failures,relaxed)
+                if case=='normal':self.assertEqual([],failures)
+                else:self.assertIn('code-line-missing',{f['code'] for f in failures})
+
     def test_whitespace_deletion_inside_string_rejected(self):
         # P1-1：行内空白被删除（printf("a b") → printf("ab")）必拒；
         # 证据已对齐原输入，失败只能来自代码内容检查本身。
@@ -1162,6 +1196,59 @@ class EmbedResampleTest(unittest.TestCase):
         facts = verifier.PdfFacts(str(pdf))
         return [img for page in verifier.collect_drawn_images(facts)
                 for img in page]
+
+    def test_bitmap_width_after_vector_uses_actual_bitmap_draw(self):
+        """真实论文回归：SVG 不占 PDF 位图绘制序号，随后 PNG 仍须量测。"""
+        import subprocess
+        from _image_binding import bind_page
+
+        vector = self.root / 'images/mixed.svg'
+        vector.write_text('<svg xmlns="http://www.w3.org/2000/svg" '
+                          'viewBox="0 0 20 20"><rect width="20" '
+                          'height="20" fill="green"/></svg>')
+        bitmap = self.root / 'images/mixed.png'
+        make_png(str(bitmap), 100, 10)
+        source = self.root / 'mixed.html'
+        source.write_text('<html><body><h1>混合图</h1>'
+                          '<img src="images/mixed.svg">'
+                          '<img src="images/mixed.png" width="100">'
+                          '</body></html>')
+        parsed = self.root / 'mixed-source.md'
+        subprocess.run([sys.executable, str(Path(exporter.__file__).parent /
+                        'parse_single_page_html.py'), str(source), str(parsed)],
+                       capture_output=True, check=True)
+        page_map = json.loads(parsed.with_suffix('.images_display.json').read_text())
+        entries, unknown = bind_page('mixed.md', page_map, [
+            ('images/mixed.svg', str(vector), str(vector)),
+            ('images/mixed.png', str(bitmap), str(bitmap))])
+        mapping = self.root / 'mixed-display.json'
+        mapping.write_text(json.dumps({'version': 1, 'entries': entries,
+                                       'undetermined': unknown}))
+        md = self.root / 'mixed.md'
+        md.write_text(self.HEAD + '![矢量](images/mixed.svg)\n\n'
+                      '![位图](images/mixed.png)\n')
+        pdf, work = self.root / 'mixed.pdf', self.root / 'mixed_work'
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(exporter.export([str(md)], pdf, work,
+                             images_display_paths=[str(mapping)]), 0)
+        chapters = exporter.load_inputs([str(md)])
+        exporter.parse_chapter(chapters[0])
+        bindings = exporter.load_display_maps(chapters, [str(mapping)], [])[0]
+        report = json.loads((work / 'export_report.json').read_text())
+        facts = verifier.PdfFacts(str(pdf))
+        failures = []
+        verifier.check_image_widths(chapters, facts,
+                                    [(chapters[0], 0, len(facts.pages))],
+                                    bindings, report, failures)
+        self.assertEqual(failures, [])
+        # HTML 固定宽度 100 CSS px = 75 pt；不由生成器报告构造期望。
+        self.assertAlmostEqual(self._drawn_images(pdf)[0][0], 75, delta=1)
+        from unittest.mock import patch
+        with patch.object(verifier, 'collect_drawn_images', return_value=[[]]):
+            verifier.check_image_widths(chapters, facts,
+                                        [(chapters[0], 0, len(facts.pages))],
+                                        bindings, report, failures)
+        self.assertIn('image-draw-count', [item['code'] for item in failures])
 
     def test_pure_below_threshold_passes_through(self):
         small = self.root / 'images/small.png'

@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/tech-doc-translator/scripts'))
 import verify_delivery as delivery_verifier
 
-from test_delivery_evidence import SCRIPTS, sha
+from translator_test_support import SCRIPTS
 
 try:
     import pymupdf

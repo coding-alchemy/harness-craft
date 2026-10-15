@@ -476,3 +476,181 @@ python3 "$PARSE" tests/fixtures/rich_single_page.html "$TMP/rich_a1.md" \
 grep -q '系统临时目录' "$TMP/a1.err" \
   || { echo "错误：临时目录解析未告警"; cat "$TMP/a1.err"; exit 1; }
 echo "A1 临时路径告警 PASS"
+
+echo "==> Ticket 04：API 家族普通行首 #、表格首格与代码注释分别保真"
+T04SITE="$TMP/t04site"
+T04OUT="$TMP/t04out"
+mkdir -p "$T04SITE" "$T04OUT/src"
+cat > "$T04SITE/index.html" <<'HTML'
+<html><body><article>
+<h1>API T04</h1>
+<p>index page</p>
+<a class="reference internal" href="t04_page.html">details</a>
+</article></body></html>
+HTML
+cat > "$T04SITE/t04_page.html" <<'HTML'
+<html><body><article>
+<h1>T04 API Page</h1>
+<p># define data table</p>
+<table><tr><th>#</th><th>name</th></tr><tr><td>1</td><td>alpha</td></tr></table>
+<pre><code># fence comment
+z = 3  # inline comment
+</code></pre>
+<h2>Config | Range</h2>
+<p>cfg</p>
+<h2># config</h2>
+<p>after</p>
+</article></body></html>
+HTML
+cat > "$T04SITE/trans_index.md" <<'MD'
+# API T04（API 文档）
+
+入口页译文。
+MD
+cat > "$T04SITE/trans_t04_page.md" <<'MD'
+# T04 API Page
+
+\# define data table
+
+| # | 名称 |
+| --- | --- |
+| 1 | alpha |
+
+```
+# fence comment
+z = 3  # inline comment
+```
+
+## Config | Range
+
+配置文字
+
+## # config
+
+注释同名标题之后
+MD
+python3 "$DISCOVER" "$T04SITE/index.html" "$T04OUT/manifest.txt"
+printf 'index.html\nt04_page.html\n' > "$T04OUT/expected.txt"
+diff -u "$T04OUT/expected.txt" "$T04OUT/manifest.txt"
+python3 "$PARSE" "$T04SITE/t04_page.html" "$T04OUT/src/t04_page.md" 2>/dev/null
+python3 "$PARSE" "$T04SITE/index.html" "$T04OUT/src/index.md" 2>/dev/null
+python3 - "$T04SITE/t04_page.html" "$T04OUT/src/t04_page.md" <<'PY'
+import sys
+sys.path.insert(0, 'skills/tech-doc-translator/scripts')
+from _verification import heading_entries
+from _source_reconcile import reconcile_html_to_markdown
+html = open(sys.argv[1], encoding='utf-8').read()
+md = open(sys.argv[2], encoding='utf-8').read()
+assert '\\# define data table' in md, '普通段落行首 # 未转义'
+assert '\\# | name' in md, '表格首格 # 未转义'
+assert '# fence comment\nz = 3  # inline comment' in md, '围栏注释被改写'
+assert [t for _, _, t in heading_entries(md)] == [
+    'T04 API Page', 'Config | Range', '# config'], '真实标题层级或顺序异常'
+assert reconcile_html_to_markdown(html, md, 'api') == [], '独立对账误判'
+print('Ticket 04 API 解析保真与独立对账 PASS')
+PY
+python3 "$MERGE" "$T04OUT/manifest.txt" "$T04SITE" "$T04OUT/merged.md"
+python3 "$VERIFY" "$T04OUT/merged.md" "$T04OUT/manifest.txt" \
+  "$T04OUT/expected.txt" "$T04SITE" \
+  "$T04OUT/src/index.md" "$T04OUT/src/t04_page.md"
+
+echo "==> Ticket 04 失败回归：API 译文去掉普通段转义必须判 FAIL"
+python3 - "$T04SITE/trans_t04_page.md" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding='utf-8').read()
+open(path, 'w', encoding='utf-8').write(
+    text.replace('\\# define data', '# define data'))
+PY
+python3 "$MERGE" "$T04OUT/manifest.txt" "$T04SITE" "$T04OUT/merged.md" >/dev/null
+if python3 "$VERIFY" "$T04OUT/merged.md" "$T04OUT/manifest.txt" \
+  "$T04OUT/expected.txt" "$T04SITE" \
+  "$T04OUT/src/index.md" "$T04OUT/src/t04_page.md"; then
+  echo "错误：API 译文伪标题未被检测到"
+  exit 1
+else
+  echo "API 译文伪标题已正确判 FAIL"
+fi
+
+
+echo "==> Ticket 05：官方标题文件与 manifest/TOC/site root/源路径并存"
+cat > "$TMP/oh_api.txt" <<'EOF'
+cublasSgemm
+Parameters
+Examples
+
+API Docs
+Kernel Launch
+Description
+Constraints
+EOF
+python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+  "$SRC_DIR/api_page1.md" \
+  "$SRC_DIR/index.md" \
+  "$SRC_DIR/api_page2.md" --official-headings-file "$TMP/oh_api.txt"
+echo "官方标题文件与既有位置参数并存且角色不变 PASS"
+
+echo "==> Ticket 05：源页与译文同时删真实标题被独立官方基准发现"
+grep -v '^## Examples' "$SRC_DIR/api_page1.md" > "$TMP/api_src_del.md"
+grep -v '^## Examples（示例）' "$SITE/trans_api_page1.md" \
+  > "$TMP/api_trans_del.md"
+cp "$SRC_DIR/api_page1.md" "$TMP/api_page1_keep.md"
+cp "$SITE/trans_api_page1.md" "$TMP/trans_api_page1_keep.md"
+cp "$TMP/api_src_del.md" "$SRC_DIR/api_page1.md"
+cp "$TMP/api_trans_del.md" "$SITE/trans_api_page1.md"
+python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR"
+python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+  "$SRC_DIR/api_page1.md" \
+  "$SRC_DIR/index.md" \
+  "$SRC_DIR/api_page2.md" \
+  || { echo "错误：源译同时删标题的无基准对照应通过"; exit 1; }
+if python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+    "$SRC_DIR/api_page1.md" \
+    "$SRC_DIR/index.md" \
+    "$SRC_DIR/api_page2.md" --official-headings-file "$TMP/oh_api.txt" \
+    >"$TMP/oh_api_del.err" 2>&1; then
+  echo "错误：独立官方基准未发现源译同时删除的真实标题"
+  exit 1
+fi
+grep -q '官方标题清单' "$TMP/oh_api_del.err" \
+  || { echo "错误：缺少官方清单差异诊断"; cat "$TMP/oh_api_del.err"; exit 1; }
+cp "$TMP/api_page1_keep.md" "$SRC_DIR/api_page1.md"
+cp "$TMP/trans_api_page1_keep.md" "$SITE/trans_api_page1.md"
+python3 "$MERGE" "$MANIFEST" "$SITE" "$MERGED" --display-src "$SRC_DIR"
+echo "API 家族独立官方基准检漏 PASS（样本已还原）"
+
+echo "==> Ticket 05：API 页面缺项/顺序损伤仍被原 TOC 拒绝（标题文件不替代 TOC）"
+printf 'api_page1.html\nindex.html\n' > "$TMP/broken_manifest.txt"
+if python3 "$VERIFY" "$MERGED" "$TMP/broken_manifest.txt" "$EXPECTED" "$SITE" \
+    "$SRC_DIR/api_page1.md" \
+    "$SRC_DIR/index.md" \
+    "$SRC_DIR/api_page2.md" --official-headings-file "$TMP/oh_api.txt" \
+    >"$TMP/oh_toc_missing.err" 2>&1; then
+  echo "错误：页面缺项未被 TOC 拒绝"; exit 1
+fi
+grep -q '官方 TOC 不闭合' "$TMP/oh_toc_missing.err" \
+  || { echo "错误：缺少 TOC 缺项诊断"; cat "$TMP/oh_toc_missing.err"; exit 1; }
+printf 'index.html\napi_page1.html\nsubdir/api_page2.html\n' \
+  > "$TMP/reorder_manifest.txt"
+if python3 "$VERIFY" "$MERGED" "$TMP/reorder_manifest.txt" "$EXPECTED" "$SITE" \
+    "$SRC_DIR/api_page1.md" \
+    "$SRC_DIR/index.md" \
+    "$SRC_DIR/api_page2.md" --official-headings-file "$TMP/oh_api.txt" \
+    >"$TMP/oh_toc_order.err" 2>&1; then
+  echo "错误：页面顺序损伤未被 TOC 拒绝"; exit 1
+fi
+grep -q '官方 TOC 不闭合' "$TMP/oh_toc_order.err" \
+  || { echo "错误：缺少 TOC 顺序诊断"; cat "$TMP/oh_toc_order.err"; exit 1; }
+echo "页面缺项与顺序损伤在提供标题文件时仍被原 TOC 拒绝"
+
+echo "==> Ticket 05：官方标题文件缺失明确失败，不降级"
+if python3 "$VERIFY" "$MERGED" "$MANIFEST" "$EXPECTED" "$SITE" \
+    "$SRC_DIR/api_page1.md" \
+    "$SRC_DIR/index.md" \
+    "$SRC_DIR/api_page2.md" --official-headings-file "$TMP/oh_absent.txt" \
+    >"$TMP/oh_absent.err" 2>&1; then
+  echo "错误：缺文件未失败"; exit 1
+fi
+grep -q '缺失或不可读' "$TMP/oh_absent.err" \
+  || { echo "错误：缺文件诊断缺失"; cat "$TMP/oh_absent.err"; exit 1; }
+echo "API 家族缺文件明确失败"

@@ -303,3 +303,118 @@ python3 "$PARSE" "$TMPDIR/src_html/rich_paginated.html" 2>"$TMPDIR/a1.err"
 grep -q '系统临时目录' "$TMPDIR/a1.err" \
   || { echo "错误：临时目录解析未告警"; cat "$TMPDIR/a1.err"; exit 1; }
 echo "A1 临时路径告警 PASS"
+
+echo "==> Ticket 04：普通行首 #、表格首格与代码注释分别保真"
+cat > "$TMPDIR/t04_page.html" <<'HTML'
+<html><body><article>
+<h1>T04 Page</h1>
+<p># define data table</p>
+<table><tr><th>#</th><th>name</th></tr><tr><td>1</td><td>alpha</td></tr></table>
+<pre><code># fence comment
+y = 2  # inline comment
+</code></pre>
+<h2>Config | Range</h2>
+<p>cfg text</p>
+<h2># config</h2>
+<p>named heading after</p>
+</article></body></html>
+HTML
+python3 "$PARSE" "$TMPDIR/t04_page.html"
+python3 - "$TMPDIR/t04_page.html" "$TMPDIR/t04_page.md" <<'PY'
+import sys
+sys.path.insert(0, '../skills/tech-doc-translator/scripts')
+from _verification import heading_entries
+from _source_reconcile import reconcile_html_to_markdown
+html = open(sys.argv[1], encoding='utf-8').read()
+md = open(sys.argv[2], encoding='utf-8').read()
+assert '\\# define data table' in md, '普通段落行首 # 未转义'
+assert '\\# | name' in md, '表格首格 # 未转义'
+assert '# fence comment\ny = 2  # inline comment' in md, '围栏注释被改写'
+assert [t for _, _, t in heading_entries(md)] == [
+    'T04 Page', 'Config | Range', '# config'], '真实标题层级或顺序异常'
+assert reconcile_html_to_markdown(html, md, 'paginated') == [], '独立对账误判'
+print('Ticket 04 分页解析保真与独立对账 PASS')
+PY
+
+echo "==> Ticket 04：分页装配译文保留转义与真实标题通过核验"
+cat > "$TMPDIR/t04_chapter.md" <<'MD'
+# 第 7 章：T04 样本
+
+> **来源** / 本地构造的 Ticket 04 回归样本
+
+## T04 Page
+
+\# define data table
+
+| # | 名称 |
+| --- | --- |
+| 1 | alpha |
+
+```
+# fence comment
+y = 2  # inline comment
+```
+
+### Config | Range
+
+配置文字
+
+### # config
+
+注释同名标题之后
+MD
+verify_paginated "$TMPDIR/t04_chapter.md" "$TMPDIR/t04_page.md"
+
+echo "==> Ticket 04 失败回归：装配译文去掉普通段转义必须判 FAIL"
+python3 - "$TMPDIR/t04_chapter.md" "$TMPDIR/t04_chapter_bad.md" <<'PY'
+import sys
+text = open(sys.argv[1], encoding='utf-8').read()
+open(sys.argv[2], 'w', encoding='utf-8').write(
+    text.replace('\\# define data', '# define data'))
+PY
+if verify_paginated "$TMPDIR/t04_chapter_bad.md" "$TMPDIR/t04_page.md"; then
+  echo "错误：装配译文伪标题未被检测到"
+  exit 1
+else
+  echo "装配译文伪标题已正确判 FAIL"
+fi
+
+
+echo "==> Ticket 05：官方标题文件与有序源路径并存（装配映射保持）"
+cat > "$TMPDIR/oh_chapter.txt" <<'EOF'
+1. Programming Model
+1.1. Kernels
+
+2. Programming Interface
+2.1. Compilation
+EOF
+verify_paginated "$TMPDIR/chapter.md" "$TMPDIR/source_p1.md" \
+  "$TMPDIR/source_p2.md" --official-headings-file "$TMPDIR/oh_chapter.txt"
+echo "官方标题文件与有序源路径并存；装配/深层/H1 合同保持 PASS"
+
+echo "==> Ticket 05：源与译文同时删真实标题被独立官方基准发现"
+grep -v '^### 2.1. Compilation' "$TMPDIR/chapter.md" > "$TMPDIR/chapter_del.md"
+grep -v '^## 2.1. Compilation' "$TMPDIR/source_p2.md" \
+  > "$TMPDIR/source_p2_del.md"
+verify_paginated "$TMPDIR/chapter_del.md" "$TMPDIR/source_p1.md" \
+  "$TMPDIR/source_p2_del.md" \
+  || { echo "错误：源译同时删标题的无基准对照应通过"; exit 1; }
+if verify_paginated "$TMPDIR/chapter_del.md" "$TMPDIR/source_p1.md" \
+    "$TMPDIR/source_p2_del.md" --official-headings-file "$TMPDIR/oh_chapter.txt" \
+    >"$TMPDIR/oh_pag.err" 2>&1; then
+  echo "错误：独立官方基准未发现源译同时删除的真实标题"
+  exit 1
+fi
+grep -q '与官方清单不一致' "$TMPDIR/oh_pag.err" \
+  || { echo "错误：缺少官方清单差异诊断"; cat "$TMPDIR/oh_pag.err"; exit 1; }
+echo "分页家族独立官方基准检漏 PASS（装配降级与源对照不受文件影响）"
+
+echo "==> Ticket 05：官方标题文件缺失明确失败，不降级"
+if verify_paginated "$TMPDIR/chapter.md" "$TMPDIR/source_p1.md" \
+    "$TMPDIR/source_p2.md" --official-headings-file "$TMPDIR/oh_absent.txt" \
+    >"$TMPDIR/oh_absent.err" 2>&1; then
+  echo "错误：缺文件未失败"; exit 1
+fi
+grep -q '缺失或不可读' "$TMPDIR/oh_absent.err" \
+  || { echo "错误：缺文件诊断缺失"; cat "$TMPDIR/oh_absent.err"; exit 1; }
+echo "分页家族缺文件明确失败"

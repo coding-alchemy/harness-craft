@@ -169,16 +169,17 @@ def _readable_ratio(text):
     return good / len(text)
 
 
-def _page_text_stats(page):
-    text = page.get_text("text") or ""
-    blocks = [b for b in page.get_text("blocks")
+def _page_text_stats(page, content=None):
+    text = content["text"] if content else page.get_text("text") or ""
+    blocks = [b for b in (content["blocks"] if content else page.get_text("blocks"))
               if b[6] == 0 and (b[4] or "").strip()]
-    area = page.rect.width * page.rect.height
+    bounds = page.rect * page.derotation_matrix
+    area = bounds.width * bounds.height
     text_area = 0.0
     for block in blocks:
-        width = max(0.0, min(block[2], page.rect.width)
+        width = max(0.0, min(block[2], bounds.x1)
                     - max(block[0], 0.0))
-        height = max(0.0, min(block[3], page.rect.height)
+        height = max(0.0, min(block[3], bounds.y1)
                      - max(block[1], 0.0))
         text_area += width * height
     return {
@@ -189,14 +190,14 @@ def _page_text_stats(page):
     }
 
 
-def page_facts(page):
+def page_facts(page, content=None):
     """单页对象统计：文本层、绘图、位图、批注与链接（对象级核查，
     文件名/元数据声明不作事实依据）。"""
-    stats = _page_text_stats(page)
-    drawings = page.get_drawings()
-    images = page.get_image_info(xrefs=True)
+    stats = _page_text_stats(page, content)
+    drawings = content["drawings"] if content else page.get_drawings()
+    images = content["images"] if content else page.get_image_info(xrefs=True)
     annots = list(page.annots())
-    links = page.get_links()
+    links = content["links"] if content else page.get_links()
     return {
         "page": page.number + 1,
         "width_pt": round(page.rect.width, 2),
@@ -219,7 +220,7 @@ def _page_usable_text(facts):
             and facts["readable_ratio"] >= MIN_READABLE_RATIO)
 
 
-def page_bitmap_regions(page):
+def page_bitmap_regions(page, content=None):
     """页面上全部嵌入位图区域，返回待裁决候选（附区域证据线索）。
 
     枚举不做任何"消失性"过滤（设计 §7.3）：面积占比、与文本块是否相交
@@ -229,10 +230,10 @@ def page_bitmap_regions(page):
     """
     fitz = load_fitz()
     page_area = page.rect.width * page.rect.height
-    text_rects = [fitz.Rect(block[:4]) for block in page.get_text("blocks")
+    text_rects = [fitz.Rect(block[:4]) for block in (content["blocks"] if content else page.get_text("blocks"))
                   if block[6] == 0 and (block[4] or "").strip()]
     regions = []
-    for info in page.get_image_info(xrefs=True):
+    for info in (content["images"] if content else page.get_image_info(xrefs=True)):
         rect = fitz.Rect(info["bbox"])
         ratio = (rect.width * rect.height / page_area) if page_area > 0             else 0.0
         overlapped = any(rect.intersects(text) for text in text_rects)
@@ -341,11 +342,11 @@ _FORMULA_RE = re.compile(
     r"[A-Za-z]\^[\d({]|[A-Za-z]_[\d({]|\\[A-Za-z]+|[≤≥≈≠∈∑∏∫√]")
 
 
-def _page_lines(doc_page):
+def _page_lines(doc_page, content=None):
     """返回 [(text, rect, max_size, bold, line_no)]：dict 模式的成行文本。"""
     entries = []
     body_sizes = []
-    for block in doc_page.get_text("dict")["blocks"]:
+    for block in (content["dict"] if content else doc_page.get_text("dict"))["blocks"]:
         if block.get("type") != 0:
             continue
         for line in block["lines"]:
@@ -366,7 +367,251 @@ def fitz_rect(seq):
     return [round(float(v), 2) for v in seq]
 
 
-def structure_candidates(doc, pages):
+def page_content(page):
+    """生成侧共同页面事实；独立核验不消费本次缓存。"""
+    # 各原接口的 flags 会影响原生分块；分别缓存结果，不从其他视图补偿。
+    text_dict = page.get_text("dict")
+    originals = ["".join(s["text"] for s in line.get("spans", []))
+                 for block in text_dict["blocks"] if block.get("type") == 0
+                 for line in block["lines"]
+                 if "".join(s["text"] for s in line.get("spans", [])).strip()]
+    return {"text": page.get_text("text"), "blocks": page.get_text("blocks"),
+            "dict": text_dict, "line_originals": originals, "drawings": page.get_drawings(),
+            "images": page.get_image_info(xrefs=True),
+            "rawdict": page.get_text("rawdict"), "links": page.get_links()}
+
+
+def candidate_evidence(page, identity, scope, rect, parameters):
+    return {"source_sha256": (identity or {}).get("sha256"), "scope": scope,
+            "page": page.number + 1, "rect": fitz_rect(rect) if rect is not None else None,
+            "coordinate_space": "unrotated-page-pt", "rotation": page.rotation,
+            "display_rect": fitz_rect(load_fitz().Rect(rect) * page.rotation_matrix)
+                            if rect is not None else None,
+            "rotation_matrix": list(page.rotation_matrix),
+            "parameters": parameters,
+            "applicability": "可靠文字层；空间关系仅作定位线索，须原页裁决",
+            "ambiguities": []}
+
+
+def figure_region_candidates(page, content, lines, identity, scope):
+    """空间连续对象组与邻近文字/题注；保留所有组及归属冲突。"""
+    fitz = load_fitz()
+    gap = median([r[3] - r[1] for _, r, _, _ in lines]) if lines else 0.0
+    objects = [{"kind": "drawing", "index": i, "rect": fitz_rect(d["rect"])}
+               for i, d in enumerate(content["drawings"])]
+    objects += [{"kind": "bitmap", "index": i, "xref": d.get("xref"),
+                 "rect": fitz_rect(d["bbox"])} for i, d in enumerate(content["images"])]
+    groups = []
+    for obj in objects:
+        region = fitz.Rect(obj["rect"])
+        members = [obj]
+        # 合并到固定点，避免绘图提取次序决定组边界。
+        again = True
+        while again:
+            again = False
+            for group in list(groups):
+                expanded = fitz.Rect(region.x0-gap, region.y0-gap,
+                                     region.x1+gap, region.y1+gap)
+                other = group[0]
+                if (expanded.x0 <= other.x1 and expanded.x1 >= other.x0
+                        and expanded.y0 <= other.y1 and expanded.y1 >= other.y0):
+                    region = fitz.Rect(min(region.x0, other.x0),
+                                       min(region.y0, other.y0),
+                                       max(region.x1, other.x1),
+                                       max(region.y1, other.y1))
+                    members.extend(group[1])
+                    groups.remove(group)
+                    again = True
+        groups.append((region, members))
+    captions = [{"index": i, "rect": r, "text": content["line_originals"][i]}
+                for i, (t, r, _, _) in enumerate(lines) if _FIGCAP_RE.match(t)]
+    out = []
+    for index, (region, members) in enumerate(groups):
+        base = fitz.Rect(region)
+        expanded = fitz.Rect(base.x0-gap, base.y0-gap, base.x1+gap, base.y1+gap)
+        nearby = []
+        conflicts = []
+        for i, (text, rect, _, _) in enumerate(lines):
+            line = fitz.Rect(rect)
+            if expanded.intersects(line) and not _FIGCAP_RE.match(text):
+                nearby.append({"kind": "text_line", "index": i, "rect": rect, "text": content["line_originals"][i]})
+                if expanded.contains(fitz.Point((line.x0+line.x1)/2,
+                                                (line.y0+line.y1)/2)):
+                    region |= line
+                else:
+                    conflicts.append(nearby[-1])
+        associations = [c for c in captions
+                        if c["rect"][0] < region.x1 and c["rect"][2] > region.x0
+                        and min(abs(c["rect"][1]-region.y1),
+                                abs(c["rect"][3]-region.y0)) <= 3 * gap]
+        associations.sort(key=lambda c: min(abs(c["rect"][1]-base.y1),
+                                              abs(c["rect"][3]-base.y0)))
+        item = candidate_evidence(page, identity, scope, region,
+                                  {"strategy": "intersecting-or-neighbouring-objects",
+                                   "gap_pt": gap, "gap_basis": "median text-line height",
+                                   "caption_gap_pt": 3 * gap,
+                                   "caption_relation": "horizontal overlap and nearest vertical edge"})
+        item.update({"occurrence": index + 1, "object_rect": fitz_rect(base),
+                     "objects": members + nearby, "caption_alternatives": associations,
+                     "text_overlap_conflicts": conflicts,
+                     "boundary_alternatives": [fitz_rect(region | fitz.Rect(c["rect"]))
+                                               for c in conflicts],
+                     "basis": "绘图/位图空间连续组及邻近文字；图号不参与合并"})
+        item["ambiguities"] = ["邻近文字可能为图例、正文或表格；逐项回页确认归属",
+                                "图形与表格/装饰均可能形成对象组，不自动分类"]
+        if conflicts:
+            item["ambiguities"].append("仅相交文字的中心在邻接框外；具体冲突见 text_overlap_conflicts，不自动扩大到其整行")
+        if not associations:
+            item["ambiguities"].append("未找到同横向区域图题；题注关联待定")
+        out.append(item)
+    associated = {c["index"] for item in out for c in item["caption_alternatives"]}
+    for caption in captions:
+        if caption["index"] in associated:
+            continue
+        item = candidate_evidence(page, identity, scope, None,
+                                  {"strategy": "caption-without-nearby-graphics",
+                                   "caption_gap_pt": 3 * gap})
+        item.update({"occurrence": len(out) + 1, "objects": [],
+                     "caption_alternatives": [caption],
+                     "basis": "图题有定位，但未发现可可靠关联的绘图/位图组"})
+        item["ambiguities"] = ["图区定位缺口：可能是文字/代码型图或距离策略未覆盖，须原页补框"]
+        out.append(item)
+    return out
+
+
+def table_cell_candidates(page, content, figures, identity, scope):
+    """保留两种原生发现结果；格位/表头及图形冲突供原页裁决。"""
+    fitz = load_fitz()
+    candidates, checks = [], []
+    lines, _ = _page_lines(page, content)
+    gap = median([r[3] - r[1] for _, r, _, _ in lines]) if lines else 0.0
+    calls = [("lines", None), ("text", None)]
+    for text, rect, _, _ in lines:
+        if not _TABCAP_RE.match(text):
+            continue
+        for figure in figures:
+            base = figure.get("object_rect")
+            if (base and base[0] < rect[2] and base[2] > rect[0]
+                    and 0 <= rect[1] - base[3] <= 3 * gap):
+                clip = [base[0] - gap, base[1] - gap,
+                        base[2] + gap, min(base[3] + gap, rect[1])]
+                if ("text", clip) not in calls:
+                    calls.append(("text", clip))
+    for strategy, clip in calls:
+        parameters = {"strategy": strategy, "snap_tolerance": 3,
+                      "join_tolerance": 3, "edge_min_length": 3,
+                      "min_words_vertical": 3, "min_words_horizontal": 1,
+                      "intersection_tolerance": 3, "text_tolerance": 3}
+        if clip is not None:
+            parameters["clip"] = clip
+        check = candidate_evidence(page, identity, scope, None, parameters)
+        check["pymupdf_version"] = fitz.VersionBind
+        check["paths_basis"] = "共同页面事实中的原生get_drawings结果"
+        if clip is not None:
+            check["clip_basis"] = {"gap_pt": gap, "caption_gap_pt": 3 * gap,
+                                   "basis": "Table题注邻接的绘图组；区域仅为备选，不裁定表格归属"}
+        try:
+            finder = page.find_tables(paths=content["drawings"], **parameters)
+            tables = finder.tables
+            check.update({"status": "checked", "found": len(tables),
+                          "basis": "未发现仅表示本策略无候选，不证明原页无表格"})
+            for index, table in enumerate(tables):
+                item = candidate_evidence(page, identity, scope, table.bbox, parameters)
+                values = table.extract()
+                cells = []
+                for row_index, row in enumerate(table.rows):
+                    for col_index, rect in enumerate(row.cells):
+                        value = values[row_index][col_index]
+                        cells.append({"row": row_index + 1, "column": col_index + 1,
+                                      "rect": fitz_rect(rect) if rect is not None else None,
+                                      "text": value,
+                                      "boundary_status": "located" if rect is not None else "unlocated",
+                                      "empty_text": value == "",
+                                      "ambiguities": ["无独立格边界；可能为合并格，须回页确认"]
+                                                     if rect is None else []})
+                header = table.header
+                item.update({"table_index": index, "row_count": table.row_count,
+                             "column_count": table.col_count, "cells": cells,
+                             "header": {"rect": fitz_rect(header.bbox),
+                                        "cells": [fitz_rect(r) if r is not None else None
+                                                  for r in header.cells],
+                                        "names": header.names, "external": header.external},
+                             "figure_conflicts": [f["occurrence"] for f in figures
+                                                  if f["rect"] and fitz.Rect(f["rect"]).intersects(fitz.Rect(table.bbox))],
+                             "basis": "PyMuPDF原生二维格位；不自动转录或认定为正文表格"})
+                item["original_lines"] = [
+                    {"index": i, "rect": rect, "text": content["line_originals"][i]}
+                    for i, (_, rect, _, _) in enumerate(lines)
+                    if fitz.Rect(rect).intersects(fitz.Rect(table.bbox))]
+                item["pymupdf_version"] = fitz.VersionBind
+                if clip is not None:
+                    item["clip_basis"] = check["clip_basis"]
+                item["ambiguities"] = ["表头所属及多行/合并格须逐格回页确认；两策略结果均保留"]
+                item["ambiguities"].append("原生格位可能拆词或截断表头；完整原文字行见original_lines，不以空格位证明原页空白")
+                if item["figure_conflicts"]:
+                    item["ambiguities"].append("与绘图对象组相交：可能为规则表边框或图内伪表格，不能自动分类")
+                candidates.append(item)
+        except (AttributeError, TypeError, RuntimeError, ValueError) as exc:
+            check.update({"status": "unavailable", "basis": str(exc),
+                          "ambiguities": ["本策略检查缺口；保留原页人工重建路径"]})
+        checks.append(check)
+    return candidates, checks
+
+
+def character_defect_candidates(page, content, identity, scope):
+    """原码位/字形及注解目标证据；没有可靠映射不猜建议值。"""
+    fitz = load_fitz()
+    out, chars = [], []
+    for bi, block in enumerate(content["rawdict"]["blocks"]):
+        if block.get("type") != 0:
+            continue
+        for li, line in enumerate(block["lines"]):
+            context = "".join(c["c"] for s in line["spans"] for c in s["chars"])
+            for si, span in enumerate(line["spans"]):
+                for ci, char in enumerate(span["chars"]):
+                    chars.append(char)
+                    value = char["c"]
+                    code = ord(value)
+                    kind = ("replacement" if code == 0xfffd else
+                            "control" if code < 32 or 0x7f <= code < 0xa0 else
+                            "private-use" if 0xe000 <= code <= 0xf8ff else
+                            "mathematical-alphanumeric" if 0x1d400 <= code <= 0x1d7ff else
+                            "ligature" if 0xfb00 <= code <= 0xfb06 else None)
+                    if kind is None:
+                        continue
+                    item = candidate_evidence(page, identity, scope, char["bbox"],
+                                              {"strategy": "native-rawdict-codepoint", "flags": fitz.TEXTFLAGS_RAWDICT})
+                    item.update({"kind": kind, "text": value, "codepoints": ["U+%04X" % code],
+                                 "context": context, "font": span["font"],
+                                 "object_locator": {"block": bi, "line": li, "span": si, "char": ci},
+                                 "suggestion": None, "suggestion_evidence": None,
+                                 "basis": "原生字形与码位线索；字符类别不证明映射错误"})
+                    item["ambiguities"] = ["无可靠字符映射建议；正确数学字符、私用字形或印刷连字也可能命中，须原页及较高保真证据确认"]
+                    out.append(item)
+    for index, link in enumerate(content["links"]):
+        target = link.get("uri")
+        rect = link.get("from")
+        if not target or rect is None:
+            continue
+        # get_links 的 from 为显示空间，rawdict 字形为未旋转页面空间。
+        rect = fitz.Rect(rect) * page.derotation_matrix
+        extracted = "".join(c["c"] for c in chars if fitz.Rect(rect).contains(
+            fitz.Point((c["bbox"][0]+c["bbox"][2])/2, (c["bbox"][1]+c["bbox"][3])/2)))
+        if not extracted.strip().startswith(("http:", "https:")) or extracted.strip() == target:
+            continue
+        item = candidate_evidence(page, identity, scope, rect,
+                                  {"strategy": "embedded-uri-versus-display-fragment"})
+        item.update({"kind": "url-target-difference", "text": extracted,
+                     "codepoints": ["U+%04X" % ord(c) for c in extracted],
+                     "context": extracted, "object_locator": {"link": index, "xref": link.get("xref")},
+                     "suggestion": target, "suggestion_evidence": {"kind": "embedded-link-uri", "uri": target},
+                     "basis": "内嵌注解目标是地址证据，非展示文字的逐字映射"})
+        item["ambiguities"] = ["换行、展示截断或标签可能解释差异；必须回页确认完整URL，不能自动替换片段"]
+        out.append(item)
+    return out
+
+
+def structure_candidates(doc, pages, contents=None, identity=None):
     """结构候选：标题、图题、表格页、脚注候选与文本层公式候选（D4）。
 
     正则只作线索，候选一律带页码、位置与判定依据，交给主 Agent 对照
@@ -379,10 +624,17 @@ def structure_candidates(doc, pages):
     footnotes = []
     formulas = []
     bitmaps = []
+    figures = []
+    tables = []
+    table_checks = []
+    reading_orders = []
+    character_defects = []
     for pno in pages:
         page = doc[pno - 1]
-        lines, body_size = _page_lines(page)
-        height = page.rect.height
+        content = contents[pno] if contents else page_content(page)
+        character_defects.extend(character_defect_candidates(page, content, identity, pages))
+        lines, body_size = _page_lines(page, content)
+        height = (page.rect * page.derotation_matrix).height
         for text, rect, size, bold in lines:
             basis = []
             numbered = _HEADING_NUM_RE.match(text)
@@ -409,10 +661,36 @@ def structure_candidates(doc, pages):
                     and _FOOTNOTE_START_RE.match(text)):
                 footnotes.append({"page": pno, "rect": rect, "text": text,
                                   "size": size})
-            if (any(ch in _FORMULA_CHARS for ch in text)
+            if (any(ch in _FORMULA_CHARS or 0x1d400<=ord(ch)<=0x1d7ff for ch in text)
                     or _FORMULA_RE.search(text)):
-                formulas.append({"page": pno, "rect": rect, "text": text})
-        for info in page.get_image_info(xrefs=True):
+                item=candidate_evidence(page,identity,pages,rect,
+                    {"strategy":"native-line-math-hint", "flags":load_fitz().TEXTFLAGS_RAWDICT})
+                item.update({"text":text,"fragments":[],
+                             "extraction":{"pymupdf":load_fitz().VersionBind,"view":"rawdict"},
+                             "ambiguities":["数学/代码/图内文字/货币及编号须原页裁决；行提示不证明完整表达式或所属"]})
+                for bi,raw_block in enumerate(content['rawdict']['blocks']):
+                    for li,raw_line in enumerate(raw_block.get('lines',[])):
+                        if fitz_rect(raw_line['bbox'])!=rect:
+                            continue
+                        item['cluster']={'block':bi,'rect':fitz_rect(raw_block['bbox']),
+                                         'lines':len(raw_block['lines'])}
+                        for si,span in enumerate(raw_line['spans']):
+                            if span['chars']:
+                                item['fragments'].append({'block':bi,'line':li,'span':si,
+                                    'start':0,'end':len(span['chars']),
+                                    'text':''.join(ch['c'] for ch in span['chars']),
+                                    'font':span['font']})
+                item['original_text']=''.join(f['text'] for f in item['fragments'])
+                formulas.append(item)
+        page_figures = figure_region_candidates(page, content, lines, identity, pages)
+        figures.extend(page_figures)
+        reading = reading_order_candidate(page, content, page_figures, identity, pages)
+        if reading is not None:
+            reading_orders.append(reading)
+        page_tables, checks = table_cell_candidates(page, content, page_figures, identity, pages)
+        tables.extend(page_tables)
+        table_checks.extend(checks)
+        for info in content["images"]:
             bitmaps.append({
                 "page": pno,
                 "xref": info.get("xref"),
@@ -427,10 +705,15 @@ def structure_candidates(doc, pages):
         "footnotes": footnotes,
         "formulas": formulas,
         "bitmaps": bitmaps,
+        "figure_regions": figures,
+        "table_cells": tables,
+        "table_checks": table_checks,
+        "reading_orders": reading_orders,
+        "character_defects": character_defects,
     }
 
 
-def snapshot_layout(doc, pages):
+def snapshot_layout(doc, pages, contents=None):
     """保版面快照：逐页文本块带坐标矩形，按提取顺序输出。"""
     out = []
     for pno in pages:
@@ -438,7 +721,7 @@ def snapshot_layout(doc, pages):
         out.append("===== 第 %d 页（%.0f x %.0f pt，旋转 %d°）====="
                    % (pno, page.rect.width, page.rect.height,
                       page.rotation))
-        for block in page.get_text("blocks"):
+        for block in (contents[pno]["blocks"] if contents else page.get_text("blocks")):
             if block[6] != 0 or not (block[4] or "").strip():
                 continue
             out.append("[块] (%.1f,%.1f)-(%.1f,%.1f)"
@@ -447,12 +730,12 @@ def snapshot_layout(doc, pages):
     return "\n".join(out) + "\n"
 
 
-def _reading_order_blocks(page):
+def _reading_order_blocks(page, content=None):
     """栏感知的块排序：全宽块（跨栏标题/图题）作锚点，相邻锚点之间
     先左栏后右栏按纵向排列。只作通读辅助，不单独裁定跨栏顺序（R2）。"""
-    blocks = [b for b in page.get_text("blocks")
+    blocks = [b for b in (content["blocks"] if content else page.get_text("blocks"))
               if b[6] == 0 and (b[4] or "").strip()]
-    width = page.rect.width
+    width = (page.rect * page.derotation_matrix).width
     anchors = sorted((b for b in blocks
                       if (b[2] - b[0]) > 0.55 * width),
                      key=lambda b: b[1])
@@ -480,7 +763,7 @@ def _reading_order_blocks(page):
     return ordered
 
 
-def snapshot_reading(doc, pages):
+def snapshot_reading(doc, pages, contents=None):
     """通读快照：栏感知阅读顺序拼接的纯文本，接近栏序通读。"""
     out = []
     for pno in pages:
@@ -488,9 +771,59 @@ def snapshot_reading(doc, pages):
         out.append("===== 第 %d 页（%.0f x %.0f pt，旋转 %d°）====="
                    % (pno, page.rect.width, page.rect.height,
                       page.rotation))
-        for block in _reading_order_blocks(page):
+        for block in _reading_order_blocks(page, contents[pno] if contents else None):
             out.append(block[4].rstrip("\n"))
     return "\n".join(out) + "\n"
+
+
+def reading_order_candidate(page, content, figures, identity, scope):
+    """呈现既有通读辅助的定位和差异，不写人工reading_order。"""
+    fitz = load_fitz()
+    bounds = page.rect * page.derotation_matrix
+    blocks = [b for b in content["blocks"] if b[6] == 0 and (b[4] or "").strip()]
+    if not blocks:
+        return None  # 空列表只表示未发现顺序线索，不能证明原页无内容。
+    suggested = _reading_order_blocks(page, content)
+    item = candidate_evidence(page, identity, scope, bounds,
+                              {"anchor_width_ratio": 0.55, "column_midpoint_pt": bounds.width / 2,
+                               "strategy": "existing-column-aware-reading-helper"})
+    layout_line, reading_line = 2, 2
+    entries = []
+    for index, block in enumerate(blocks):
+        size = block[4].rstrip("\n").count("\n") + 1
+        anchor = block[2] - block[0] > 0.55 * bounds.width
+        entries.append({"block_index": block[5], "rect": fitz_rect(block[:4]),
+                        "text": block[4], "extracted_order": index + 1,
+                        "suggested_order": next(i + 1 for i, b in enumerate(suggested) if b is block),
+                        "column": "anchor" if anchor else "left" if (block[0]+block[2])/2 < bounds.width/2 else "right",
+                        "overlapping_blocks": [b[5] for b in blocks if b is not block
+                                               and fitz.Rect(b[:4]).intersects(fitz.Rect(block[:4]))],
+                        "layout_page_lines": [layout_line + 1, layout_line + size]})
+        layout_line += size + 1
+    for block in suggested:
+        entry = next(e for e in entries if e["block_index"] == block[5])
+        size = block[4].rstrip("\n").count("\n") + 1
+        entry["reading_page_lines"] = [reading_line, reading_line + size - 1]
+        reading_line += size
+    item.update({"blocks": entries,
+                 "column_regions": {"left": [0, 0, bounds.width / 2, bounds.height],
+                                    "right": [bounds.width / 2, 0, bounds.width, bounds.height]},
+                 "extracted_sequence": [b[5] for b in blocks],
+                 "suggested_sequence": [b[5] for b in suggested],
+                 "graphic_regions": [{"occurrence": f["occurrence"], "rect": f["rect"],
+                                      "caption_alternatives": f["caption_alternatives"],
+                                      "intersecting_text_blocks": [b[5] for b in blocks
+                                                                   if f["rect"] and fitz.Rect(f["rect"]).intersects(fitz.Rect(b[:4]))],
+                                      "crosses_midline": bool(f["rect"] and f["rect"][0] < bounds.width/2 < f["rect"][2])}
+                                     for f in figures],
+                 "snapshot_correspondence": "页内section行号，页标题为第1行；snapshots_layout.txt / snapshots_reading.txt",
+                 "basis": "原生文本块提取序与既有通读排序的完整定位；图形组不按文本栏切开"})
+    item["ambiguities"] = ["宽度阈值和中点仅为原辅助参数；单栏/跨栏标题、交织正文与图题须原页裁决",
+                           "图形可能无原生文本块；graphic_regions整组及题注备选不能由文本流裁定所属",
+                           "具体交织/重叠位置见overlapping_blocks与intersecting_text_blocks，不自动改框或改序"]
+    if page.rotation:
+        item["ambiguities"].append("旋转页定位为未旋转pt，建议序并非显示页阅读权威")
+    return item
 
 
 def extract_region_text(page, rect):
@@ -624,7 +957,7 @@ def region_object_census(page, rect):
 def render_figure(page, rect, dpi, path):
     """按页面矩形与 dpi 口径把矢量图区域渲染为 PNG 并落盘。"""
     fitz = load_fitz()
-    pix = page.get_pixmap(dpi=dpi, clip=fitz.Rect(rect))
+    pix = page.get_pixmap(dpi=dpi, clip=fitz.Rect(rect) * page.rotation_matrix)
     pix.save(path)
     return pix.width, pix.height
 

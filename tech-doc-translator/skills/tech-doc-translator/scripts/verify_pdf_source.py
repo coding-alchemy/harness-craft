@@ -4,7 +4,16 @@
 用法：
     python3 verify_pdf_source.py <pdf> --checklist <清单.json> \
         --source-md <源Markdown> [--block-map <映射.json>] \
-        [--translation <译文.md>]
+        [--translation <译文.md>] \
+        [--numeric-review] [--numeric-policy <UTF-8 项目约定文件>]
+
+--numeric-review 显式启用数字与单位复核辅助（R5/§4.7）：以既有裁决
+后源 Markdown 与实际译文为输入，报告数字、百分比、数量级与单位差异
+及位置，只报告不换算、不改文、不授予语义完成；不附带 --translation
+时明确失败（不从渲染文本另立数字权威，不用该辅助放行原 PDF 源缺
+口）。未启用时明示未检查。
+--numeric-policy 引用本次实际适用的 UTF-8 项目数字约定：记录路径与
+内容摘要作复核上下文，不执行为换算规则。
 
 独立于物化操作重新打开源 PDF：核对源身份（realpath/sha256/页数）与清单
 一致；按清单逐块定位重读页面区域内容，与源 Markdown 的对应行区间
@@ -187,14 +196,22 @@ def run_translation_checks(checklist, source_md_text, translation_text,
     # 标题：权威清单 (层级, 原题) 有序对照；中文后缀按边界规则允许
     expected = [(0, b.get("level"), (b.get("text") or "").strip())
                 for b in blocks if b.get("type") == "heading"]
+    if checklist.get('formula_contract')=='confirmed-tex-v1':
+        # 全源已独立回原页准入，确认数学标题不回退原生残片展平值。
+        expected=heading_entries(source_md_text)
     actual = heading_entries(translation_text)
     product += compare_headings(expected, actual,
                                 src_label="权威清单", doc_label="译文")
 
     # 代码：译文围栏与源文按出现顺序逐块对照（正文逐字节）
+    code_source,code_target=source_md_text,translation_text
+    if checklist.get('formula_contract')=='confirmed-tex-v1':
+        import _pdf_math
+        code_source=_pdf_math.footnote_view(source_md_text,_pdf_math.context(checklist))[0]
+        code_target=_pdf_math.footnote_view(translation_text,_pdf_math.context(checklist))[0]
     product += compare_code_fences(
-        scan_code_fences(source_md_text).blocks,
-        scan_code_fences(translation_text).blocks,
+        scan_code_fences(code_source).blocks,
+        scan_code_fences(code_target).blocks,
         src_label="源文", doc_label="译文")
 
     # 图片：出现次序与来源身份（清单固化摘要）逐项核对
@@ -236,6 +253,7 @@ def run_translation_checks(checklist, source_md_text, translation_text,
     # 脚注：相对权威清单覆盖（清单 footnote_label），整对删除也检出，
     # 不以译文内部配对代替源覆盖
     for block in blocks:
+        if checklist.get('formula_contract')=='confirmed-tex-v1':continue
         label = block.get("footnote_label")
         if not label:
             continue
@@ -275,7 +293,7 @@ def run_translation_checks(checklist, source_md_text, translation_text,
 
 def run_verification(pdf_path, checklist, md_text, block_map,
                      checklist_dir=None, md_dir=None,
-                     translation_text=None, translation_dir=None):
+                     translation_text=None, translation_dir=None, approved_extra_math=()):
     """独立对账核心；返回 (fails, warns)。CLI 与后续预检共用。
 
     checklist_dir 为 golden/图片相对路径（块显式记录）的解析基点，
@@ -317,6 +335,14 @@ def run_verification(pdf_path, checklist, md_text, block_map,
         fails.append("正文类型为 %s，不能宣称全文准备完成" % doc_type)
 
     lines = md_text.split("\n")
+    import _pdf_math
+    formal_math = False
+    try:
+        formal_math = _pdf_math.enabled(checklist, md_text)
+        if formal_math:
+            _pdf_math.verify(checklist,doc,md_text,block_map,translation_text,approved_extra_math=approved_extra_math)
+    except (ValueError,KeyError,IndexError,TypeError) as exc:
+        fails.append('确认数学独立对账失败: '+str(exc))
     blocks = sorted(checklist.get("blocks") or [],
                     key=lambda b: b.get("order", 0))
     by_id = {b.get("id"): b for b in blocks}
@@ -365,6 +391,8 @@ def run_verification(pdf_path, checklist, md_text, block_map,
     for _block, span in ranges:
         covered.update(range(span[0], span[1] + 1))
     for line_no, line in enumerate(lines, start=1):
+        if formal_math and line_no <= 4:
+            continue  # 新合同文档头不作为正文或确认数学消费。
         if line.strip() and line_no not in covered:
             fails.append("源 Markdown L%d 不属于任何已裁决块区间（多余或"
                          "漏裁决）: %r" % (line_no, line[:60]))
@@ -376,6 +404,8 @@ def run_verification(pdf_path, checklist, md_text, block_map,
         label = "块 %s（%s, page=%s, L%d-%d）" % (
             block.get("id"), btype, block.get("page"), span[0], span[1])
         slice_lines = lines[span[0] - 1:span[1]]
+        if formal_math and ('content' in block or 'cells' in block):
+            continue  # 已由原字形/有序事实与实际块独立对账，不展平数学。
         if btype == "heading":
             level, text = block.get("level"), (block.get("text") or "").strip()
             found = re.match(r"^(#{1,8})\s+(.+)$",
@@ -438,7 +468,9 @@ def run_verification(pdf_path, checklist, md_text, block_map,
                     expected = expected[:-1]
                 # 原始字节切片比较：不得经 extract_region_text 的
                 # rstrip 通道，行尾空白差异必须可检出
-                fences = [fence for fence in scan_code_fences(md_text).blocks
+                code_view=(_pdf_math.footnote_view(md_text,_pdf_math.context(checklist))[0]
+                           if formal_math and block.get('footnote') is not None else md_text)
+                fences = [fence for fence in scan_code_fences(code_view).blocks
                           if span[0] <= fence.start_line <= span[1]]
                 if len(fences) != 1:
                     fails.append("%s: 对应围栏数 %d（期望 1，golden ↔ 块"
@@ -492,7 +524,10 @@ def run_verification(pdf_path, checklist, md_text, block_map,
     if len(expected_headings) != len(md_headings):
         fails.append("标题数不一致: 清单裁决 %d 条 vs 源 Markdown %d 条"
                      % (len(expected_headings), len(md_headings)))
+    heading_blocks=[b for b in blocks if b.get('type')=='heading']
     for index, (level, text) in enumerate(expected_headings):
+        if formal_math and 'content' in heading_blocks[index]:
+            continue  # 已由原页有序文字/数学及实际标题层级独立核验。
         if index >= len(md_headings):
             break
         line_no, md_level, actual_title = md_headings[index]
@@ -533,6 +568,12 @@ def build_parser():
                         help="块区间映射（默认 <源Markdown>.blocks.json）")
     parser.add_argument("--translation", default=None,
                         help="译文 Markdown（提供时追加译文硬检查）")
+    parser.add_argument("--approved-extra-math", action="append", default=[],
+                        help="逐次显式获准的译注数学表达式（沿用译文核验选项）")
+    parser.add_argument("--numeric-review", action="store_true",
+                        help="显式启用数字与单位复核辅助（需 --translation）")
+    parser.add_argument("--numeric-policy", default=None,
+                        help="UTF-8 项目数字约定文件（复核上下文，不执行）")
     return parser
 
 
@@ -564,9 +605,36 @@ def main(argv=None):
         checklist_dir=os.path.dirname(os.path.abspath(args.checklist)),
         md_dir=os.path.dirname(os.path.abspath(args.source_md)),
         translation_text=translation_text,
-        translation_dir=translation_dir)
+        translation_dir=translation_dir, approved_extra_math=args.approved_extra_math)
     for item in warns:
         print("WARN: %s" % item)
+    if args.numeric_review:
+        # R5/§4.7：数字辅助以既有裁决后源 Markdown 与实际译文为输入
+        #（不另立文本权威）；只报告差异与定位 ID。
+        if translation_text is None:
+            print("FAIL: --numeric-review 需要 --translation（不以源侧单"
+                  "边扫描充当数字复核）", file=sys.stderr)
+            return 1
+        import _numeric_review as numeric
+        try:
+            review = numeric.compute_numeric_review(
+                md_text, translation_text, src_label=args.source_md,
+                doc_label=args.translation, scope="full",
+                policy_path=args.numeric_policy)
+        except ValueError as exc:
+            print("FAIL: 数字辅助: %s" % exc, file=sys.stderr)
+            return 1
+        print("WARN: %s" % numeric.format_policy_line(review["policy"]))
+        for diff in review["diffs"]:
+            print("WARN: %s" % numeric.format_diff_hint(diff))
+        if not review["diffs"]:
+            print("WARN: 数字提示: 本次范围源/译逐字保留，无统计差异"
+                  "（仍须独立语义复核，不授予完成）")
+        for note in numeric.unchecked_notes(review):
+            print("WARN: %s" % note)
+    else:
+        print("WARN: 数字辅助: 未启用 --numeric-review，此项未检查"
+              "（原人工数字复核义务不变）")
     if fails:
         product = [f for f in fails if f.startswith("【产物】")]
         convention = [f for f in fails if f.startswith("【口径】")]

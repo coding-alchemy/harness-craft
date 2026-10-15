@@ -3,7 +3,12 @@
 
 用法：
     python3 verify_api_translation.py <merged.md> <manifest.txt> <official_toc.txt> <site_root> <src1.md> [<src2.md> ...]
+        [--official-headings-file <文件>]
         [--approved-extra-math <表达式>]...
+
+--official-headings-file 提供 UTF-8 官方原题清单文件（每行一项，按官方
+页面顺序）；与 manifest/TOC/site root/源路径可并存，角色不变。原 TOC
+继续独立核对页面集合与顺序，标题文件不替代 TOC。
 
 --approved-extra-math 按原文表达式逐条豁免获准译注公式（可重复；不掩盖源公式遗漏）。
 
@@ -18,6 +23,13 @@ official_toc.txt 是独立的官方导航/TOC 快照（每行一个页面相对�
 4. 代码围栏：配对、数量及逐字节内容与源一致。
 5. 图片：每页数量/顺序一致，最终 Markdown 的相对引用存在，并做魔数 / `file` 验证。
 6. 暗亮图片对只计一次。
+
+--numeric-review 显式启用数字与单位复核辅助（R5/§4.7）：按 manifest
+确认顺序拼接全部源页与合并译文比较，报告数字、百分比、数量级与单位
+差异及位置（页来源角色保留在定位标签中），只报告不换算、不改文、
+不授予语义完成；漏页/页序不符由页面闭合门禁拒绝。未启用时明示未检查。
+--numeric-policy 引用本次实际适用的 UTF-8 项目数字约定：记录路径与
+内容摘要作复核上下文，不执行为换算规则。
 """
 import os
 import re
@@ -25,6 +37,11 @@ import subprocess
 import sys
 
 from bs4 import BeautifulSoup
+from _official_headings import (
+    extract_official_headings_option,
+    load_official_headings,
+    official_titles_diff,
+)
 from _verification import (
     check_image_file,
     compare_code_fences,
@@ -32,16 +49,18 @@ from _verification import (
     compare_math_spans,
     extract_approved_extra_math,
     extract_image_options,
+    extract_numeric_review_options,
     extract_strong_tokens,
     fenced_line_numbers,
     heading_entries,
     image_occurrence_fails,
     image_references,
     load_image_digests,
+    math_issue_fails,
     resource_identity_digest,
     resolve_delivery_image,
     scan_code_fences,
-    scan_math_spans,
+    scan_math,
     strong_token_report,
 )
 
@@ -107,13 +126,19 @@ def _split_pages(text):
 def run_checks(merged_text, merged_dir, manifest, official, site_root,
                src_texts, *, merged_label, delivery_root=None,
                image_digests=None, approved_extra_math=(),
-               strong_tokens=()):
-    """多页 API 检查核心：接收候选文本与实际目标目录，返回失败诊断列表。
+               strong_tokens=(), official_headings=(),
+               numeric_review=False, numeric_policy=None):
+    """多页 API 检查核心：接收候选文本与实际目标目录，返回 (失败诊断, 告警)。
 
     merged_text 可来自工作区外临时候选（草稿预检）；merged_dir 必须是
     最终 Markdown 目录——图片按最终目标路径定位，不按候选临时路径定位。
+    强 token 的缺席/未配置告警与失败诊断一并返回，不丢弃。
+    official_headings 为加载后的官方原题清单：按 manifest 页面顺序对
+    全部译文标题做有序逐项对照；页面集合与顺序仍由官方 TOC 独立核对，
+    标题文件不替代 TOC。
     """
     fails = []
+    warns = []
 
     if not manifest:
         raise SystemExit('empty manifest')
@@ -160,22 +185,26 @@ def run_checks(merged_text, merged_dir, manifest, official, site_root,
                 src_label, doc_label):
             fails.append('页 %s 代码逐块核对: %s' % (page_rel, diff))
 
-        # 公式逐项核对（类型/顺序/原表达式）
-        src_math = scan_math_spans(src_text)
-        doc_math = scan_math_spans(trans_text)
+        # 公式逐项核对（类型/顺序/原表达式）与未解决定界
+        src_scan = scan_math(src_text)
+        doc_scan = scan_math(trans_text)
         math_diffs, _ = compare_math_spans(
-            src_math, doc_math, src_label, doc_label,
+            src_scan.spans, doc_scan.spans, src_label, doc_label,
             approved_extra_exprs=approved_extra_math, doc_text=trans_text)
         for diff in math_diffs:
             fails.append('页 %s 公式逐项核对: %s' % (page_rel, diff))
+        for issue_fail in math_issue_fails(src_scan.issues, src_label) + \
+                math_issue_fails(doc_scan.issues, doc_label):
+            fails.append('页 %s 公式逐项核对: %s' % (page_rel, issue_fail))
 
-        # 强 token（项目显式指定；未配置时明示未检查）
-        token_diffs, _ = strong_token_report(src_text, trans_text,
-                                             strong_tokens,
-                                             src_label, doc_label)
-        if token_diffs is not None:
-            for diff in token_diffs:
-                fails.append('页 %s 强 token %s' % (page_rel, diff))
+        # 强 token（项目显式指定；未配置或源中缺席时明示未检查）
+        token_diffs, token_warns = strong_token_report(src_text, trans_text,
+                                                       strong_tokens,
+                                                       src_label, doc_label)
+        for diff in token_diffs or []:
+            fails.append('页 %s 强 token %s' % (page_rel, diff))
+        for warn in token_warns:
+            warns.append('页 %s 强 token %s' % (page_rel, warn))
 
         # 图片：按出现顺序以来源文件摘要核对身份（不依赖 basename），
         # 交付引用解析、离线类型与暗亮出现数一并核验
@@ -206,6 +235,38 @@ def run_checks(merged_text, merged_dir, manifest, official, site_root,
                 fails.append('页 %s 图片 #%d 源快照资源缺失: %s'
                              % (page_rel, order, html_visible[order - 1]))
 
+    if official_headings:
+        # 官方原题清单独立基准：按 manifest 页面顺序拼接译文标题原题
+        # 后逐项对照；源页与译文同时漏标题时仍被检出。
+        got = [t for page in trans_pages for _, _, t in heading_entries(page)]
+        diff = official_titles_diff(official_headings, got)
+        if diff is not None:
+            fails.append('官方标题清单: 与官方清单不一致（%s）' % diff)
+
+    if numeric_review:
+        # R5/§4.7：按 manifest 确认顺序拼接全部源页与合并译文比较；
+        # 只报告差异与定位 ID，不换算/改文/授予完成。
+        import _numeric_review as numeric
+        src_label = '源页拼接(%s)' % '+'.join(manifest)
+        try:
+            review = numeric.compute_numeric_review(
+                '\n'.join(src_texts), merged_text, src_label=src_label,
+                doc_label=merged_label, scope='full',
+                policy_path=numeric_policy)
+        except ValueError as exc:
+            fails.append('数字辅助: %s' % exc)
+        else:
+            warns.append(numeric.format_policy_line(review['policy']))
+            for diff in review['diffs']:
+                warns.append(numeric.format_diff_hint(diff))
+            if not review['diffs']:
+                warns.append('数字提示: 本次范围源/译逐字保留，无统计差异'
+                             '（仍须独立语义复核，不授予完成）')
+            warns.extend(numeric.unchecked_notes(review))
+    else:
+        warns.append('数字辅助: 未启用 --numeric-review，此项未检查'
+                     '（原人工数字复核义务不变）')
+
     # 全局出现序号的来源身份映射（--image-map，按交付出现顺序）
     global_refs = [(page_idx, order, src)
                    for page_idx, page in enumerate(trans_pages)
@@ -226,14 +287,21 @@ def run_checks(merged_text, merged_dir, manifest, official, site_root,
                         for i in range(page_idx))]:
                     fails.append('第 %d 页图片 #%d 来源身份不符: %s 与 --image-map 摘要不一致'
                                  % (page_idx + 1, order, src))
-    return fails
+    return fails, warns
 
 
-def parse_args(argv):
-    """解析既有 CLI 参数，返回语义结构（verify_delivery 复用同一解释）。"""
+def parse_args(argv, *, base_dir=None):
+    """解析既有 CLI 参数，返回语义结构（verify_delivery 复用同一解释）。
+
+    --official-headings-file 与 manifest/official TOC/site root/源路径可
+    并存，角色不变；官方 TOC 继续独立核对页面集合与顺序。
+    """
+    argv, official_headings_file = extract_official_headings_option(argv)
     argv, approved_extra_math = extract_approved_extra_math(argv)
-    argv, strong_tokens = extract_strong_tokens(argv)
+    token_files = []
+    argv, strong_tokens = extract_strong_tokens(argv, base_dir=base_dir, files=token_files)
     argv, image_map, delivery_root = extract_image_options(argv)
+    argv, numeric_review, numeric_policy = extract_numeric_review_options(argv)
     if len(argv) < 6:
         sys.exit(__doc__)
     return {
@@ -242,10 +310,14 @@ def parse_args(argv):
         'toc_path': argv[2],
         'site_root': argv[3],
         'src_paths': list(argv[4:]),
+        'official_headings_file': official_headings_file,
+        'strong_token_files': token_files,
         'strong_tokens': strong_tokens,
         'approved_extra_math': approved_extra_math,
         'image_map': image_map,
         'delivery_root': delivery_root,
+        'numeric_review': numeric_review,
+        'numeric_policy': numeric_policy,
     }
 
 
@@ -261,6 +333,11 @@ def main():
     delivery_root = parsed['delivery_root']
     image_map = parsed['image_map']
     image_digests = load_image_digests(image_map) if image_map else None
+    official_headings = ()
+    if parsed['official_headings_file']:
+        # 共享加载器在 CLI 实际调用基点（本进程 cwd）读取
+        _path, official_headings = load_official_headings(
+            parsed['official_headings_file'])
 
     with open(manifest_path, encoding='utf-8') as f:
         manifest = [l.strip() for l in f if l.strip()]
@@ -269,15 +346,19 @@ def main():
     merged = open(merged_path, encoding='utf-8').read()
     src_texts = [open(p, encoding='utf-8').read() for p in src_paths]
 
-    fails = run_checks(
+    fails, warns = run_checks(
         merged, os.path.dirname(os.path.abspath(merged_path)),
         manifest, official, site_root, src_texts,
         merged_label=os.path.basename(merged_path),
         delivery_root=delivery_root, image_digests=image_digests,
         approved_extra_math=approved_extra_math,
-        strong_tokens=strong_tokens)
+        strong_tokens=strong_tokens, official_headings=official_headings,
+        numeric_review=parsed['numeric_review'],
+        numeric_policy=parsed['numeric_policy'])
 
     print('校验: %s' % os.path.basename(merged_path))
+    for w in warns:
+        print('WARN:', w)
     if fails:
         for f in fails:
             print('FAIL:', f)

@@ -8,25 +8,35 @@
 """
 import copy
 import hashlib
+import json
+from html import escape
+import os
 import re
 
-from bs4 import BeautifulSoup, Comment, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 from _html_fidelity import (
     _INLINE_TAGS,
     HtmlFidelity,
     clean_code_html,
+    markdown_inline_code,
     protect_code_entities,
 )
 from _verification import (
+    SourceMathContext as _SourceMathContext,
+    _HEADING_FACTS_MD,
     fenced_line_numbers,
     heading_entries,
     image_marker_spans,
     image_reference_spans,
     line_code_spans,
     parse_inline_code_spans,
+    resolve_backslash_escapes,
     scan_code_fences,
-    scan_math_spans,
+    scan_math,
+    table_math_spans, markdown_table_row_lines, markdown_table_tokens,
+    decode_table_math,
+    footnote_definition_block,
 )
 
 _WS_RE = re.compile(r'\s+')
@@ -36,7 +46,6 @@ _MD_LINK_RE = re.compile(r'\[((?:\\.|[^\[\]])*)\]\(((?:\\.|[^()])*)\)')
 _MD_IMAGE_RE = re.compile(r'!\[[^\]]*\]\([^)]*\)')
 _MD_IMG_MARKER_RE = re.compile(r'\[IMG:\s*[^\]]*\]')
 _MD_FOOTNOTE_RE = re.compile(r'\[\^([^\]]+)\]')
-_MD_BOLD_RE = re.compile(r'\*\*([^*]+)\*\*')
 _MD_MATH_RE = re.compile(r'\$+([^$]*)\$+')
 _MD_CODE_SPAN_RE = re.compile(r'(`+)(.*?)\1', re.S)
 _SRC_MATH_WRAP_RE = re.compile(r'\\\(|\\\)|\\\[|\\\]')
@@ -45,6 +54,230 @@ _TABLE_CODE_MARKER_RE = re.compile(
     r'^\[TABLE-CODE r=(\d+) c=(\d+)#(\d+)\]$')
 _MD_LIST_MARKER_RE = re.compile(r'^(\s*)-(?: (\S.*?))?\s*$')
 
+# 实际 Markdown 的真实行内阅读（CommonMark）：强调、反斜线转义、链接
+# 与行内代码的生成语法只解码一次，得到阅读文字（§7.11.5：实际端按真实
+# 阅读取事实，不消费生成侧自报文字）
+from markdown_it import MarkdownIt as _MarkdownIt
+
+_MD_INLINE_READ = _MarkdownIt('commonmark', {'html': False})
+
+# 真实阅读的跨度占位符（私用区字符，markdown-it 原样保留）：数学/图片
+# 跨度先换成占位符整段一次行内阅读，强调/链接等成对语法跨跨度时仍能正
+# 确解码，阅读后按占位符切回
+_MD_READ_PLACEHOLDER_RE = re.compile('(\\d+)')
+
+
+def _md_inline_reading(text, preserve_roles=False):
+    """实际行内语法只阅读一次；LaTeXML 保留代码与链接叶子事实。"""
+    if not text or not text.strip():
+        return text
+    rendered = BeautifulSoup(_MD_INLINE_READ.renderInline(text),
+                             'html.parser')
+    if preserve_roles:
+        return _direct_read(rendered)
+    return rendered.get_text()
+
+
+class _ReadText(str):
+    """已读文字及真实保护叶子；归一时不再次解释 Markdown 语法。"""
+    def __new__(cls, template, leaves=()):
+        value = re.sub('\ue004(\\d+)\ue005',
+                       lambda m: leaves[int(m.group(1))], template)
+        obj = str.__new__(cls, value)
+        obj.template, obj.leaves = template, tuple(leaves)
+        return obj
+
+
+def _code_fact(content):
+    # Internal role fact, never emitted into Markdown or the public record.
+    return '\ue00a' + json.dumps(_norm_code_text(content)) + '\ue00b'
+
+
+def _read_replace(pattern, replacement, text):
+    if isinstance(text, _ReadText):
+        return _ReadText(re.sub(pattern, replacement, text.template), text.leaves)
+    return re.sub(pattern, replacement, text)
+
+
+def _norm_reading(text, source_context=None, **kwargs):
+    """只归一普通文字。代码使用成熟跨度规则解码，精确内容不参与归一。"""
+    already_read = isinstance(text, _ReadText)
+    codes = list(text.leaves) if already_read else []
+    parts = []
+    cursor = 0
+    if not already_read:
+        def keep_fact(match):
+            codes.append(match.group(0))
+            return '\ue004%d\ue005' % (len(codes) - 1)
+        text = re.sub('\ue00a.*?\ue00b', keep_fact, text, flags=re.S)
+        for content, (start, end) in parse_inline_code_spans(text):
+            parts.append(text[cursor:start])
+            parts.append('\ue004%d\ue005' % len(codes))
+            codes.append(_code_fact(content))
+            cursor = end
+        parts.append(text[cursor:])
+    else:
+        parts.append(text.template)
+    # Ordinary normalization never defines math boundaries. The shared scanner
+    # protects confirmed spans until after whitespace and syntax normalization.
+    ordinary = ''.join(parts)
+    maths = scan_math(ordinary, source_context=source_context).spans
+    for index, span in reversed(list(enumerate(maths))):
+        ordinary = ordinary[:span.start] + '\ue008%d\ue009' % index + ordinary[span.end:]
+    normalized = _norm_text(ordinary, unwrap_links=False, reading=already_read, **kwargs)
+    normalized = re.sub('\ue008(\\d+)\ue009',
+                        lambda m: maths[int(m.group(1))].expr, normalized)
+    result = _ReadText(normalized, codes)
+    return result if already_read else str(result)
+
+
+def _protected_reading(text, source_context=None, keep_math=False, table=False):
+    """共享扫描先保护公式，再且仅再做一次普通行内阅读。"""
+    spans = scan_math(text, source_context=source_context).spans
+    parts = []
+    cursor = 0
+    for index, span in enumerate(spans):
+        parts.extend((text[cursor:span.start], '\ue006%d\ue007' % index))
+        cursor = span.end
+    parts.append(text[cursor:])
+    reading = _md_inline_reading(''.join(parts), preserve_roles=True)
+    def restore(match):
+        span = spans[int(match.group(1))]
+        value = span.raw if keep_math else span.expr
+        return decode_table_math(value, parsed=True) if table else value
+    return _read_replace('\ue006(\\d+)\ue007', restore, reading)
+
+
+def _direct_read(node):
+    """独立 DOM 阅读：按源序保留代码、链接及文字，复用叶子表示规则。
+
+    代码先保护再归一普通文字；链接目标直接读 href，标签递归读取。
+    不调用生成器的宿主遍历或行内/块渲染出口。
+    """
+    protected = []
+
+    def keep(value):
+        protected.append(value)
+        return '\ue004%d\ue005' % (len(protected) - 1)
+
+    def read(el):
+        parts = []
+        for child in el.children:
+            if isinstance(child, Comment):
+                continue
+            if isinstance(child, NavigableString):
+                # Quote the private fact delimiters in literal DOM text;
+                # only actual nodes may introduce protected role facts.
+                parts.append(re.sub('[\ue004\ue005\ue00a\ue00b\ue00c\ue00d]',
+                    lambda m: json.dumps(m.group(0))[1:-1], str(child)))
+                continue
+            if not isinstance(child, Tag):
+                continue
+            if child.name in ('script', 'style', 'noscript'):
+                continue
+            if child.name == 'br':
+                parts.append(' ')
+                continue
+            if child.name == 'a' and any(
+                    'headerlink' in c for c in (child.get('class') or [])):
+                continue
+            if child.name == 'code':
+                parts.append(keep(_code_fact(child.get_text())))
+                continue
+            label = read(child)
+            if child.name == 'a' and child.get('href') and label:
+                target = _MD_INLINE_READ.normalizeLink(child['href'].strip())
+                # Keep the real link boundary and protected target; the label
+                # retains its ordinary text, code and math reading rules.
+                parts.append('\ue00c' + label + keep(
+                    '\ue00a' + json.dumps(['link', target]) + '\ue00b') + '\ue00d')
+            else:
+                parts.append(label)
+        return ' '.join(part for part in parts if part.strip())
+
+    text = read(node)
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r' ([.,;:!?)\]])', r'\1', text)
+    text = re.sub(r'([\[(]) ', r'\1', text).strip()
+    return _ReadText(text, protected)
+
+
+def _block_reading_facts(node, normalize=_norm_reading, table_facts=None):
+    """有限的定义内有序块事实；DOM 来源与实际阅读 DOM 各自调用。"""
+    facts = []
+    inline = []
+
+    def flush():
+        if inline:
+            fragment = BeautifulSoup(''.join(inline), 'html.parser')
+            text = normalize(_direct_read(fragment))
+            if text:
+                facts.append(('p', text))
+            inline.clear()
+
+    for child in node.children:
+        if isinstance(child, Comment):
+            continue
+        if isinstance(child, NavigableString):
+            inline.append(escape(str(child)))
+            continue
+        if not isinstance(child, Tag):
+            continue
+        block_names = ('pre', 'p', 'ul', 'ol', 'table', 'div')
+        if child.name not in block_names and not child.find(block_names):
+            inline.append(str(child))
+            continue
+        flush()
+        if child.name == 'pre':
+            facts.append(('code', clean_code_html(
+                child.decode_contents()).rstrip('\n')))
+        elif child.name in ('ul', 'ol'):
+            facts.append((child.name, tuple(
+                _block_reading_facts(item, normalize, table_facts)
+                for item in child.find_all('li', recursive=False))))
+        elif child.name == 'table' and table_facts is not None:
+            facts.extend(table_facts(child))
+        elif child.name == 'table':
+            facts.append(('table', tuple(tuple(
+                normalize(_direct_read(cell))
+                for cell in row.find_all(['td', 'th']))
+                for row in child.find_all('tr'))))
+        elif child.name != 'p':
+            facts.extend(_block_reading_facts(child, normalize, table_facts))
+        else:
+            text = normalize(_direct_read(child))
+            if text:
+                facts.append(('p', text))
+    flush()
+    return tuple(facts)
+
+
+def _markdown_block_facts(text, source_context):
+    """真实块解析先确定结构；仅在行内阅读前保护共享数学跨度。"""
+    expressions = []
+    def protect_math(state):
+        in_table = False
+        for token in state.tokens:
+            if token.type in ('table_open', 'table_close'):
+                in_table = token.type == 'table_open'
+            if token.type != 'inline':
+                continue
+            spans = scan_math(token.content, source_context=source_context).spans
+            parts, cursor = [], 0
+            for span in spans:
+                parts.extend((token.content[cursor:span.start],
+                              '\ue006%d\ue007' % len(expressions)))
+                expressions.append(decode_table_math(span.expr, parsed=True) if in_table else span.expr)
+                cursor = span.end
+            parts.append(token.content[cursor:])
+            token.content = ''.join(parts)
+    reader = _MarkdownIt('commonmark', {'html': False}).enable('table')
+    reader.core.ruler.before('inline', 'protect_math', protect_math)
+    dom = BeautifulSoup(reader.render(text), 'html.parser')
+    def normalize(value):
+        return re.sub('\ue006(\\d+)\ue007',
+                      lambda m: expressions[int(m.group(1))], _norm_reading(value))
+    return _block_reading_facts(dom, normalize)
 
 def _norm_code_text(content):
     """行内代码事实的文字口径：行结束符逐个转空格，其余逐字节保留。
@@ -63,8 +296,10 @@ _ADMONITION_TOKENS = ('admonition', 'note', 'warning', 'important', 'tip')
 _MD_TABLE_SEP_CELL_RE = re.compile(r'^-*$')
 
 
-def _norm_text(text, unwrap_links=True, mark_code=False):
-    """内容归一化：行内代码、链接/强调/脚注/公式记法、空白与标点紧排。
+def _norm_text(text, unwrap_links=True, mark_code=False,
+               decode_heading_escape=False, resolve_escapes=False,
+               strip_bracket_escapes=True, reading=False):
+    """内容归一化：行内代码、链接/脚注/公式记法、空白与标点紧排。
 
     链接解包只用于输出侧（渲染后的 [标签](URL)）；源侧是纯文本，
     其中形似链接的字面量（如 “__fadd_[rn,rz,ru,rd](x, y)”）须保持
@@ -73,26 +308,65 @@ def _norm_text(text, unwrap_links=True, mark_code=False):
     mark_code 为 True（标题流）：行内代码最先隔离为 \\x00 定界占位、
     内容不参与任何后续归一（图片语法删除、空白折叠都不能改写代码
     字面量），公式保留 ``$`` 定界（去定界的拍平必须可检）；其余步骤
-    与普通口径一致。"""
+    与普通口径一致。
+
+    decode_heading_escape 仅由输出侧普通文本角色开启，且只在编码实际
+    生效的位置（列表项首/续行、提示框引用行文字等行首角色）调用：
+    按 Markdown 阅读语义解码——行首反斜线串偶数对折叠（\\\\→\\），尾余
+    一个的转义反斜线消解（\\#→#），# 裸写，即还原实际阅读文字；源侧、
+    代码与公式流不开启，不做全局反斜线删除。
+
+    resolve_escapes 为 True（表格格位等行内语境）：全文按 Markdown
+    行内阅读语义解析反斜线（\\+ASCII 标点→标点、\\\\→\\），代码跨度与
+    公式内容字面保留（resolve_backslash_escapes），与源格字面文字比较
+    实际阅读（F1）。此路径下链接先行解包，标签内的 \\[ \\] 由同一次
+    阅读解析解释，不再手工二次替换。
+
+    strip_bracket_escapes 为 False（真实标题路径）：标题事实已是
+    按阅读语义解释过的文字（heading_entries），余下的 \\[ \\] 是阅读
+    内容本身，不再当作生成语法剥离（F1：剥离会把阅读文字二次解释，
+    与独立 DOM 预期不符而误拒合法输入）。生成语法侧（如源侧
+    render_inline 序列化）保持默认 True，撤销生成的标签转义。"""
     code_spans = []
     if mark_code:
         def _keep_code(match):
             code_spans.append(_pad_code_content(match.group(2)))
             return '\x00%d\x00' % (len(code_spans) - 1)
         text = _MD_CODE_SPAN_RE.sub(_keep_code, text)
-    text = _MD_IMAGE_RE.sub(' ', text)
-    text = _MD_IMG_MARKER_RE.sub(' ', text)
-    if not mark_code:
+    link_labels = []
+    if unwrap_links and resolve_escapes:
+        # 链接解包先于反斜线解析，且标签以哨兵保护到归一化结束：标签内
+        # 的 \[ \] 是链接语法，由 resolve_backslash_escapes 按阅读语义
+        # 一次解释；若解析后再经下方的 \[ \] 剥离，同一反斜线被解释
+        # 两次，双重加写的阅读损伤会被掩盖（R2）。图片语法先移除：
+        # 图片的 [alt](src) 不是链接
+        text = _MD_IMAGE_RE.sub(' ', text)
+        text = _MD_IMG_MARKER_RE.sub(' ', text)
+
+        def _keep_label(match):
+            link_labels.append(match.group(1))
+            return '\x00L%d\x00' % (len(link_labels) - 1)
+        text = _MD_LINK_RE.sub(_keep_label, text)
+    if resolve_escapes:
+        text = resolve_backslash_escapes(text)
+    if decode_heading_escape:
+        text = re.sub(
+            r'^(\\+)(#{1,8})(?=\s|$)',
+            lambda m: '\\' * (len(m.group(1)) // 2) + m.group(2), text)
+    if not resolve_escapes:
+        text = _MD_IMAGE_RE.sub(' ', text)
+        text = _MD_IMG_MARKER_RE.sub(' ', text)
+    if not mark_code and not reading:
         text = _MD_CODE_SPAN_RE.sub(lambda m: _pad_code_content(m.group(2)),
                                     text)
-    if unwrap_links:
+    if unwrap_links and not resolve_escapes:
         text = _MD_LINK_RE.sub(lambda m: m.group(1).replace(
             '\\[', '[').replace('\\]', ']'), text)
     text = _MD_FOOTNOTE_RE.sub(r'[\1]', text)
-    text = _MD_BOLD_RE.sub(r'\1', text)
     if not mark_code:
         text = _MD_MATH_RE.sub(r'\1', text)
-    text = text.replace('\\]', ']').replace('\\[', '[')
+    if strip_bracket_escapes:
+        text = text.replace('\\]', ']').replace('\\[', '[')
     if not mark_code:
         text = _SRC_MATH_WRAP_RE.sub('', text)
     text = _WS_RE.sub(' ', text).strip()
@@ -100,6 +374,9 @@ def _norm_text(text, unwrap_links=True, mark_code=False):
     text = re.sub(r'([\[(]) ', r'\1', text)
     for index, span in enumerate(code_spans):
         text = text.replace('\x00%d\x00' % index, '\x00%s\x00' % span)
+    for index, label in enumerate(link_labels):
+        text = text.replace('\x00L%d\x00' % index,
+                            _norm_link_label(label, resolve=True))
     return text
 
 
@@ -110,9 +387,115 @@ def _pad_code_content(content):
     return content
 
 
-def _norm_math(expr):
-    """公式表达式比较口径：空白不敏感（LaTeX 排版空白无语义）。"""
-    return _WS_RE.sub('', expr)
+def _norm_link_label(label, resolve):
+    r"""链接标签的文字口径。
+
+    输出侧（resolve=True）标签是 Markdown 源：取 markdown-it 实际行内
+    阅读文字——转义、强调与代码跨度由真实解析一次完成，不再用反斜线
+    解码加语法剥离的组合冒充阅读（F2：解码不是完整阅读，强调吃掉的
+    字面星号会被漏过）。公式段先由代码感知的 scan_math 隔离为原文
+    片段：普通阅读器无数学规则，会把 $a*b*c$ 的 *b* 当强调吃掉
+    （P2-1），隔离后普通阅读只解释其余文字段，公式表达式按共享事实
+    原文还原。只隔离美元定界跨度：链接标签是行内语境，其中的 \[ \]
+    是生成的标签括号转义而非块级公式定界（R2 口径），由普通阅读的
+    转义解析一次还原。源侧（resolve=False）是 DOM 字面文字：不做
+    Markdown 强调剥离，字面标点保留；字面数学复用共享 scan_math
+    边界去定界（与输出侧同一公式事实，相邻公式的闭合/开启美元不被
+    吞并），代码跨度记法归一保持（与既有单元格文字口径一致）。两侧
+    共有：脚注引用与剩余文字的数学记法归一、空白与标点紧排。
+    """
+    if resolve:
+        math_exprs = []
+        parts = []
+        cursor = 0
+        # scan_math 的链接语法转义掩蔽（_math_scan_mask）只在完整
+        # [标签](URL) 形态下生效；抽出后的裸标签中的 \[ \] 会被当作
+        # 块级公式定界，吞掉内部 $…$（P2-1 方括号包公式）。扫描前把
+        # 标签包回合成链接语法还原掩蔽语境（标签由 _MD_LINK_RE 抽出，
+        # 不含未转义 ]，包裹无歧义），跨度偏移回移一个字符；raw 非 $
+        # 开头的过滤保留为 R2 角色防线
+        wrapped = '[%s]()' % label
+        for span in scan_math(wrapped).spans:
+            if not span.raw.startswith('$'):
+                continue  # 标签内 \[ \] 是括号转义，不是公式定界
+            start, end = span.start - 1, span.end - 1
+            parts.append(BeautifulSoup(
+                _HEADING_FACTS_MD.renderInline(label[cursor:start]),
+                'html.parser').get_text())
+            parts.append('\x00M%d\x00' % len(math_exprs))
+            math_exprs.append(span.expr)
+            cursor = end
+        parts.append(BeautifulSoup(
+            _HEADING_FACTS_MD.renderInline(label[cursor:]),
+            'html.parser').get_text())
+        label = ''.join(parts)
+    else:
+        math_exprs = []
+        # 源标签字面数学复用共享 scan_math 边界隔离为原文片段（与输出
+        # 侧同一公式事实）：旧 _MD_MATH_RE 的 \$+ 会吞掉相邻公式的
+        # 闭合/开启美元（$x$$y$ 被误归一为 xy$），与输出侧正确归一不
+        # 一致而误拒。代码跨度由扫描器既有代码感知掩蔽（与输出侧口径
+        # 一致），隔离后代码记法归一与剩余文字的 _MD_MATH_RE 行为不变
+        # （金额等旧口径两侧同型保持）。只隔离美元定界跨度：源标签内
+        # 的 \[ \] 是字面文字而非公式定界（与 _literal_math_exprs
+        # 口径一致）
+        parts = []
+        cursor = 0
+        # 按 _literal_math_exprs 的源字面角色在扫描前消除括号定界影响；
+        # 等长掩蔽仅用于定位，文字及表达式仍从原标签截取。
+        masked = label.replace('\\[', '  ').replace('\\]', '  ')
+        for span in scan_math(masked).spans:
+            if not span.raw.startswith('$'):
+                continue
+            parts.append(label[cursor:span.start])
+            parts.append('\x00M%d\x00' % len(math_exprs))
+            width = 1 if span.kind == 'inline' else 2
+            math_exprs.append(label[span.start + width:span.end - width])
+            cursor = span.end
+        parts.append(label[cursor:])
+        label = ''.join(parts)
+        label = _MD_CODE_SPAN_RE.sub(lambda m: _pad_code_content(m.group(2)),
+                                     label)
+    label = _MD_FOOTNOTE_RE.sub(r'[\1]', label)
+    label = _MD_MATH_RE.sub(r'\1', label)
+    label = _WS_RE.sub(' ', label).strip()
+    label = re.sub(r' ([.,;:!?)\]])', r'\1', label)
+    label = re.sub(r'([\[(]) ', r'\1', label)
+    for index, expr in enumerate(math_exprs):
+        label = label.replace('\x00M%d\x00' % index, expr)
+    return label
+
+
+def _strip_math_wrappers(body):
+    r"""DOM 已确认的数学包装去除：\(…\) 与 \[…\] 整体包裹时剥除。"""
+    if (body.startswith('\\(') and body.endswith('\\)')) \
+            or (body.startswith('\\[') and body.endswith('\\]')):
+        return body[2:-2].strip()
+    return body
+
+
+def _family_math_expectation(node, family):
+    r"""已识别数学节点按现行家族的行内/块级表示生成独立预期。
+
+    源侧继续独立读取原 DOM，不接触渲染器输出；允许转换仅限家族合同
+    已确认的表示：包装去除（\(…\)/\[…\]）、实体解码（DOM get_text）
+    与行内格式空白序列化。序列化口径与各家族渲染器一致：paginated/
+    reference 的 div.math 为块级（$$\n…\n$$，t = get_text(' ', strip=True)），
+    paginated 为单行 $$…$$；api 的 div.math 为行内（$\s*\n\s* 折叠）；
+    其余（single 家族全部节点与各家族 span.math）走 render_inline 的
+    行内序列化（\s+ 折叠 + 包装去除）。块级首尾排版空白在事实提取时
+    归一（strip），内部逐字节保留。
+    """
+    if node.name == 'div' and family in ('paginated', 'reference'):
+        body = _strip_math_wrappers(node.get_text(' ', strip=True))
+        expr = body if family == 'paginated' else '\n' + body + '\n'
+        return 'block', expr.strip()
+    if node.name == 'div' and family == 'api':
+        body = re.sub(r'\s*\n\s*', ' ', node.get_text()).strip()
+        return 'inline', body
+    body = node.get_text().strip()
+    body = _strip_math_wrappers(body)
+    return 'inline', re.sub(r'\s+', ' ', body)
 
 
 def _footnote_label(text):
@@ -121,9 +504,21 @@ def _footnote_label(text):
 
 
 def _literal_math_exprs(text):
-    """文本中的字面公式流；转义括号 `\\[…\\]` 是字面文字而非公式定界。"""
-    stripped = text.replace('\\[', ' ').replace('\\]', ' ')
-    return [_norm_math(span.expr) for span in scan_math_spans(stripped)]
+    """文本节点中的字面公式流 (kind, expr)；转义括号 `\\[…\\]` 是
+    字面文字而非公式定界（与解析侧的剥离口径一致），行内格式空白
+    序列化（\\s+ 折叠为单空格）是家族合同允许的表示转换——两侧都
+    在序列化后的文字上运行同一次共享扫描，类型与原表达式逐字节比较。"""
+    serialized = _WS_RE.sub(' ', text)
+    stripped = serialized.replace('\\[', ' ').replace('\\]', ' ')
+    return [(span.kind, span.expr.strip() if span.kind == 'block'
+             else span.expr) for span in scan_math(stripped).spans]
+
+
+def _literal_math_issues(text):
+    """文本节点字面公式扫描的未解决定界（原偏移在序列化后的文字上）。"""
+    serialized = _WS_RE.sub(' ', text)
+    stripped = serialized.replace('\\[', ' ').replace('\\]', ' ')
+    return list(scan_math(stripped).issues)
 
 
 def _in_pre(node):
@@ -168,7 +563,11 @@ def _rendered_raw_ancestors(node):
 class _SourceFacts:
     """从原始 HTML 独立提取的有序源事实流。"""
 
-    def __init__(self, raw_html, family, section_id):
+    def __init__(self, raw_html, family, section_id,
+                 mathml_alttext=False):
+        # LaTeXML 来源（二期）：MathML 格内公式以实体解码后的 alttext 为
+        # 原 TeX（02 精确口径）；其他家族保持渲染文字口径不变
+        self._mathml_alttext = mathml_alttext
         # `<code>` 内未转义的尖括号会被 HTML 解析器当标记吃掉；与渲染端
         # 共用同一保护（跳过 pre），保证源侧独立提取拿到相同的代码文字。
         soup = BeautifulSoup(protect_code_entities(raw_html, skip_pre=True),
@@ -200,6 +599,7 @@ class _SourceFacts:
             self.headings = []
             self.code = []
             self.math = []
+            self.math_issues = []
             self.inline_code = []
             self.images = []
             self.image_facts = []
@@ -212,6 +612,7 @@ class _SourceFacts:
             return
         self.headings = self._headings()
         self.code = self._code()
+        self.math_issues = []
         self.math = self._math()
         self.inline_code = self._inline_code()
         self.images = self._images()
@@ -237,8 +638,11 @@ class _SourceFacts:
         return self._heading_ordinals.get(section, 0)
 
     def _headings(self):
-        """标题事实 (层级, 行内序列化文字)：与渲染端 heading_text 同一
-        序列化，行内代码以 \x00 定界参与比较——拍平或改字即差异。"""
+        r"""标题事实 (层级, 行内序列化文字)：与渲染端 heading_text 同一
+        序列化，行内代码以 \x00 定界参与比较——拍平或改字即差异。
+        render_inline 对链接标签生成的 \[ \] 转义只在标签内撤销一层，
+        恢复 DOM 字面标签（F1：标题路径不再全局剥离，纯文本中的字面
+        \[ 保持；链接目标身份保留）。"""
         entries = []
         for h in self.root.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
             if _in_pre(h):
@@ -247,9 +651,15 @@ class _SourceFacts:
             for link in copied.find_all('a', class_='headerlink'):
                 link.decompose()
             text = self._inline.render_inline(copied)
+            text = _MD_LINK_RE.sub(
+                lambda m: '[%s](%s)' % (
+                    m.group(1).replace('\\[', '[').replace('\\]', ']'),
+                    m.group(2)),
+                text)
             entries.append((int(h.name[1]), _norm_text(
                 text.replace('¶', '').replace('\uf0c1', ''),
-                unwrap_links=False, mark_code=True)))
+                unwrap_links=False, mark_code=True,
+                strip_bracket_escapes=False)))
         return entries
 
     def _code(self):
@@ -261,20 +671,16 @@ class _SourceFacts:
         return blocks
 
     def _math(self):
-        """公式流：class=math 元素与文本节点中的字面 $…$，按文档顺序。
+        """公式流 (kind, expr)：class=math 元素与文本节点中的字面 $…$。
 
-        解析器把 span/div.math 转成 `$…$`，正文中本就存在的 `$…$` 文字
-        原样保留并同样参与公式扫描；源侧流必须同时覆盖两类，才能与
-        解析结果的扫描口径一致。
+        解析器把 span/div.math 转成 `$…$`（或 paginated/reference 的
+        `$$…$$`），正文中本就存在的 `$…$` 文字原样保留并同样参与公式
+        扫描；源侧流必须同时覆盖两类，才能与解析结果的扫描口径一致。
+        已识别节点按 `_family_math_expectation` 生成独立预期（保留
+        行内/块级类型与原表达式，不做任意归一）；字面数学用共享
+        scan_math 的同一次扫描定义。issues 单独登记，由对账入口阻断。
         """
         spans = []
-
-        def strip_wrappers(expr):
-            e = expr.strip()
-            if (e.startswith('\\(') and e.endswith('\\)')) \
-                    or (e.startswith('\\[') and e.endswith('\\]')):
-                return e[2:-2].strip()
-            return e
 
         sub_by_index = {}
         for node in self.root.descendants:
@@ -286,16 +692,18 @@ class _SourceFacts:
                     order = self._index[id(node)]
                     sub = sub_by_index.get(order, 0)
                     sub_by_index[order] = sub + 1
-                    spans.append((self._section_of(node), order, sub, 'math',
-                                  _norm_math(strip_wrappers(node.get_text()))))
+                    kind, expr = _family_math_expectation(node, self.family)
+                    spans.append((self._section_of(node), order, sub, kind,
+                                  expr))
                 continue
             if isinstance(node, str):
                 if node.find_parent(class_='math') is not None:
                     continue
                 order = self._index[id(node)]
                 sub = sub_by_index.get(order, 0)
-                for expr in _literal_math_exprs(str(node)):
-                    spans.append((self._section_of(node), order, sub, 'math',
+                self.math_issues.extend(_literal_math_issues(str(node)))
+                for kind, expr in _literal_math_exprs(str(node)):
+                    spans.append((self._section_of(node), order, sub, kind,
                                   expr))
                     sub += 1
                 sub_by_index[order] = sub
@@ -658,12 +1066,48 @@ class _SourceFacts:
         flush()
         return seq
 
-    @staticmethod
-    def _cell_text(cell):
+    def _cell_text(self, cell):
         copied = copy.deepcopy(cell)
         for pre in copied.find_all('pre'):
             pre.decompose()
-        return _norm_text(copied.get_text(' '), unwrap_links=False)
+        # 格内公式按家族合同做包装去除（\(…\)/\[…\]），与渲染端
+        # render_inline 同一口径投影为 $…$，使格文字与输出侧归一后的
+        # 阅读文字一致（块级 \[…\] 不再残留字面方括号）；LaTeXML 来源
+        # 的 MathML 节点优先取实体解码后的 alttext 原 TeX（04/02）
+        maths = copied.find_all('math') + copied.find_all(class_='math') \
+            if self._mathml_alttext else copied.find_all(class_='math')
+        math_context = []
+        for math in maths:
+            body = None
+            if self._mathml_alttext and math.name == 'math':
+                alttext = math.get('alttext')
+                if alttext and alttext.strip():
+                    body = alttext
+            if body is None:
+                body = _strip_math_wrappers(
+                    re.sub(r'\s+', ' ', math.get_text()).strip())
+            math.replace_with('\ue006%d\ue007' % len(math_context)
+                              if self._mathml_alttext else '$' + body + '$')
+            math_context.append((body, None))
+        if self._mathml_alttext:
+            reading = _read_replace('\ue006(\\d+)\ue007',
+                             lambda m: '$' + math_context[int(m.group(1))][0] + '$',
+                             _direct_read(copied))
+            return _norm_reading(reading,
+                source_context=_SourceMathContext(math_context))
+        # 链接标签是源字面文字：其中的 \[ \] 不是数学包装/语法转义，
+        # 以哨兵保护穿过文本归一化，按标签口径还原（R2：与输出侧
+        # 解包后的阅读文字逐字对应）
+        labels = []
+        for link in copied.find_all('a', href=True):
+            label = link.get_text(' ', strip=True)
+            link.replace_with('\x00L%d\x00' % len(labels))
+            labels.append(label)
+        text = _norm_text(copied.get_text(' '), unwrap_links=False)
+        for index, label in enumerate(labels):
+            text = text.replace('\x00L%d\x00' % index,
+                                _norm_link_label(label, resolve=False))
+        return text
 
     @staticmethod
     def _span_value(cell, attr):
@@ -749,24 +1193,28 @@ class _SourceFacts:
 class _MarkdownFacts:
     """用既有扫描器从解析 Markdown 提取的有序输出事实流。"""
 
-    def __init__(self, text):
+    def __init__(self, text, source_context=None):
         self.text = text
         self.lines = text.split('\n')
         self.fenced = fenced_line_numbers(text)
+        self._source_context = source_context
         self._heading_entries = heading_entries(text)
         # 标题行文字由标题流对账（源侧同样排除标题内容），标题公式与
         # 行内代码不进入通用流避免双计；图片不受排除（独立事实，标题
         # 图片序列化缺失必须阻断）
         self._heading_lines = {entry[0] for entry in self._heading_entries}
         self.headings = [
-            (level, _norm_text(title, unwrap_links=False, mark_code=True))
+            (level, _norm_text(title, unwrap_links=False, mark_code=True,
+                               strip_bracket_escapes=False))
             for _, level, title in self._heading_entries]
         # 章节唯一身份 = 标题在文档中的序号（同名小节不合并）
         self._heading_ordinals = {entry[0]: ordinal + 1
                                   for ordinal, entry in
                                   enumerate(self._heading_entries)}
         self.code = self._tagged_code()
-        # math 流剥离转义括号后再扫描，链接标签中的 `\[字面\]` 不算公式
+        # math 流剥离转义括号后再扫描（家族合同：字面 \[ \] 不是公式
+        # 定界），类型与表达式从同一次共享 scan_math 结果投影，issues
+        # 由对账入口作为阻断项上报
         self.math = self._tagged_math()
         self.inline_code = self._tagged_inline_code()
         self.images = self._tagged_images()
@@ -792,10 +1240,13 @@ class _MarkdownFacts:
         for line_no, line in enumerate(stripped.split('\n'), start=1):
             line_starts[line_no] = offset
             offset += len(line) + 1
+        scan = scan_math(stripped)
+        self.math_issues = scan.issues
         return [(self._md_section(span.start_line), span.start_line,
                  max(0, span.start - line_starts.get(span.start_line, 0)),
-                 'math', _norm_math(span.expr))
-                for span in scan_math_spans(stripped)
+                 span.kind,
+                 span.expr.strip() if span.kind == 'block' else span.expr)
+                for span in scan.spans
                 if span.start_line not in self._heading_lines]
 
     def _tagged_inline_code(self):
@@ -847,6 +1298,7 @@ class _MarkdownFacts:
                 continue
             m = re.match(r'^\s+\[+\s*([^\[\]]+?)\s*\]+\s*(.*)$', line)
             if m:
+                # 脚注正文不经行首 # 编码（行首是缩进的 [[标签]]），不解码
                 defs.append((_footnote_label(m.group(1)),
                              _norm_text(m.group(2))))
         return refs, defs
@@ -871,7 +1323,10 @@ class _MarkdownFacts:
                     cur = {'label': None, 'texts': []}
                     records.append(cur)
                     cur_closed = False
-                text = _norm_text(s[1:])
+                # 剥掉引用前缀后的前导空白（引用行空白无语义，归一化后
+                # 与原先一致），使行首转义（\#）的解码锚点能够命中
+                text = _norm_text(s[1:].lstrip(),
+                                  decode_heading_escape=True)
                 if text:
                     cur['texts'].append(text)
             else:
@@ -1017,7 +1472,8 @@ class _MarkdownFacts:
                 for deeper in [k for k in last_ordinal if k > level]:
                     del last_ordinal[deeper]
                 last_ordinal[level] = ordinal
-                text_value = _norm_text(match.group(2) or '')
+                text_value = _norm_text(match.group(2) or '',
+                                        decode_heading_escape=True)
                 stack.append({'level': level, 'ordinal': ordinal,
                               'seq': ([('text', text_value)]
                                       if text_value else []),
@@ -1029,7 +1485,8 @@ class _MarkdownFacts:
                 target = target_at(max(
                     1, (len(line) - len(line.lstrip(' '))) >> 1))
                 if target is not None:
-                    text_value = _norm_text(stripped)
+                    text_value = _norm_text(stripped,
+                                            decode_heading_escape=True)
                     if text_value:
                         target['seq'].append(('text', text_value))
                 continue
@@ -1047,20 +1504,54 @@ class _MarkdownFacts:
 
         行按 `' | '` 识别列界并保留首尾空单元格（仅剥行尾换行，不先
         strip 整行）；[TABLE-CODE r c#n] 标记归属最近一个 [TABLE] 块，
-        其后首个围栏即该格代码。
+        其后首个围栏即该格代码。提供来源依据限定上下文（LaTeXML 家族，
+        D2）时，被多行公式跨度覆盖的续行并入起始行——格内换行是公式
+        逐字内容，不构成新行（F4 表格格宿主）。
         """
+        def cell_reading(text, gfm=False):
+            if self._source_context is not None:
+                return _norm_reading(_protected_reading(text, self._source_context, keep_math=True, table=gfm),
+                                     source_context=self._source_context)
+            return _norm_text(text, resolve_escapes=True)
+
+        merged_lines = {}
+        merged_away = set()
+        if self._source_context is not None:
+            scan = scan_math(self.text,
+                             source_context=self._source_context)
+            for span in scan.spans:
+                end_line = self.text.count('\n', 0, span.end - 1) + 1
+                if end_line == span.start_line \
+                        or span.start_line in merged_away:
+                    continue
+                parts = [self.lines[span.start_line - 1]]
+                for ln in range(span.start_line + 1, end_line + 1):
+                    parts.append(self.lines[ln - 1])
+                    merged_away.add(ln)
+                merged_lines[span.start_line] = '\n'.join(parts)
         records = []
         current = None
         for line_no, line in enumerate(self.lines, start=1):
+            if line_no in merged_away:
+                continue
+            line = merged_lines.get(line_no, line)
             if line_no in self.fenced:
+                # 围栏结束当前表格区域（其后的 [TABLE-CODE] 归属按标记行
+                # 独立匹配，不依赖 current）；围栏正文永不成为表格行
+                current = None
                 continue
             stripped = line.strip()
             if stripped == '[TABLE]':
-                current = {'ordinal': len(records) + 1, 'rows': [],
+                current = {'ordinal': len(records) + 1, 'start_line': line_no, 'rows': [],
                            'codes': {}, 'marker_lines': [], 'row_lines': set()}
                 records.append(current)
                 continue
             if current is None:
+                continue
+            if line_no in self._heading_lines:
+                # 标题行可含 ' | '（含管道真实标题）：属于标题流对账，
+                # 不得被吞作当前表格的输出行
+                current = None
                 continue
             if stripped.startswith('[TABLE-CODE'):
                 match = _TABLE_CODE_MARKER_RE.match(stripped)
@@ -1074,7 +1565,8 @@ class _MarkdownFacts:
                 continue
             if not stripped and line:
                 # 单列全空单元格行（渲染端以单个空格输出，与零长空行区分）
-                current['rows'].append([_norm_text('')])
+                current['rows'].append([_norm_text('',
+                                                   decode_heading_escape=True)])
                 current['row_lines'].add(line_no)
                 continue
             if not stripped:
@@ -1083,24 +1575,57 @@ class _MarkdownFacts:
                     # 记录保留以继续接受其后的 [TABLE-CODE] 标记
                     current['single_closed'] = True
                 continue
-            if line.endswith('|') and ' | ' in line:
-                # 行尾独立竖线 = 末列空格位（写作端可能剥掉尾随空格）
+            if line.endswith('|') and (' | ' in line or (
+                    current['rows'] and len(current['rows'][-1]) > 1)):
+                # 行尾独立竖线 = 末列空格位（写作端可能剥掉尾随空格；两列
+                # 行被剥后行内不再残留 ' | ' 列界，按前序行已建立的多列
+                # 形态识别；单列行内容以 | 结尾时不受影响）
                 line = line + ' '
             cells = line.split(' | ')
             if all(cell.strip() and _MD_TABLE_SEP_CELL_RE.match(cell.strip())
                    for cell in cells):
                 continue  # 表头分隔行（单列 --- 同样适用）
             if ' | ' in line:
-                current['rows'].append([_norm_text(cell) for cell in cells])
+                # 逐格按实际阅读核对：格位序列化对 \+ASCII 标点按阅读语义
+                # 加写（\\ 阅读为一个反斜线），此处解析回阅读文字，与源
+                # 格字面文字一致（F1：非首格字面反斜线可读可验）
+                current['rows'].append(
+                    [cell_reading(cell) for cell in cells])
                 current['row_lines'].add(line_no)
             elif not current.get('single_closed') and (
                     current.get('single_column') or not current['rows']):
                 # 单列表格行（无列界记号）：自首行起进入单列模式，空行结束
                 current['single_column'] = True
-                current['rows'].append([_norm_text(line)])
+                current['rows'].append([cell_reading(line)])
                 current['row_lines'].add(line_no)
             else:
                 current = None
+        # GFM facts come from the same actual block reader as PDF export.
+        covered = merged_away | set().union(*(r['row_lines'] for r in records))
+        current_gfm = None
+        for token in markdown_table_tokens(self.text):
+            if token.type == 'table_open':
+                lines = set(range(token.map[0] + 1, token.map[1] + 1))
+                current_gfm = None if lines & covered else {
+                    'start_line': token.map[0] + 1, 'rows': [], 'codes': {},
+                    'marker_lines': [], 'row_lines': lines, 'gfm': True}
+                if current_gfm is not None:
+                    records.append(current_gfm)
+            elif token.type == 'table_close':
+                current_gfm = None
+            elif current_gfm is not None and token.type == 'tr_open':
+                current_gfm['rows'].append([])
+            elif current_gfm is not None and token.type == 'inline':
+                current_gfm['rows'][-1].append(cell_reading(token.content, gfm=True))
+        records.sort(key=lambda record: record['start_line'])
+        for ordinal, record in enumerate(records, 1):
+            record['ordinal'] = ordinal
+            if record.get('gfm'):
+                end = records[ordinal]['start_line'] if ordinal < len(records) else len(self.lines) + 1
+                for line_no in range(max(record['row_lines']) + 1, end):
+                    match = _TABLE_CODE_MARKER_RE.match(self.lines[line_no - 1].strip())
+                    if match:
+                        record['marker_lines'].append((line_no, tuple(int(g) for g in match.groups()), None))
         fences = sorted(scan_code_fences(self.text).blocks,
                         key=lambda block: block.start_line)
         used_fences = set()
@@ -1116,7 +1641,12 @@ class _MarkdownFacts:
                 if fence is not None:
                     used_fences.add(fence.start_line)
                     record['code_fence_lines'].add(fence.start_line)
-                record['codes'][key] = fence.body if fence else None
+                body = fence.body if fence else None
+                if fence is not None and record.get('gfm'):
+                    indent = re.match(r' *', self.lines[fence.start_line - 1]).group()
+                    body = '\n'.join(line[len(indent):] if line.startswith(indent) else line
+                                     for line in body.split('\n'))
+                record['codes'][key] = body
         return records
 
     def terms(self):
@@ -1139,8 +1669,10 @@ class _MarkdownFacts:
                 continue
             m = re.match(r'^\*\*(.+?)\*\*\s*(.*)$', s)
             if m:
-                pairs.append((_norm_text(m.group(1)),
-                              _norm_text(m.group(2))))
+                pairs.append((_norm_text(m.group(1),
+                                         decode_heading_escape=True),
+                              _norm_text(m.group(2),
+                                         decode_heading_escape=True)))
         return pairs
 
 
@@ -1455,9 +1987,15 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
                         record['rows']) else None
                     cell_text = row_cells[col - 1] if row_cells and col <= len(
                         row_cells) else ''
-                    note_text = _norm_text(' '.join(
-                        md.lines[lines[0] - 1:lines[1]]))
-                    if cell_text and _norm_text(cell_text) not in note_text:
+                    note_raw = ' '.join(md.lines[lines[0] - 1:lines[1]])
+                    if src._mathml_alttext:
+                        note_text = _norm_reading(_protected_reading(note_raw, md._source_context, keep_math=True),
+                                                  source_context=md._source_context)
+                        expected_text = cell_text
+                    else:
+                        note_text = _norm_text(note_raw, decode_heading_escape=True)
+                        expected_text = _norm_text(cell_text)
+                    if cell_text and expected_text not in note_text:
                         diffs.append('源表 #%d 格 %s 内容未在声明说明区间找到: %r'
                                      % (record['ordinal'], position, cell_text))
                 else:
@@ -1567,6 +2105,16 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
     if src.root is None:
         return ['%s 未找到 article/main/body 选区' % html_label]
 
+    diffs = []
+    # 未解决数学定界：源与解析两侧都不得忽略；忠实解析含未闭合定界的
+    # 输入同样阻断分派（不能用剩余跨度相等消除未解决项）
+    for issue in src.math_issues:
+        diffs.append('%s 未解决数学定界 %r: %s'
+                     % (html_label, issue.raw, issue.reason))
+    for issue in md.math_issues:
+        diffs.append('%s L%d 未解决数学定界 %r: %s'
+                     % (md_label, issue.start_line, issue.raw, issue.reason))
+
     if table_conversions is None:
         (map_diffs, mapped_src, claimed_md, cell_factors, cell_table_targets,
          note_targets) = [], set(), set(), {}, {}, {}
@@ -1598,7 +2146,6 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
         flush()
         return expanded
 
-    diffs = []
     diffs += _stream_diffs('标题', src.headings, md.headings,
                            html_label, md_label)
     # 内容流含行内代码事实；映射表格的格内代码由格内代码归属比较负责，
@@ -1621,8 +2168,11 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
         if entry[3] == 'code' and src.cell_pre_orders.get(
                 entry[1]) in mapped_src:
             continue
+        # 公式条目标签为 inline/block（_family_math_expectation 与输出侧
+        # scan_math 的 kind），格位分类须覆盖两类；image/inline-code 照旧
         cell = (src.mapped_cell_of(entry[1])
-                if entry[3] in ('math', 'image', 'inline-code') else None)
+                if entry[3] in ('inline', 'block', 'image', 'inline-code')
+                else None)
         if cell is not None and cell[0] in mapped_src:
             src_inside.append(entry)
         else:
@@ -1742,4 +2292,1701 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
     diffs += map_diffs
     diffs += _stream_diffs('定义列表', src.terms, md.terms(),
                            html_label, md_label)
+    return diffs
+
+
+# ---------------------------------------------------------------------------
+# LaTeXML 来源分支（二期 ticket 01）：独立原 DOM 重建正文流并核对候选与
+# 来源依据。与适配端不共享渲染遍历或“已输出”清单；事实规则（节点命名、
+# 类型确认、TeX 提取）与适配端共用同一口径，如同两侧共用 _norm_text。
+
+def _latexml_src_stream(raw_html, section_id, decisions,
+                        decision_results=None, table_conversions=None,
+                        adaptation=None):
+    """从原始快照独立重建有序源 token 流与逐节点事实。
+
+    返回 (tokens, facts, confirmed, problems, occ_stream, hosts)；tokens 供有序
+    比较，facts 按节点身份登记独立重建的内容（类型/TeX/所属/文字），用于
+    核对来源依据的 correspondences 与 unresolved；problems 为字面数学
+    识别诊断（未闭合/歧义定界）；occ_stream 是已解决公式出现的文档序流
+    （与候选 Markdown 公式跨度按序配对）；hosts 与 tokens 一一对应，登记
+    各 token 的来源节点身份（§7.11.4 出现→实际区间独立对齐用，无对应
+    身份的 token 为 None）。公式出现身份按 §7.11.4 与适配
+    端同一机制：原 DOM 冻结后登记全部出现（MathML/遗留文本公式/字面公
+    式）并以唯一标记替换，标记随同一序列化出口传递后展开为有序片段；
+    不使用生成标记表，不按同文本反查。代码/TeX/内容性字符不随普通排版
+    空白归一。
+    """
+    from _latexml_source import (_MARK_RE, OccurrenceRegistry,
+                                 _expand_markers_inline,
+                                 aside_node_ids as _lx_aside_node_ids,
+                                 classify_block, container_node_ids,
+                                 figure_node_ids as _lx_figure_node_ids,
+                                 group_node_ids as _lx_group_node_ids,
+                                 has_marker, mark_literal_occurrences,
+                                 marked_text_frags, math_wrap,
+                                 note_ref_label, paragraph_div_ids,
+                                 plan_image_targets,
+                                 listing_node_ids as _lx_listing_ids,
+                                 prepare_math_dom, prepare_notes_dom,
+                                 render_mapped_table,
+                                 section_of, table_cell_facts,
+                                 table_node_ids as _lx_table_node_ids)
+
+    soup = BeautifulSoup(protect_code_entities(raw_html, skip_pre=True),
+                         'html.parser')
+    if section_id:
+        root = soup.find(id=section_id)
+    else:
+        root = (soup.find('article') or soup.find('main')
+                or soup.find('body'))
+    if root is None:
+        return None, None, None, [], None, None
+    fidelity = HtmlFidelity()
+    # 节点命名在任何 DOM 变更前按原始文档序计算（与适配端同一时点）
+    container_ids = container_node_ids(root)
+    paragraph_divs = paragraph_div_ids(root)
+    group_ids = _lx_group_node_ids(root)
+    figure_ids = _lx_figure_node_ids(root)
+    aside_ids = _lx_aside_node_ids(root)
+    table_ids = _lx_table_node_ids(root)
+    listing_ids = _lx_listing_ids(root)
+    image_targets = plan_image_targets(
+        root, ((adaptation or {}).get('resource_substitutions')
+               if adaptation else None))
+    p_ids = {id(node): 'p[%d]' % ordinal for ordinal, node in
+             enumerate(root.find_all('p'), start=1)}
+    h_counts = {}
+    h_ids = {}
+    for node in root.find_all(re.compile(r'h[1-6]')):
+        h_counts[node.name] = h_counts.get(node.name, 0) + 1
+        h_ids[id(node)] = '%s[%d]' % (node.name, h_counts[node.name])
+    figcaption_ids = {id(node): 'figcaption[%d]' % ordinal
+                      for ordinal, node in
+                      enumerate(root.find_all('figcaption'), start=1)}
+    img_ids = {}
+    ordinal = 0
+    for img in root.find_all('img'):
+        if img.find_parent('pre') is not None:
+            continue
+        ordinal += 1
+        img_ids[id(img)] = 'img[%d]' % ordinal
+    tokens = []
+    hosts = []
+    facts = {}
+    fn_ordinal = [0]
+    _fig_ctx = []
+
+    def _push(token, host=None):
+        """登记一个有序 token 及其来源节点身份（§7.11.4 出现→实际区间
+        独立对齐用；无对应身份的 token 为 None）。"""
+        tokens.append(token)
+        hosts.append(host)
+
+    def _norm(value):
+        return _norm_reading(value, source_context=reading_context)
+
+    def _register(node_id, fact):
+        facts[node_id] = fact
+
+    # 03-4：已确认的装饰排除/重复合并裁决按节点身份摘除（与适配端同一
+    # 时点：命名映射计算之后、公式出现登记之前；节点名在原始 DOM 独立
+    # 解析，不能凭适配端 DOM）；未确认的裁决内容保留
+    _decision_results = [d for d in (decision_results or [])
+                         if isinstance(d, dict)
+                         and d.get('action') in
+                         ('exclude-decoration', 'merge-duplicate')]
+    if _decision_results:
+        name_map = {}
+        tag_first = {}
+        for node in root.find_all(True):
+            tag_first.setdefault(node.name, node)
+            for mapping in (container_ids, group_ids, figure_ids,
+                            aside_ids):
+                name = mapping.get(id(node))
+                if name:
+                    name_map[name] = node
+
+        def _lookup(node_name):
+            if not isinstance(node_name, str):
+                return None
+            if node_name in name_map:
+                return name_map[node_name]
+            return tag_first.get(node_name.split('#', 1)[0])
+
+        for decision in _decision_results:
+            node = _lookup(decision.get('node'))
+            if node is not None and decision.get('result') in (
+                    'excluded', 'merged'):
+                node.decompose()
+
+    # 来源出现身份先于输出（§7.11.4 独立端镜像）：全部公式出现登记入
+    # 独立注册表并以唯一标记替换原节点内容；未闭合/歧义定界上报诊断，
+    # 不用剩余跨度相等消除
+    registry = OccurrenceRegistry()
+    prepare_math_dom(root, decisions, registry)
+    problems = mark_literal_occurrences(
+        root, registry, base=len(registry.occurrences))
+    reading_context = _SourceMathContext([
+        (occ['tex'], occ.get('section') or 0)
+        for occ in registry.occurrences.values()
+        if occ['kind'] == 'inline' and occ['unresolved'] is None])
+
+    # 脚注引用：真实命名标签全局替换（与适配端 prepare_notes_dom 同一
+    # 时点）；替换前按锚点所属段落登记引用事实（键格式不变）
+    for anchor in root.find_all('a'):
+        cls = anchor.get('class') or []
+        if not any('note_ref' in c for c in cls):
+            continue
+        label = note_ref_label(anchor)
+        if label is None:
+            continue
+        host = anchor.find_parent('p')
+        host_id = p_ids.get(id(host), '?') if host is not None else '?'
+        _register('ref:%s@%s' % (label, host_id),
+                  {'type': 'footnote-ref', 'label': label,
+                   'host': host_id})
+    prepare_notes_dom(root)
+
+    def _paragraph_frags(p):
+        """含来源标记的宿主 → 有序片段：直接 DOM 行内阅读（_direct_read，
+        不调用生成侧序列化出口，复评 S1），标记展开为 ('m', kind, tex,
+        node) 片段（原 TeX 逐字，身份来自独立注册表）；未解决出现还原
+        为其写出文字并入相邻文字段。"""
+        return marked_text_frags(_direct_read(p), registry)
+
+    def _preserved_container_frags(child):
+        """未支持容器保留文字的分段事实（F4）：直接 DOM 阅读
+        （_direct_read），来源标记展开为独立 m 片段（原 TeX 逐字）；
+        未解决出现还原为写出文字并入相邻文字段。"""
+        return marked_text_frags(_direct_read(child), registry)
+
+    def _image_token(img, figure_id, sub_index):
+        if img.find_parent('pre') is not None:
+            return
+        src = img.get('src', '')
+        if not src:
+            return
+        reference = image_targets.get(id(img)) or (
+            'images/%s' % src.rsplit('/', 1)[-1])
+        _push(('img', reference), img_ids.get(id(img)))
+        _register(img_ids.get(id(img)), {
+            'type': 'image', 'reference': reference, 'source_ref': src,
+            'figure': figure_id, 'subfigure': sub_index,
+            'section': section_of(root, img)})
+
+    def _figure_caption_token(cap, figure_id, sub_index):
+        cap_id = figcaption_ids.get(id(cap))
+        # 直接 DOM 阅读（不调用生成侧题注出口，复评 S1）；headerlink
+        # 在阅读中本就不出现，¶/链接图标按既有阅读清理
+        text = _direct_read(cap).replace('¶', '').replace('\uf0c1', '')
+        frags = marked_text_frags('[FIGURE] ' + text, registry)
+        if any(f[0] == 'm' for f in frags):
+            _push(('pm', tuple(frags)), cap_id)
+            fact_text = _norm(''.join(
+                f[1] if f[0] == 't' else math_wrap(f[1], f[2])
+                for f in frags))
+        else:
+            _push(('p', _norm('[FIGURE] ' + text)), cap_id)
+            fact_text = _norm('[FIGURE] ' + text)
+        _register(cap_id, {
+            'type': 'figure-caption',
+            'text': fact_text,
+            'figure': figure_id, 'subfigure': sub_index,
+            'section': section_of(root, cap)})
+
+    def _algorithm_tokens(node):
+        """算法清单独立重建（03-2）：官方编号题注归属本清单；正文由
+        既有分支递归处理，未知内容不转代码。"""
+        node_id = container_ids.get(id(node)) or 'algorithm'
+        title = None
+        for child in node.children:
+            if isinstance(child, Tag):
+                cls = child.get('class') or []
+                if any('title' in c for c in cls):
+                    title = child
+                    break
+        if title is not None:
+            # 直接 DOM 阅读（不调用生成侧序列化出口，复评 S1）；含公式
+            # 出现时标记展开为 pm 分段事实（原 TeX 逐字，三轮 F2/F4）
+            frags = marked_text_frags(
+                '[ALGORITHM] ' + _direct_read(title), registry)
+            if any(f[0] == 'm' for f in frags):
+                _push(('pm', tuple(frags)), node_id)
+                text = ''.join(
+                    f[1] if f[0] == 't' else math_wrap(f[1], f[2])
+                    for f in frags)[len('[ALGORITHM] '):]
+            else:
+                text = _norm(_direct_read(title))
+                _push(('p', '[ALGORITHM] ' + text), node_id)
+            _register(node_id, {'type': 'algorithm', 'title': text,
+                                'section': section_of(root, node)})
+        for child in node.children:
+            if title is not None and child is title:
+                continue
+            # 直属子节点逐个分派（p/pre/table 保持各自角色与节点身份），
+            # 不跳过直属节点只解析其孩子（§7.11.5，ticket 20）
+            walk(node, only=child)
+
+    def _footnote_def_tokens(node):
+        """LaTeXML 脚注定义独立重建：命名标签原样；定义内容按文档序完整
+        消费——直属文字、段落、列表和简单表分别保留块事实，代码块
+        保留在定义内的原位置（角色与所属保留），未知内容
+        以直接阅读文字保留；任何内容不静默丢弃（§7.11.5，复评 F2）。
+        定义内公式出现以标记逐字展开为实际写出文字（文字$TeX$文字）。"""
+        label = node.get('id')
+        fn_ordinal[0] += 1
+        node_id = 'fn[%d]' % fn_ordinal[0]
+        body = next((child for child in node.children
+                     if isinstance(child, Tag) and any(
+                         'content' in c for c in (child.get('class') or []))),
+                    node)
+        def table_facts(table):
+            if classify_block(table) != 'table-complex':
+                return _block_reading_facts(BeautifulSoup(str(table), 'html.parser'), normalize)
+            ordinal = int(table_ids[id(table)].split('[')[1].rstrip(']'))
+            mapping = _lx_locate_mapping(table, ordinal)
+            if mapping is None:
+                return (('table-unresolved', '缺少 table_conversions 裁决映射'),)
+            cells, codes = table_cell_facts(table)
+            rendered, _ = render_mapped_table(cells, codes, mapping, gfm=True)
+            return _markdown_block_facts(_expand_markers_inline(rendered, registry, table_math=True), reading_context)
+        def normalize(text):
+            return _norm_reading(_expand_markers_inline(text, registry),
+                                 source_context=reading_context)
+        content = _block_reading_facts(body, normalize, table_facts)
+        _push(('fndef', label, content), node_id)
+        _register(node_id, {'type': 'footnote-def', 'label': label,
+                            'content': content,
+                            'section': section_of(root, node)})
+
+    def _table_tokens(node, style):
+        "表格独立重建（04）：简单表复用既有格位表示；复杂表仅按声明映射物化。"
+        node_id = table_ids.get(id(node))
+        if style == 'complex':
+            ordinal = int(node_id.split('[')[1].rstrip(']')) \
+                if node_id else None
+            mapping = _lx_locate_mapping(node, ordinal)
+            if mapping is None:
+                # 与适配端同一口径：表内已确认公式出现随宿主保留（不猜写、
+                # 不丢弃），逐出现置未解决，保留文字中的公式维持既有
+                # $…$ 包裹字节（preserved 与实际写出内容一致）
+                for occ in registry.occurrences.values():
+                    host = occ.get('table_host')
+                    if host is None or occ['unresolved'] is not None:
+                        continue
+                    if host is node or node in host.parents:
+                        occ['unresolved'] = (
+                            '所在复杂表缺少 table_conversions 裁决映射'
+                            '（公式随宿主保留）')
+                        occ['serialized'] = '$%s$' % occ['tex']
+                        occ['raw'] = occ['serialized']
+                frags = _preserved_container_frags(node)
+                if any(f[0] == 'm' for f in frags):
+                    if frags and frags[0][0] == 't':
+                        frags = [('t', '[%s] %s' % (
+                            node.name.upper(), frags[0][1]))] + list(
+                            frags[1:])
+                    else:
+                        frags = [('t', '[%s]' % node.name.upper())] + list(
+                            frags)
+                    _push(('pm', tuple(frags)), node_id or node.name)
+                else:
+                    text = _norm('[%s] %s' % (
+                        node.name.upper(),
+                        ''.join(f[1] for f in frags)))
+                    if text.strip():
+                        _push(('p', text), node_id or node.name)
+                _register(node_id or node.name, {
+                    'type': 'unresolved-container',
+                    'text': _norm('[%s] %s' % (
+                        node.name.upper(),
+                        ''.join(f[1] for f in frags))),
+                    'reason': '复杂表缺少 table_conversions 逐源格裁决映射'
+                              '（已保留原文，不展平不转代码）',
+                    'section': section_of(root, node)})
+                return
+            cells, codes = table_cell_facts(node)
+            _register(node_id, {'type': 'table', 'style': 'mapped',
+                                'ordinal': ordinal,
+                                'section': section_of(root, node)})
+        else:
+            _register(node_id, {'type': 'table', 'style': 'simple',
+                                'section': section_of(root, node)})
+        _push(('table', node_id), node_id)
+
+    def _lx_locate_mapping(node, ordinal):
+        conversions = table_conversions
+        for entry in (conversions or {}).get('tables') or []:
+            if not isinstance(entry, dict):
+                continue
+            locate = entry.get('locate') or {}
+            if 'table' in locate and locate['table'] == ordinal:
+                return entry
+            if 'table_id' in locate and locate['table_id'] is not None \
+                    and locate['table_id'] == (node.get('id') or None):
+                return entry
+        return None
+
+    def _listing_tokens(node):
+        '清单行独立重建：逐行文字与行内公式出现按源序进入事实流。'
+        lid = listing_ids.get(id(node))
+        _register(lid, {
+            'type': 'listing',
+            'section': section_of(root, node)})
+        for line in node.children:
+            if not isinstance(line, Tag):
+                continue
+            lcls = line.get('class') or []
+            if not any('listingline' in c for c in lcls):
+                continue
+            # 直接 DOM 阅读（不调用生成侧序列化出口，复评 S1）；含公式
+            # 出现时标记展开为分段事实（原 TeX 逐字；未解决出现还原为
+            # 写出文字），块级出现按拆段口径成为独立块级 token
+            frags = marked_text_frags(_direct_read(line), registry)
+            if any(f[0] == 'm' for f in frags):
+                _emit_paragraph_tokens(frags, [], lid)
+                continue
+            text = ' '.join(
+                ''.join(f[1] for f in frags).split())
+            if not text:
+                continue
+            _push(('p', _norm(text)), lid)
+
+    def _math_group_tokens(node):
+        """公式组/式号容器独立重建（ticket 02 + §7.11.4）：行内容格按源序
+        空格拼接为行（含来源标记），成员 = 行内已解决公式出现的身份（文
+        档序，不扫描成品、不按同文本挑选）；纯字面行按行登记展开文本；
+        块级出现拆为独立块级 token；式号官方文字保留为相邻文字 token；
+        组/成员序/式号登记事实供来源依据核对。"""
+        gid = group_ids.get(id(node))
+        section = section_of(root, node)
+        if gid is None:
+            return
+        if node.name == 'table':
+            rows = [node]
+        else:
+            rows = [c for c in node.children
+                    if isinstance(c, Tag)
+                    and classify_block(c) == 'math-group']
+            if not rows:
+                rows = [node]
+        occ_by_node = {occ['node']: occ
+                       for occ in registry.occurrences.values()}
+        members = []
+        eqnos = []
+        for row in rows:
+            cells = [td for td in row.find_all('td')
+                     if not any('eqn_center_pad' in c or 'eqno' in c
+                                for c in (td.get('class') or []))]
+            line = ' '.join(
+                ' '.join(td.get_text(' ', strip=True).split())
+                for td in cells).strip()
+            if line:
+                frags = marked_text_frags(line, registry)
+                resolved = [occ_by_node[f[3]] for f in frags
+                            if f[0] == 'm']
+                if resolved and all(o['source'] == 'literal'
+                                    for o in resolved):
+                    # 纯字面行（无 MathML 快照，08）：组关系按行登记，
+                    # 记录文本展开标记（不含内部记号）
+                    members.append(_expand_markers_inline(line, registry))
+                elif resolved:
+                    # 含 MathML/遗留节点的行：成员 = 已解决出现身份
+                    members.extend(o['node'] for o in resolved)
+                else:
+                    members.append(_expand_markers_inline(line, registry))
+                _emit_paragraph_tokens(frags, [], gid)
+            for td in row.find_all('td'):
+                tcls = td.get('class') or []
+                if not any('eqno' in c for c in tcls):
+                    continue
+                text = re.sub(r'\s+', ' ', td.get_text(' ', strip=True))
+                text = re.sub(r' ([.,;:!?)\]])', r'\1', text)
+                text = re.sub(r'([\[(]) ', r'\1', text).strip()
+                if not text:
+                    continue
+                anchor = td.find('a', href=True)
+                efrags = marked_text_frags(text, registry)
+                if any(f[0] == 'm' for f in efrags):
+                    _push(('pm', tuple(efrags)), gid)
+                else:
+                    _push(('p', text), gid)
+                eqnos.append({
+                    'member': len(members) - 1,
+                    'text': _expand_markers_inline(text, registry),
+                    'target': anchor['href'] if anchor else None})
+        _register(gid, {'type': 'group', 'members': members,
+                        'eqnos': eqnos, 'section': section})
+
+    def _emit_paragraph_tokens(frags, all_frags, host=None):
+        """文字/公式片段 token 化：块级公式出现拆为独立块级公式 token
+        （与适配端写出拆段同一布局），前后文字/行内公式段各自成为
+        p/pm token。frags 并入 all_frags（宿主段落事实合并登记用）。
+        host 为来源节点身份（出现→实际区间独立对齐用）。"""
+        buffer = []
+
+        def flush_text():
+            if not buffer:
+                return
+            if any(f[0] == 'm' for f in buffer):
+                _push(('pm', tuple(buffer)), host)
+            else:
+                joined = _norm(''.join(f[1] for f in buffer))
+                if joined:
+                    _push(('p', joined), host)
+            del buffer[:]
+
+        for frag in frags:
+            if frag[0] == 'm' and frag[1] == 'block':
+                flush_text()
+                _push(('math', 'block', frag[2]), host)
+            else:
+                buffer.append(frag)
+        flush_text()
+        all_frags.extend(frags)
+
+    def _register_paragraph(node_id, all_frags, section):
+        """段落事实登记（与适配端同一口径）：存在非空文字片段或行内公
+        式片段才登记；宿主片段全部为块级公式时无正文事实（块级公式是
+        独立成块的数学片段）。"""
+        if node_id is None:
+            return
+        if not any((f[0] == 't' and str(f[1]).strip())
+                   or (f[0] == 'm' and f[1] != 'block')
+                   for f in all_frags):
+            return
+        _register(node_id, {
+            'type': 'paragraph', 'frags': all_frags,
+            'text': _norm(''.join(f[1] for f in all_frags
+                                  if f[0] == 't')),
+            'section': section})
+
+    def _flush_paragraph(frags, node_id, section):
+        "段落 token 化 + 段落事实登记（同一宿主只登记一次）。"
+        all_frags = []
+        _emit_paragraph_tokens(frags, all_frags, node_id)
+        _register_paragraph(node_id, all_frags, section)
+
+    def _paragraph_host_tokens(child, node_id):
+        """段落宿主（p/div/aside）：行内图片在源位置成为独立 img token
+        （08，与适配端 _paragraph_host 同序，不静默丢弃），前后文字段按
+        文档序与图片交错输出。含图片的宿主登记覆盖性段落事实（聚合全部
+        文字/公式片段，段界计一个空白银分，与适配端段落对应区间合并
+        口径一致；图片本身由 img token 与图片对应独立核对）；无图片宿
+        主照常登记。"""
+        imgs = [img for img in child.find_all('img')
+                if img.find_parent('pre') is None and img.get('src')]
+        if not imgs:
+            _flush_paragraph(_paragraph_frags(child), node_id,
+                             section_of(root, child))
+            return
+        ctx = _fig_ctx[-1] if _fig_ctx else (None, None)
+        copied = copy.deepcopy(child)
+        copied_imgs = [img for img in copied.find_all('img')
+                       if img.find_parent('pre') is None
+                       and img.get('src')]
+        for index, img in enumerate(copied_imgs):
+            img.replace_with(NavigableString('\x01%d\x01' % index))
+        text = _direct_read(copied)
+        all_frags = []
+        segment = []
+
+        def flush_segment():
+            _emit_paragraph_tokens(segment, all_frags, node_id)
+            del segment[:]
+
+        for position, piece in enumerate(
+                re.split(r'\x01(\d+)\x01', text)):
+            if position % 2 == 1:
+                flush_segment()
+                if all_frags:
+                    all_frags.append(('t', ' '))
+                _image_token(imgs[int(piece)], ctx[0], ctx[1])
+            elif piece:
+                segment.extend(marked_text_frags(piece, registry))
+        flush_segment()
+        _register_paragraph(node_id, all_frags, section_of(root, child))
+
+    def walk(node, only=None):
+        for child in node.children:
+            if only is not None and child is not only:
+                continue
+            if isinstance(child, str):
+                # 与适配端 _walk 同口径：容器直属文字（含出现标记替换后
+                # 的公式位置）照常输出；块级出现拆为独立块级 token
+                if child.strip():
+                    _emit_paragraph_tokens(
+                        marked_text_frags(child.strip(), registry), [])
+                continue
+            if not isinstance(child, Tag):
+                continue
+            kind_class = classify_block(child)
+            name = child.name
+            if name in ('img', 'figcaption', 'figure'):
+                ctx = _fig_ctx[-1] if _fig_ctx else (None, None)
+                if name == 'img':
+                    _image_token(child, ctx[0], ctx[1])
+                elif name == 'figcaption':
+                    _figure_caption_token(child, ctx[0], ctx[1])
+                else:
+                    figure_id = figure_ids.get(id(child))
+                    dom_parent = child.find_parent('figure')
+                    if dom_parent is not None:
+                        # 嵌套子图：按 DOM 宿主归属父浮动体，子图序 = 同一
+                        # 父内文档序（与适配端 _figure 同口径；中间 flex
+                        # 单元等包装不影响计数）
+                        parent_id = figure_ids.get(id(dom_parent))
+                        sub_index = 1 + sum(
+                            1 for sib in child.find_all_previous('figure')
+                            if sib.find_parent('figure') is dom_parent)
+                        _fig_ctx.append((parent_id, sub_index))
+                    else:
+                        _fig_ctx.append((figure_id, None))
+                    try:
+                        walk_skip(child)
+                    finally:
+                        _fig_ctx.pop()
+                continue
+            if kind_class == 'skip':
+                continue
+            if kind_class == 'unsupported':
+                node_id = container_ids[id(child)]
+                frags = _preserved_container_frags(child)
+                if any(f[0] == 'm' for f in frags):
+                    # F4：含已确认公式的保留文字按分段事实输出（[TAG]
+                    # 前缀并入首个文字段），公式逐字、文字/公式相对位置
+                    # 可逐段核对
+                    if frags and frags[0][0] == 't':
+                        frags = [('t', '[%s] %s' % (name.upper(),
+                                                    frags[0][1]))
+                                 ] + list(frags[1:])
+                    else:
+                        frags = [('t', '[%s]' % name.upper())] + list(frags)
+                    _push(('pm', tuple(frags)), node_id)
+                else:
+                    text = _norm('[%s] %s'
+                                 % (name.upper(), ''.join(
+                                     f[1] for f in frags)))
+                    if text.strip():
+                        _push(('p', text), node_id)
+                _register(node_id, {
+                    'type': 'unresolved-container',
+                    'text': _norm('[%s] %s' % (
+                        name.upper(),
+                        ''.join(f[1] for f in frags))),
+                    'reason': '未支持内容容器 <%s>（ticket 01 范围外），'
+                              '已保留原文' % name,
+                    'section': section_of(root, child)})
+                continue
+            if re.fullmatch(r'h[1-6]', name):
+                # 直接 DOM 阅读（不调用生成侧序列化出口，复评 S1）；
+                # headerlink 在阅读中本就不出现；标记逐字保留并展开为
+                # 实际写出文字（原 TeX 逐字）
+                title_raw = _expand_markers_inline(
+                    _direct_read(child), registry)
+                title = _norm_reading(
+                    title_raw.replace('¶', '').replace('\uf0c1', ''),
+                    mark_code=True,
+                    strip_bracket_escapes=False)
+                _push(('h', int(name[1]), title), h_ids[id(child)])
+                _register(h_ids[id(child)], {
+                    'type': 'heading', 'level': int(name[1]),
+                    'section': section_of(root, child)})
+                continue
+            if name == 'p':
+                _paragraph_host_tokens(child, p_ids.get(id(child)))
+                continue
+            if name == 'pre':
+                body = clean_code_html(child.decode_contents()).rstrip('\n')
+                _push(('code', body))
+                continue
+            if kind_class == 'table-simple':
+                _table_tokens(child, 'simple')
+                continue
+            if kind_class == 'table-complex':
+                _table_tokens(child, 'complex')
+                continue
+            if kind_class == 'math-group':
+                _math_group_tokens(child)
+                continue
+            if kind_class == 'biblist':
+                for item in child.find_all('li', recursive=False):
+                    # 条内公式出现按标记逐字重建（原 TeX 逐字，三轮 F2）；
+                    # 块级出现拆为独立块级 token（与适配端写出拆段同一布
+                    # 局，ticket 20）；文字直接 DOM 阅读（复评 S1）
+                    frags = marked_text_frags(_direct_read(item), registry)
+                    if any(f[0] == 'm' for f in frags):
+                        _emit_paragraph_tokens(frags, [])
+                        continue
+                    text = _norm_reading(''.join(f[1] for f in frags))
+                    if text:
+                        _push(('p', _norm(text)))
+                continue
+            if kind_class == 'itemize':
+                for item in child.find_all('li', recursive=False):
+                    # F4：条内公式出现按标记逐字重建（原 TeX 逐字），
+                    # `- ` 前缀并入首个文字段；块级出现拆为独立块级
+                    # token（ticket 20）；文字直接 DOM 阅读（复评 S1）
+                    frags = marked_text_frags(_direct_read(item), registry)
+                    if frags and frags[0][0] == 't':
+                        frags = [('t', '- ' + frags[0][1])] + list(
+                            frags[1:])
+                    else:
+                        frags = [('t', '- ')] + list(frags)
+                    if any(f[0] == 'm' for f in frags):
+                        _emit_paragraph_tokens(frags, [])
+                        continue
+                    text = _norm_reading(''.join(f[1] for f in frags))
+                    if text:
+                        _push(('p', _norm(text)))
+                continue
+            if kind_class == 'listing':
+                _listing_tokens(child)
+                continue
+            if kind_class == 'algorithm':
+                _algorithm_tokens(child)
+                continue
+            if kind_class == 'footnote-def':
+                _footnote_def_tokens(child)
+                continue
+            if name == 'aside':
+                _paragraph_host_tokens(child, aside_ids.get(id(child)))
+                continue
+            if name == 'div' and id(child) in paragraph_divs:
+                _paragraph_host_tokens(child, paragraph_divs[id(child)])
+                continue
+            walk_skip(node=child)
+
+    def walk_skip(node):
+        walk(node)
+
+    walk_skip(root)
+
+    # 公式出现事实由独立注册表全局登记（含行走期间按宿主置未解决的出
+    # 现，如未映射复杂表）；confirmed 只收集已确认 MathML 行内出现
+    # （多行或边界空白，D2 限定扫描上下文），与旧逐宿主登记同一口径
+    confirmed = []
+    for occ in registry.occurrences.values():
+        if occ['unresolved'] is not None:
+            _register(occ['node'], {
+                'type': 'math-unresolved', 'reason': occ['unresolved'],
+                'serialized': occ['serialized'],
+                'section': occ['section']})
+            continue
+        _register(occ['node'], {
+            'type': 'math', 'kind': occ['kind'], 'tex': occ['tex'],
+            'raw': occ['raw'], 'section': occ['section']})
+        if occ['source'] == 'mathml' and occ['kind'] == 'inline' \
+                and (occ['tex'] != occ['tex'].strip()
+                     or '\n' in occ['tex']):
+            confirmed.append((occ['tex'], occ['section']))
+    # 出现流（只取已解决）：标记在 DOM 中的顺序即来源出现顺序，供与候
+    # 选 Markdown 公式跨度流按序配对（同表达式身份交换、共同漏内容都
+    # 在此现形）。已映射复杂表内的出现按裁决映射的目标输出序——与共
+    # 享渲染器 render_mapped_table 同一顺序（目标行主序、格内源格序、
+    # 格内标记序），而非 DOM 文档序；未映射复杂表的出现已在行走期间置
+    # 未解决，被下方过滤
+    occ_stream = []
+
+    def _occ_scan(node):
+        if isinstance(node, Comment):
+            return
+        if isinstance(node, NavigableString):
+            for match in _MARK_RE.finditer(str(node)):
+                occ = registry.occurrences[int(match.group(1))]
+                if occ['unresolved'] is None:
+                    occ_stream.append(occ)
+            return
+        if not isinstance(node, Tag):
+            return
+        if node.name == 'table' and classify_block(node) == 'table-complex':
+            node_id = table_ids.get(id(node))
+            ordinal = int(node_id.split('[')[1].rstrip(']')) \
+                if node_id else None
+            mapping = _lx_locate_mapping(node, ordinal)
+            if mapping is not None:
+                cells, codes = table_cell_facts(
+                    node, pre_bodies=getattr(fidelity, '_pre_blocks', None))
+                rendered, _declared = render_mapped_table(cells, codes,
+                                                          mapping)
+                for match in _MARK_RE.finditer(rendered):
+                    occ = registry.occurrences[int(match.group(1))]
+                    if occ['unresolved'] is None:
+                        occ_stream.append(occ)
+                return
+        if node.name == 'table' and classify_block(node) == 'math-group':
+            # 公式组表的输出序为“内容格先行、式号格随后”（与
+            # _math_group_tokens/适配端组序列化同一口径），式号格在 DOM
+            # 中可先于后续内容行，不能按文档序配对
+            for td in node.find_all('td'):
+                tcls = td.get('class') or []
+                if any('eqn_center_pad' in c or 'eqno' in c for c in tcls):
+                    continue
+                for match in _MARK_RE.finditer(
+                        td.get_text(' ', strip=True)):
+                    occ = registry.occurrences[int(match.group(1))]
+                    if occ['unresolved'] is None:
+                        occ_stream.append(occ)
+            for td in node.find_all('td'):
+                tcls = td.get('class') or []
+                if not any('eqno' in c for c in tcls):
+                    continue
+                for match in _MARK_RE.finditer(
+                        td.get_text(' ', strip=True)):
+                    occ = registry.occurrences[int(match.group(1))]
+                    if occ['unresolved'] is None:
+                        occ_stream.append(occ)
+            return
+        for child in node.children:
+            _occ_scan(child)
+
+    _occ_scan(root)
+    return tokens, facts, confirmed, problems, occ_stream, hosts
+
+
+def _latexml_md_stream(md_text, source_context=None,
+                       table_ranges=None):
+    """从实际候选 Markdown 独立重建有序 token 流（解析侧）。
+
+    返回 (tokens, scan, ranges)：ranges 与 tokens 一一对应，为各 token
+    在实际候选中的精确字符区间（按行扫描独立推导，不消费生成端声明的
+    范围）；文字事实按真实阅读取得（markdown-it 行内解析，强调/转义/
+    链接/行内代码语法只解码一次，§7.11.5：实际端不消费生成侧自报文字）。
+    """
+    from _verification import (fenced_line_numbers, heading_entries,
+                               image_marker_spans, scan_code_fences,
+                               scan_math)
+
+    def _read(value):
+        return _md_inline_reading(value, preserve_roles=True)
+
+    tokens = []
+    ranges = []
+    lines = md_text.split('\n')
+    fences = {block.start_line: block
+              for block in scan_code_fences(md_text).blocks}
+    fenced = fenced_line_numbers(md_text)
+    headings = {entry[0]: (entry[1], entry[2])
+                for entry in heading_entries(md_text)}
+    line_offsets = {}
+    offset = 0
+    for index, text in enumerate(lines, start=1):
+        line_offsets[index] = offset
+        offset += len(text) + 1
+
+    def _line_end(line_no):
+        return line_offsets[line_no] + len(lines[line_no - 1])
+
+    markers = {}
+    for line_no, start, end, path in image_marker_spans(md_text):
+        markers.setdefault(line_no, []).append((start, end, ('i', path)))
+    scan = scan_math(md_text, source_context=source_context)
+    scan = type(scan)(tuple(table_math_spans(scan.spans, md_text, decode_entities=True)), scan.issues)
+    inline_by_line = {}
+    block_spans = []
+    cross = {}
+    for span in scan.spans:
+        if span.kind == 'block':
+            block_spans.append(span)
+        else:
+            end_line = md_text.count('\n', 0, span.end - 1) + 1
+            if end_line != span.start_line:
+                cross[span.start_line] = (span, end_line)
+                continue
+            line_base = line_offsets[span.start_line]
+            inline_by_line.setdefault(span.start_line, []).append(
+                (span.start - line_base, span.end - line_base,
+                 ('m', span.kind, span.raw)))
+    block_lines = {}
+    for span in block_spans:
+        for line_no in range(span.start_line,
+                             md_text.count('\n', 0, span.end - 1) + 2):
+            block_lines[line_no] = span
+
+    def _norm(value):
+        return _norm_reading(value)
+
+    _PLACEHOLDER_RE = re.compile('(\\d+)')
+
+    def _masked_reading_frags(prefix, frag_list, suffix):
+        """跨片段边界的真实阅读：数学/图片跨度先换成私用区占位符，整段
+        一次行内阅读（强调等成对语法跨跨度时仍能正确解码），再按占位符
+        切回（文字片段, 跨度片段）交错流。"""
+        masked = [prefix]
+        for index, _frag in enumerate(frag_list):
+            masked.append('%d' % index)
+        masked.append(suffix)
+        reading = _read(''.join(masked))
+        out = []
+        for position, part in enumerate(
+                _PLACEHOLDER_RE.split(reading)):
+            if position % 2 == 1:
+                out.append(frag_list[int(part)])
+            elif part:
+                out.append(('t', part))
+        return out
+
+    # 表格对应范围整体吸收为单个 ('table', node) token（内容与格位由
+    # 逐格核对负责，04）；其区间来自声明范围本身，不参与出现→区间核对
+    table_zones = sorted(table_ranges or [])
+    line_no = 1
+    while line_no <= len(lines):
+        zone = next((z for z in table_zones
+                     if z[0] <= line_offsets[line_no] < z[1]), None)
+        if zone is not None:
+            tokens.append(('table', zone[2]))
+            ranges.append((zone[0], zone[1]))
+            while line_no <= len(lines) and \
+                    line_offsets[line_no] < zone[1]:
+                line_no += 1
+            continue
+        line = lines[line_no - 1]
+        if line_no in fenced:
+            if line_no in fences:
+                tokens.append(('code', fences[line_no].body))
+                ranges.append((fences[line_no].start,
+                               fences[line_no].end))
+            line_no += 1
+            continue
+        if line_no in headings:
+            level, title = headings[line_no]
+            end_line = line_no
+            if line_no in cross:
+                # 标题内跨行公式（D2 逐字）：标题文字贯通重建到公式
+                # 跨度末行，与源侧哨兵口径重建的标题事实同一 _norm 比较
+                _span, end_line = cross[line_no]
+                raw_lines = [lines[line_no - 1][len('#' * level) + 1:]]
+                raw_lines += lines[line_no:end_line]
+                title = '\n'.join(raw_lines)
+            if end_line == line_no:
+                title = re.sub(r'^\s*#{1,6}\s+', '', line)
+                title = re.sub(r'\s+#+\s*$', '', title)
+            title = _protected_reading(title, source_context, keep_math=True)
+            tokens.append(('h', level, _norm_reading(
+                title, mark_code=True, strip_bracket_escapes=False)))
+            ranges.append((line_offsets[line_no], _line_end(end_line)))
+            line_no = end_line + 1
+            continue
+        fn_match = re.match(r'^\[\^([^\]]+)\]:\s*(.*)$', line)
+        if fn_match:
+            body, last_content, cursor = footnote_definition_block(lines, line_no, cross)
+            text = _markdown_block_facts(body, source_context)
+            tokens.append(('fndef', fn_match.group(1), text))
+            ranges.append((line_offsets[line_no], _line_end(last_content)))
+            line_no = cursor
+            continue
+        if line_no in block_lines:
+            # 块级公式跨度所在行的前后文字拆为独立 p token（§7.11.4：适配
+            # 端把块级出现拆为独立块片段，前后文字各自成行，不再整行吞并）
+            span = block_lines[line_no]
+            end_line = md_text.count('\n', 0, span.end - 1) + 1
+            if span.start_line == line_no:
+                col = span.start - line_offsets[line_no]
+                prefix = line[:col]
+                if prefix.strip():
+                    tokens.append(('p', _norm(_read(prefix))))
+                    ranges.append((line_offsets[line_no], span.start))
+                tokens.append(('math', 'block', span.expr))
+                ranges.append((span.start, span.end))
+            if end_line == line_no:
+                col_end = span.end - line_offsets[end_line]
+                suffix = line[col_end:]
+                if suffix.strip():
+                    tokens.append(('p', _norm(_read(suffix))))
+                    ranges.append((span.end, _line_end(end_line)))
+            line_no += 1
+            continue
+        if line_no in cross:
+            span, end_line = cross[line_no]
+            col_start = span.start - line_offsets[line_no]
+            col_end = span.end - line_offsets[end_line]
+            frags = _masked_reading_frags(
+                line[:col_start], [('m', 'inline', span.raw)],
+                lines[end_line - 1][col_end:])
+            tokens.append(('pm', tuple(frags)))
+            ranges.append((line_offsets[line_no], _line_end(end_line)))
+            line_no = end_line + 1
+            continue
+        if not line.strip():
+            line_no += 1
+            continue
+        spans = sorted((inline_by_line.get(line_no) or [])
+                       + (markers.get(line_no) or []))
+        if spans:
+            frag_list = [frag for _start, _end, frag in spans]
+            segments = []
+            cursor = 0
+            for start, end, _frag in spans:
+                segments.append(line[cursor:start])
+                cursor = end
+            segments.append(line[cursor:])
+            images = [f for f in frag_list if f[0] == 'i']
+            if images and not ''.join(segments).strip() \
+                    and len(images) == len(frag_list):
+                for start, end, frag in spans:
+                    tokens.append(('img', frag[1]))
+                    ranges.append((line_offsets[line_no] + start,
+                                   line_offsets[line_no] + end))
+            else:
+                # 文字段按真实阅读取得（复评 S1）；跨度先换成私用区占位
+                # 符整段一次行内阅读，强调等成对语法跨跨度时仍能正确解
+                # 码，再按占位符切回交错片段流
+                masked = []
+                for index, segment in enumerate(segments[:-1]):
+                    masked.append(segment)
+                    masked.append('\ue000%d\ue001' % index)
+                masked.append(segments[-1])
+                reading = _read(''.join(masked))
+                frags = []
+                for position, part in enumerate(
+                        _PLACEHOLDER_RE.split(reading)):
+                    if position % 2 == 1:
+                        frags.append(frag_list[int(part)])
+                    elif part:
+                        frags.append(('t', part))
+                tokens.append(('pm', tuple(frags)))
+                ranges.append((line_offsets[line_no],
+                               _line_end(line_no)))
+        else:
+            tokens.append(('p', _norm(_read(line))))
+            ranges.append((line_offsets[line_no], _line_end(line_no)))
+        line_no += 1
+    return tokens, scan, ranges
+
+
+def _latexml_tok_eq(src_tok, md_tok):
+    """源/输出 token 相等：公式只比较已确认定界与逐字原表达式（行内与
+    展示同一精确口径），文字经同一归一；类型冲突即不等。"""
+    from _latexml_source import math_wrap
+
+    if src_tok[0] != md_tok[0]:
+        return False
+    if src_tok[0] == 'h':
+        return src_tok[1] == md_tok[1] and src_tok[2] == md_tok[2]
+    if src_tok[0] in ('p', 'code', 'img'):
+        return src_tok[1] == md_tok[1]
+    if src_tok[0] == 'fndef':
+        return src_tok[1] == md_tok[1] and src_tok[2] == md_tok[2]
+    if src_tok[0] == 'table':
+        return src_tok[1] == md_tok[1]
+    if src_tok[0] == 'math':
+        if src_tok[1] != md_tok[1]:
+            return False
+        if src_tok[1] == 'block':
+            # 块级：两侧同为扫描表达式；MathML 适配包装（$$\n…\n$$）的
+            # 已确认包装换行可剥，表达式本体逐字
+            return md_tok[2] == src_tok[2] or (
+                md_tok[2].startswith('\n') and md_tok[2].endswith('\n')
+                and md_tok[2][1:-1] == src_tok[2])
+        return md_tok[2] == math_wrap(src_tok[1], src_tok[2])
+    if src_tok[0] == 'pm':
+        # 分段事实比较（F5）：先丢弃两侧纯空白文字片段（图片块行化使
+        # 边界纯空白片段计数漂移，不构成内容差异），再按（种类, 归一
+        # 内容）逐段比较——文字片段经 _WS_RE 折叠+strip 后逐段相等，
+        # 保留文字相对公式/图片的位置分布（位置盲的拼接比较会漏判
+        # 公式移位）；公式维持 math_wrap 精确口径，图片维持引用相等。
+        def _segs(frags):
+            segs = []
+            for frag in frags:
+                if frag[0] == 't':
+                    text = _norm_reading(frag[1])
+                    if text:
+                        segs.append(('t', text))
+                else:
+                    segs.append(frag)
+            return segs
+
+        a_segs, b_segs = _segs(src_tok[1]), _segs(md_tok[1])
+        if len(a_segs) != len(b_segs):
+            return False
+        for a, b in zip(a_segs, b_segs):
+            if a[0] != b[0]:
+                return False
+            if a[0] == 't' and a[1] != b[1]:
+                return False
+            if a[0] == 'm' and (a[1] != b[1]
+                                or b[2] != math_wrap(a[1], a[2])):
+                return False
+            if a[0] == 'i' and a[1] != b[1]:
+                return False
+        return True
+    return src_tok == md_tok
+
+
+def _latexml_is_decorative(node):
+    """可确认装饰（导航/页码）判定：标签或类 token 命中；不认识的类名
+    不构成排除依据（03-4）。"""
+    if node.name in ('nav', 'header', 'footer'):
+        return True
+    cls = node.get('class') or []
+    return any(any(token in c for token in ('pagination', 'page-nav',
+                                            'ltx_page_nav'))
+               for c in cls)
+
+
+def _expected_table_block(label, entry, expected_map):
+    """独立重算表格对应声明的候选块（简单表=既有 table_block 表示；
+    映射表=按声明映射物化）；expected_map 由对账入口预计算。"""
+    return expected_map.get(label)
+
+
+def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
+                                  adaptation, html_label='原快照',
+                                  md_label='解析 Markdown',
+                                  table_conversions=None):
+    """LaTeXML 来源独立对账：身份/摘要核对 + 候选 correspondences 与
+    unresolved 逐节点核对 + 两侧有序流比较。返回损伤诊断（空 = 通过）。
+
+    删正文、漏节点、范围交叠、额外输出、错归属、无解释重复、等数替换、
+    改类型都按各自目标原因失败；两侧不共享渲染遍历或“已输出”清单。
+    """
+    from _latexml_source import (math_wrap, substitution_by_ref,
+                                 validate_adaptation,
+                                 validate_resource_substitutions)
+
+    diffs = []
+    diffs += validate_adaptation(adaptation, raw_html=raw_html)
+    decisions = (adaptation or {}).get('decisions') \
+        if isinstance(adaptation, dict) else None
+    decision_results = ((adaptation or {}).get('decision_results') or []) \
+        if isinstance(adaptation, dict) else []
+    if table_conversions is None:
+        table_conversions = \
+            ((adaptation or {}).get('table_conversions') or None) \
+            if isinstance(adaptation, dict) else None
+    (src_tokens, facts, confirmed, src_problems,
+     occ_stream, hosts) = _latexml_src_stream(
+        raw_html, section_id, decisions, decision_results,
+        table_conversions=table_conversions, adaptation=adaptation)
+    if isinstance(adaptation, dict) \
+            and adaptation.get('resource_substitutions'):
+        snap_path = (adaptation.get('snapshot') or {}).get('path')
+        snapshot_dir = (os.path.dirname(os.path.abspath(snap_path))
+                        if isinstance(snap_path, str)
+                        and os.path.isfile(snap_path) else None)
+        if snapshot_dir is None:
+            diffs.append('来源依据缺 snapshot.path，无法核对资源替换基点')
+        else:
+            diffs += validate_resource_substitutions(
+                adaptation, snapshot_dir,
+                ((adaptation.get('paper_identity') or {}).get('version')))
+    if src_tokens is None:
+        return diffs + ['%s 未找到选区根（article/main/body 或 section_id）'
+                        % html_label]
+    for problem in src_problems:
+        diffs.append('%s %s' % (html_label, problem))
+    # 共享扫描上下文只来自独立重建的已确认行内事实（多行或边界空白，
+    # D2 逐字）：待验证
+    # 对应不能自行授予跨行资格；核对失败由正文流/切片逐字比较兜底
+    context = _SourceMathContext(confirmed)
+    table_zones = [
+        (entry['md_start'], entry['md_end'], entry.get('node'))
+        for entry in ((adaptation or {}).get('correspondences') or [])
+        if isinstance(entry, dict) and entry.get('content_type') == 'table'
+        and isinstance(entry.get('md_start'), int)]
+    md_tokens, scan, md_ranges = _latexml_md_stream(
+        md_text, source_context=context, table_ranges=table_zones)
+    actual_table_rows = markdown_table_row_lines(md_text)
+    for issue in scan.issues:
+        diffs.append('%s L%d 未解决数学定界 %r: %s'
+                     % (md_label, issue.start_line, issue.raw, issue.reason))
+
+    # ---- 表格候选块的独立重算（简单=既有表示；映射=按声明物化） ----
+    expected_table_blocks = {}
+    if any(c.get('content_type') == 'table'
+           for c in ((adaptation or {}).get('correspondences') or [])
+           if isinstance(c, dict)):
+        from _latexml_source import (locate_table_mapping as _ltm,
+                                     render_mapped_table, table_cell_facts,
+                                     table_node_ids as _tids)
+        check_soup = BeautifulSoup(
+            protect_code_entities(raw_html, skip_pre=True), 'html.parser')
+        check_root = (check_soup.find(id=section_id)
+                      if section_id else
+                      (check_soup.find('article') or check_soup.find('main')
+                       or check_soup.find('body')))
+        if check_root is not None:
+            tids = _tids(check_root)
+            for entry in ((adaptation or {}).get('correspondences') or []):
+                if not (isinstance(entry, dict)
+                        and entry.get('content_type') == 'table'):
+                    continue
+                node_id = entry.get('node')
+                table = next((n for n in check_root.find_all('table')
+                              if tids.get(id(n)) == node_id
+                              and n.find_parent('table') is None), None)
+                if table is None:
+                    diffs.append('表格对应 %s 在原始快照选区内不存在' % node_id)
+                    continue
+                style = (entry.get('conversion') or {}).get('style')
+                if style == 'simple':
+                    try:
+                        from _latexml_source import (
+                            OccurrenceRegistry as _OccReg,
+                            _expand_markers_inline as _expand_marks,
+                            prepare_math_dom as _pmd)
+                        converted = copy.deepcopy(table)
+                        fidelity2 = HtmlFidelity()
+                        # 与适配端同一 DOM 形态：格内 <pre> 先换为占位注释
+                        # （代码正文不进格文字），格内代码由 cell_fences
+                        # 恢复为 [TABLE-CODE] 围栏
+                        for pre in converted.find_all('pre'):
+                            body = clean_code_html(pre.decode_contents())
+                            marker = ' __TECHDOC_PRE_%d__ ' % len(
+                                fidelity2._pre_blocks)
+                            fidelity2._pre_blocks.append(body)
+                            pre.replace_with(Comment(marker))
+                        registry2 = _OccReg()
+                        _pmd(converted, [], registry2)
+                        expected_table_blocks[node_id] = _expand_marks(
+                            '\n'.join(fidelity2.table_block(converted)
+                                      ).strip('\n'), registry2)
+                    except Exception:
+                        diffs.append('表格 %s 含未解释跨度且缺少映射'
+                                     % node_id)
+                elif style == 'mapped':
+                    ordinal = int(node_id.split('[')[1].rstrip(']'))
+                    mapping = _ltm(table, ordinal,
+                                   (table_conversions or {}).get('tables'))
+                    if mapping is None:
+                        diffs.append('表格 %s 声明映射但 locate 无对应条目'
+                                     % node_id)
+                        continue
+                    cells, codes = table_cell_facts(table)
+                    expected_table_blocks[node_id] = render_mapped_table(
+                        cells, codes, mapping)[0]
+
+    # ---- 来源依据（correspondences/unresolved）逐节点核对 ----
+    corrs = [c for c in ((adaptation or {}).get('correspondences') or [])
+             if isinstance(c, dict)]
+    unres = [u for u in ((adaptation or {}).get('unresolved') or [])
+             if isinstance(u, dict)]
+    ranges = []
+    seen_nodes = {}
+    for entry in corrs + unres:
+        label = entry.get('node')
+        start, end = entry.get('md_start'), entry.get('md_end')
+        if not isinstance(label, str) or not label:
+            diffs.append('依据条目缺少节点身份: %r' % (entry,))
+            continue
+        if not isinstance(start, int) or not isinstance(end, int) \
+                or start < 0 or end > len(md_text) or start >= end:
+            diffs.append('依据条目 %s 的 Markdown 范围非法: %r'
+                         % (label, (start, end)))
+            continue
+        ranges.append((start, end, label))
+        if label in seen_nodes:
+            diffs.append('依据条目 %s 被重复声明（无解释重复）' % label)
+        seen_nodes[label] = entry
+    ranges.sort()
+    # 出现身份区间为精确字符区间（§7.11.4）：公式对应落在宿主覆盖区间
+    # 内（含相等）是正常归属；部分交叠与非公式间的重复/包含区间一律
+    # 拦截。
+    math_labels = {e.get('node') for e in corrs
+                   if e.get('content_type') == 'math'}
+    for (prev_s, prev_e, prev_l), (s, e, label) in zip(ranges, ranges[1:]):
+        if s < prev_e and not (prev_s < s and e < prev_e):
+            if (prev_l in math_labels) != (label in math_labels):
+                # 精确公式区间落在宿主覆盖区间内（含相等、含同起点）是
+                # 正常归属；排序不保证宿主在前，按角色判定包含方向
+                m_s, m_e = (prev_s, prev_e) if prev_l in math_labels \
+                    else (s, e)
+                h_s, h_e = (s, e) if prev_l in math_labels \
+                    else (prev_s, prev_e)
+                if h_s <= m_s and m_e <= h_e:
+                    continue
+            diffs.append('依据条目范围交叠: %s [%d,%d) 与 %s [%d,%d)'
+                         % (prev_l, prev_s, prev_e, label, s, e))
+    fence_lines = fenced_line_numbers(md_text)
+
+    # ---- 出现流配对（§7.11.4）：独立重建的来源出现（文档序，只取已解
+    #      决）与候选 Markdown 公式跨度（排除围栏行）按序一一配对——数
+    #      量、类型与逐字表达式必须一致；同表达式身份交换、源文与候选
+    #      共同漏内容都会在此现形。配对结果为各出现身份给出独立预期区
+    #      间，逐条核对声明的公式对应区间。 ----
+    paired_ranges = {}
+    if occ_stream is not None:
+        md_spans = [span for span in scan.spans
+                    if span.start_line not in fence_lines]
+        if len(md_spans) != len(occ_stream):
+            diffs.append('公式出现数量不一致: %s %d 处 vs %s %d 处'
+                         % (html_label, len(occ_stream), md_label,
+                            len(md_spans)))
+        for occ, span in zip(occ_stream, md_spans):
+            expr = span.expr
+            if span.kind == 'block' and expr.startswith('\n') \
+                    and expr.endswith('\n'):
+                # 块级证据口径：剥一层 $$ 包装换行（math_wrap 逆运算）
+                expr = expr[1:-1]
+            if occ['kind'] != span.kind or occ['tex'] != expr:
+                diffs.append('公式出现 %s 与候选跨度不符（身份交换/错位/'
+                             '缺漏）: %s (%s, %r) vs %s L%d (%s, %r)'
+                             % (occ['node'], html_label, occ['kind'],
+                                occ['tex'], md_label, span.start_line,
+                                span.kind, expr))
+                continue
+            paired_ranges[occ['node']] = (span.start, span.end)
+
+    # ---- 出现→实际区间独立对齐（复评 F1）：两侧正文流全等时，按对齐
+    #      token 聚合各来源节点身份的独立实际字符区间（区间由解析侧行扫
+    #      描独立推导，不消费生成端声明），与依据声明范围逐节点精确核
+    #      对——标题/段落/图片等同文或同资源节点的声明范围互换、错绑他
+    #      处区间即不符。流不等时已有流差异，区间对齐不可靠，不再核对。
+    #      表格 token 的区间来自声明范围（自证），由逐格核对负责；公式
+    #      由上方出现流配对负责。 ----
+    paired_node_ranges = {}
+    streams_equal = len(src_tokens) == len(md_tokens) and all(
+        _latexml_tok_eq(s_tok, m_tok)
+        for s_tok, m_tok in zip(src_tokens, md_tokens))
+    if streams_equal:
+        for host, m_tok, rng in zip(hosts, md_tokens, md_ranges):
+            if host is None or m_tok[0] == 'table':
+                continue
+            bound = paired_node_ranges.get(host)
+            if bound is None:
+                paired_node_ranges[host] = [rng[0], rng[1]]
+            else:
+                bound[0] = min(bound[0], rng[0])
+                bound[1] = max(bound[1], rng[1])
+
+    _RANGE_CHECKED_TYPES = (
+        'heading', 'paragraph', 'image', 'figure-caption', 'footnote-def',
+        'listing', 'algorithm', 'math-group', 'unresolved-container')
+
+    md_fences = scan_code_fences(md_text).blocks
+
+    def _slice_reading(slice_text, base):
+        """候选切片的真实阅读：切片内的公式跨度（共享扫描口径）换成占位
+        符、完整落入切片的代码围栏整块剔除（代码由独立 code token 逐字
+        对账），剩余文字整段一次行内阅读后把占位符还原为表达式——公式
+        在链接标签内时链接语法不被拆断，\\[ 等公式定界不被普通阅读当成
+        括号转义，强调/反斜线转义只解码一次。"""
+        end_limit = base + len(slice_text)
+        fence_events = [(fence.start, fence.end)
+                        for fence in md_fences
+                        if fence.start >= base and fence.end <= end_limit]
+
+        def _in_fence(pos):
+            return any(f_start <= pos < f_end
+                       for f_start, f_end in fence_events)
+
+        events = [(f_start, f_end, None)
+                  for f_start, f_end in fence_events]
+        exprs = []
+        for span in scan.spans:
+            if span.start < base or span.end > end_limit \
+                    or _in_fence(span.start):
+                continue
+            events.append((span.start, span.end, span.raw))
+        events.sort()
+        masked = []
+        cursor = 0
+        read_exprs = []
+        for ev_start, ev_end, replacement in events:
+            if ev_start - base < cursor:
+                continue
+            masked.append(slice_text[cursor:ev_start - base])
+            if replacement is not None:
+                masked.append('%d' % len(read_exprs))
+                read_exprs.append(replacement)
+            cursor = ev_end - base
+        masked.append(slice_text[cursor:])
+        reading = _md_inline_reading(''.join(masked), preserve_roles=True)
+        return _MD_READ_PLACEHOLDER_RE.sub(
+            lambda m: read_exprs[int(m.group(1))], reading)
+
+    def _check_declared_range(label, entry):
+        """声明范围 == 独立对齐的实际区间（复评 F1）；类型不符等致命问
+        题已单独报告时不再重复。"""
+        if not streams_equal:
+            return
+        d_start, d_end = entry.get('md_start'), entry.get('md_end')
+        if not isinstance(d_start, int) or not isinstance(d_end, int):
+            return  # 范围非法已在登记检查中报告
+        paired = paired_node_ranges.get(label)
+        if paired is None:
+            diffs.append('对应节点 %s 未在独立对齐的实际输出区间中登记'
+                         '（正文流未覆盖该身份）' % label)
+            return
+        if (d_start, d_end) != (paired[0], paired[1]):
+            diffs.append('对应节点 %s 的声明范围 [%d,%d) 与独立对齐的实'
+                         '际区间 [%d,%d) 不符（错绑输出区间/范围互换）'
+                         % (label, d_start, d_end,
+                            paired[0], paired[1]))
+
+    for entry in corrs:
+        label = entry.get('node')
+        fact = facts.get(label)
+        if fact is None:
+            # 全部公式出现（含字面）在独立重建中均有身份登记；无身份的
+            # 对应一律为依据与快照不符，不再按同文本/宿主区间找补
+            diffs.append('对应节点 %s 在原始快照选区内不存在（依据与'
+                         '快照不符）' % label)
+            continue
+        if fact.get('section') is not None \
+                and entry.get('section') != fact.get('section'):
+            diffs.append('对应节点 %s 章节归属不符: 依据 #%s vs 独立重建 #%s'
+                         % (label, entry.get('section'), fact['section']))
+        ctype = entry.get('content_type')
+        start, end = entry['md_start'], entry['md_end']
+        slice_text = md_text[start:end]
+        if ctype in _RANGE_CHECKED_TYPES:
+            # 非公式节点的声明范围与独立对齐实际区间精确核对（复评 F1）
+            _check_declared_range(label, entry)
+        if ctype == 'math':
+            if fact['type'] != 'math':
+                diffs.append('对应节点 %s 内容类型不符: 依据 math vs 实际 %s'
+                             % (label, fact['type']))
+                continue
+            if entry.get('kind') != fact['kind']:
+                diffs.append('公式 %s 类型冲突: 依据 %s vs 原节点 %s'
+                             % (label, entry.get('kind'), fact['kind']))
+                continue
+            if (entry.get('tex') or '') != fact['tex']:
+                diffs.append('公式 %s 表达式与原节点不符（等数替换/改写）: '
+                             '依据 %r vs 原节点 %r'
+                             % (label, entry.get('tex'), fact['tex']))
+                continue
+            if md_text.count('\n', 0, start) + 1 in actual_table_rows:
+                slice_text = decode_table_math(slice_text)
+            if slice_text != fact['raw']:
+                diffs.append('公式 %s 的候选切片与实际写出内容不符: %r'
+                             % (label, slice_text))
+            paired = paired_ranges.get(label)
+            if paired is None:
+                diffs.append('公式 %s 未通过出现流配对（数量/类型/表达式'
+                             '不符或缺失）' % label)
+            elif (start, end) != paired:
+                diffs.append('公式 %s 的候选区间 [%d,%d) 与出现身份传递'
+                             '区间 [%d,%d) 不符'
+                             % (label, start, end, paired[0], paired[1]))
+        elif ctype == 'heading':
+            if fact['type'] != 'heading':
+                diffs.append('对应节点 %s 内容类型不符: 依据 heading vs 实际 %s'
+                             % (label, fact['type']))
+            elif entry.get('level') is not None \
+                    and entry.get('level') != fact['level']:
+                diffs.append('标题 %s 层级不符: 依据 %r vs 原节点 %r'
+                             % (label, entry.get('level'), fact['level']))
+        elif ctype == 'paragraph':
+            if fact['type'] != 'paragraph':
+                diffs.append('对应节点 %s 内容类型不符: 依据 paragraph vs '
+                             '实际 %s' % (label, fact['type']))
+                continue
+            expected = ''.join(
+                f[1] if f[0] == 't' else math_wrap(f[1], f[2])
+                for f in fact['frags'])
+            if _norm_reading(_slice_reading(slice_text, start), source_context=context) \
+                    != _norm_reading(expected, source_context=context):
+                diffs.append('段落 %s 候选内容被改写/删除: 依据范围文字与'
+                             '独立重建不符' % label)
+        elif ctype == 'image':
+            if fact['type'] != 'image':
+                diffs.append('对应节点 %s 内容类型不符: 依据 image vs 实际 %s'
+                             % (label, fact['type']))
+                continue
+            for field in ('figure', 'subfigure'):
+                if entry.get(field) != fact.get(field):
+                    diffs.append('图片 %s %s 归属不符: 依据 %r vs 独立重建 %r'
+                                 '（错父节点）' % (label, field,
+                                                 entry.get(field),
+                                                 fact.get(field)))
+            expected = '[IMG: %s]' % fact['reference']
+            if slice_text.strip() != expected:
+                diffs.append('图片 %s 候选切片不符: %r vs %r'
+                             % (label, slice_text.strip(), expected))
+            declared_ref = (entry.get('conversion') or {}).get('reference')
+            if declared_ref is not None \
+                    and declared_ref != fact['reference']:
+                diffs.append('图片 %s 目标引用与独立规划不符: 依据 %r vs '
+                             '实际 %r（同名异资源不得静默覆盖）'
+                             % (label, declared_ref, fact['reference']))
+            style = (entry.get('conversion') or {}).get('style')
+            if style == 'substituted':
+                subs = substitution_by_ref(adaptation)
+                if fact.get('source_ref') not in subs:
+                    diffs.append('图片 %s 声明替换但 resource_substitutions '
+                                 '无对应原引用（依据不完整）' % label)
+        elif ctype == 'figure-caption':
+            if fact['type'] != 'figure-caption':
+                diffs.append('对应节点 %s 内容类型不符: 依据 figure-caption '
+                             'vs 实际 %s' % (label, fact['type']))
+                continue
+            for field in ('figure', 'subfigure'):
+                if entry.get(field) != fact.get(field):
+                    diffs.append('图题 %s %s 归属不符: 依据 %r vs 独立重建 '
+                                 '%r（错父节点）' % (label, field,
+                                                  entry.get(field),
+                                                  fact.get(field)))
+            if _norm_reading(_slice_reading(slice_text, start), source_context=context) != fact['text']:
+                diffs.append('图题 %s 候选内容被改写' % label)
+        elif ctype == 'footnote-def':
+            if fact['type'] != 'footnote-def':
+                diffs.append('对应节点 %s 内容类型不符: 依据 footnote-def '
+                             'vs 实际 %s' % (label, fact['type']))
+                continue
+            if entry.get('label') != fact.get('label'):
+                diffs.append('脚注定义 %s 标签不符: 依据 %r vs 原节点 %r'
+                             '（命名标签被抽数字合并）' % (label,
+                                                     entry.get('label'),
+                                                     fact.get('label')))
+        elif ctype == 'listing':
+            if fact['type'] != 'listing':
+                diffs.append('对应节点 %s 内容类型不符: 依据 listing vs '
+                             '实际 %s' % (label, fact['type']))
+                continue
+            if slice_text.strip() == '':
+                diffs.append('清单 %s 候选块为空' % label)
+        elif ctype == 'math-group':
+            if fact['type'] != 'group':
+                diffs.append('对应节点 %s 内容类型不符: 依据 math-group vs '
+                             '实际 %s' % (label, fact['type']))
+        elif ctype == 'table':
+            if fact['type'] != 'table':
+                diffs.append('对应节点 %s 内容类型不符: 依据 table vs 实际 %s'
+                             % (label, fact['type']))
+                continue
+            expected = _expected_table_block(label, entry,
+                                             expected_table_blocks)
+            if expected is not None and \
+                    _norm_text(slice_text, unwrap_links=False) \
+                    != _norm_text(expected, unwrap_links=False):
+                diffs.append('表格 %s 候选切片与独立重建输出不符（错格/'
+                             '展平/转代码）' % label)
+        elif ctype == 'algorithm':
+            if fact['type'] != 'algorithm':
+                diffs.append('对应节点 %s 内容类型不符: 依据 algorithm vs '
+                             '实际 %s' % (label, fact['type']))
+                continue
+            if entry.get('title') != fact.get('title'):
+                diffs.append('算法题注 %s 与独立重建不符: 依据 %r vs 实际 %r'
+                             % (label, entry.get('title'),
+                                fact.get('title')))
+        else:
+            diffs.append('对应节点 %s 的 content_type 未识别: %r'
+                         % (label, ctype))
+
+    for entry in unres:
+        label = entry.get('node')
+        fact = facts.get(label)
+        if fact is None:
+            diffs.append('未解决项 %s 在原始快照选区内不存在（依据与快照'
+                         '不符）' % label)
+            continue
+        if entry.get('reason') != fact.get('reason'):
+            diffs.append('未解决项 %s 原因不符: 依据 %r vs 独立重建 %r'
+                         % (label, entry.get('reason'), fact.get('reason')))
+            continue
+        if entry.get('content_type') in _RANGE_CHECKED_TYPES:
+            # 保留容器的声明范围同样与独立对齐实际区间精确核对（复评 F1）
+            _check_declared_range(label, entry)
+        preserved = entry.get('preserved')
+        if preserved is not None \
+                and md_text[entry['md_start']:entry['md_end']] != preserved:
+            diffs.append('未解决项 %s 的保留内容在候选中被改写/删除' % label)
+
+    # ---- 公式组：独立重建的组/成员序/式号与依据核对（02-4） ----
+    group_facts = {label: fact for label, fact in facts.items()
+                   if fact.get('type') == 'group'}
+    declared_groups = [g for g in ((adaptation or {}).get('groups') or [])
+                       if isinstance(g, dict)]
+    declared_by_node = {}
+    for group in declared_groups:
+        label = group.get('node')
+        if label in declared_by_node:
+            diffs.append('公式组 %s 被重复声明（无解释重复）' % label)
+        declared_by_node[label] = group
+        fact = group_facts.get(label)
+        if fact is None:
+            diffs.append('公式组 %s 在原始快照选区内不存在（依据与快照不符）'
+                         % label)
+            continue
+        if fact.get('section') is not None                 and group.get('section') != fact.get('section'):
+            diffs.append('公式组 %s 章节归属不符: 依据 #%s vs 独立重建 #%s'
+                         % (label, group.get('section'), fact['section']))
+        if list(group.get('members') or []) != list(fact['members']):
+            diffs.append('公式组 %s 成员或顺序与独立重建不符: 依据 %r vs '
+                         '原快照 %r' % (label, group.get('members'),
+                                       fact['members']))
+        declared_eqnos = [{'member': e.get('member'), 'text': e.get('text'),
+                           'target': e.get('target')}
+                          for e in (group.get('eqnos') or [])]
+        if declared_eqnos != fact['eqnos']:
+            diffs.append('公式组 %s 式号与独立重建不符: 依据 %r vs 原快照 %r'
+                         % (label, declared_eqnos, fact['eqnos']))
+    for label, fact in group_facts.items():
+        if label not in declared_by_node:
+            diffs.append('原始快照公式组 %s 缺少来源依据登记（漏组）' % label)
+
+    # ---- 脚注真实标签配对：引用出现 ↔ 定义（不抽数字合并，03-3） ----
+    def_labels = {f['label'] for f in facts.values()
+                  if f.get('type') == 'footnote-def'}
+    for label, fact in facts.items():
+        if fact.get('type') == 'footnote-ref' \
+                and fact.get('label') not in def_labels:
+            diffs.append('脚注引用 %s 的标签 %r 在原始快照中无定义节点配对'
+                         % (label, fact.get('label')))
+
+    # ---- 装饰排除/重复合并裁决的独立验证（03-4）：节点名在原始快照
+    #      重新定位，装饰性与同源内容相等由独立 DOM 重算 ----
+    if decision_results:
+        from _latexml_source import (aside_node_ids as _aids,
+                                     container_node_ids as _cids,
+                                     figure_node_ids as _fids,
+                                     group_node_ids as _gids)
+        check_soup = BeautifulSoup(
+            protect_code_entities(raw_html, skip_pre=True), 'html.parser')
+        check_root = (check_soup.find(id=section_id)
+                      if section_id else
+                      (check_soup.find('article') or check_soup.find('main')
+                       or check_soup.find('body')))
+        name_map = {}
+        tag_first = {}
+        if check_root is not None:
+            for node in check_root.find_all(True):
+                tag_first.setdefault(node.name, node)
+                for mapping in (_cids(check_root), _gids(check_root),
+                                _fids(check_root), _aids(check_root)):
+                    name = mapping.get(id(node))
+                    if name:
+                        name_map[name] = node
+
+        def _lookup_result(node_name):
+            if not isinstance(node_name, str):
+                return None
+            if node_name in name_map:
+                return name_map[node_name]
+            return tag_first.get(node_name.split('#', 1)[0])
+
+        for result in decision_results:
+            if not isinstance(result, dict):
+                continue
+            node_name = result.get('node')
+            action = result.get('action')
+            outcome = result.get('result')
+            node = _lookup_result(node_name)
+            if action == 'exclude-decoration':
+                if outcome == 'excluded':
+                    if node is None:
+                        diffs.append('装饰排除裁决 %s 的节点在原始快照不'
+                                     '存在' % node_name)
+                    elif not _latexml_is_decorative(node):
+                        diffs.append('装饰排除裁决 %s 不成立：节点不是可确'
+                                     '认装饰（导航/页码）' % node_name)
+                    else:
+                        text = _WS_RE.sub(' ', node.get_text(' ')).strip()
+                        if text and text in _WS_RE.sub(' ', md_text):
+                            diffs.append('装饰排除裁决 %s 未落实：被排除内'
+                                         '容仍在候选中' % node_name)
+                elif outcome != 'unresolved':
+                    diffs.append('装饰排除裁决 %s 结果状态非法: %r'
+                                 % (node_name, outcome))
+            elif action == 'merge-duplicate':
+                target = _lookup_result(result.get('into'))
+                if outcome == 'merged':
+                    if node is None or target is None:
+                        diffs.append('重复合并裁决 %s 的节点不存在'
+                                     % node_name)
+                    else:
+                        a = _WS_RE.sub(' ', node.get_text(' ')).strip()
+                        b = _WS_RE.sub(' ', target.get_text(' ')).strip()
+                        if not a or a != b:
+                            diffs.append('重复合并裁决 %s 不成立：同源内容'
+                                         '不相等，不能只按图号/题注前缀/'
+                                         '字节去重' % node_name)
+                elif outcome != 'unresolved':
+                    diffs.append('重复合并裁决 %s 结果状态非法: %r'
+                                 % (node_name, outcome))
+
+    # ---- 表格逐格核对（04）：复用现行逐表转换映射合同——_SourceFacts
+    #      独立提取源格（跨度/空值/代码/公式），_MarkdownFacts 扫描实际
+    #      输出格位，_conversion_map_diffs 逐源格验证映射；未映射表按
+    #      既有格位/代码表示比较。转代码、展平串、总计数不能豁免。 ----
+    if any(fact.get('type') == 'table' for fact in facts.values()) \
+            or table_conversions:
+        try:
+            src_facts_all = _SourceFacts(raw_html, 'reference', section_id,
+                                         mathml_alttext=True)
+            md_facts_all = _MarkdownFacts(md_text,
+                                          source_context=context)
+        except Exception as exc:  # 独立提取失败按损伤定位，不静默跳过
+            diffs.append('表格独立事实提取失败: %s' % exc)
+            src_facts_all = md_facts_all = None
+        if src_facts_all is not None:
+            mapped_src = set()
+            claimed_md = set()
+            if table_conversions:
+                (map_diffs, mapped_src, claimed_md, _factors,
+                 _cell_targets, _note_targets) = _conversion_map_diffs(
+                    raw_html, section_id, src_facts_all, md_facts_all,
+                    table_conversions, html_label, md_label)
+                diffs.extend(map_diffs)
+            data_table_ordinals = set()
+            _check_soup = BeautifulSoup(
+                protect_code_entities(raw_html, skip_pre=True),
+                'html.parser')
+            _check_root = (_check_soup.find(id=section_id)
+                           if section_id else
+                           (_check_soup.find('article')
+                            or _check_soup.find('main')
+                            or _check_soup.find('body')))
+            if _check_root is not None:
+                # 以顶层表格的文档序号为键（与 _SourceFacts._table_records
+                # 同一枚举口径）：表 id 属性可缺失，无 id 时 None 碰撞会把
+                # 等式表误并入数据表
+                _ordinal = 0
+                for _t in _check_root.find_all('table'):
+                    if _t.find_parent('table') is not None or _in_pre(_t):
+                        continue
+                    _ordinal += 1
+                    if 'equation' in ' '.join(_t.get('class') or []):
+                        continue  # 等式表由公式组核对负责
+                    data_table_ordinals.add(_ordinal)
+            data_records = [r for r in src_facts_all.table_records
+                            if r['ordinal'] in data_table_ordinals]
+            table_diffs = _table_record_diffs(
+                data_records, md_facts_all.table_records(),
+                mapped_src, claimed_md, html_label, md_label)
+            diffs.extend(table_diffs)
+
+    # ---- 覆盖：独立重建的每个内容节点必须有依据（漏节点/漏正文） ----
+    for label, fact in facts.items():
+        if fact['type'] in ('math', 'paragraph', 'image', 'heading',
+                            'figure-caption', 'footnote-def', 'algorithm',
+                            'table', 'listing'):
+            if label not in seen_nodes:
+                diffs.append('原始快照节点 %s（%s）缺少来源依据对应'
+                             '（漏节点/漏正文）' % (label, fact['type']))
+        elif fact['type'] in ('math-unresolved', 'unresolved-container'):
+            if label not in seen_nodes:
+                diffs.append('原始快照未解决节点 %s（%s）未在依据中登记'
+                             % (label, fact['type']))
+
+    # ---- 输出覆盖：候选中的每个公式必须落在某个公式对应范围内 ----
+    corr_math_ranges = sorted(
+        (entry['md_start'], entry['md_end'])
+        for entry in corrs
+        if entry.get('content_type') == 'math'
+        and isinstance(entry.get('md_start'), int))
+    # 各类宿主内公式出现均有各自的精确对应（§7.11 ticket 19–22），宿主
+    # 范围不再授予覆盖资格：无对应范围的公式输出即无依据额外输出
+    for span in scan.spans:
+        if span.start_line in fence_lines:
+            continue
+        if any(s <= span.start and span.end <= e for s, e in corr_math_ranges):
+            continue
+        diffs.append('%s 存在无来源依据的公式输出（额外输出）: L%d %r'
+                     % (md_label, span.start_line, span.raw))
+
+    # ---- 两侧有序流比较（删正文/漏公式/乱序/错归属/额外输出） ----
+    for index, (src_tok, md_tok) in enumerate(zip(src_tokens, md_tokens)):
+        if not _latexml_tok_eq(src_tok, md_tok):
+            diffs.append('正文流第 %d 项不一致: %s %r vs %s %r'
+                         % (index + 1, html_label, src_tok,
+                            md_label, md_tok))
+    if len(src_tokens) != len(md_tokens):
+        diffs.append('正文流长度不一致: %s %d 项 vs %s %d 项（删正文/'
+                     '额外输出）' % (html_label, len(src_tokens),
+                                    md_label, len(md_tokens)))
     return diffs

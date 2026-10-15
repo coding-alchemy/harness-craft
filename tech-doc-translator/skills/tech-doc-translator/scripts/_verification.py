@@ -3,6 +3,7 @@
 本文件是内部模块；各源家族 adapter 继续定义自己的通过条件和报告文案。
 """
 import hashlib
+from html import escape as _escape, unescape as _unescape
 import os
 import re
 import subprocess
@@ -17,9 +18,59 @@ _IMAGE = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')
 _LINK = re.compile(r'(?<!!)\[(?:\\.|[^\\\]])+\]\(([^)]+)\)')
 _FENCE_OPEN = re.compile(r'^(`{3,}|~{3,})(.*)$')
 _FENCE_CLOSE = re.compile(r'^(`{3,}|~{3,})\s*$')
-_MATH_BLOCK = re.compile(r'\$\$[\s\S]*?\$\$')
-_MATH_BRACKET_BLOCK = re.compile(r'\\\[[\s\S]*?\\\]')
-_MATH_INLINE = re.compile(r'\$([^\s$][^$\n]*?[^\s$]|[^\s$])\$(?!\d)')
+
+# CommonMark 可反斜线转义的 ASCII 标点集合（\+标点 阅读为标点，阅读丢
+# 反斜线；\\ 阅读为一个反斜线）。
+_ESCAPABLE_PUNCT = frozenset('!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~')
+
+
+def _protected_inline_spans(text):
+    """行内序列化中反斜线属字面/结构内容、不参与阅读归一的区间：
+    代码跨度与美元公式跨度（与对账端扫描同一口径）。
+
+    公式区间复用代码感知的 scan_math 事实（行内代码已掩蔽，不与代码
+    区间重叠），删除独立的第二套美元识别，避免重叠区间导致消费端
+    重复拼接。`\\[…\\]` 块级跨度不属保护区：字面 `\\[` `\\]` 由家族
+    合同的包装去除口径处理，与美元公式的字面保留不同。
+    """
+    spans = [(start, end) for _content, (start, end)
+             in parse_inline_code_spans(text)]
+    spans.extend((span.start, span.end) for span in scan_math_spans(text)
+                 if span.raw.startswith('$'))
+    return sorted(spans)
+
+
+def resolve_backslash_escapes(text):
+    r"""按 Markdown 行内阅读语义解析反斜线：普通文字段 \+ASCII 标点阅读
+    为标点（反斜线消解）、\\ 阅读为一个反斜线；代码跨度与公式跨度内容
+    字面保留。即把行内序列化还原为实际阅读文字。
+    """
+    if '\\' not in text:
+        return text
+    spans = _protected_inline_spans(text)
+    out = []
+    cursor = 0
+    for start, end in spans:
+        out.append(_resolve_escapes_segment(text[cursor:start]))
+        out.append(text[start:end])
+        cursor = end
+    out.append(_resolve_escapes_segment(text[cursor:]))
+    return ''.join(out)
+
+
+def _resolve_escapes_segment(segment):
+    chars = segment
+    out = []
+    i = 0
+    while i < len(chars):
+        if chars[i] == '\\' and i + 1 < len(chars) \
+                and chars[i + 1] in _ESCAPABLE_PUNCT:
+            out.append(chars[i + 1])
+            i += 2
+        else:
+            out.append(chars[i])
+            i += 1
+    return ''.join(out)
 
 
 @dataclass(frozen=True)
@@ -239,12 +290,80 @@ def link_targets(text):
 @dataclass(frozen=True)
 class MathSpan:
     """一个公式及其在原文中的确切位置。"""
-    kind: str        # 'inline'（行内 $…$）或 'block'（块级 $$…$$）
+    kind: str        # 'inline'（行内 $…$）或 'block'（块级 $$…$$ / \[…\]）
     expr: str        # 不含定界符的原始表达式切片，逐字节保留
     raw: str         # 含定界符的原文切片
     start: int       # 含定界符起始偏移
     end: int         # 含定界符结束偏移（不含）
     start_line: int  # 起始行号（1 起）
+
+
+@dataclass(frozen=True)
+class MathIssue:
+    """未解决或歧义的数学定界：只保存原偏移、行号、定界原文与原因。
+
+    不建通用解析 IR；消费者必须将其作为阻断项（未解决数学不得进入
+    分派、拆包或完整核验）。
+    """
+    start: int       # 定界原文起始偏移
+    end: int         # 定界原文结束偏移（不含）
+    start_line: int  # 起始行号（1 起）
+    raw: str         # 定界原文切片
+    reason: str      # 原因
+
+
+@dataclass(frozen=True)
+class MathScan:
+    """一次上下文扫描的有序结果：有效公式跨度与未解决定界。"""
+    spans: tuple     # MathSpan 元组，按起始偏移排序
+    issues: tuple    # MathIssue 元组，按起始偏移排序
+
+
+class SourceMathContext:
+    """已独立确认的行内公式上下文（二期 D2 限定扫描）。
+
+    只包含经独立原始 MathML 事实确认、默认规则无法识别的行内原表达
+    式（多行，或单行但首尾有空白——原 TeX 逐字保持，D2）及其所属章节
+    序；scan_math 仅在行内定界无法同行闭合（或 $ 后遇空白即将按孤立
+    美元跳过）时按序核对确认表达式（切片逐字相等且下一掩蔽字符为闭合
+    $）才授予识别，不从任意子串搜索"正确公式"。普通 Markdown 不传上
+    下文时行为完全不变；代码/转义/货币掩蔽对确认路径同样生效（候选闭
+    合取掩蔽文本）。
+    """
+
+    __slots__ = ('_entries',)
+
+    def __init__(self, entries):
+        # entries: 可迭代 ((expr, section), ...)，按文档序
+        self._entries = tuple(
+            (expr, section) for expr, section in entries
+            if isinstance(expr, str)
+            and (expr != expr.strip() or '\n' in expr))
+
+    def __bool__(self):
+        return bool(self._entries)
+
+    @property
+    def entries(self):
+        return self._entries
+
+    def match(self, text, masked, content_start):
+        """确认表达式占据 [content_start, 闭合 $) 时返回 (expr, end)。
+
+        end 为闭合 $ 之后的位置；无任何确认表达式匹配返回 None（调用
+        方按未解决定界处理）。较长表达式优先，避免前缀歧义。
+        """
+        best = None
+        for expr, _section in self._entries:
+            for represented in dict.fromkeys((expr, encode_table_math(expr), encode_table_math(expr, parsed=True))):
+                end_content = content_start + len(represented)
+                if masked[end_content:end_content + 1] != '$':
+                    continue
+                if text[content_start:end_content] != represented:
+                    continue
+                if best is None or len(represented) > len(best[0]):
+                    best = (represented, end_content + 1)
+        return best
 
 
 def _mask_inline_code(line):
@@ -303,49 +422,249 @@ def _math_scan_mask(text):
     return '\n'.join(out)
 
 
-def scan_math_spans(text):
-    """按文档顺序返回行内/块级公式 span，供校验与拆包共享。
+def _math_line_no(masked, offset):
+    """offset 在原输入中的行号（1 起）；masked 与原文等长且保留换行。"""
+    return masked.count('\n', 0, offset) + 1
 
-    排除代码围栏内部、行内代码与转义美元。行内公式为同一行内成对
-    `` $…$ ``：内容首尾不得为空白，闭合 `` $ `` 不得紧跟数字，以排除
-    普通货币文本；块级公式为 `` $$…$$ `` 或源家族的 `` \\[…\\] `` 表示，
-    可跨行。expr/raw 均为原文切片，不做任何归一化。
+
+_CURRENCY_AMOUNT = re.compile(r'(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?')
+_CURRENCY_MATH_FEATURE = re.compile(
+    r'[+\-*/=<>^_\\|]|(?<![A-Za-z])[A-Za-z](?![A-Za-z])')
+
+
+def _pure_currency_tail(masked, pos, line_end):
+    """数字开头的未闭合候选能否整体判为纯金额片段。
+
+    pos 位于 `$`/`$$` 后的数字处：只有同一行剩余内容确为金额形态
+    （数字、千分位、小数，其后无运算符、命令或孤立单字母等数学特征，
+    到空白/标点或行尾结束）才返回 True，按货币静默排除；金额与残缺
+    数学确有两种合理解释时返回 False，由调用方定位 issue（一期设计 D2，
+    不靠屏蔽所有数字开头表达式避免误扫）。
+    """
+    tail = masked[pos:line_end]
+    amount = _CURRENCY_AMOUNT.match(tail)
+    if not amount:
+        return False
+    return _CURRENCY_MATH_FEATURE.search(tail[amount.end():]) is None
+
+
+def scan_math(text, *, source_context=None):
+    r"""按原偏移推进的上下文扫描，一次返回有序 spans 与 issues。
+
+    复用 `_math_scan_mask` 掩蔽（代码围栏、行内代码、转义美元、链接
+    语法转义），未进入数学与已进入数学两种上下文按偏移推进，不先全局
+    抓取块级：
+
+    - 未进入数学时，`$$` 或家族支持的 `\[` 开启块级（可跨行，只用
+      匹配定界闭合，块内单美元属原表达式）；单个 `$` 开启同一行的
+      行内候选（内容首尾非空白，不跨行）。
+    - 已进入行内时先消费一个闭合 `$`；紧随的另一个 `$` 由外层继续
+      处理，因此 `$x$$\sim$` 是两个行内公式，不会被中间 `$$` 抢作
+      块级起点。闭合 `$` 后的数字不再否定该公式。
+    - 货币排除独立于“闭合后数字”：先检查能否构成同一行、内容首尾
+      非空白的完整公式跨度（`$5$`、`$5 + x$` 等数字开头完整表达式
+      优先算公式）；无法构成完整跨度的候选只有同一行剩余内容能整体
+      判为纯金额片段（`$100`、`$1,000.50`，其后无运算符/孤立单字母
+      等数学特征）时才按普通货币排除；金额与残缺数学确有两种合理解释
+      （如 `$5 + x`、`$$5 + x`）时定位 issue，不靠屏蔽所有数字开头
+      表达式避免误扫。
+    - 非货币的候选无法闭合（`$x`、`$x $b$` 中前半）或块级定界无法
+      闭合时，定位 issue（原偏移、行号、定界原文、原因）；行内不跨
+      行寻找闭合来吞入正文（无已确认来源上下文时，D2）。
+    - source_context（keyword-only，SourceMathContext）：只对独立原始
+      MathML 确认的默认规则无法识别行内节点（多行或边界空白）开启限定
+      识别；确认路径仍受围栏、行内代码、转义与货币排除约束，并从实际
+      美元定界取得候选。
+
+    expr/raw 均为原文切片，不做任何归一化。
     """
     masked = _math_scan_mask(text)
     spans = []
-    block_regions = []
-    for regex in (_MATH_BLOCK, _MATH_BRACKET_BLOCK):
-        for match in regex.finditer(masked):
-            raw = text[match.start():match.end()]
-            expr = raw[2:-2]
-            if not expr.strip():
+    issues = []
+    n = len(masked)
+    i = 0
+    while i < n:
+        if masked[i] == '$':
+            if masked[i + 1:i + 2] == '$':
+                close = masked.find('$$', i + 2)
+                if close != -1:
+                    expr = text[i + 2:close]
+                    if expr.strip():
+                        spans.append(MathSpan(
+                            kind='block', expr=expr, raw=text[i:close + 2],
+                            start=i, end=close + 2,
+                            start_line=_math_line_no(masked, i)))
+                    i = close + 2
+                    continue
+                block_line_end = masked.find('\n', i)
+                if block_line_end == -1:
+                    block_line_end = n
+                if masked[i + 2:i + 3].isdigit() and _pure_currency_tail(
+                        masked, i + 2, block_line_end):
+                    i += 2  # $$100 等纯金额片段按普通文字排除
+                    continue
+                issues.append(MathIssue(
+                    start=i, end=i + 2, start_line=_math_line_no(masked, i),
+                    raw=text[i:i + 2], reason='未闭合的块级公式定界：'
+                    '后续全文没有配对 $$'))
+                i += 2
                 continue
-            spans.append(MathSpan(
-                kind='block', expr=expr, raw=raw,
-                start=match.start(), end=match.end(),
-                start_line=masked.count('\n', 0, match.start()) + 1))
-            block_regions.append((match.start(), match.end()))
-        chars = list(masked)
-        for start, end in block_regions:
-            for p in range(start, end):
-                if chars[p] != '\n':
-                    chars[p] = ' '
-        masked = ''.join(chars)
-        block_regions = []
-    for match in _MATH_INLINE.finditer(masked):
-        raw = text[match.start():match.end()]
-        spans.append(MathSpan(
-            kind='inline', expr=raw[1:-1], raw=raw,
-            start=match.start(), end=match.end(),
-            start_line=masked.count('\n', 0, match.start()) + 1))
-    spans.sort(key=lambda span: span.start)
-    return spans
+            nxt = masked[i + 1:i + 2]
+            if not nxt or nxt.isspace():
+                # 孤立美元（如行尾、shell 提示符）不是公式候选；已确认
+                # 行内表达式（多行或边界空白，D2 逐字）仍按限定上下文识别
+                if source_context is not None and source_context:
+                    hit = source_context.match(text, masked, i + 1)
+                    if hit is not None:
+                        expr, end = hit
+                        spans.append(MathSpan(
+                            kind='inline', expr=expr,
+                            raw=text[i:end], start=i, end=end,
+                            start_line=_math_line_no(masked, i)))
+                        i = end
+                        continue
+                i += 1
+                continue
+            line_end = masked.find('\n', i)
+            if line_end == -1:
+                line_end = n
+            close = masked.find('$', i + 1, line_end)
+            if close != -1 and not masked[close - 1].isspace():
+                spans.append(MathSpan(
+                    kind='inline', expr=text[i + 1:close],
+                    raw=text[i:close + 1], start=i, end=close + 1,
+                    start_line=_math_line_no(masked, i)))
+                i = close + 1
+                continue
+            # 限定来源上下文（D2）：只授予已确认行内表达式（多行或边界
+            # 空白）的识别
+            if source_context is not None and source_context:
+                hit = source_context.match(text, masked, i + 1)
+                if hit is not None:
+                    expr, end = hit
+                    spans.append(MathSpan(
+                        kind='inline', expr=expr,
+                        raw=text[i:end], start=i, end=end,
+                        start_line=_math_line_no(masked, i)))
+                    i = end
+                    continue
+            if nxt.isdigit() and _pure_currency_tail(masked, i + 1,
+                                                     line_end):
+                i += 1  # 货币：$100 等纯金额片段排除，不制造公式也不制造 issue
+                continue
+            reason = ('未闭合的行内公式定界：同一行没有可配对的 '
+                      '$（内容首尾须非空白）')
+            if source_context is not None and source_context:
+                reason += ('，且与已确认的行内来源表达式不匹配'
+                           '（多行或边界空白）')
+            issues.append(MathIssue(
+                start=i, end=i + 1, start_line=_math_line_no(masked, i),
+                raw=text[i:i + 1], reason=reason))
+            i += 1
+            continue
+        if masked[i] == '\\' and masked[i + 1:i + 2] == '[':
+            close = masked.find('\\]', i + 2)
+            if close != -1:
+                expr = text[i + 2:close]
+                if expr.strip():
+                    spans.append(MathSpan(
+                        kind='block', expr=expr, raw=text[i:close + 2],
+                        start=i, end=close + 2,
+                        start_line=_math_line_no(masked, i)))
+                i = close + 2
+                continue
+            issues.append(MathIssue(
+                start=i, end=i + 2, start_line=_math_line_no(masked, i),
+                raw=text[i:i + 2], reason='未闭合的块级公式定界：'
+                '后续全文没有配对 \\]'))
+            i += 2
+            continue
+        i += 1
+    return MathScan(tuple(spans), tuple(issues))
+
+
+def scan_math_spans(text, *, source_context=None):
+    """`scan_math(text)` 的有效跨度投影：按文档顺序返回 MathSpan 列表。
+
+    只读调用（如工作清单）可用本投影，但不取得完整通过资格；实际核验
+    消费者必须使用 `scan_math` 并处理 issues。source_context 与
+    scan_math 同一实现（D2 限定行内识别）。
+    """
+    return list(scan_math(text, source_context=source_context).spans)
+
+
+def math_issue_fails(issues, label):
+    """把未解决数学定界格式化为阻断诊断列表（中文，带原位置）。"""
+    return ['%s L%d 未解决数学定界 %r: %s'
+            % (label, issue.start_line, issue.raw, issue.reason)
+            for issue in issues]
 
 
 # 与实际导出渲染同配置（export_pdf.build_markdown：html=False）：字面
 # HTML 行只是普通文字，不吞并其后紧邻的表格（F5）；表格块范围与交付
 # 渲染同源，不为复用配置导入 PDF 导出模块
 _TABLE_ROWS_MD = MarkdownIt('commonmark', {'html': False}).enable('table')
+# 标题事实与表格行范围同一解析配置（真实渲染语境），不为复用配置引入
+# 第二实例
+_HEADING_FACTS_MD = _TABLE_ROWS_MD
+
+
+def footnote_definition_block(lines, line_no, cross=None):
+    """既有定义读取：首行及四空格续行；返回正文、末行、下一块行。"""
+    cross = cross or {}
+    match = re.match(r'^\[\^([^\]]+)\]:\s*(.*)$', lines[line_no - 1])
+    last_content = line_no
+    cursor = line_no + 1
+    if line_no in cross:
+        _span, last_content = cross[line_no]
+        cursor = last_content + 1
+    while cursor <= len(lines) and (
+            lines[cursor - 1].startswith('    ') or not lines[cursor - 1].strip()):
+        if lines[cursor - 1].strip():
+            last_content = cursor
+        if cursor in cross:
+            _span, last_content = cross[cursor]
+            cursor = last_content + 1
+            continue
+        cursor += 1
+    body = [match.group(2)]
+    body.extend(line[4:] if line.startswith('    ') else line
+                for line in lines[line_no:last_content])
+    return '\n'.join(body), last_content, cursor
+
+
+def markdown_table_tokens(text):
+    """实际块规则读取正文和既有脚注正文，不在块解析前改写公式。"""
+    lines = text.splitlines()
+    fragments = []
+    excluded = set()
+    fenced = fenced_line_numbers(text)
+    line_no = 1
+    while line_no <= len(lines):
+        if line_no not in fenced and re.match(r'^\[\^([^\]]+)\]:', lines[line_no - 1]):
+            body, last, cursor = footnote_definition_block(lines, line_no)
+            fragments.append((body, line_no - 1, set()))
+            excluded.update(range(line_no - 1, cursor - 1))
+            line_no = cursor
+        else:
+            line_no += 1
+    fragments.insert(0, (text, 0, excluded))
+    tables = []
+    for fragment, offset, ignored in fragments:
+        current = None
+        for token in _TABLE_ROWS_MD.parse(fragment):
+            if token.type == 'table_open':
+                current = [] if token.map[0] not in ignored else None
+                if current is not None:
+                    tables.append(current)
+            if current is not None:
+                if token.map:
+                    token.map = [line + offset for line in token.map]
+                current.append(token)
+            if token.type == 'table_close':
+                current = None
+    tables.sort(key=lambda table: table[0].map[0])
+    return [token for table in tables for token in table]
 
 
 def markdown_table_row_lines(text):
@@ -358,19 +677,43 @@ def markdown_table_row_lines(text):
     表内合法 ``\\|`` 转义必须归一）。
     """
     rows = set()
-    for token in _TABLE_ROWS_MD.parse(text):
+    for token in markdown_table_tokens(text):
         if token.type == 'table_open' and token.map:
             rows.update(range(token.map[0] + 1, token.map[1] + 1))
     return rows
 
 
+def encode_table_math(text, parsed=False):
+    """GFM 数学表示层：实体与换行可逆编码，管道沿用原表格转义。"""
+    represented = _escape(text, quote=False).replace('\r', '&#13;').replace('\n', '&#10;')
+    return represented if parsed else represented.replace('|', r'\|')
+
+
+def decode_table_math(text, parsed=False):
+    """仅由已确认的真实表格数学消费者调用；不能用于普通格文字。"""
+    return _unescape(text if parsed else text.replace('\\|', '|'))
+
+
+def table_math_spans(spans, text, decode_entities=False):
+    """只在实际表格行解码已有管道转义合同；原始切片及坐标不变。"""
+    rows = markdown_table_row_lines(text)
+    return [MathSpan(kind=s.kind, expr=(decode_table_math(s.expr) if decode_entities
+                           else s.expr.replace('\\|', '|')),
+                     raw=s.raw, start=s.start, end=s.end, start_line=s.start_line)
+            if s.start_line in rows else s for s in spans]
+
+
 def compare_math_spans(src_spans, doc_spans, src_label='源文', doc_label='译文',
-                       approved_extra_exprs=(), doc_text=None):
+                       approved_extra_exprs=(), doc_text=None, precise=False):
     """按（类型、顺序、原表达式）逐项比较公式。
 
     返回 (diffs, warns)：diffs 非空即硬失败；warns 为回源定性告警
     （如源译一致的历史包装）。doc 侧表达式逐条命中 approved_extra_exprs
     的视为获准译注公式，豁免后参与对账，不掩盖源公式遗漏。
+
+    precise=True（LaTeXML 来源已确认定界口径）：行内与展示都逐字比较
+    表达式（含首尾空白与换行），不执行默认块级 .strip() 容差；src_spans
+    须为按来源依据核对过的公式事实。普通家族默认容差保持不变。
 
     译文使用真实 Markdown 表格时，表格行内公式的 ``|`` 必须转义为
     ``\\|``（否则破坏列界）；提供 doc_text 时，译文公式所在行为真实
@@ -381,14 +724,7 @@ def compare_math_spans(src_spans, doc_spans, src_label='源文', doc_label='译�
     diffs = []
     warns = []
     if doc_text is not None:
-        table_rows = markdown_table_row_lines(doc_text)
-        doc_spans = [
-            span if (span.start_line not in table_rows
-                     or '\\|' not in span.expr) else
-            MathSpan(kind=span.kind, expr=span.expr.replace('\\|', '|'),
-                     raw=span.raw, start=span.start, end=span.end,
-                     start_line=span.start_line)
-            for span in doc_spans]
+        doc_spans = table_math_spans(doc_spans, doc_text, decode_entities=precise)
 
     doc_aligned = []
     pending = list(approved_extra_exprs)
@@ -428,10 +764,19 @@ def compare_math_spans(src_spans, doc_spans, src_label='源文', doc_label='译�
             diffs.append('%s 类型不一致: 源 %s L%d %s vs 译 %s L%d %s'
                          % (tag, src_label, src.start_line, _KIND_CN[src.kind],
                             doc_label, doc.start_line, _KIND_CN[doc.kind]))
-        elif src.expr != doc.expr and (
-                src.kind == 'inline' or src.expr.strip() != doc.expr.strip()):
+            continue
+        doc_expr = doc.expr
+        if precise and src.kind == 'block' \
+                and doc_expr.startswith('\n') and doc_expr.endswith('\n'):
+            # 只剥离已独立确认的定界包装换行（$$\n…\n$$ 的新增包装），
+            # 其余首尾空白与内部换行逐字比较，不执行默认 strip 容差
+            doc_expr = doc_expr[1:-1]
+        if src.expr != doc_expr and (
+                precise or src.kind == 'inline'
+                or src.expr.strip() != doc_expr.strip()):
             # 行内表达式逐字节比较；块级表达式仅首尾空白属排版差异
-            # （内部空白与换行仍逐字节保留）
+            # （内部空白与换行仍逐字节保留）；precise（LaTeXML 来源
+            # 已确认口径）下块级同样逐字比较，不做 strip 容差
             diffs.append('%s 表达式不一致: 源 %s L%d %r vs 译 %s L%d %r'
                          % (tag, src_label, src.start_line, src.expr,
                             doc_label, doc.start_line, doc.expr))
@@ -469,41 +814,138 @@ def extract_approved_extra_math(argv):
     return rest, exprs
 
 
-def extract_strong_tokens(argv):
-    """从 argv 摘除重复的 --strong-token <token>，返回 (剩余argv, token 列表)。
+def normalize_strong_tokens(tokens):
+    """保留首次顺序及字面值；空 token 不是未配置。"""
+    result = []
+    for token in tokens:
+        if not isinstance(token, str) or not token.strip():
+            raise SystemExit('强 token 不得为空')
+        if token not in result:
+            result.append(token)
+    return result
 
-    既有强 token 位置参数可与该显式参数并存，合并为同一检查列表。
-    """
-    tokens = []
+
+def extract_strong_tokens(argv, *, base_dir=None, files=None):
+    """逐项及 UTF-8 文件共用输入，文件路径按真实调用基点解释。"""
+    tokens, rest = [], []
+    i = 0
+    while i < len(argv):
+        flag = argv[i]
+        if flag in ('--strong-token', '--strong-token-file'):
+            if i + 1 >= len(argv):
+                raise SystemExit('%s 需要非空值' % flag)
+            value = argv[i + 1]
+            if flag == '--strong-token':
+                tokens.extend(normalize_strong_tokens([value]))
+            else:
+                if not value.strip():
+                    raise SystemExit('--strong-token-file 需要文件路径')
+                path = os.path.realpath(os.path.join(base_dir or os.getcwd(), value))
+                try:
+                    with open(path, encoding='utf-8') as handle:
+                        items = [line.strip() for line in handle if line.strip()]
+                except (OSError, UnicodeError) as exc:
+                    raise SystemExit('强 token 文件缺失、不可读或非 UTF-8: %s: %s'
+                                     % (path, exc))
+                tokens.extend(items)
+                if files is not None:
+                    files.append(path)
+                if not items:
+                    print('强 token 文件未配置（不清除其他配置）: %s' % path)
+            i += 2
+        else:
+            rest.append(flag)
+            i += 1
+    return rest, normalize_strong_tokens(tokens)
+
+
+def extract_source_adaptation(argv):
+    """从 argv 摘除全部 --source-adaptation <路径>，返回 (剩余argv, 路径列表)。
+
+    LaTeXML 来源显式声明：可重复传入（多快照 F7/§7.5，按给定顺序切片），
+    缺失或与来源链声明不符时由各入口拒绝，不降级为普通来源。单用时列表
+    长度 1，语义与旧单值行为一致。"""
+    paths = []
     rest = []
     i = 0
     while i < len(argv):
-        if argv[i] == '--strong-token' and i + 1 < len(argv):
-            tokens.append(argv[i + 1])
+        if argv[i] == '--source-adaptation' and i + 1 < len(argv):
+            paths.append(argv[i + 1])
             i += 2
         else:
             rest.append(argv[i])
             i += 1
-    return rest, tokens
+    return rest, paths
+
+
+def extract_numeric_review_options(argv):
+    """从 argv 摘除 --numeric-review 与 --numeric-policy <路径>。
+
+    返回 (剩余argv, enabled, policy_path)。数字辅助显式启用；约定文件
+    只作复核上下文，不执行为规则。verify_delivery 复用同一解释。
+    """
+    enabled = False
+    policy_path = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == '--numeric-review':
+            enabled = True
+            i += 1
+        elif argv[i] == '--numeric-policy' and i + 1 < len(argv):
+            policy_path = argv[i + 1]
+            i += 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    return rest, enabled, policy_path
 
 
 _WS_RE = re.compile(r'\s+')
 
 
 def heading_entries(text):
-    """按文档顺序返回标题 (line_no, level, title)；排除代码围栏内行。
+    """按文档顺序返回标题 (line_no, level, title)，以 markdown-it 实际
+    块解析为准（与渲染端编码、对账解码同一语境）。
 
-    title 保留官方原题的内容性字符（弯引号、全角括号等），仅去除首尾空白。
-    参考手册源家族的深层嵌套标题（H7/H8）同样识别，不截断到 H6。
+    真实解析天然覆盖列 0 行首、列表项内（项首 bullet 后、缩进续行）、
+    引用前缀及复合容器（> - # x）等一切会成为 ATX 标题的位置，并天然
+    排除代码围栏与缩进代码块；setext（markup 为 -/=）与字面 HTML 吞并
+    的 # 行按真实语义不是 ATX 标题，不记入。title 保留官方原题的内容性
+    字符（弯引号、全角括号等），仅去除首尾空白。参考手册源家族的深层
+    嵌套标题（H7/H8，markdown-it ATX 只到 h6）由列 0 扩展识别保留，
+    不截断到 H6。
     """
-    fenced = fenced_line_numbers(text)
     entries = []
+    covered = set()
+    if text.strip():
+        tokens = _HEADING_FACTS_MD.parse(text)
+        pos = 0
+        while pos < len(tokens):
+            tok = tokens[pos]
+            if tok.type == 'heading_open' and tok.markup.startswith('#') \
+                    and tok.map:
+                inline = tokens[pos + 1]
+                # title 还原为实际阅读文字：真实标题序列化对内容性尾部 #
+                # 作 \# 转义（防 ATX 关闭标记），此处按阅读语义解析回内容
+                entries.append((tok.map[0] + 1, int(tok.tag[1]),
+                                resolve_backslash_escapes(
+                                    inline.content).strip()))
+                covered.add(tok.map[0] + 1)
+                pos += 3
+                continue
+            pos += 1
+    # H7/H8 扩展：markdown-it ATX 识别止于 h6，列 0 的 7/8 个 # 按既有
+    # 合同补识别（围栏内行除外）；title 与 ATX 路径同一阅读语义解码
+    fenced = fenced_line_numbers(text)
     for line_no, line in enumerate(text.split('\n'), start=1):
-        if line_no in fenced:
+        if line_no in fenced or line_no in covered:
             continue
-        m = re.match(r'^(#{1,8})\s+(.+)$', line.rstrip('\r'))
+        m = re.match(r'^(#{7,8})\s+(.+)$', line.rstrip('\r'))
         if m:
-            entries.append((line_no, len(m.group(1)), m.group(2).strip()))
+            entries.append((line_no, len(m.group(1)),
+                            resolve_backslash_escapes(m.group(2)).strip()))
+    entries.sort(key=lambda entry: entry[0])
     return entries
 
 
@@ -599,11 +1041,74 @@ def footnote_diffs(src_text, doc_text, src_label='源文', doc_label='译文'):
     return diffs, warns
 
 
+_TOKEN_DOT_SEGMENT = re.compile(r'\.\w+\Z')
+_TOKEN_REGISTER = re.compile(r'%[A-Za-z]\w*\Z')
+
+
+def _word_char(ch):
+    return ch == '_' or ch.isalnum()
+
+
+def _count_dot_segment(text, token):
+    """`.`+标识符修饰段（如 ``.rn``、``.f32``）的完整点分段计数。
+
+    右侧标识符续字符使命中无效（``.rni`` 不满足 ``.rn``），右侧紧邻的
+    完整点分段不阻止命中（``add.rn.f32`` 中 ``.rn`` 与 ``.f32`` 各自
+    计数），残缺点分段（``.`` 后非标识符字符）同样使命中无效；左侧必须
+    是文字边界或包含标识符字母的点分链，数字小数部分不制造命中
+    （``3.5`` 不算 ``.5``）。大小写与字面字符不改写。
+    """
+    count = 0
+    pos = 0
+    n = len(text)
+    while True:
+        i = text.find(token, pos)
+        if i < 0:
+            return count
+        j = i + len(token)
+        right_ok = True
+        if j < n:
+            nxt = text[j]
+            if _word_char(nxt):
+                right_ok = False
+            elif nxt == '.' and (j + 1 >= n or not _word_char(text[j + 1])):
+                right_ok = False
+        left_ok = True
+        if i > 0 and (_word_char(text[i - 1]) or text[i - 1] == '.'):
+            k = i - 1
+            has_letter = False
+            while k >= 0 and (_word_char(text[k]) or text[k] == '.'):
+                if text[k].isalpha():
+                    has_letter = True
+                k -= 1
+            left_ok = has_letter
+        if left_ok and right_ok:
+            count += 1
+        pos = i + 1
+
+
 def count_token(text, token):
-    """项目强 token 出现次数；词形 token 按词边界计数。"""
-    if re.search(r'\w', token):
-        return len(re.findall(r'(?<!\w)' + re.escape(token) + r'(?!\w)', text))
-    return text.count(token)
+    """项目强 token 出现次数；按已配置 token 的形态选择有限边界。
+
+    - 无词字符的既有 token（如 ``<<<``）保留字面计数；
+    - ``.``+标识符修饰段按完整点分段计数（见 `_count_dot_segment`）；
+    - ``%``+寄存器名计入 ``%`` 本身：左侧不能附在另一词形/百分号内
+      （``(?<![\\w%])``），右侧不能继续该寄存器名（``%tidy`` 不满足
+      ``%tid``），后接点分字段允许（``%tid.x`` 满足 ``%tid``）；
+    - 其他词形 token 保留完整词边界（``kernel`` 不由 ``subkernel``
+      满足）。
+
+    正文与代码同一口径，不屏蔽代码；大小写与字面字符不改写，不从正文
+    自动发现或启用 token。
+    """
+    if not re.search(r'\w', token):
+        return text.count(token)
+    if _TOKEN_DOT_SEGMENT.match(token):
+        return _count_dot_segment(text, token)
+    if _TOKEN_REGISTER.match(token):
+        return len(re.findall(r'(?<![\w%])' + re.escape(token) + r'(?!\w)',
+                              text))
+    return len(re.findall(r'(?<!\w)' + re.escape(token) + r'(?!\w)', text))
 
 
 def strong_token_report(src_text, doc_text, tokens, src_label='源文',
@@ -611,6 +1116,9 @@ def strong_token_report(src_text, doc_text, tokens, src_label='源文',
     """项目强 token 多重集差异；返回 (diffs, warns)。
 
     tokens 为空时 diffs 为 None 并给出未配置告警，不冒称已检查。
+    源中出现次数为零的配置项逐项告警“源中未出现，此项未检查”，即使
+    译文同样为零；家族汇总只应声明 `strong_token_checked_items` 返回的
+    实际非零源项已检查，缺席项独立列出。
     """
     if not tokens:
         return None, ['强 token: 未配置项目指定 token，此项未检查']
@@ -619,6 +1127,9 @@ def strong_token_report(src_text, doc_text, tokens, src_label='源文',
     for token in tokens:
         sc = count_token(src_text, token)
         dc = count_token(doc_text, token)
+        if sc == 0:
+            warns.append('强 token 配置项 %r: 源 %s 中未出现，此项未检查'
+                         % (token, src_label))
         if dc < sc:
             diffs.append('强 token 遗漏 %r: 源 %s %d 处 vs 译 %s %d 处'
                          % (token, src_label, sc, doc_label, dc))
@@ -626,6 +1137,15 @@ def strong_token_report(src_text, doc_text, tokens, src_label='源文',
             warns.append('强 token 增加 %r: 源 %s %d 处 vs 译 %s %d 处'
                          % (token, src_label, sc, doc_label, dc))
     return diffs, warns
+
+
+def strong_token_checked_items(src_text, tokens):
+    """返回源中出现次数非零、实际参与核对的配置项（按配置顺序）。
+
+    缺席项不在其中；家族汇总只应声明这些项已检查，缺席项由
+    `strong_token_report` 的未检查告警独立列出。
+    """
+    return [token for token in tokens if count_token(src_text, token) > 0]
 
 
 def extract_image_options(argv):

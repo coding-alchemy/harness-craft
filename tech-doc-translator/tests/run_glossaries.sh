@@ -176,3 +176,179 @@ grep -q '项目覆盖:.*leading-dimension-project.md.*leading dimension.*nvidia.
   "$TMP/leading-dimension-subset.md"
 
 echo "==> Ticket 01 术语整合基础回归通过"
+
+echo "==> Ticket 06 术语表别名只读复用回归"
+
+cat > "$TMP/source-alias.md" <<'EOF'
+# Source
+
+A kernel schedules a warp on the padded device.
+EOF
+
+# 规范表头 vs 两个别名表头：同一路径依次写入，选择输出应除映射说明外一致。
+# padded 行尾空单元格须保留（宽 4），不因吞掉首尾盘符而错列。
+cat > "$TMP/project.md" <<'EOF'
+# 项目术语表
+
+| 英文原词 | 中文译法/保留形式 | 处理方式 | 语境/备注 |
+| --- | --- | --- | --- |
+| kernel | 内核 | 首现附英文 | 计算 |
+| warp | warp | 保留英文 | 计算 |
+| padded |  | 英文 | |
+EOF
+before="$(shasum -a 256 "$TMP/project.md" | awk '{print $1}')"
+python3 "$SELECT" --source "$TMP/source-alias.md" --project "$TMP/project.md" \
+  --output "$TMP/subset-canonical.md"
+after="$(shasum -a 256 "$TMP/project.md" | awk '{print $1}')"
+test "$before" = "$after" || { echo "别名输入术语表被改写"; exit 1; }
+grep -q '| padded | padded | 英文 |  |' "$TMP/subset-canonical.md"
+grep -q 'padded ← “中文译法/保留形式”（project.md 表头行 3，第 2 列）' \
+  "$TMP/subset-canonical.md"
+
+cat > "$TMP/project.md" <<'EOF'
+# 项目术语表
+
+| 英文原词 | 中文译法/保留 | 处理方式 | 语境/备注 |
+| --- | --- | --- | --- |
+| kernel | 内核 | 首现附英文 | 计算 |
+| warp | warp | 保留英文 | 计算 |
+| padded |  | 英文 | |
+EOF
+before="$(shasum -a 256 "$TMP/project.md" | awk '{print $1}')"
+python3 "$SELECT" --source "$TMP/source-alias.md" --project "$TMP/project.md" \
+  --output "$TMP/subset-alias-keep.md"
+after="$(shasum -a 256 "$TMP/project.md" | awk '{print $1}')"
+test "$before" = "$after" || { echo "别名输入术语表被改写"; exit 1; }
+grep -q 'kernel ← “中文译法/保留”（project.md 表头行 3，第 2 列）' \
+  "$TMP/subset-alias-keep.md"
+
+cat > "$TMP/project.md" <<'EOF'
+# 项目术语表
+
+| 英文原词 | 直译 | 处理方式 | 语境/备注 |
+| --- | --- | --- | --- |
+| kernel | 内核 | 首现附英文 | 计算 |
+| warp | warp | 保留英文 | 计算 |
+| padded |  | 英文 | |
+EOF
+python3 "$SELECT" --source "$TMP/source-alias.md" --project "$TMP/project.md" \
+  --output "$TMP/subset-literal.md"
+grep -q 'kernel ← “直译”（project.md 表头行 3，第 2 列）' "$TMP/subset-literal.md"
+
+# 词条表部分（映射说明之前）三份输出逐字一致；`直译` 不推导处理方式。
+sed -n '1,/^## 目标列映射/p' "$TMP/subset-canonical.md" | sed '$d' > "$TMP/table-canonical.txt"
+sed -n '1,/^## 目标列映射/p' "$TMP/subset-alias-keep.md" | sed '$d' > "$TMP/table-alias-keep.txt"
+sed -n '1,/^## 目标列映射/p' "$TMP/subset-literal.md" | sed '$d' > "$TMP/table-literal.txt"
+cmp "$TMP/table-canonical.txt" "$TMP/table-alias-keep.txt"
+cmp "$TMP/table-canonical.txt" "$TMP/table-literal.txt"
+grep -q '| kernel | 内核 | 首现中英，后文中文 | 计算 |' "$TMP/subset-literal.md"
+grep -q '| warp | warp | 英文 | 计算 |' "$TMP/subset-literal.md"
+
+# 重复目标列（即使值相同）即表头歧义，不猜首列；坏表头下数据行也有去向。
+cat > "$TMP/duplicate-target.md" <<'EOF'
+| 英文原词 | 中文译法 | 中文译法 | 处理方式 |
+| --- | --- | --- | --- |
+| kernel | 内核 | 内核 | 中文 |
+EOF
+if python3 "$SELECT" --source "$TMP/source-alias.md" --project "$TMP/duplicate-target.md" \
+  --output "$TMP/dup-subset.md" 2>"$TMP/dup-error.log"; then
+  echo "重复目标列应使选择失败"
+  exit 1
+fi
+grep -q 'duplicate-target.md:1.*表头歧义：目标译法列匹配多列' "$TMP/dup-error.log"
+grep -q 'duplicate-target.md:3.*表头歧义' "$TMP/dup-error.log"
+
+# 重复英文原词列（即使值相同）同样是表头歧义，不能按“无英文列”静默
+# 吞表；已识别术语表的可识别数据行逐行有去向（提交前评审 R9 反例）。
+cat > "$TMP/duplicate-english.md" <<'EOF'
+| 英文原词 | 英文原词 | 中文译法 | 处理方式 |
+| --- | --- | --- | --- |
+| kernel | kernel | 内核 | 中文 |
+EOF
+if python3 "$SELECT" --source "$TMP/source-alias.md" --project "$TMP/duplicate-english.md" \
+  --output "$TMP/dup-en-subset.md" 2>"$TMP/dup-en-error.log"; then
+  echo "重复英文原词列应使选择失败"
+  exit 1
+fi
+grep -q 'duplicate-english.md:1.*表头歧义：英文原词列匹配多列' "$TMP/dup-en-error.log"
+grep -q 'duplicate-english.md:3.*表头歧义' "$TMP/dup-en-error.log"
+
+# 无英文原词角色的普通表：其他角色列重复（ambiguous）也不误收、不报错，
+# 按非术语表跳过（R9.3）；表头歧义报错只适用于含英文原词角色的术语表。
+cat > "$TMP/plain-table.md" <<'EOF'
+# 指标
+
+| 指标 | 中文译法/保留 | 中文译法/保留 |
+| --- | --- | --- |
+| 术语数 | 4 | 4 |
+EOF
+python3 "$SELECT" --source "$TMP/source-alias.md" --project "$TMP/plain-table.md" \
+  --output "$TMP/plain-subset.md"
+if grep -q '^| kernel |' "$TMP/plain-subset.md"; then
+  echo "普通表不应产出术语行"
+  exit 1
+fi
+grep -q '^## 目标列映射' "$TMP/plain-subset.md"
+
+# 缺目标译法列、行宽损伤、首尾空单元格不错列。
+cat > "$TMP/damaged.md" <<'EOF'
+# 损伤表
+
+| 英文原词 | 处理策略 | 语境/备注 |
+| --- | --- | --- |
+| kernel | 首现附英文 | 计算 |
+
+| 英文原词 | 中文译法/保留 | 处理方式 | 语境/备注 |
+| --- | --- | --- | --- |
+| sparse |
+EOF
+if python3 "$SELECT" --source "$TMP/source-alias.md" --project "$TMP/damaged.md" \
+  --output "$TMP/damaged-subset.md" 2>"$TMP/damaged-error.log"; then
+  echo "缺目标译法列与行宽损伤应使选择失败"
+  exit 1
+fi
+grep -q 'damaged.md:3.*术语表列含义无法识别' "$TMP/damaged-error.log"
+grep -q 'damaged.md:5.*术语表列含义无法识别' "$TMP/damaged-error.log"
+grep -q 'damaged.md:9.*列数（1）与表头列数（4）不符' "$TMP/damaged-error.log"
+
+# 多表逐行核算：有效记录、歧义行、窄行各有着落，总数对账。
+cat > "$TMP/multi.md" <<'EOF'
+# 多表
+
+| 英文原词 | 中文译法/保留 | 处理方式 |
+| --- | --- | --- |
+| good | 好 | 中文 |
+
+| 英文原词 | 中文译法 | 中文译法 |
+| --- | --- | --- |
+| dup | 甲 | 甲 |
+
+| 英文原词 | 中文译法/保留 | 处理方式 |
+| --- | --- | --- |
+| sparse |
+EOF
+if python3 "$SCRIPT" --baseline "$TMP/baseline.md" --draft "$TMP/multi-draft.md" \
+  --report "$TMP/multi-report.md" "$TMP/multi.md"; then
+  echo "多表损伤应使整合失败"
+  exit 1
+fi
+grep -q '| good | 好 | 中文 |' "$TMP/multi-draft.md"
+grep -q 'multi.md:7.*表头歧义' "$TMP/multi-report.md"
+grep -q 'multi.md:9.*表头歧义' "$TMP/multi-report.md"
+grep -q 'multi.md:13.*列数（1）与表头列数（3）不符' "$TMP/multi-report.md"
+grep -q '输入记录: 3 / 权威候选: 1 / 重复: 0 / 冲突: 0 / 错误: 3' "$TMP/multi-report.md"
+
+# 整合同样接受别名表头并回查映射。
+cat > "$TMP/alias-input.md" <<'EOF'
+# 别名输入
+
+| 英文原词 | 直译 | 处理方式 | 首现 |
+| --- | --- | --- | --- |
+| alias term | 别名词条 | 译 | 1.1 |
+EOF
+python3 "$SCRIPT" --baseline "$TMP/baseline.md" --draft "$TMP/alias-draft.md" \
+  --report "$TMP/alias-report.md" "$TMP/alias-input.md"
+grep -q 'alias term.*首现中英，后文中文' "$TMP/alias-draft.md"
+grep -q 'alias term ← “直译”（alias-input.md 表头行 3，第 2 列）' "$TMP/alias-report.md"
+
+echo "==> Ticket 06 术语表别名只读复用回归通过"

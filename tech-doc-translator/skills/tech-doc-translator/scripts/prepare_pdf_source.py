@@ -60,6 +60,7 @@ from _pdf_source import (
     load_fitz,
     norm_words,
     page_bitmap_regions,
+    page_content,
     page_facts,
     parse_pages_arg,
     probe_environment,
@@ -112,17 +113,18 @@ def cmd_inspect(args):
     pages = parse_pages_arg(args.pages, doc.page_count)
     identity = source_identity(args.pdf, doc)
     environment = probe_environment()
-    facts = [page_facts(doc[p - 1]) for p in pages]
+    contents = {p: page_content(doc[p - 1]) for p in pages}
+    facts = [page_facts(doc[p - 1], contents[p]) for p in pages]
     doc_type, evidence = classify_pages(facts)
-    candidates = structure_candidates(doc, pages)
+    candidates = structure_candidates(doc, pages, contents, identity)
 
     _ensure_output_dir(args.output)
     layout_path = os.path.join(args.output, LAYOUT_SNAPSHOT)
     reading_path = os.path.join(args.output, READING_SNAPSHOT)
     with open(layout_path, "w", encoding="utf-8") as handle:
-        handle.write(snapshot_layout(doc, pages))
+        handle.write(snapshot_layout(doc, pages, contents))
     with open(reading_path, "w", encoding="utf-8") as handle:
-        handle.write(snapshot_reading(doc, pages))
+        handle.write(snapshot_reading(doc, pages, contents))
     candidates_path = os.path.join(args.output, CANDIDATES_NAME)
     dump_json(_empty_marked(candidates), candidates_path)
 
@@ -146,7 +148,7 @@ def cmd_inspect(args):
     for pno in pages:
         if pno in covered_pages:
             continue  # 该页已有整页级定位，区域级重复
-        for region in page_bitmap_regions(doc[pno - 1]):
+        for region in page_bitmap_regions(doc[pno - 1], contents[pno]):
             pending.append({
                 "kind": "bitmap_region",
                 "page": pno,
@@ -206,20 +208,21 @@ def cmd_inspect(args):
             checklist["pending"] = _merge_pending(old["pending"], pending)
             preserved.append("pending")
         if old.get("classification", {}).get("adjudicated"):
-            checklist["classification"]["adjudicated"] = \
-                old["classification"]["adjudicated"]
+            # 分类是已裁决的整体：保留人工类型及依据，新的机器证据在
+            # inspection_report 中可查。不能只保留类型而覆盖/丢弃依据。
+            checklist["classification"] = dict(old["classification"])
             preserved.append("classification.adjudicated")
-            # 机器 classify_pages 的新判定只写入勘察报告作候选，不回写
-            # 清单：已裁决时继承裁决类型值（含依据），随 stale 冻结待重核
             if "type" in old["classification"]:
-                checklist["classification"]["type"] = \
-                    old["classification"]["type"]
                 preserved.append("classification.type")
         if old.get("stale"):
             # stale 不因再次勘察消失：源/范围变化后的重核只能由显式的
             # revalidate 依据清除，二次勘察继承旧标记
             checklist["stale"] = old["stale"]
             preserved.append("stale")
+        for key in ('formula_contract','formula_review'):
+            if key in old:
+                checklist[key]=old[key]
+                preserved.append(key)
         if preserved:
             # 裁决身份绑定：继承旧绑定；旧版清单回填为旧源身份/范围
             # （旧裁决即针对旧源作出）；全新清单不写该字段
@@ -353,7 +356,9 @@ def cmd_extract_figures(args):
                                             block["rect"], dpi, path)
         digest = file_sha256(path)
         census = region_object_census(doc[block["page"] - 1], block["rect"])
-        width_pt = round(block["rect"][2] - block["rect"][0], 2)
+        page = doc[block["page"] - 1]
+        display_rect = fitz.Rect(block["rect"]) * page.rotation_matrix
+        width_pt = round(display_rect.width, 2)
         block["image_sha256"] = digest
         block["figure_extraction"] = {
             "dpi": dpi,
@@ -495,12 +500,47 @@ def cmd_materialize(args):
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
     os.makedirs(out_dir, exist_ok=True)
+    import _pdf_math
+    try:
+        formal_math = _pdf_math.enabled(checklist)
+        if formal_math:
+            _pdf_math.validate(checklist, doc)
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        fail("确认数学拒绝物化: %s" % exc)
     lines = []
+    if formal_math:
+        lines = ['---', 'pdf_formula_contract: '+_pdf_math.CONTRACT,
+                 'pdf_checklist: '+json.dumps(os.path.relpath(args.checklist,out_dir)),
+                 '---', '']
     block_map = []
     for block in blocks:
         start_line = len(lines) + 1
+        start_char = sum(len(line)+1 for line in lines)
         btype = block.get("type")
-        if btype == "heading":
+        math_ranges = None
+        if formal_math and ('content' in block or 'cells' in block):
+            body, math_ranges = (_pdf_math.render_table(block) if 'cells' in block
+                                 else _pdf_math.render_content(block))
+            prefix=('#'*block['level']+' ' if btype=='heading' else
+                    '**Figure: ' if btype=='figure_caption' else
+                    '**Table: ' if btype=='table_caption' else
+                    '[ALGORITHM] ' if btype=='algorithm' else
+                    block['list_marker']+' ' if btype=='list_item' and 'list_marker' in block else '')
+            suffix='**' if btype in ('figure_caption','table_caption') else ''
+            if prefix:
+                body=prefix+body+suffix
+                for occurrence in math_ranges:
+                    occurrence['md_start']+=len(prefix);occurrence['md_end']+=len(prefix)
+                    if 'label_range' in occurrence:
+                        occurrence['label_range']=[pos+len(prefix) for pos in occurrence['label_range']]
+            lines.extend(body.split('\n'))
+            lines.append('')
+            for occurrence in math_ranges:
+                occurrence['md_start'] += start_char
+                occurrence['md_end'] += start_char
+                if 'label_range' in occurrence:
+                    occurrence['label_range']=[pos+start_char for pos in occurrence['label_range']]
+        elif btype == "heading":
             level = block.get("level")
             text = (block.get("text") or "").strip()
             if not isinstance(level, int) or not (1 <= level <= 8) \
@@ -577,6 +617,19 @@ def cmd_materialize(args):
             lines.append("")
         else:
             fail("清单块 %s 类型未知: %r" % (block.get("id"), btype))
+        if formal_math and (btype=='footnote_def' or block.get('footnote') is not None):
+            body='\n'.join(lines[start_line-1:-1]);represented='';offsets=[]
+            for index,char in enumerate(body):
+                if index==0 or body[index-1]=='\n':
+                    represented+=('[^'+block['footnote_label']+']: ' if index==0 and btype=='footnote_def' else '    ')
+                offsets.append(len(represented));represented+=char
+            offsets.append(len(represented))
+            if not body and btype=='footnote_def':
+                represented='[^'+block['footnote_label']+']:'
+            lines[start_line-1:]=represented.split('\n')+['']
+            for occurrence in math_ranges or []:
+                for key in ('md_start','md_end'):occurrence[key]=start_char+offsets[occurrence[key]-start_char]
+                if 'label_range' in occurrence:occurrence['label_range']=[start_char+offsets[pos-start_char] for pos in occurrence['label_range']]
         block_map.append({
             "id": block["id"],
             "type": block.get("type"),
@@ -585,10 +638,20 @@ def cmd_materialize(args):
             "md_lines": [start_line, len(lines) - 1
                          if lines and lines[-1] == "" else len(lines)],
         })
-    with open(args.output, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines).rstrip("\n") + "\n")
+        if formal_math:
+            block_map[-1].update(md_start=start_char,
+                                 md_end=sum(len(line)+1 for line in lines[:-1])-1)
+            if math_ranges is not None:
+                block_map[-1]['math']=math_ranges
+    markdown = "\n".join(lines).rstrip("\n") + "\n"
+    if not formal_math:
+        with open(args.output, "w", encoding="utf-8") as handle:
+            handle.write(markdown)
     map_path = args.output + ".blocks.json"
-    dump_json({"version": CHECKLIST_VERSION, "blocks": block_map}, map_path)
+    if not formal_math:
+        dump_json({"version": CHECKLIST_VERSION, "blocks": block_map}, map_path)
+    publish = [(args.output, markdown),
+               (map_path,json.dumps({'version':CHECKLIST_VERSION,'blocks':block_map},ensure_ascii=False,indent=2))]
     # 解析期显示映射（两级映射的 PDF 分支）：每次图片出现保留来源
     # （页面/区域 + 提取口径）、资源身份与确定尺寸或未确定原因；
     # 代码清单转围栏不生成伪图片条目。
@@ -630,8 +693,8 @@ def cmd_materialize(args):
                 "source_block": block.get("id"),
             })
         display_entries.append(entry)
-    if display_entries or display_undetermined:
-        dump_json({
+    if display_entries or display_undetermined or (formal_math and os.path.exists(args.output+'.images_display.json')):
+        display_payload = {
             "version": 1,
             "markdown": os.path.basename(args.output),
             "family": "pdf-source",
@@ -640,7 +703,39 @@ def cmd_materialize(args):
             "scope": checklist.get("scope"),
             "entries": display_entries,
             "undetermined": display_undetermined,
-        }, args.output + ".images_display.json")
+        }
+        if formal_math:
+            publish.append((args.output+'.images_display.json',json.dumps(display_payload,ensure_ascii=False,indent=2)))
+        else:
+            dump_json(display_payload,args.output+'.images_display.json')
+    if formal_math:
+        from verify_pdf_source import run_verification
+        problems,_ = run_verification(args.pdf,checklist,markdown,block_map,
+                                      checklist_dir=checklist_dir,md_dir=out_dir)
+        if problems:
+            fail('候选独立源核验拒绝: '+'；'.join(problems))
+        protected = {os.path.realpath(p) for p in (args.pdf,args.checklist)}
+        protected.update(os.path.realpath(os.path.join(checklist_dir,p))
+                         for p in (LAYOUT_SNAPSHOT,READING_SNAPSHOT,REPORT_NAME,CANDIDATES_NAME))
+        for block in blocks:
+            protected.update(os.path.realpath(os.path.join(checklist_dir,block[k]))
+                             for k in ('golden','image') if block.get(k))
+        if any(os.path.realpath(path) in protected for path,_ in publish):
+            fail('输出路径覆盖受保护来源/人工输入，拒绝发布')
+        if os.path.exists(args.output):
+            try:
+                with open(args.output+'.blocks.json',encoding='utf-8') as handle:
+                    old_map=json.load(handle)
+                managed=old_map.get('version')==CHECKLIST_VERSION and isinstance(old_map.get('blocks'),list)
+            except (OSError,ValueError,AttributeError):
+                managed=False
+            if not managed:
+                fail('输出是未关联源块映射的受保护已有文件，拒绝覆盖人工输入')
+        elif any(os.path.exists(path) for path,_ in publish[1:]):
+            fail('新源输出旁存在未关联的受保护已有映射，拒绝覆盖')
+        # 复用既有多成员回滚发布；独立端已经验证本次实际字符区间。
+        from parse_reference_html import _publish_group
+        _publish_group(publish)
     print("源 Markdown 草稿: %s（%d 块）" % (args.output, len(block_map)))
     print("块区间映射: %s" % map_path)
     return 0
