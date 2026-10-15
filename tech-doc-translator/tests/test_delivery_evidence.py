@@ -8,7 +8,6 @@
 缺失仍必须拒绝。
 """
 import contextlib
-import hashlib
 import io
 import json
 import os
@@ -22,13 +21,12 @@ import uuid
 import zlib
 from pathlib import Path
 
+from translator_test_support import SCRIPTS, sha
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/tech-doc-translator/scripts'))
 import export_pdf as exporter
 import verify_delivery as delivery_verifier
 import verify_pdf as pdf_verifier
-
-
-SCRIPTS = Path(__file__).resolve().parents[1] / 'skills/tech-doc-translator/scripts'
 
 
 def make_png(path, w, h, color=b'\x01\x02\x03'):
@@ -44,10 +42,6 @@ def make_png(path, w, h, color=b'\x01\x02\x03'):
     open(path, 'wb').write(
         b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr)
         + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
-
-
-def sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def build_delivery(root: Path, require_strict=False):
@@ -491,6 +485,215 @@ class ReviewBindingUnitTest(unittest.TestCase):
             any('复核摘要与当前输入不符' in p for p in problems), problems)
 
 
+class GlossaryBindingUnitTest(unittest.TestCase):
+    """D6/D7 适用身份（R5 收窄）：仅交付实际使用术语（记录登记了项目
+    术语表文件）时，术语读取/选择脚本与项目术语表才参与交付身份与
+    语义复核绑定。
+
+    修改检查器（glossary_markdown.py 等）或项目术语表（术语表.md）使
+    旧语义复核结论失效；重新按当前身份复核后才恢复交付资格。未使用
+    术语的交付不投影术语维度，术语脚本变化不影响其旧复核有效性。
+    """
+
+    def setUp(self):
+        base = Path(tempfile.mkdtemp(prefix='glossary-binding-'))
+        self.addCleanup(shutil.rmtree, base, True)
+        self.root = base / 'delivery'
+        self.root.mkdir()
+        (self.root / '01_章.md').write_text('# 第 1 章\n\n正文。\n',
+                                            encoding='utf-8')
+        (self.root / 'docs').mkdir()
+        (self.root / 'docs/source_en.md').write_text(
+            '# Chapter 1\n\nBody.\n', encoding='utf-8')
+        (self.root / '术语表.md').write_text(
+            '# 术语表\n\n| 英文原词 | 中文译法 | 处理方式 |\n'
+            '| --- | --- | --- |\n| kernel | 内核 | 中文 |\n',
+            encoding='utf-8')
+
+    def record(self):
+        return {'mode': 'translation', 'inputs': ['01_章.md'],
+                'outputs': [], 'sources': [],
+                'files': {'01_章.md': 'chapter', '术语表.md': 'glossary'},
+                'reviews': []}
+
+    def record_without_glossary(self):
+        record = self.record()
+        del record['files']['术语表.md']
+        return record
+
+    def input_checks(self):
+        translated = str((self.root / '01_章.md').resolve())
+        src = str((self.root / 'docs/source_en.md').resolve())
+        facts = {
+            'script_sha256': sha(SCRIPTS / 'verify_translation.py'),
+            'shared_deps': {
+                name: sha(SCRIPTS / name)
+                for name in delivery_verifier.CHECK_SHARED_DEPS[
+                    'verify_translation']},
+            'params': {'strong_tokens': [], 'official': [],
+                       'approved_extra_math': [], 'fragment': False},
+            'files': {'translated': [translated, sha(self.root / '01_章.md')],
+                      'sources': [[src, sha(self.root / 'docs/source_en.md')]]},
+        }
+        return {translated: [{
+            'order': 1, 'tool': 'verify_translation',
+            'script_sha256': facts['script_sha256'],
+            'shared_deps': facts['shared_deps'], 'facts': facts}]}
+
+    def semantic_binding(self, identity=None, record=None):
+        record = record if record is not None else self.record()
+        ident = identity or delivery_verifier.compute_delivery_identity(
+            str(self.root), record, [])
+        return delivery_verifier.expected_review_binding(
+            'semantic', '01_章.md', str(self.root), record, [],
+            self.input_checks(), {}, ident)
+
+    def test_glossary_participates_in_identity_and_binding(self):
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), self.record(), [])
+        glossary = identity['glossary']
+        self.assertEqual(glossary['files'],
+                         {'术语表.md': sha(self.root / '术语表.md')})
+        for name in ('glossary_markdown.py', 'select_glossary.py',
+                     'consolidate_glossaries.py'):
+            self.assertEqual(glossary['scripts'][name], sha(SCRIPTS / name),
+                             name)
+        binding = self.semantic_binding(identity)
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding['glossary'], glossary)
+
+    def test_glossary_file_change_invalidates_review(self):
+        # 项目术语表（适用输入）变化：旧语义复核绑定与当前身份不符，
+        # 旧结论失效；当前身份下重新复核后恢复。
+        record = self.record()
+        record['reviews'] = [{
+            'kind': 'semantic', 'target': '01_章.md', 'status': 'closed',
+            'sha256': sha(self.root / '01_章.md'),
+            'binding': self.semantic_binding(), 'note': '语义复核闭合'}]
+        (self.root / '术语表.md').write_text(
+            '# 术语表\n\n| 英文原词 | 中文译法 | 处理方式 |\n'
+            '| --- | --- | --- |\n| kernel | 核函数 | 中文 |\n',
+            encoding='utf-8')
+        problems = []
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), record, [])
+        delivery_verifier.check_reviews(
+            record, problems, None, root=str(self.root),
+            input_checks=self.input_checks(), pdf_checks={},
+            source_entries=[], identity=identity)
+        self.assertTrue(
+            any('binding 与当前完整上下文不符' in p for p in problems),
+            problems)
+        # 按当前身份重新复核：同一函数算出的新绑定闭合，恢复交付资格。
+        record['reviews'] = [
+            {'kind': 'semantic', 'target': '01_章.md', 'status': 'closed',
+             'sha256': sha(self.root / '01_章.md'),
+             'binding': self.semantic_binding(identity), 'note': '语义复核闭合'},
+            {'kind': 'source-reconcile', 'target': '01_章.md',
+             'status': 'closed', 'sha256': sha(self.root / '01_章.md'),
+             'binding': delivery_verifier.expected_review_binding(
+                 'source-reconcile', '01_章.md', str(self.root), record, [],
+                 self.input_checks(), {}, identity),
+             'note': '源全量对账闭合'}]
+        problems = []
+        delivery_verifier.check_reviews(
+            record, problems, None, root=str(self.root),
+            input_checks=self.input_checks(), pdf_checks={},
+            source_entries=[], identity=identity)
+        self.assertEqual(problems, [])
+
+    def test_glossary_checker_change_invalidates_review(self):
+        # 术语读取/选择检查器口径变化：旧绑定中的脚本摘要与当前不符，
+        # 旧复核失效，须重新复核后才恢复交付资格。
+        record = self.record()
+        record['reviews'] = [{
+            'kind': 'semantic', 'target': '01_章.md', 'status': 'closed',
+            'sha256': sha(self.root / '01_章.md'),
+            'binding': self.semantic_binding(), 'note': '语义复核闭合'}]
+        problems = []
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), record, [])
+        identity['glossary']['scripts']['glossary_markdown.py'] = 'f' * 64
+        delivery_verifier.check_reviews(
+            record, problems, None, root=str(self.root),
+            input_checks=self.input_checks(), pdf_checks={},
+            source_entries=[], identity=identity)
+        self.assertTrue(
+            any('binding 与当前完整上下文不符' in p for p in problems),
+            problems)
+
+    def test_glossary_digest_missing_blocks_publish(self):
+        # 术语脚本摘要不可得：发布前完整性检查拒绝（None 不构成身份）。
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), self.record(), [])
+        identity['glossary']['scripts']['select_glossary.py'] = None
+        missing = delivery_verifier._identity_missing_digests(identity)
+        self.assertTrue(
+            any('术语脚本 select_glossary.py' in m for m in missing),
+            missing)
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), self.record(), [])
+        identity['glossary']['files']['术语表.md'] = None
+        missing = delivery_verifier._identity_missing_digests(identity)
+        self.assertTrue(
+            any('项目术语表 术语表.md' in m for m in missing), missing)
+
+    def test_glossary_absent_without_project_glossary(self):
+        # R5 收窄：未登记项目术语表（未实际使用术语）的交付不投影
+        # 术语维度；身份中 glossary 为 None，复核绑定不含 glossary 键。
+        record = self.record_without_glossary()
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), record, [])
+        self.assertIsNone(identity['glossary'])
+        binding = self.semantic_binding(identity, record)
+        self.assertIsNotNone(binding)
+        self.assertNotIn('glossary', binding)
+        self.assertEqual(delivery_verifier._identity_missing_digests(identity),
+                         [])
+
+    def test_glossary_script_change_leaves_unrelated_review_valid(self):
+        # R5：未使用术语的交付，术语脚本摘要不参与其复核绑定。旧口径
+        # binding（含 glossary 节）与当前身份不符，旧复核失效；按当前
+        # 身份重复核后恢复，且术语脚本变化不再影响该交付的复核有效性。
+        record = self.record_without_glossary()
+        identity = delivery_verifier.compute_delivery_identity(
+            str(self.root), record, [])
+        binding = self.semantic_binding(identity, record)
+        old_style = dict(binding)
+        old_style['glossary'] = {
+            'scripts': {name: 'a' * 64
+                        for name in delivery_verifier.GLOSSARY_SHARED_DEPS},
+            'files': {}}
+        record['reviews'] = [{
+            'kind': 'semantic', 'target': '01_章.md', 'status': 'closed',
+            'sha256': sha(self.root / '01_章.md'),
+            'binding': old_style, 'note': '旧口径复核闭合'}]
+        problems = []
+        delivery_verifier.check_reviews(
+            record, problems, None, root=str(self.root),
+            input_checks=self.input_checks(), pdf_checks={},
+            source_entries=[], identity=identity)
+        self.assertTrue(
+            any('binding 与当前完整上下文不符' in p for p in problems),
+            problems)
+        recon = delivery_verifier.expected_review_binding(
+            'source-reconcile', '01_章.md', str(self.root), record, [],
+            self.input_checks(), {}, identity)
+        record['reviews'] = [
+            {'kind': 'semantic', 'target': '01_章.md', 'status': 'closed',
+             'sha256': sha(self.root / '01_章.md'),
+             'binding': binding, 'note': '语义复核闭合'},
+            {'kind': 'source-reconcile', 'target': '01_章.md',
+             'status': 'closed', 'sha256': sha(self.root / '01_章.md'),
+             'binding': recon, 'note': '源全量对账闭合'}]
+        problems = []
+        delivery_verifier.check_reviews(
+            record, problems, None, root=str(self.root),
+            input_checks=self.input_checks(), pdf_checks={},
+            source_entries=[], identity=identity)
+        self.assertEqual(problems, [])
+
+
 class CheckFactsUnitTest(unittest.TestCase):
     """检查身份事实（设计 §9.3 固定回归，无浏览器）。
 
@@ -653,6 +856,32 @@ class CheckFactsUnitTest(unittest.TestCase):
         self.assertNotEqual(binding, self.semantic_binding())
         imgmap.write_text('{"digests": []}', encoding='utf-8')
         self.assertEqual(binding, self.semantic_binding())
+
+    def test_plugin_version_enters_pdf_binding_only(self):
+        # 复评 P2-3（设计 §7.7）：mdit-py-plugins 是 PDF 导出渲染与
+        # 成品核验脚注结构的实际消费依赖，版本登记进环境身份并随完整
+        # 环境投影覆盖 PDF 复核绑定；HTML 翻译检查不调用它，普通绑定
+        # 继续按 TRANSLATION_ENV_KEYS 隔离
+        import mdit_py_plugins
+        from unittest.mock import patch
+        identity = self.identity()
+        self.assertEqual(identity['environment'].get('mdit-py-plugins'),
+                         mdit_py_plugins.__version__)
+        visual = self.visual_binding(identity=identity)
+        semantic = self.semantic_binding(identity=identity)
+        self.assertIsNotNone(visual)
+        self.assertIsNotNone(semantic)
+        self.assertIn('mdit-py-plugins', visual['environment'])
+        self.assertNotIn('mdit-py-plugins', semantic['environment'])
+        # 同环境身份稳定
+        self.assertEqual(identity, self.identity())
+        # 仅插件版本变化：相关 PDF 旧复核失效，无关 HTML 绑定不变
+        with patch.object(mdit_py_plugins, '__version__',
+                          'different-review-probe'):
+            altered = self.identity()
+        self.assertNotEqual(identity, altered)
+        self.assertNotEqual(visual, self.visual_binding(identity=altered))
+        self.assertEqual(semantic, self.semantic_binding(identity=altered))
 
     def test_visual_binding_scopes_to_covering_inputs(self):
         # 多 PDF 交付：a.pdf 的 visual 绑定只投影其覆盖检查的实际输入，
@@ -930,6 +1159,147 @@ class MergedSourceRangesTest(unittest.TestCase):
              [self.total_lines - self.first_lines + 1, self.total_lines]])
         self.assertTrue(
             any('源全量对账失败' in p for p in problems), problems)
+
+
+class LatexmlMultiSnapshotSourceTest(unittest.TestCase):
+    """F7/§4.6：多快照 LaTeXML 来源交付——逐快照依据声明与逐段对账。
+
+    正例：双快照各由 parse_reference_html 真实解析并声明自身依据，源链
+    预检（身份/摘要/逐节点对应）与按声明 range 的逐段独立对账均通过；
+    负例：缺一份逐快照依据、调换快照声明顺序、合并 Markdown 第二段被改、
+    依据身份被改，均被对应目标原因拒绝。纯规则测试，不启动浏览器。
+    """
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(prefix='latexml-multi-'))
+        self.addCleanup(shutil.rmtree, self.base, True)
+        self.root = self.base / 'delivery'
+        (self.root / 'source').mkdir(parents=True)
+        parts = []
+        for stem, text, tex in (
+                ('a', 'First part studies', 'a+b'),
+                ('b', 'Second part shows', 'c=d')):
+            html = self.root / ('source/%s.html' % stem)
+            html.write_text(
+                '<!DOCTYPE html>\n<html>\n<head><meta charset="utf-8">'
+                '<title>Probe Paper</title></head>\n<body>\n'
+                '<article id="paper" class="ltx_document">\n'
+                '<h1 class="ltx_title">Probe Paper</h1>\n'
+                '<p class="ltx_p">%s <math xmlns="http://www.w3.org/1998/'
+                'Math/MathML" alttext="%s" display="inline" id="m1">'
+                '<mrow><mi>x</mi></mrow></math> inline.</p>\n'
+                '</article>\n</body>\n</html>\n' % (text, tex),
+                encoding='utf-8')
+            raw = html.read_text(encoding='utf-8')
+            (self.root / ('source/%s.input.json' % stem)).write_text(
+                json.dumps({
+                    'version': 1, 'format': 'latexml',
+                    'snapshot': {'path': str(html),
+                                 'sha256': sha(html)},
+                    'paper_identity': {
+                        'expected_title': 'Probe Paper',
+                        'actual_title': 'Probe Paper',
+                        'paper_id': '2101.00001', 'version': 'v1',
+                        'final_url': 'https://example.org/abs/2101.00001v1',
+                        'retrieved_at': '2026-10-01T00:00:00Z',
+                        'confirmation': 'Independent synthetic fixture'},
+                    'decisions': [], 'correspondences': [],
+                    'unresolved': []}, ensure_ascii=False), encoding='utf-8')
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS / 'parse_reference_html.py'),
+                 str(html),
+                 str(self.root / ('source/%s.md' % stem)),
+                 '--source-adaptation',
+                 str(self.root / ('source/%s.input.json' % stem)),
+                 '--adaptation-output',
+                 str(self.root / ('source/%s.adaptation.json' % stem))],
+                capture_output=True, text=True)
+            assert result.returncode == 0, result.stderr + result.stdout
+            parts.append(
+                (self.root / ('source/%s.md' % stem))
+                .read_text(encoding='utf-8'))
+        (self.root / 'source/merged.md').write_text(
+            ''.join(parts), encoding='utf-8')
+        self.first_lines = len(parts[0].split('\n')) - 1
+        self.total_lines = len(''.join(parts).split('\n'))
+
+    def entry(self, snaps):
+        return {'order': 1, 'family': 'reference', 'source_version': 'v1',
+                'parsed_markdown': 'source/merged.md', 'snapshots': snaps,
+                'covers': [], 'table_conversions': None}
+
+    def legal_snaps(self):
+        return [
+            {'snapshot': 'source/a.html',
+             'source_adaptation': 'source/a.adaptation.json',
+             'range': [1, self.first_lines]},
+            {'snapshot': 'source/b.html',
+             'source_adaptation': 'source/b.adaptation.json',
+             'range': [self.first_lines + 1, self.total_lines]},
+        ]
+
+    def preflight(self, snaps):
+        problems = []
+        record = {'mode': 'translation', 'inputs': [],
+                  'sources': [self.entry(snaps)]}
+        entries = delivery_verifier.check_source_chains(
+            str(self.root), record, problems)
+        return entries, problems
+
+    def reconcile(self, snaps):
+        entries, problems = self.preflight(snaps)
+        assert not problems, problems
+        record = {'mode': 'translation', 'inputs': [],
+                  'sources': [self.entry(snaps)]}
+        delivery_verifier.run_source_reconcile(
+            str(self.root), record, entries, problems)
+        return problems
+
+    def test_legal_two_snapshot_record_passes(self):
+        entries, problems = self.preflight(self.legal_snaps())
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            len(entries[0]['_source_adaptations']), 2)
+        self.assertEqual(self.reconcile(self.legal_snaps()), [])
+
+    def test_missing_per_snapshot_adaptation_rejected(self):
+        snaps = self.legal_snaps()
+        del snaps[1]['source_adaptation']
+        _entries, problems = self.preflight(snaps)
+        self.assertTrue(
+            any('快照 #2' in p and 'source_adaptation' in p
+                for p in problems), problems)
+
+    def test_swapped_snapshot_adaptations_rejected(self):
+        snaps = self.legal_snaps()
+        snaps[0]['source_adaptation'], snaps[1]['source_adaptation'] = \
+            snaps[1]['source_adaptation'], snaps[0]['source_adaptation']
+        _entries, problems = self.preflight(snaps)
+        self.assertTrue(
+            any('快照 #1' in p and '核对失败' in p for p in problems),
+            problems)
+
+    def test_tampered_second_segment_rejected(self):
+        merged = self.root / 'source/merged.md'
+        merged.write_text(
+            merged.read_text(encoding='utf-8').replace(
+                'Second part shows', 'Altered part shows'),
+            encoding='utf-8')
+        problems = self.reconcile(self.legal_snaps())
+        self.assertTrue(
+            any('LaTeXML 源全量对账失败' in p and '快照 #2' in p
+                for p in problems), problems)
+
+    def test_tampered_adaptation_identity_rejected(self):
+        adapt = self.root / 'source/a.adaptation.json'
+        payload = json.loads(adapt.read_text(encoding='utf-8'))
+        payload['paper_identity']['actual_title'] = 'Wrong Title'
+        adapt.write_text(json.dumps(payload, ensure_ascii=False),
+                         encoding='utf-8')
+        _entries, problems = self.preflight(self.legal_snaps())
+        self.assertTrue(
+            any('快照 #1' in p and ('身份错配' in p or '无效' in p)
+                for p in problems), problems)
 
 
 class PerSnapshotSourceIdentityTest(unittest.TestCase):
@@ -2761,8 +3131,6 @@ class DeliveryEvidenceTest(unittest.TestCase):
         assert_protected(result)
 
 
-
-
 class PdfSourceDeliveryTests(unittest.TestCase):
     """pdf-source 来源家族的交付证据与复核绑定（设计 §4.6）。"""
 
@@ -2909,6 +3277,63 @@ class PdfSourceDeliveryTests(unittest.TestCase):
         if getattr(cls, '_evidence_made', False):
             shutil.rmtree(cls.evidence, True)
         shutil.rmtree(cls.base, True)
+
+    def test_phase3_outputs_cannot_overwrite_pdf_source_dependencies(self):
+        import split_work_packages as split
+        import verify_delivery as delivery
+        from review_delivery_batch import protected_record_paths
+        root = self.root
+        for name in ('phase3-source-record.json', 'phase3-rule.md',
+                     'phase3-context.json', 'phase3-batch.json'):
+            self.addCleanup((root/name).unlink, missing_ok=True)
+        for name in ('phase3-wps', 'phase3-trans', 'phase3-evidence'):
+            self.addCleanup(shutil.rmtree, root/name, True)
+        record = self.record()
+        record['reviews'] = []
+        record_path = root/'phase3-source-record.json'
+        record_path.write_text(json.dumps(record))
+        problems = []
+        entries = delivery.check_source_chains(root, record, problems, source_only=True)
+        self.assertEqual([], problems)
+        entry = entries[0]
+        wps, trans = root/'phase3-wps', root/'phase3-trans'
+        packages = split.split(str(self.source_md), str(wps), str(trans), 'h2')
+        rule = root/'phase3-rule.md'
+        rule.write_text('完整翻译，保留代码、公式与资源。\n')
+        context = {'project_root': str(root), 'source_record': record_path.name,
+            'skill_dir': str(SCRIPTS.parent), 'python': sys.executable,
+            'source_scope': 'all', 'source_review': {'scope': 'all',
+                'basis': '独立固定 PDF 源与已有合法裁决',
+                'binding': {k: entry[k] for k in ('parsed_sha256', 'source_version', 'snapshots')}},
+            'instructions': [rule.name], 'rules': [rule.name], 'glossary': [],
+            'output_contract': [rule.name],
+            'examples': [{'path': rule.name, 'differences': '保持当前代码和图结构'}],
+            'return_contract': '返回术语、源问题、检查、不确定项。', 'check_args': []}
+        context_path = root/'phase3-context.json'
+        context_path.write_text(json.dumps(context))
+        manifest = root/'phase3-batch.json'
+        manifest.write_text(json.dumps({'projects': [{'project': 'pdf-source',
+            'record': record_path.name, 'evidence_dir': 'phase3-evidence',
+            'mode': record['mode'], 'scope': record['inputs']}]}))
+        paths = [(root/entry[f]).resolve() for f in ('pdf', 'checklist',
+            'layout_snapshot', 'reading_snapshot', 'block_map', 'parsed_markdown')]
+        paths.append(Path(str(self.source_md)+'.images_display.json').resolve())
+        paths.extend((self.checklist.parent/item['path']).resolve()
+                     for item in entry['_pdf_goldens']+entry['_pdf_images'])
+        protected = protected_record_paths(record)
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertIn(path, protected)
+                before = path.read_bytes()
+                for script, args in [('build_work_package_tasks.py', ['--source', str(self.source_md),
+                    '--strategy', 'h2', '--source-packages', str(wps),
+                    '--project-context', str(context_path), '--package', Path(packages[0]).name]),
+                    ('review_delivery_batch.py', ['--manifest', str(manifest)])]:
+                    result = subprocess.run([sys.executable, str(SCRIPTS/script),
+                        *args, '--output', str(path)], capture_output=True, text=True)
+                    self.assertNotEqual(0, result.returncode, result.stdout+result.stderr)
+                    self.assertIn('受保护', result.stderr)
+                    self.assertEqual(before, path.read_bytes())
 
     def record(self, mutator=None):
         entry = {

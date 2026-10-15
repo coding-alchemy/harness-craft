@@ -15,6 +15,7 @@ import datetime
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import shutil
 import sys
@@ -26,12 +27,6 @@ from urllib.parse import unquote, urlsplit
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
-from mdit_py_plugins.dollarmath import dollarmath_plugin
-from mdit_py_plugins.footnote import footnote_plugin
-from pygments import highlight as pygments_highlight
-from pygments.formatters import HtmlFormatter
-from pygments.lexers import get_lexer_by_name
-from pygments.util import ClassNotFound
 
 from _html_fidelity import reason_code
 from _image_preflight import (
@@ -43,6 +38,8 @@ from _image_preflight import (
     decode_budget,
     undetermined_binding_diagnostics,
 )
+from _verification import (fenced_line_numbers, math_issue_fails, scan_math,
+                           markdown_table_row_lines, table_math_spans)
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets" / "pdf"
 REPORT_NAME = "export_report.json"
@@ -2039,12 +2036,393 @@ def classify_math(content, display_mode):
     return latex, mode, original_form
 
 
-def build_markdown(math_sink, chapter_prefix):
-    """构造按本章作用域工作的解析器；math_sink 收集公式条目。"""
+def _footnote_render_extents(text, scan_context=None, math_spans=None):
+    """脚注定义的合法交付投影：实际解析定位与渲染顺序（设计 §7.7）。
+
+    用与导出侧相同的 footnote 插件对导出视图做一次只读结构重读：插件把
+    被引用定义移到章末（tail），tail 中 footnote_open/close 段携带原
+    定义内容的 map（实际解析定位），段顺序即渲染序（首次引用序）。未
+    引用定义不进入 tail（不渲染），其跨度仍属源文本序列，由数量门禁
+    拒绝。声明下限 mdit-py-plugins 0.4.0 的 tail 结构与此相同。
+
+    重读只启用 CommonMark/table/footnote，不识别数学定界：公式内部记法
+    （如 $[^b]$）会被 footnote 插件误当作真实引用，改变首次引用序。重读
+    前复用共享扫描已确定的公式跨度做等长掩蔽——跨度内仅非空白字符替换为
+    占位字母，缩进、空白行、换行与偏移逐位保持（缩进与空白行是决定脚注
+    定义归属的结构事实，擦除会把多行公式后的定义区间提前截断），公式内容
+    不参与脚注结构判定，定义定位与真实引用顺序保持。掩蔽扫描与跨度扫描、
+    确认序列对齐使用同一已确认来源上下文（六轮 F2）：含边界空白或跨行
+    行内公式只在已确认上下文中可识别，缺上下文时漏掩蔽会把公式内的
+    `[^b]` 记法误当真实引用，改写首次引用序。
+    """
+    masked = list(text)
+    for span in (math_spans if math_spans is not None else scan_math(text, source_context=scan_context).spans):
+        masked[span.start:span.end] = re.sub(r"\S", "x", text[span.start:span.end])
+    markdown = MarkdownIt("commonmark", {"html": False})
+    markdown.enable("table")
+    if "[^" in text:
+        from mdit_py_plugins.footnote import footnote_plugin
+        markdown.use(footnote_plugin)
+    tokens = markdown.parse("".join(masked), {})
+    line_starts = [0]
+    for match in re.finditer("\n", text):
+        line_starts.append(match.end())
+    extents = []
+    current = None
+    for token in tokens:
+        if token.type == "footnote_open":
+            current = []
+            extents.append(current)
+        elif token.type == "footnote_close":
+            current = None
+        elif current is not None and token.map:
+            current.append(tuple(token.map))
+    result = []
+    for maps in extents:
+        if not maps:
+            continue
+        start_line = min(item[0] for item in maps)
+        end_line = max(item[1] for item in maps)
+        start = line_starts[start_line]
+        end = (line_starts[end_line] if end_line < len(line_starts)
+               else len(text))
+        result.append((start, end))
+    return result
+
+
+def render_ordered_confirmed(text, confirmed, scan_context=None, math_spans=None):
+    """已确认来源公式序列按合法渲染投影重排（五轮 F3，设计 §7.8）。
+
+    footnote 插件把被引用定义移到章末按首次引用序渲染，确认序列的渲染
+    消费（导出解析游标、独立核验期望序列）须按同一投影：正文保持源序，
+    脚注定义内公式按投影区间序移到章末，同一脚注内保持源序；未命中扫描
+    跨度的确认条目保持原相对位置。无脚注投影或空序列时原样返回（恒等）。
+    源文本顺序语义（绑定/分配）不受影响；删式/改式仍由逐项比较与数量
+    门禁发现。
+    """
+    confirmed = list(confirmed or [])
+    if not confirmed:
+        return confirmed
+    # 六轮 F2：投影掩蔽与下方跨度扫描使用同一已确认上下文
+    extents = _footnote_render_extents(text, scan_context, math_spans)
+    if not extents:
+        return confirmed
+    fence_lines = fenced_line_numbers(text)
+    spans = list(math_spans) if math_spans is not None else [s for s in table_math_spans(
+        scan_math(text, source_context=scan_context).spans, text, decode_entities=True)
+        if s.start_line not in fence_lines]
+    aligned = []
+    cursor = 0
+    for span in spans:
+        hit = None
+        for index in range(cursor, len(confirmed)):
+            kind, tex = confirmed[index]
+            expr = span.expr
+            if expr != tex and kind == "block" and expr.startswith("\n") \
+                    and expr.endswith("\n"):
+                expr = expr[1:-1]
+            if span.kind == kind and expr == tex:
+                hit = index
+                break
+        aligned.append(hit)
+        if hit is not None:
+            cursor = hit + 1
+
+    def _extent_order(span):
+        for position, (start, end) in enumerate(extents):
+            if start <= span.start < end:
+                return position
+        return None
+
+    foot = sorted(
+        (i for i, span in enumerate(spans)
+         if aligned[i] is not None and _extent_order(span) is not None),
+        key=lambda i: (_extent_order(spans[i]), spans[i].start))
+    if not foot:
+        return confirmed
+    foot_set = {aligned[i] for i in foot}
+    reordered = [entry for index, entry in enumerate(confirmed)
+                 if index not in foot_set]
+    reordered.extend(confirmed[aligned[i]] for i in foot)
+    return reordered
+
+
+class ConfirmedMathCursor(object):
+    """已确认来源公式游标：按序为解析跨度解析受约束分类。
+
+    命中（类型一致且剥除已确认包装后的表达式逐字相等）返回
+    (tex, mode, "source_constrained")；未命中返回 None（调用方回退
+    历史包装分类）。允许跳过未确认的额外跨度（译注公式），不因此
+    错位后续确认项；确认项不会被历史 trim/环境启发式重写。
+    """
+
+    def __init__(self, entries):
+        self._entries = list(entries or [])
+        self._cursor = 0
+
+    def resolve(self, content, display_mode):
+        # strict：逐字命中（只剥已确认包装）；locate：解析插件可能裁掉
+        # 块级内容边界空白（markdown-it dollarmath），定位回退仅用于
+        # 找到确认项，输出永远是确认原表达式（逐字），改写检测由扫描
+        # 侧逐字事实负责（verify_pdf source-math-mismatch）
+        for mode_strict in (True, False):
+            for index in range(self._cursor, len(self._entries)):
+                kind, tex = self._entries[index]
+                want_mode = "display" if kind == "block" else "inline"
+                if bool(display_mode) != (kind == "block"):
+                    continue
+                expr = content
+                if kind == "block" and expr.startswith("\n") \
+                        and expr.endswith("\n"):
+                    # 只剥离已确认块级包装换行（$$\n…\n$$），其余逐字
+                    expr = expr[1:-1]
+                if expr != tex:
+                    if mode_strict or expr.strip() != tex.strip():
+                        continue
+                self._cursor = index + 1
+                return (tex, want_mode, "source_constrained")
+        return None
+
+    def remaining(self):
+        return len(self._entries) - self._cursor
+
+
+def apply_source_math_context(chapters, payload):
+    """把已确认来源上下文装配到章对象（导出与独立核验同一入口）。
+
+    装配前重读并结构性校验依据文件（结构无效即拒绝，由调用方转为导出/
+    核验失败）；上下文含限定跨行扫描事实与按序确认公式（类型 + 逐字原
+    表达式）。不自动搜索邻近文件。payload 为 {"_path": 单路径}（单依据
+    行为不变）或 {"_paths": [有序路径]}（多快照 F7/§7.5：扫描上下文取
+    并集、已确认公式按序拼接成整文序列）。
+    """
+    import os
+    import _latexml_source as latexml
+    from _verification import SourceMathContext
+    paths = list(payload.get("_paths") or [payload["_path"]])
+    datas = []
+    for adaptation_path in paths:
+        adaptation_path = os.path.realpath(adaptation_path)
+        digest = latexml.sha256_text(
+            open(adaptation_path, encoding="utf-8").read())
+        data = latexml.load_adaptation(adaptation_path)
+        if data.get("unresolved"):
+            raise ExportError(
+                "来源依据含未解决项 %s，存在来源约束形态的导出必须补齐后重试"
+                % [u.get("node") for u in data["unresolved"]][:5])
+        datas.append((adaptation_path, digest, data))
+    scan_entries = []
+    confirmed = []
+    for _path, _digest, data in datas:
+        scan_entries.extend(
+            latexml.scan_context_from_payload(data).entries)
+        confirmed.extend([
+            (corr["kind"], corr["tex"])
+            for corr in data.get("correspondences") or []
+            if isinstance(corr, dict) and corr.get("content_type") == "math"
+        ])
+    scan_context = SourceMathContext(scan_entries)
+    if len(datas) == 1:
+        for chapter in chapters:
+            chapter.math_scan_context = scan_context
+            chapter.math_confirmed = [] if chapter.is_toc else confirmed
+        return {"path": datas[0][0], "sha256": datas[0][1]}
+    # 多依据多章（三轮 F5）：按实际章节范围分配已确认公式——逐章以并集
+    # 扫描上下文扫描本章 Markdown，全局游标把确认序列按序切段：章内第
+    # i 个来源约束跨度（类型与逐字表达式）必须等于序列当前项；每章只
+    # 绑定本章子序列，章级核对据此判定本章来源约束全部落实。分配结束
+    # 游标未耗尽即拒绝（已确认公式未落入任何章——最终完整性核验保留）。
+    # 四轮 F3：受来源约束的导出中每个扫描跨度都必须落入确认序列——
+    # 不等即拒绝、耗尽后仍有跨度即拒绝（额外公式章不再静默通过）。
+    # 单依据维持整列表绑定，行为不变。
+    remaining = list(confirmed)
+    for chapter in chapters:
+        text = chapter.projected_text
+        scan = latexml.scan_math(text, source_context=scan_context)
+        scan = type(scan)(tuple(table_math_spans(scan.spans, text, decode_entities=True)), scan.issues)
+        fence_lines = latexml.fenced_line_numbers(text)
+        chapter_confirmed = []
+        for span in scan.spans:
+            if span.start_line in fence_lines:
+                continue  # 围栏内美元是代码文字
+            if not remaining:
+                raise ExportError(
+                    "第 %d 章存在已确认序列之外的公式（L%d %r），"
+                    "拒绝导出（旧成品不变）"
+                    % (chapter.index, span.start_line, span.expr))
+            kind, tex = remaining[0]
+            expr = span.expr
+            if span.kind == "block" and expr.startswith("\n") \
+                    and expr.endswith("\n"):
+                expr = expr[1:-1]
+            if span.kind != kind or expr != tex:
+                raise ExportError(
+                    "第 %d 章公式与已确认来源序列不符（L%d 实际 %r，"
+                    "期望下一项 %r），拒绝导出（旧成品不变）"
+                    % (chapter.index, span.start_line, expr, tex))
+            chapter_confirmed.append(remaining.pop(0))
+        chapter.math_scan_context = scan_context
+        chapter.math_confirmed = chapter_confirmed
+    if remaining:
+        raise ExportError(
+            "已确认来源公式未落入任何章节：%d 条未分配（缺章或公式缺失），"
+            "拒绝导出（旧成品不变）" % len(remaining))
+    return {"paths": [p for p, _d, _data in datas],
+            "sha256": [d for _p, d, _data in datas]}
+
+
+def apply_pdf_math_context(chapters, projection):
+    """从当前就绪引用重读PDF事实，核对完整覆盖后给章分配确认序列。"""
+    import _pdf_math as pdf_math
+    try:
+        for source in (projection or {}).get('sources',[]):
+            entry=source.get('pdf_source')
+            if entry is None:continue
+            covered=[c for c in chapters if str(c.path) in entry['covers']]
+            if len(covered)!=len(entry['covers']):raise ValueError('PDF确认来源缺章或重复覆盖')
+            view=pdf_math.source_view(entry,entry['root'],entry['source_markdown'])
+            if view is None:raise ValueError('PDF确认来源合同已消失')
+            text='';ranges=[]
+            for chapter in covered:
+                chapter.text=pdf_math.read_document(chapter.path,exact=True)
+                chapter.projected_text,chapter.exclusions=project_management_fields(chapter.text)
+                chapter.pdf_math_approved_extra_math=(projection or {}).get('approved_extra_math',{}).get(str(chapter.path),[])
+                chapter.projected_text,chapter.pdf_math_note_exclusions=pdf_math.approved_extra_view(
+                    chapter.projected_text,pdf_math.context(view['checklist']),
+                    chapter.pdf_math_approved_extra_math)
+                removed={line for exclusion in chapter.exclusions
+                         for line in range(exclusion['start_line'],exclusion['end_line']+1)}
+                original_lines=[line for line in range(1,len(chapter.text.split('\n'))+1) if line not in removed]
+                for note in chapter.pdf_math_note_exclusions:note['line']=original_lines[note['line']-1]
+                if text:text+='\n\n'
+                start=len(text);text+=chapter.projected_text;ranges.append((start,len(text)))
+            items=pdf_math.check_fragment(view,0,len(view['text']),text)
+            context=pdf_math.context(view['checklist'])
+            _,source_scan=pdf_math.markdown_blocks(view['text'],context)
+            _,actual_scan=pdf_math.markdown_blocks(text,context)
+            # 源表示已由原PDF/人工事实独立核过；只携带其定界/标签包装，
+            # 不从待验章制造确认值，也不保存导出专用权威文件。
+            confirmed=[(item['kind'],span.expr) for item,span in zip(items,source_scan.spans)]
+            used=0
+            for chapter,(start,end) in zip(covered,ranges):
+                selected=[index for index,span in enumerate(actual_scan.spans) if start<=span.start and span.end<=end]
+                chapter.math_scan_context=context
+                chapter.math_confirmed=[confirmed[index] for index in selected]
+                chapter.pdf_math_confirmed=True
+                used+=len(selected)
+            if used!=len(confirmed):raise ValueError('PDF数学跨章边界或确认未消费')
+    except (ValueError,OSError,KeyError) as exc:
+        raise ExportError('PDF确认数学来源/章节核验失败: '+str(exc)) from exc
+
+
+def chapter_math_scan(chapter):
+    if getattr(chapter,'pdf_math_confirmed',False):
+        import _pdf_math
+        return _pdf_math.markdown_blocks(chapter.projected_text,chapter.math_scan_context)[1]
+    return scan_math(chapter.projected_text,source_context=getattr(chapter,'math_scan_context',None))
+
+
+def _span_token(span):
+    r"""共享跨度 → (token 内容, display_mode, token 类型)。
+
+    `\[…\]` 块级保留原包装送入 classify_math（与历史 $$\[…\]$$ 的包装
+    剥离同一职责，original_form=legacy_bracket）；`$$` 块级内容不含
+    定界（与历史 dollarmath 块 token 一致，original_form=dollar_block）。
+    """
+    if span.kind == "inline":
+        return span.expr, False, "math_inline"
+    if span.raw.startswith("\\["):
+        return "\\[" + span.expr + "\\]", False, "math_block"
+    return span.expr, True, "math_block"
+
+
+def _standalone_block(text, span):
+    """块级跨度是否会被块级规则消费：行首（允许缩进与排版空白）且
+    独占至行尾。带尾随正文的块级退回行内规则渲染。"""
+    if span.kind != "block":
+        return False
+    line_start = text.rfind("\n", 0, span.start) + 1
+    if text[line_start:span.start].strip():
+        return False
+    line_end = text.find("\n", span.end)
+    if line_end == -1:
+        line_end = len(text)
+    return not text[span.end:line_end].strip()
+
+
+def _aligned_span_length(src, pos, raw):
+    r"""span.raw 在 inline state.src 中可消费的长度（容器剥离感知）。
+
+    先做严格前缀匹配（无容器时 state.src 是原文子串，原样命中）。
+    严格失败且 raw 跨行时按最小对齐重试：首行仍须严格相等；后续行
+    与 src 行一一对应，逐行去掉行首空白后内容必须完全一致——列表/
+    引用等容器的 inline 内容已剥掉 item 内容列缩进，与含原始缩进的
+    span.raw 错位，但行内容不被改写。末行允许其后还有同段正文（去
+    行首空白后为前缀即可）。任何内容差异都返回 None，不放宽比对。
+    """
+    if src.startswith(raw, pos):
+        return len(raw)
+    raw_lines = raw.split("\n")
+    if len(raw_lines) < 2:
+        return None
+    src_pos = pos
+    last = len(raw_lines) - 1
+    for index, raw_line in enumerate(raw_lines):
+        if index:
+            if src_pos >= len(src) or src[src_pos] != "\n":
+                return None
+            src_pos += 1
+            content = raw_line.lstrip(" ")
+            line_end = src.find("\n", src_pos)
+            if line_end == -1:
+                line_end = len(src)
+            line = src[src_pos:line_end]
+            offset = len(line) - len(line.lstrip(" "))
+            src_pos += offset
+            if not line[offset:].startswith(content):
+                return None
+            if index < last and src_pos + len(content) != line_end:
+                # 中间行须整行相等（行一一对应，容器只剥行首缩进）
+                return None
+            src_pos += len(content)
+        else:
+            if not src.startswith(raw_line, src_pos):
+                return None
+            src_pos += len(raw_line)
+    return src_pos - pos
+
+
+def build_markdown(math_sink, chapter_prefix, math_spans, text,
+                   confirmed_math=None, highlight=True, math_decoded=False,
+                   table_math_starts=None):
+    """构造按本章作用域工作的解析器；math_sink 收集公式条目。
+
+    数学识别边界直接消费 `_verification.scan_math` 的共享跨度（与四族
+    译文、拆包、对账同一事实）：不再配置独立数字/空白规则，合法数字
+    邻接公式进入渲染，货币与代码/转义排除由共享扫描裁决。块级规则只
+    认领行首且独占至行尾的块级跨度（公式 DOM 与历史一致）；其余跨度
+    由行内规则按文档顺序以原文切片匹配渲染（markdown-it 的 inline
+    src 是各块 token 的内容子串，偏移非全局，故用有序游标 + raw 前缀
+    匹配，不用全局偏移）。容器（列表/引用等）inline 内容剥掉内容列
+    缩进后与含原始缩进的 raw 错位：严格前缀失败时按行做去行首空白的
+    最小对齐重试（`_aligned_span_length`），行内容仍须完全一致，有序、
+    内容一致语义不变。
+
+    confirmed_math（已确认来源公式 (kind, tex) 有序列表，二期 02-6）
+    提供时，受来源约束的数学节点按原类型与原表达式渲染：只剥离已确认
+    定界包装，不经历史 trim/环境启发式重写；未确认的跨度回退既有分类。
+    """
+    confirmed_cursor = ConfirmedMathCursor(confirmed_math)
+
     def render_math(content, env):
-        latex, mode, original_form = classify_math(
-            content, env.get("display_mode", False)
-        )
+        resolved = confirmed_cursor.resolve(
+            content, env.get("display_mode", False))
+        if resolved is not None:
+            latex, mode, original_form = resolved
+        else:
+            latex, mode, original_form = classify_math(
+                content, env.get("display_mode", False)
+            )
         index = len(math_sink)
         dom_id = "%sm%04d" % (chapter_prefix, index)
         math_sink.append(
@@ -2054,6 +2432,7 @@ def build_markdown(math_sink, chapter_prefix):
                 "mode": mode,
                 "original_form": original_form,
                 "source": content,
+                "markup": env.get("markup", ""),
             }
         )
         tag = "div" if mode == "display" else "span"
@@ -2067,22 +2446,106 @@ def build_markdown(math_sink, chapter_prefix):
             tag,
         )
 
+    spans = list(math_spans) if math_decoded else table_math_spans(math_spans, text, decode_entities=confirmed_math is not None)
+    table_rows = markdown_table_row_lines(text) if table_math_starts is None else ()
+    block_consumed = {span.start for span in spans
+                      if _standalone_block(text, span)}
+    global_by_start = {span.start: span for span in spans
+                       if span.kind == "block"}
+    cursor = {"i": 0}
+
+    def _cursor_span():
+        i = cursor["i"]
+        while i < len(spans) and spans[i].start in block_consumed:
+            i += 1
+        cursor["i"] = i
+        return spans[i] if i < len(spans) else None
+
+    def math_inline_rule(state, silent):
+        if state.env.get("pdf_deep_probe"):
+            # 深层标题探测（split_deep_headings）只关心行内代码：不消费
+            # 公式、不推进游标，避免探测消耗真实解析的跨度序列。
+            return False
+        span = _cursor_span()
+        if span is None:
+            return False
+        consumed = _aligned_span_length(state.src, state.pos, span.raw)
+        in_table=(span.start in table_math_starts if table_math_starts is not None else span.start_line in table_rows)
+        if consumed is None and in_table:
+            consumed = _aligned_span_length(state.src, state.pos, span.raw.replace('\\|', '|'))
+        if consumed is None:
+            return False
+        if not silent:
+            content, display_mode, token_type = _span_token(span)
+            token = state.push(token_type, "math", 0)
+            token.content = content
+            token.markup = span.raw[:1] if span.kind == "inline" \
+                else span.raw[:2]
+            token.meta = {"display_mode": display_mode}
+            if token_type == "math_block":
+                token.block = True
+            cursor["i"] += 1
+        state.pos += consumed
+        return True
+
+    def math_block_rule(state, startLine, endLine, silent):
+        start_pos = state.bMarks[startLine] + state.tShift[startLine]
+        span = global_by_start.get(start_pos)
+        if span is None or span.start not in block_consumed:
+            return False
+        end_line = startLine + state.src[
+            state.bMarks[startLine]:span.end].count("\n")
+        if not silent:
+            content, display_mode, _ = _span_token(span)
+            token = state.push("math_block", "math", 0)
+            token.block = True
+            token.content = content
+            token.markup = span.raw[:2]
+            token.meta = {"display_mode": display_mode}
+            token.map = [startLine, end_line + 1]
+        state.line = end_line + 1
+        return True
+
     markdown = MarkdownIt("commonmark", {"html": False})
     markdown.enable("table")
     markdown.enable("strikethrough")
-    markdown.use(
-        dollarmath_plugin,
-        allow_labels=False,
-        allow_space=False,
-        allow_digits=False,
-        double_inline=False,
-        renderer=render_math,
-    )
-    markdown.use(footnote_plugin)
+    markdown.inline.ruler.before("escape", "math_inline", math_inline_rule)
+    # alt=["paragraph"]：列表项等容器内段落从标记行起吸后续行，块级
+    # 规则须能终止段落认领行首块级公式（严格全局偏移比对不变）
+    markdown.block.ruler.before("fence", "math_block", math_block_rule,
+                                {"alt": ["paragraph"]})
+
+    def render_math_inline(self, tokens, idx, options, env):
+        content = render_math(
+            str(tokens[idx].content).strip(),
+            {"display_mode": bool(
+                (tokens[idx].meta or {}).get("display_mode")),
+             "markup": tokens[idx].markup or "$"})
+        return '<span class="math inline">%s</span>' % content
+
+    def render_math_block(self, tokens, idx, options, env):
+        content = render_math(
+            str(tokens[idx].content).strip(),
+            {"display_mode": bool(
+                (tokens[idx].meta or {}).get("display_mode", True)),
+             "markup": tokens[idx].markup or "$$"})
+        return '<div class="math block">\n%s\n</div>\n' % content
+
+    markdown.add_render_rule("math_inline", render_math_inline)
+    markdown.add_render_rule("math_block", render_math_block)
+    if "[^" in text:
+        from mdit_py_plugins.footnote import footnote_plugin
+        markdown.use(footnote_plugin)
     markdown.core.ruler.before("inline", "pdf_deep_headings", split_deep_headings)
     markdown.inline.ruler.before("html_inline", "pdf_anchor", parse_anchor)
     markdown.add_render_rule("pdf_anchor", render_anchor)
 
+    if not highlight:
+        return markdown, None
+    from pygments import highlight as pygments_highlight
+    from pygments.formatters import HtmlFormatter
+    from pygments.lexers import get_lexer_by_name
+    from pygments.util import ClassNotFound
     formatter = HtmlFormatter(nowrap=False, style="default")
 
     def render_fence(_renderer, tokens, idx, options, env):
@@ -2162,7 +2625,9 @@ def split_deep_headings(state):
                 marker += "X"
             probe = lines.copy()
             probe[number] = marker + line[match.end(1):]
-            tokens = state.md.parseInline("\n".join(probe), {})[0].children or []
+            tokens = state.md.parseInline(
+                "\n".join(probe), {"pdf_deep_probe": True}
+            )[0].children or []
             if any(t.type == "code_inline" and marker in t.content for t in tokens):
                 continue
             headings[number] = match
@@ -2224,6 +2689,50 @@ def github_slug(text):
     return "".join(result)
 
 
+def assign_heading_targets(soup, prefix=""):
+    """PDF 与目录共享的有限标题目标职责，不打印、不处理图片/高亮。"""
+    headings, targets = [], {}
+    slug_seen = {}
+    duplicates = []
+    for tag in soup.find_all(HEADING_TAGS):
+        text = tag.get_text().strip()
+        slug = github_slug(text)
+        count = slug_seen.get(slug, 0)
+        slug_seen[slug] = count + 1
+        alias = slug if count == 0 else "%s-%d" % (slug, count)
+        if count > 0:
+            duplicates.append(text[:60])
+        dom_id = prefix + alias
+        tag["id"] = dom_id
+        source_level = tag.get("data-source-level")
+        headings.append(
+            {
+                "level": int(tag.name[1]),
+                "text": text,
+                "segments": block_text_segments(tag),
+                "slug": alias,
+                "id": dom_id,
+                "source_level": int(source_level) if source_level else None,
+            }
+        )
+        targets[alias] = {"kind": "heading", "level": int(tag.name[1])}
+
+    return headings, targets, duplicates
+
+
+def heading_targets(text):
+    projected, _ = project_management_fields(text)
+    scan = scan_math(projected)
+    if scan.issues:
+        raise ExportError('标题解析存在未解决数学定界')
+    markdown, _ = build_markdown([], '', scan.spans, projected, highlight=False)
+    soup = BeautifulSoup(markdown.render(projected), 'html.parser')
+    anchors = {a['id']: {'kind':'anchor'} for a in soup.find_all('a',id=True,href=False)}
+    headings, targets, _ = assign_heading_targets(soup)
+    anchors.update(targets)
+    return headings, anchors
+
+
 class Chapter:
     def __init__(self, index, source_path):
         self.index = index
@@ -2260,9 +2769,53 @@ class Chapter:
 
 
 def parse_chapter(chapter):
-    """解析单章（经授权投影后的导出视图）并渲染为带前缀的 HTML 片段。"""
-    markdown, formatter = build_markdown(chapter.math, chapter.prefix)
-    raw_html = markdown.render(chapter.projected_text)
+    """解析单章（经授权投影后的导出视图）并渲染为带前缀的 HTML 片段。
+
+    数学定界消费 `_verification.scan_math` 的共享结果：未解决定界
+    （issues）带原位置拒绝导出，合法跨度（含相邻行内与数字邻接）全部
+    进入既有渲染，与四族译文/拆包/对账的结论一致。
+    """
+    table_math_starts=None
+    if getattr(chapter,'pdf_math_confirmed',False):
+        import _pdf_math
+        blocks,scan=_pdf_math.markdown_blocks(chapter.projected_text,chapter.math_scan_context)
+        table_math_starts={span.start for block in blocks if block['role']=='table_region' for span in block['spans']}
+    else:
+        scan = chapter_math_scan(chapter)
+    if scan.issues:
+        raise ExportError(
+            "未解决数学定界，拒绝导出：\n%s"
+            % "\n".join(math_issue_fails(scan.issues, str(chapter.path))))
+    confirmed = getattr(chapter, "math_confirmed", None)
+    if confirmed:
+        # 五轮 F3：确认序列按脚注渲染投影重排后进入游标——插件按首次
+        # 引用序把被引用定义渲染到章末，回调顺序即渲染序；不重排时脚注
+        # 公式错过游标并回退历史分类（丢掉来源约束形态与边界空白）。
+        confirmed = render_ordered_confirmed(
+            chapter.projected_text, confirmed,
+            getattr(chapter, "math_scan_context", None),
+            scan.spans if getattr(chapter,'pdf_math_confirmed',False) else None)
+    render_text=chapter.projected_text
+    render_spans=scan.spans
+    if getattr(chapter,'pdf_math_confirmed',False):
+        from dataclasses import replace
+        protected=list(render_text)
+        for span in scan.spans:
+            protected[span.start:span.end]=re.sub(r'[\r\n]',' ',render_text[span.start:span.end])
+        render_text=''.join(protected)
+        # 只保护CommonMark分块；实际TeX仍取原expr，不把语法缩进送入公式。
+        render_spans=[replace(span,raw=render_text[span.start:span.end],
+                              start_line=render_text.count('\n',0,span.start)+1) for span in scan.spans]
+    markdown, formatter = build_markdown(
+        chapter.math, chapter.prefix, render_spans, render_text,
+        confirmed_math=confirmed,math_decoded=getattr(chapter,'pdf_math_confirmed',False),
+        table_math_starts=table_math_starts)
+    raw_html = markdown.render(render_text)
+    _confirmed = getattr(chapter, "math_confirmed", None)
+    if _confirmed and len(chapter.math) < len(_confirmed):
+        raise ExportError(
+            "来源约束公式未全部落实：成品渲染 %d 条，少于已确认来源 %d 条"
+            % (len(chapter.math), len(_confirmed)))
     soup = BeautifulSoup(raw_html, "html.parser")
     for anchor in soup.find_all("a", id=True, href=False):
         chapter.targets.setdefault(anchor["id"], {"kind": "anchor"})
@@ -2273,30 +2826,8 @@ def parse_chapter(chapter):
         element["id"] = chapter.prefix + element["id"]
 
     # 2) 标题补 slug id；同章重复标题按 GitHub 规则追加 -N 别名并显式报告。
-    slug_seen = {}
-    chapter.slug_duplicates = []
-    for tag in soup.find_all(HEADING_TAGS):
-        text = tag.get_text().strip()
-        slug = github_slug(text)
-        count = slug_seen.get(slug, 0)
-        slug_seen[slug] = count + 1
-        alias = slug if count == 0 else "%s-%d" % (slug, count)
-        if count > 0:
-            chapter.slug_duplicates.append(text[:60])
-        dom_id = chapter.prefix + alias
-        tag["id"] = dom_id
-        source_level = tag.get("data-source-level")
-        chapter.headings.append(
-            {
-                "level": int(tag.name[1]),
-                "text": text,
-                "segments": block_text_segments(tag),
-                "slug": alias,
-                "id": dom_id,
-                "source_level": int(source_level) if source_level else None,
-            }
-        )
-        chapter.targets[alias] = {"kind": "heading", "level": int(tag.name[1])}
+    chapter.headings, heading_table, chapter.slug_duplicates = assign_heading_targets(soup, chapter.prefix)
+    chapter.targets.update(heading_table)
 
     # 3) 脚注目标也注册为可跳转片段（id 已加前缀，注册时用未前缀原名）。
     for element in soup.find_all(id=True):
@@ -2473,6 +3004,8 @@ def strip_translator_notes(chapter, records):
     配对，登记片段取源文原文）。队列耗尽时登记 line=None，由核验侧
     计数对账暴露。
     """
+    projected_notes=getattr(chapter,'pdf_math_note_exclusions',[])
+    records.extend({'input':str(chapter.path),**note} for note in projected_notes)
     queue = None  # translator_note_occurrences 的 [(行号, 片段)]，按源序
     for element in chapter.soup.find_all(
             ["p", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -2499,6 +3032,8 @@ def strip_translator_notes(chapter, records):
             continue
         if queue is None:
             queue = list(translator_note_occurrences(chapter.text))
+            for note in projected_notes:
+                queue.remove((note['line'],note['fragment']))
         edits = []  # (节点, 局部起点, 局部终点)
         for match in TRANSLATOR_NOTE_RE.finditer(joined):
             begin = match.start()
@@ -2531,6 +3066,8 @@ def strip_translator_notes(chapter, records):
             for local_start, local_end in sorted(spans, reverse=True):
                 text = text[:local_start] + text[local_end:]
             node.replace_with(text)
+    current=[note for note in records if note["input"]==str(chapter.path)]
+    records[:]=[note for note in records if note["input"]!=str(chapter.path)]+sorted(current,key=lambda note:note["line"] or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -3127,7 +3664,8 @@ def summarize_inputs(chapters):
 
 
 def candidate_code_check(input_paths, unlink_targets, toc_sections,
-                         candidate_path, view_declaration_path=None):
+                         candidate_path, view_declaration_path=None,
+                         source_adaptation_path=None, readiness_projection=None):
     """对候选 PDF 运行与核验器同一实现的代码检查（设计 §4.9）。
 
     候选完成目录页码收敛后、复制到最终目标前调用：独立重读候选内容
@@ -3141,7 +3679,8 @@ def candidate_code_check(input_paths, unlink_targets, toc_sections,
     failures = []
     chapters = verifier.reparse_inputs(
         list(input_paths), failures, list(unlink_targets), toc_sections,
-        view_declaration_path)
+        view_declaration_path, source_adaptation_path=source_adaptation_path,
+        readiness_projection=readiness_projection)
     pdf = verifier.PdfFacts(candidate_path)
     heading_pages = {}
     verifier.check_headings(chapters, pdf, failures, heading_pages)
@@ -3159,7 +3698,7 @@ def candidate_code_check(input_paths, unlink_targets, toc_sections,
 def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
            toc_sections=False, require_display_map=False,
            provenance_map_path=None, translation_record_path=None,
-           view_declaration_path=None):
+           view_declaration_path=None, source_adaptation_path=None):
     work_dir.mkdir(parents=True, exist_ok=True)
     diagnostics = []
     report = {"diagnostics": diagnostics}
@@ -3184,8 +3723,40 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             return 1
         readiness_projection = readiness.get("identity") or {}
 
+    # 来源依据上下文（二期 02-6）：显式 --source-adaptation 优先（可重复，
+    # 多快照 F7/§7.5）；翻译加导出从 --translation-record 的就绪投影取得
+    # 同一引用（不自动搜索邻近文件）；两者声明不一致即拒绝。装配后受来
+    # 源约束的公式按原类型/原表达式渲染，跨行行内经限定扫描事实识别。
+    adaptation_path = source_adaptation_path
+    declared_paths = []
+    if readiness_projection:
+        for source_info in readiness_projection.get("sources") or []:
+            if source_info.get("source_adaptations"):
+                declared_paths.extend(source_info["source_adaptations"])
+            elif source_info.get("source_adaptation"):
+                declared_paths.append(source_info["source_adaptation"])
+    if adaptation_path is None:
+        adaptation_path = declared_paths or None
+    source_adaptation_info = None
+
     try:
         chapters = load_inputs(paths)
+        if adaptation_path is not None:
+            if source_adaptation_path is not None and readiness_projection:
+                cli_reals = {os.path.realpath(p)
+                             for p in source_adaptation_path}
+                declared_reals = {os.path.realpath(p)
+                                  for p in declared_paths}
+                if cli_reals != declared_reals:
+                    raise ExportError(
+                        "--source-adaptation %s 与验收记录声明的 %s 不符"
+                        % (sorted(source_adaptation_path),
+                           sorted(declared_paths)))
+            apply_paths = adaptation_path \
+                if isinstance(adaptation_path, list) else [adaptation_path]
+            source_adaptation_info = apply_source_math_context(
+                chapters, {"_paths": apply_paths})
+        apply_pdf_math_context(chapters,readiness_projection)
     except ExportError as exc:
         report["status"] = STATUS_MACHINE_FAIL
         report["error"] = str(exc)
@@ -3247,9 +3818,19 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             chapters, list(images_display_paths), diagnostics
         )
     # 先完成全部章节解析，再做链接消解：跨章文件链接与片段链接都依赖
-    # 所有章节的目标映射就绪。
-    for chapter in chapters:
-        parse_chapter(chapter)
+    # 所有章节的目标映射就绪。未解决数学定界（共享扫描 issues）在此
+    # 带原位置失败，不生成候选、不触碰既有成品。
+    try:
+        for chapter in chapters:
+            parse_chapter(chapter)
+    except ExportError as exc:
+        report["status"] = STATUS_MACHINE_FAIL
+        report["error"] = str(exc)
+        (work_dir / REPORT_NAME).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print("FAIL: %s" % exc, file=sys.stderr)
+        return 1
 
     # 中文文档总标题决定（R3/A4/C5）：必须在印刷目录合成与正文事实
     # 收集前投影（印刷目录条目与正文预期使用投影后的可见标题）；
@@ -3601,7 +4182,8 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     # 已有成品保持原样。
     code_gate_failures = candidate_code_check(
         [str(c.path) for c in chapters], unlink_targets, toc_sections,
-        candidate, view_declaration_path)
+        candidate, view_declaration_path,
+        source_adaptation_path=adaptation_path,readiness_projection=readiness_projection)
     hard_failures.extend(code_gate_failures)
     fonts = browser_checks.get("fonts", {}) if browser_checks else {}
     # 正文与代码的 CJK 回退族必须至少一项可用，否则中文会退到不可控字体。
@@ -3682,6 +4264,9 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             ],
         }
     )
+    if source_adaptation_info is not None:
+        # 导出证据记录实际来源依据身份（02-6/02-7：核验按同一引用重读）
+        report["source_adaptation"] = source_adaptation_info
     if translation_record_path:
         # 导出证据记录本次只读就绪身份投影（运行事实；验收记录路径关联）
         report["translation_readiness"] = {
@@ -3851,6 +4436,17 @@ def main(argv=None):
              "摘要漂移、越界、重叠或跨技术正文即在生成候选前失败",
     )
     parser.add_argument(
+        "--source-adaptation",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="LaTeXML 来源依据（version:1/format:latexml）：受来源约束的"
+             "公式按原类型/原表达式渲染（data-tex 保留原文），跨行行内"
+             "经限定扫描事实识别；不自动搜索邻近文件；与 --translation-"
+             "record 声明冲突即拒绝。可重复传入（多快照 F7/§7.5），按给定"
+             "顺序把确认公式拼接成整文序列、扫描上下文取并集",
+    )
+    parser.add_argument(
         "--translation-record",
         default=None,
         metavar="PATH",
@@ -3873,6 +4469,7 @@ def main(argv=None):
             provenance_map_path=args.provenance,
             translation_record_path=args.translation_record,
             view_declaration_path=args.view_declaration,
+            source_adaptation_path=args.source_adaptation,
         )
     except ExportError as exc:
         print("FAIL: %s" % exc, file=sys.stderr)

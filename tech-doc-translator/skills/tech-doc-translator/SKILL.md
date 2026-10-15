@@ -9,7 +9,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 
 ## 何时适用
 
-- 源是 HTML（单页、分页站点均可）；源是文字版 PDF（学术论文等）时先完整读取 `<SKILL目录>/references/pdf_source.md`，按勘察→裁决→物化→独立对账执行。
+- 源是 HTML（单页、分页站点均可）；源是 LaTeXML 生成的快照（如 arXiv HTML）时按 LaTeXML 来源闭环执行，先完整读取 `<SKILL目录>/references/latexml_source.md`；源是文字版 PDF（学术论文等）时先完整读取 `<SKILL目录>/references/pdf_source.md`，按勘察→裁决→物化→独立对账执行。
 - 用户已给出：权威源 URL/文件、欲翻译的范围、交付文件位置、项目术语表（若有）。
 - 单页、分页、数学/深层嵌套参考手册和多页面 API/DSL 均为当前支持的 HTML 源家族；按实际结构选择对应脚本。
 - 已有本 Skill 产出的中文 Markdown，需要导出为单篇 PDF 或按明确顺序合订为一份 PDF；用户仅提供译文时直接进入导出模式，不要求英文源或术语表。
@@ -53,13 +53,13 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 5. **校验**
    - 按源家族运行对应 `verify_*.py`；标题/代码/公式/图片/脚注/强 token 等硬不变量失败时修复后重跑。
    - 代码围栏按出现顺序逐块核对：正文与关闭行和源逐字节一致，开启行围栏字符与长度一致；源已有的语言标签不得改动或删除，源裸围栏可补语言标签。差异诊断包含源/译文件、块序号与行号。
-   - 公式按出现顺序逐项核对类型与原表达式，不做代数等价推断；代码、行内代码、转义美元与普通货币文本不进入公式预期。源译一致的历史数学包装仅作回源告警，新增或变化失败；获准译注公式用 `--approved-extra-math` 按原文表达式逐条豁免，不掩盖源公式遗漏。
-   - 标题按 (层级, 官方原题) 有序对照：中文后缀按边界识别（只允许在原题后附加一个（…）后缀），弯引号等内容性字符不归一化；分页路线的整节降级属已批准装配，由校验器口径描述。脚注以源引用/定义关系为基准（含命名标签），整对删除也会被检出；译文新增脚注仅作回源告警。
-   - 项目强 token 用 `--strong-token` 向四类入口显式传递（可与既有位置参数并存，合并为同一检查口径）；未配置时校验器明示“未检查”，不冒称全部 API 已核对。工作包片段校验用 `--fragment`：仅免除整篇 H1 要求，标题仍与源片段逐项对照（内容、数量、层级与顺序），提供官方清单时再作独立基准对照。
+   - 公式按出现顺序逐项核对类型与原表达式，不做代数等价推断；相邻行内公式分别识别，闭合 `$` 后紧跟数字不影响公式成立；代码、行内代码、转义美元与普通货币文本不进入公式预期；无法判定的数学定界定位上报并阻断分派与完整核验，不因剩余公式数量相等而放行。源译一致的历史数学包装仅作回源告警，新增或变化失败；获准译注公式用 `--approved-extra-math` 按原文表达式逐条豁免，不掩盖源公式遗漏。
+   - 标题按 (层级, 官方原题) 有序对照：中文后缀按边界识别（只允许在原题后附加一个（…）后缀），弯引号等内容性字符不归一化；分页路线的整节降级属已批准装配，由校验器口径描述。四类入口可用 `--official-headings-file <UTF-8 文件>` 提供官方原题（每行一项、忽略空行、行首 `#` 等内容保留，缺文件/空清单/坏编码明确失败），仅与单页逐项官方原题互斥，源路径、强 token、API 页面 TOC 等既有位置参数角色不变；普通段落、列表项、提示框、表格文字与代码注释的行首 `#` 由解析器转义保真，不会变成伪标题。`export_heading_list.py <源.md> <输出>` 可导出围栏感知的标题工作清单，仅供任务准备，不作为官方基准。脚注以源引用/定义关系为基准（含命名标签），整对删除也会被检出；译文新增脚注仅作回源告警。
+   - 项目强 token 用 `--strong-token` 或可重复的 `--strong-token-file <UTF-8 文件>` 向四类入口显式传递（可与既有位置参数并存，合并为同一检查口径）：文件每个非空行一个 token，裁首尾空白，`#` 是数据；缺文件、坏 UTF-8、缺值或显式空 token 失败。重复项只检查一次，空文件不清除其他配置；恢复与合并支持同一参数，包资格按有效集合比较，最终交付仍绑定实际文件依赖。点修饰符（如 `.rn`）与百分号寄存器（如 `%tid`）按完整形态计数，较长标识符与小数不冒充命中；未配置时校验器明示“未检查”，已配置但源中未出现的项同样逐项明示“未检查”，不冒称全部 API 已核对。工作包片段校验用 `--fragment`：仅免除整篇 H1 要求，标题仍与源片段逐项对照（内容、数量、层级与顺序），提供官方清单时再作独立基准对照。
    - 图片按最终 Markdown 路径语境核验：引用必须落在交付根内（默认 Markdown 所在目录，跨章共享资源用 `--delivery-root` 显式指定），不回退 cwd、不接受热链与机器绝对路径；代码围栏内的图片语法与 `[IMG:…]` 示例不计为真实图片。CSS 字符串、注释与 SVG `data-*`/aria 属性中的 url 文本不是资源依赖；依赖识别按 CSS 语法语境进行（样式表、style 声明列表、展示属性值），普通翻译依赖见同目录 requirements.txt。源译图片出现次数对账常开，漏图必 FAIL 且不依赖可选参数开启。实际文件按每次出现判型（PNG/JPEG/GIF/WebP/SVG，空文件与 HTML 伪装拒绝；SVG 须为有效 XML 文档且根元素为 svg，不得含外部网络依赖，href/src、fill/stroke/filter/clip-path/mask/marker 等展示属性与 `<style>` 中的 url(...) 及 @import 导入样式表均须真实存在并落在交付根内，被引用 SVG/CSS 的后续依赖递归核验，循环引用按其实际有效性处理）。完整通过必须建立每次图片出现的来源身份：身份摘要含 SVG/CSS 依赖内容（位图与自包含 SVG 为文件字节 sha256，含依赖文档为递归复合摘要），顶层相同而子资源换图同样 FAIL。身份依据来自 `--image-map`（按出现顺序提供原始快照身份，由源对账独立建立，不从待验译文反推）或可靠的当前源资源推导；既有映射/证据对含依赖 SVG 需按新身份从快照补验重建；两条依据都不可用而译文含图时，校验器明示来源身份未核验并判 FAIL，不判定完整通过。
    - 源家族校验器是完成判定依据；不匹配源模板的通用校验结果只作为需回源定性的告警，不能直接判译文失败。源文原样包含的历史格式异常只有在译文新增或扩大差异时才判 FAIL。
    - 表格、列表和段落等因合法重建产生的计数漂移必须定位到具体小节并解释；计数、多重集或校验脚本 PASS 均不能单独证明无丢失或语义正确。
-   - 结构通过后回源复核数字与单位、否定和条件、指代与交叉引用、术语首现；语义或术语修改后重跑相关结构检查。
+   - 结构通过后回源复核数字与单位、否定和条件、指代与交叉引用、术语首现；语义或术语修改后重跑相关结构检查。数字与单位复核辅助用 `--numeric-review`（可选 `--numeric-policy` 项目约定）显式启用：差异逐项修译或按项目口径登记闭合，包证据与最终交付的消费方式见 `<SKILL目录>/references/numeric_review.md`。
 6. **按交付合同合并**
    - 只合并构成同一目标交付物的工作包或页面；不同完整章节默认独立交付。只有用户或项目交付模板明确要求时，才额外生成跨章节合集。
    - 对需要合并的产物，只做围栏感知的拼接或结构调整，禁止不感知围栏的全局空白压缩；按最终交付路径重新运行全量校验。
@@ -84,10 +84,12 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 | 分页、代码密集型 HTML（多页/多节，需围栏拼接） | `<SKILL目录>/scripts/parse_paginated_html.py page1.html page2.html ...` → `splice_fences.py` → `merge_sections.py` |
 | 数学密集或深层嵌套参考手册 | `<SKILL目录>/scripts/parse_reference_html.py <html> <out.md>` |
 | 多页面 API/DSL 文档 | `<SKILL目录>/scripts/discover_pages.py <site/index.html>` → `parse_api_html.py` → `merge_api.py`；页面清单必须与**独立的官方 TOC/导航快照**逐项对账，manifest 交付顺序按官方 TOC 重排（`discover_pages` 的字典序输出只用于集合发现，不作为交付顺序）；保留图片显示尺寸时用 `merge_api.py --display-src` 自动绑定（契约见 `<SKILL目录>/references/images_display.md`） |
-| 文字版 PDF（正文有可靠文本层；含位图插图仍按文字版判定，素材单列） | 先完整读取 `<SKILL目录>/references/pdf_source.md`；`<SKILL目录>/scripts/prepare_pdf_source.py inspect <pdf> --pages <范围> --output <项目source/>` → 主 Agent 对照原页逐项裁决清单 → `extract-code` / `extract-figures` 提取并回源确认 → `materialize` → `<SKILL目录>/scripts/verify_pdf_source.py --translation <译文.md>` 机器硬检查通过后才交付；机器 PASS 不登记语义复核；不自动 OCR、不自动提取位图/公式，未闭合素材写显式 `[PENDING-*]` 标记 |
+| LaTeXML 快照（arXiv HTML 等；含或不含 MathML） | 先完整读取 `<SKILL目录>/references/latexml_source.md`；`parse_reference_html.py <html> <out.md> --source-adaptation <依据.json> --adaptation-output <候选依据.json>` → 独立对账通过后接入项目 → 按工作包链翻译与复核 → `verify_delivery.py` 当前交付；多快照合并源每份快照各自依据，拆包/恢复/合并/核验/导出重复 `--source-adaptation` 按序传入（单依据用法不变） |
+| 文字版 PDF（正文有可靠文本层；含位图插图仍按文字版判定，素材单列） | 先完整读取 `<SKILL目录>/references/pdf_source.md`；`<SKILL目录>/scripts/prepare_pdf_source.py inspect <pdf> --pages <范围> --output <项目source/>` → 主 Agent 对照原页逐项裁决清单 → `extract-code` / `extract-figures` 提取并回源确认 → `materialize` → `<SKILL目录>/scripts/verify_pdf_source.py --translation <译文.md>` 机器硬检查通过后才交付；机器 PASS 不登记语义复核；不自动 OCR、不自动提取位图或推导 TeX；人工确认数学按 `pdf_source.md` 的 confirmed-tex-v1 合同消费，未闭合素材写显式 `[PENDING-*]` 标记 |
 | 扫描版 PDF | 仅当用户明确要求且使用宿主 OCR 工具 |
 
 工作包编排：
+- 使用强 token 候选、自足任务、逐包证据、官方目录或显式批次辅助前，完整读取 [工作包与交付辅助入口](references/workflow_helpers.md)。它们复用当前来源、计数和资格消费；硬检查只产生待复核，主 Agent 实际逐包回源后登记，合并后仍独立验收成品。
 - 拆分：`<SKILL目录>/scripts/split_work_packages.py <source.md> <wps_dir> <trans_dir> [h2|chars:N]`；`chars:N` 的 N 是目标体量而非硬上限：完整结构优先，单个不可拆块超限时保留整包并报告实际体量与范围。拆分脚本自检包区间无缝且按序还原与源逐字节一致后才可分派；续片正文是真实源切片（不注入重复标题），小节上下文只在 frontmatter（section_id/section_instance/fragment_index/source_line_start-end/fragment_digest）中
 - 合并译文：`<SKILL目录>/scripts/merge_work_packages.py <out.md> <wp_*.md>... --source <source.md> --strategy <h2|chars:N> --source-packages <wps_dir> --review-evidence <evidence.json> [--scope <order_csv>] [--image-map <map.json>] [--delivery-root <dir>]`；必须提供当前源、策略与源包映射重建的全量依据，缺包/重复/额外/异源/错误顺序按原因拒绝，每包 target_file 对照源包权威映射（交换现存目标、指向无关现存文件同样拒绝），逆序实参按源顺序装配；`--review-evidence` 必需，范围内每包须持有与当前源资源、当前文件绑定的有效复核资格，缺失/过期/不匹配/未完成即拒绝，不能因省略参数绕过；显式 `--scope` 才允许局部交付。候选先在最终目录语境通过对照当前源的全量硬检查（含源译图片出现次数对账与每次出现的来源身份核对，身份含 SVG/CSS 依赖内容），写出后再从实际路径复验，失败恢复原成品、不留下声称有效的新成品
 - 合并术语：`<SKILL目录>/scripts/merge_glossary.py <术语表.md> <out.md> <conflicts.md> [--approve 批准词表.txt] [--pending 待定.md] <candidates*.md>`；只有列入批准词表的候选才写入，其余进入待定文件

@@ -1,5 +1,8 @@
 """共享公式扫描与逐项比较的固定语义验收（任务 02：公式内容与顺序）。"""
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -8,6 +11,7 @@ from _verification import (
     compare_math_spans,
     extract_approved_extra_math,
     markdown_table_row_lines,
+    scan_math,
     scan_math_spans,
 )
 
@@ -55,14 +59,21 @@ class ScanMathSpansTest(unittest.TestCase):
 
     def test_currency_heuristics(self):
         text = '共 $100，另收 $200。\n单价 $5 和 $10 均非公式。\n'
-        self.assertEqual(scan_math_spans(text), [])
+        scan = scan_math(text)
+        self.assertEqual(scan.spans, ())
+        self.assertEqual(scan.issues, ())
         # 无闭合美元也不是公式
         self.assertEqual(scan_math_spans('价格 $100\n'), [])
+        self.assertEqual(scan_math('价格 $100\n').issues, ())
 
     def test_inline_math_cannot_span_lines_but_block_can(self):
         text = '$a\nb$ 不是行内公式\n\n$$\nc\nd\n$$\n'
-        spans = scan_math_spans(text)
-        self.assertEqual(kinds(spans), [('block', '\nc\nd\n')])
+        scan = scan_math(text)
+        self.assertEqual(kinds(scan.spans), [('block', '\nc\nd\n')])
+        # 行内不跨行吞入正文：$a 是无法闭合的非货币候选，定位 issue
+        self.assertEqual(len(scan.issues), 1)
+        self.assertEqual(scan.issues[0].raw, '$')
+        self.assertEqual(scan.issues[0].start_line, 1)
 
     def test_backslash_dollar_and_wrapped_inline(self):
         text = r'成本 \$3，历史包装 $\(N\)$ 保持。'
@@ -73,6 +84,205 @@ class ScanMathSpansTest(unittest.TestCase):
         text = '$$x$$ 正文'
         spans = scan_math_spans(text)
         self.assertEqual(kinds(spans), [('block', 'x')])
+
+
+class ScanMathAdjacentInlineTest(unittest.TestCase):
+    """R2/D2：相邻行内公式与数字邻接公式按上下文逐一定界（一期需求 §3.1
+    直接验收样例）；预期值由原输入含义手工写出。"""
+
+    def test_adjacent_sample_four_inlines(self):
+        text = ('gain $x$$\\sim$ noise and more prose here $y$$\\le$ '
+                'bound end')
+        spans = scan_math_spans(text)
+        self.assertEqual(kinds(spans),
+                         [('inline', 'x'), ('inline', '\\sim'),
+                          ('inline', 'y'), ('inline', '\\le')])
+        # 原切片、顺序、行号与偏移可回查；相邻正文不被吞入表达式
+        self.assertEqual(text[spans[0].start:spans[0].end], '$x$')
+        self.assertEqual(text[spans[1].start:spans[1].end], '$\\sim$')
+        self.assertEqual(text[spans[2].start:spans[2].end], '$y$')
+        self.assertEqual(text[spans[3].start:spans[3].end], '$\\le$')
+        self.assertEqual([s.start_line for s in spans], [1, 1, 1, 1])
+        self.assertEqual(text[spans[0].end:spans[1].start], '')
+        self.assertEqual(text[spans[2].end:spans[3].start], '')
+
+    def test_adjacent_sample_digit_neighbors(self):
+        text = 'speedup of 2$\\times$$\\sim$3 over baseline and $a$ ok'
+        spans = scan_math_spans(text)
+        self.assertEqual(kinds(spans),
+                         [('inline', '\\times'), ('inline', '\\sim'),
+                          ('inline', 'a')])
+
+    def test_digit_adjacent_sample_two_inlines(self):
+        # 数字邻接样例：删除或修改任一个必须可定位（比较器反例见下）
+        text = '2$\\times$3 and $\\sim$10'
+        spans = scan_math_spans(text)
+        self.assertEqual(kinds(spans),
+                         [('inline', '\\times'), ('inline', '\\sim')])
+        self.assertEqual(text[spans[0].start:spans[0].end], '$\\times$')
+        self.assertEqual(text[spans[1].start:spans[1].end], '$\\sim$')
+
+    def test_digit_adjacent_damage_counterexamples(self):
+        src = scan_math_spans('2$\\times$3 and $\\sim$10\n')
+        for damaged, why in (
+                ('2$\\times$3 and 10\n', '删除第二个公式'),
+                ('2 3 and $\\sim$10\n', '删除第一个公式'),
+                ('2$\\div$3 and $\\sim$10\n', '等数换内容'),
+                ('$\\sim$10 and 2$\\times$3\n', '换序'),
+                ('2$$\\times$$3 and $\\sim$10\n', '改类型')):
+            doc = scan_math_spans(damaged)
+            diffs, _ = compare_math_spans(src, doc, 'src.md', 'doc.md')
+            self.assertTrue(diffs, '%s 未被检出' % why)
+
+    def test_closing_dollar_followed_by_digit_kept(self):
+        # 闭合 $ 后的数字不再否定公式；也不再需要货币式排除误伤
+        spans = scan_math_spans('$x$5 and $y$')
+        self.assertEqual(kinds(spans), [('inline', 'x'), ('inline', 'y')])
+
+    def test_currency_priority_and_exclusion(self):
+        # 数字开头完整公式优先识别；金额片段不构成公式也不制造 issue
+        text = '成本 $5 + x$ 与 $5$ 是公式；costs $5 and $10 不是。\n'
+        scan = scan_math(text)
+        self.assertEqual(kinds(scan.spans),
+                         [('inline', '5 + x'), ('inline', '5')])
+        self.assertEqual(scan.issues, ())
+        self.assertEqual(scan_math_spans('价格 $100\n'), [])
+        self.assertEqual(scan_math('价格 $100\n').issues, ())
+
+    def test_unresolved_inline_delimiter_located(self):
+        scan = scan_math('前文 $x 后文\n下一行 $ok$\n')
+        self.assertEqual(kinds(scan.spans), [('inline', 'ok')])
+        self.assertEqual(len(scan.issues), 1)
+        issue = scan.issues[0]
+        self.assertEqual(issue.start_line, 1)
+        self.assertEqual(issue.raw, '$')
+
+    def test_unresolved_block_delimiter_located(self):
+        scan = scan_math('$$\n未闭合块级\n')
+        self.assertEqual(scan.spans, ())
+        self.assertEqual(len(scan.issues), 1)
+        self.assertEqual(scan.issues[0].start_line, 1)
+        self.assertEqual(scan.issues[0].raw, '$$')
+
+    def test_unresolved_bracket_block_located(self):
+        scan = scan_math('\\[ 未闭合\n')
+        self.assertEqual(len(scan.issues), 1)
+        self.assertEqual(scan.issues[0].raw, '\\[')
+
+    def test_stray_dollar_not_an_issue(self):
+        # 行尾/空白后的孤立美元（如 shell 提示符）不是数学候选
+        scan = scan_math('$ \n$\nls $ 列目录\n')
+        self.assertEqual(scan.spans, ())
+        self.assertEqual(scan.issues, ())
+
+    def test_projection_matches_full_scan(self):
+        text = 'a $x$ b $$\ny\n$$ c $z\n'
+        scan = scan_math(text)
+        self.assertEqual(scan_math_spans(text), list(scan.spans))
+
+
+class ScanMathDigitLeadingUnclosedTest(unittest.TestCase):
+    """R6/一期设计 D2：数字开头未闭合候选只有能判定为纯金额片段（数字/
+    千分位/小数到空白或行尾）才静默排除；同一行剩余含运算符/孤立单字母
+    等数学特征且无法闭合的，定位 issue（原偏移、行号、定界原文）。预期值
+    由样例含义手工写出。"""
+
+    def test_unclosed_digit_leading_with_operator_located(self):
+        text = '前文 $5 + x 后文\n'
+        scan = scan_math(text)
+        self.assertEqual(scan.spans, ())
+        self.assertEqual(len(scan.issues), 1)
+        issue = scan.issues[0]
+        self.assertEqual(issue.raw, '$')
+        self.assertEqual(issue.start_line, 1)
+        self.assertEqual(text[issue.start:issue.end], '$')
+
+    def test_unclosed_double_dollar_digit_leading_located(self):
+        text = '前文 $$5 + x 后文\n'
+        scan = scan_math(text)
+        self.assertEqual(scan.spans, ())
+        self.assertEqual(len(scan.issues), 1)
+        issue = scan.issues[0]
+        self.assertEqual(issue.raw, '$$')
+        self.assertEqual(issue.start_line, 1)
+
+    def test_pure_currency_fragments_still_excluded(self):
+        for text in ('单个 $100。\n',
+                     '共 $1,000.50，另收 $200\n',
+                     'costs $5 and $10\n',
+                     '价格 $5 元\n',
+                     '价格 $$100\n'):
+            scan = scan_math(text)
+            self.assertEqual(scan.spans, (), text)
+            self.assertEqual(scan.issues, (), text)
+
+    def test_digit_leading_complete_spans_unchanged(self):
+        scan = scan_math('$5 + x$ 与 $5$ 合法\n')
+        self.assertEqual(kinds(scan.spans),
+                         [('inline', '5 + x'), ('inline', '5')])
+        self.assertEqual(scan.issues, ())
+
+
+class VerifyTranslationUnclosedDigitCliTest(unittest.TestCase):
+    """R6 复现链路：源含 `$5 + x` 未闭合片段、译文整段删除时，
+    verify_translation.py 必须 FAIL 并定位到该 issue（静默漏检反例）。"""
+
+    def test_deleted_unclosed_fragment_fails_with_location(self):
+        base = Path(tempfile.mkdtemp(prefix='tdt-r6-'))
+        try:
+            src = base / 'src.md'
+            doc = base / 'doc.md'
+            src.write_text('# 示例\n\n前文 $5 + x 后文。\n', encoding='utf-8')
+            doc.write_text('# 示例\n\n前文 后文。\n', encoding='utf-8')
+            result = subprocess.run(
+                [sys.executable,
+                 str(Path(__file__).resolve().parents[1]
+                     / 'skills/tech-doc-translator/scripts'
+                     / 'verify_translation.py'),
+                 str(doc), str(src)],
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('未解决数学定界', result.stdout)
+            self.assertIn('L3', result.stdout)
+            self.assertIn('$5 + x', src.read_text(encoding='utf-8'))
+        finally:
+            shutil.rmtree(base, True)
+
+
+class ScanMathMaskExclusionTest(unittest.TestCase):
+    """掩蔽保持：长反引号/波浪线围栏、行内代码、转义美元继续排除。"""
+
+    def test_long_backtick_and_tilde_fences_excluded(self):
+        text = ('````\n$$\n````\n\n~~~~\n$\\sim$\n~~~~\n\n`$x$`\n')
+        scan = scan_math(text)
+        self.assertEqual(scan.spans, ())
+        self.assertEqual(scan.issues, ())
+
+    def test_escaped_dollar_not_delimiter(self):
+        scan = scan_math('转义 \\$5 与 \\$x$ 不是公式开头\n')
+        # 第二个 \$ 被掩蔽，其后的 x$ 不构成定界对
+        self.assertEqual(scan.spans, ())
+        self.assertEqual(scan.issues, ())
+
+
+class ScanMathIssueContractTest(unittest.TestCase):
+    """issue 只保存原偏移、行号、定界原文与原因；偏移可回查原输入。"""
+
+    def test_issue_offsets_reference_original_text(self):
+        text = 'aaa $x bbb\n'
+        scan = scan_math(text)
+        issue = scan.issues[0]
+        self.assertEqual(text[issue.start:issue.end], '$')
+        self.assertEqual(issue.start, 4)
+        self.assertEqual(issue.start_line, 1)
+
+    def test_inline_candidate_with_trailing_space_content(self):
+        # '$a $b$'：$a 无法构成完整公式（内容首尾须非空白）→ issue；
+        # $b$ 仍是合法行内公式
+        scan = scan_math('$a $b$\n')
+        self.assertEqual(kinds(scan.spans), [('inline', 'b')])
+        self.assertEqual(len(scan.issues), 1)
+        self.assertEqual(scan.issues[0].start, 0)
 
 
 class CompareMathSpansTest(unittest.TestCase):

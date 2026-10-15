@@ -161,12 +161,7 @@ import split_work_packages as swp
 
 source, trans_dir, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
 names = sys.argv[4:] or None
-base = '../skills/tech-doc-translator/scripts'
-checker = {
-    name: rwp.file_sha256(os.path.join(base, name))
-    for name in ('recover_work_packages.py', '_verification.py',
-                 'split_work_packages.py')
-}
+checker = rwp._script_identity()
 tmp_dir = os.path.dirname(os.path.abspath(out_path))
 with contextlib.redirect_stdout(io.StringIO()):
     expected = swp.split(source, os.path.join(tmp_dir, 'exp_wps'),
@@ -704,7 +699,7 @@ if python3 "$RECOVER" "$TMP/changed_source.md" "$TMP/wps" "$TMP/trans" h2 \
   echo "错误：源变更后仍整体通过"
   exit 1
 fi
-grep -q 'wp_001.md (order=1): 源片段已变化' "$TMP/recover3.txt" \
+grep -Eq 'wp_001.md \(order=1\): (源片段已变化|当前源正文/来源/顺序与旧包不符)' "$TMP/recover3.txt" \
   || { echo "错误：源变更未定位到受影响包"; cat "$TMP/recover3.txt"; exit 1; }
 grep -q '\[PENDING\] wp_002.md' "$TMP/recover3.txt" \
   || { echo "错误：无证据包应为待复核"; cat "$TMP/recover3.txt"; exit 1; }

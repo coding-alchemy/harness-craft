@@ -1232,3 +1232,226 @@ print('A28 四反引号/波浪线围栏回填与预检 PASS')
 PY
 
 echo "==> Ticket 01 回归全部通过"
+
+echo "==> Ticket 04：普通行首 #、表格首格与代码注释分别保真"
+cat > "$TMP/t04.html" <<'HTML'
+<html><body><article>
+<h1>T04 Doc</h1>
+<p># define data structures first</p>
+<p>preprocessor flag with # inline mention</p>
+<table><tr><th>#</th><th>name</th></tr><tr><td>1</td><td>alpha</td></tr></table>
+<pre><code># fenced comment
+x = 1  # inline comment
+</code></pre>
+<p>use <code># inline code</code> here</p>
+<h2>Config | Range</h2>
+<p>cfg text</p>
+<h2># config</h2>
+<p>after comment-named heading</p>
+</article></body></html>
+HTML
+python3 "$PARSE" "$TMP/t04.html" "$TMP/t04_src.md"
+python3 - "$TMP/t04.html" "$TMP/t04_src.md" <<'PY'
+import sys
+sys.path.insert(0, '../skills/tech-doc-translator/scripts')
+from _verification import heading_entries
+from _source_reconcile import reconcile_html_to_markdown
+html = open(sys.argv[1], encoding='utf-8').read()
+md = open(sys.argv[2], encoding='utf-8').read()
+# 普通段落与表格首格只在行首第一个 # 前加反斜线；围栏与行内代码逐字保持
+assert '\\# define data structures first' in md, '普通段落行首 # 未转义'
+assert '\\# | name' in md, '表格首格 # 未转义'
+assert '# fenced comment\nx = 1  # inline comment' in md, '围栏注释被改写'
+assert '`# inline code`' in md, '行内代码被改写'
+# 含管道、与代码注释同名的真实标题保留层级与顺序，不产生伪标题
+assert [t for _, _, t in heading_entries(md)] == [
+    'T04 Doc', 'Config | Range', '# config'], '真实标题层级或顺序异常'
+assert reconcile_html_to_markdown(html, md, 'single') == [], '独立对账误判'
+print('Ticket 04 单页解析保真与独立对账 PASS')
+PY
+
+echo "==> Ticket 04：译文保留转义与真实标题通过核验"
+cat > "$TMP/t04_zh.md" <<'MD'
+# T04 Doc（文档）
+
+\# define data structures first
+
+预处理器标志以及行内 # 提及
+
+| # | 名称 |
+| --- | --- |
+| 1 | alpha |
+
+```
+# fenced comment
+x = 1  # inline comment
+```
+
+使用 `# inline code` 这里
+
+## Config | Range
+
+配置文字
+
+## # config
+
+注释同名标题之后
+MD
+python3 "$VERIFY" "$TMP/t04_zh.md" "$TMP/t04_src.md" \
+  "T04 Doc" "Config | Range" "# config"
+
+echo "==> Ticket 04 失败回归：译文去掉普通段转义产生伪标题必须判 FAIL"
+python3 - "$TMP/t04_zh.md" "$TMP/t04_zh_bad_escape.md" <<'PY'
+import sys
+text = open(sys.argv[1], encoding='utf-8').read()
+open(sys.argv[2], 'w', encoding='utf-8').write(
+    text.replace('\\# define data', '# define data'))
+PY
+if python3 "$VERIFY" "$TMP/t04_zh_bad_escape.md" "$TMP/t04_src.md" \
+  "T04 Doc" "Config | Range" "# config"; then
+  echo "错误：译文伪标题未被检测到"
+  exit 1
+else
+  echo "译文伪标题已正确判 FAIL"
+fi
+
+echo "==> Ticket 04 失败回归：删除/降级含管道真实标题必须判 FAIL"
+grep -v '^## Config | Range$' "$TMP/t04_zh.md" > "$TMP/t04_zh_nohead.md"
+if python3 "$VERIFY" "$TMP/t04_zh_nohead.md" "$TMP/t04_src.md" \
+  "T04 Doc" "Config | Range" "# config"; then
+  echo "错误：译文删除真实标题未被检测到"
+  exit 1
+else
+  echo "译文删除真实标题已正确判 FAIL"
+fi
+sed 's/^## Config | Range$/### Config | Range/' "$TMP/t04_zh.md" \
+  > "$TMP/t04_zh_level.md"
+if python3 "$VERIFY" "$TMP/t04_zh_level.md" "$TMP/t04_src.md" \
+  "T04 Doc" "Config | Range" "# config"; then
+  echo "错误：译文降级真实标题未被检测到"
+  exit 1
+else
+  echo "译文降级真实标题已正确判 FAIL"
+fi
+
+
+echo "==> Ticket 05：官方标题文件与逐项官方原题同结论"
+EXPORT_HEADINGS="../skills/tech-doc-translator/scripts/export_heading_list.py"
+printf '1. Compute Kernel Basics\n\n  1.1. Thread Hierarchy\n\n1.1.1. Memory Model\n' \
+  > "$TMP/official_file.txt"
+python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
+  --official-headings-file "$TMP/official_file.txt" \
+  | grep -q '标题: 与官方清单一致（含顺序） PASS' \
+  || { echo "错误：等价官方标题文件未得到与逐项输入同结论"; exit 1; }
+echo "等价文件（空行忽略、排版空白移除）与逐项官方原题同结论 PASS"
+
+echo "==> Ticket 05：文件与逐项官方原题并用必须拒绝（互斥仅限同角色）"
+if python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
+    "1. Compute Kernel Basics" --official-headings-file "$TMP/official_file.txt" \
+    >"$TMP/oh_mutex.err" 2>&1; then
+  echo "错误：两种同角色官方输入并用未被拒绝"
+  exit 1
+fi
+grep -q '互斥' "$TMP/oh_mutex.err" \
+  || { echo "错误：缺少互斥诊断"; cat "$TMP/oh_mutex.err"; exit 1; }
+echo "两种同角色官方输入并用已正确拒绝"
+
+echo "==> Ticket 05：缺文件/空清单/坏 UTF-8/缺值/重复声明明确失败"
+printf '\n  \n' > "$TMP/oh_empty.txt"
+printf '\xff\xfe bad\n' > "$TMP/oh_bad.txt"
+if python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
+    --official-headings-file "$TMP/oh_absent.txt" >"$TMP/oh_absent.err" 2>&1; then
+  echo "错误：缺文件未失败"; exit 1
+fi
+grep -q '缺失或不可读' "$TMP/oh_absent.err" \
+  || { echo "错误：缺文件诊断缺失"; cat "$TMP/oh_absent.err"; exit 1; }
+if python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
+    --official-headings-file "$TMP/oh_empty.txt" >"$TMP/oh_empty.err" 2>&1; then
+  echo "错误：空清单未失败"; exit 1
+fi
+grep -q '清单为空' "$TMP/oh_empty.err" \
+  || { echo "错误：空清单诊断缺失"; cat "$TMP/oh_empty.err"; exit 1; }
+if python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
+    --official-headings-file "$TMP/oh_bad.txt" >"$TMP/oh_bad.err" 2>&1; then
+  echo "错误：坏 UTF-8 未失败"; exit 1
+fi
+grep -q '不是有效 UTF-8' "$TMP/oh_bad.err" \
+  || { echo "错误：坏 UTF-8 诊断缺失"; cat "$TMP/oh_bad.err"; exit 1; }
+if python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
+    --official-headings-file >"$TMP/oh_noval.err" 2>&1; then
+  echo "错误：选项缺值未失败"; exit 1
+fi
+grep -q '缺值' "$TMP/oh_noval.err" \
+  || { echo "错误：缺值诊断缺失"; cat "$TMP/oh_noval.err"; exit 1; }
+if python3 "$VERIFY" "$TMP/sample_translated.md" "$TMP/sample_source.md" \
+    --official-headings-file "$TMP/official_file.txt" \
+    --official-headings-file "$TMP/official_file.txt" \
+    >"$TMP/oh_dup.err" 2>&1; then
+  echo "错误：重复声明未失败"; exit 1
+fi
+grep -q '重复声明' "$TMP/oh_dup.err" \
+  || { echo "错误：重复声明诊断缺失"; cat "$TMP/oh_dup.err"; exit 1; }
+echo "五类错误输入均明确失败，未降级为未提供基准"
+
+echo "==> Ticket 05：行首 # 原题内容保留；源译同时删真实标题被独立基准发现"
+printf 'T04 Doc\n\nConfig | Range\n# config\n' > "$TMP/oh_t04.txt"
+python3 "$VERIFY" "$TMP/t04_zh.md" "$TMP/t04_src.md" \
+  --official-headings-file "$TMP/oh_t04.txt"
+grep -v '^## # config$' "$TMP/t04_zh.md" > "$TMP/t04_zh_del.md"
+grep -v '^## # config$' "$TMP/t04_src.md" > "$TMP/t04_src_del.md"
+python3 "$VERIFY" "$TMP/t04_zh_del.md" "$TMP/t04_src_del.md" \
+  || { echo "错误：源译同时删标题的无基准对照应通过"; exit 1; }
+if python3 "$VERIFY" "$TMP/t04_zh_del.md" "$TMP/t04_src_del.md" \
+    --official-headings-file "$TMP/oh_t04.txt" >"$TMP/oh_del.err" 2>&1; then
+  echo "错误：独立官方基准未发现源译同时删除的真实标题"
+  exit 1
+fi
+grep -q '与官方清单不一致' "$TMP/oh_del.err" \
+  || { echo "错误：缺少官方清单差异诊断"; cat "$TMP/oh_del.err"; exit 1; }
+echo "行首 # 原题保留；源译同时删除的真实标题被独立官方基准发现"
+
+echo "==> Ticket 05：独立 CLI 相对路径按调用 cwd 解释"
+VERIFY_ABS="$(cd "$(dirname "$VERIFY")" && pwd)/$(basename "$VERIFY")"
+cp "$TMP/official_file.txt" "$TMP/cwd_titles.txt"
+(cd "$TMP" && python3 "$VERIFY_ABS" sample_translated.md sample_source.md \
+    --official-headings-file cwd_titles.txt) \
+  | grep -q '与官方清单一致' \
+  || { echo "错误：独立 CLI 相对路径未按调用 cwd 解释"; exit 1; }
+echo "从其他目录调用，标题文件相对路径按调用 cwd 解释 PASS"
+
+echo "==> Ticket 05：导出围栏感知标题工作清单（不覆盖源、未闭合诊断）"
+cat > "$TMP/worklist_src.md" <<'EOF'
+# 1. Real Heading
+
+````
+# quad backtick fenced comment
+````
+
+~~~text
+# tilde fenced comment
+~~~
+
+## 1.1. Second Heading
+EOF
+SRC_SHA_BEFORE=$(shasum -a 256 "$TMP/worklist_src.md" | cut -d' ' -f1)
+python3 "$EXPORT_HEADINGS" "$TMP/worklist_src.md" "$TMP/worklist.txt"
+printf '1. Real Heading\n1.1. Second Heading\n' > "$TMP/worklist_expected.txt"
+diff -u "$TMP/worklist_expected.txt" "$TMP/worklist.txt" \
+  || { echo "错误：工作清单导出不符"; exit 1; }
+SRC_SHA_AFTER=$(shasum -a 256 "$TMP/worklist_src.md" | cut -d' ' -f1)
+test "$SRC_SHA_BEFORE" = "$SRC_SHA_AFTER" \
+  || { echo "错误：导出改写了源 Markdown"; exit 1; }
+if python3 "$EXPORT_HEADINGS" "$TMP/worklist_src.md" "$TMP/worklist_src.md" \
+    >"$TMP/worklist_over.err" 2>&1; then
+  echo "错误：导出未拒绝覆盖源"; exit 1
+fi
+printf '# 1. A\n\n```\n# hidden\n' > "$TMP/worklist_broken.md"
+if python3 "$EXPORT_HEADINGS" "$TMP/worklist_broken.md" \
+    "$TMP/worklist_broken.txt" >"$TMP/worklist_broken.err" 2>&1; then
+  echo "错误：未闭合围栏导出未失败"; exit 1
+fi
+grep -q '未闭合' "$TMP/worklist_broken.err" \
+  || { echo "错误：未闭合围栏诊断缺失"; cat "$TMP/worklist_broken.err"; exit 1; }
+test ! -e "$TMP/worklist_broken.txt" \
+  || { echo "错误：未闭合围栏仍产出了清单文件"; exit 1; }
+echo "长反引号/波浪线围栏注释不导出；源摘要不变；未闭合围栏明确诊断"

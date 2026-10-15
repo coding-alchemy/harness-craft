@@ -665,6 +665,32 @@ class TocNavigationTests(unittest.TestCase):
         self.assertEqual([(e['level'], e['title']) for e in entries],
                          [(1, '1. 简介'), (2, '1.1. 基础')])
 
+    def test_same_title_distinct_targets_keep_independent_identity(self):
+        chapters = self.build(
+            '[tdt-toc-start]: #\n\n'
+            '- [基础一](a.md#11-基础)\n'
+            '- [基础二](a.md#11-基础-1)\n'
+            '- [再次指向基础二](a.md#11-基础-1)\n\n'
+            '[tdt-toc-end]: #\n', include_b=False, order=('a.md',))
+        path = chapters[1].path
+        path.write_text(A_CHAPTER + '\n## 1.1. 基础\n\n另一目标。\n',
+                        encoding='utf-8')
+        chapters[1] = exporter.Chapter(2, path)
+        exporter.parse_chapter(chapters[1])
+        failures = []
+        derived = verifier.derive_toc_expectations(chapters, True, failures)
+        self.assertEqual([e['title'] for e in derived],
+                         ['1. 简介', '1.1. 基础', '1.1. 基础'])
+        self.assertEqual([e['heading_id'] for e in derived[1:]],
+                         ['ch02-11-基础', 'ch02-11-基础-1'])
+        entries, _ = self.entries(chapters, sections=True)
+        self.assertEqual([e['target'] for e in entries[1:]],
+                         ['ch02-11-基础', 'ch02-11-基础-1'])
+        text = self.soup_text(chapters)
+        self.assertNotIn('tdt-toc-', text)
+        self.assertNotIn('再次指向基础二', text)
+        self.assertEqual(failures, [])
+
     def test_T15_document_order_overrides_filename(self):
         chapters = self.build('- [b 章](b.md)\n- [a 章](a.md)\n',
                               order=('b.md', 'a.md'))

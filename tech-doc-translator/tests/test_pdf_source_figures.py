@@ -12,54 +12,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-try:
-    import pymupdf
-    HAVE_PYMUPDF = True
-except ImportError:
-    try:
-        import fitz as pymupdf
-        HAVE_PYMUPDF = True
-    except ImportError:
-        HAVE_PYMUPDF = False
-
-if not HAVE_PYMUPDF:
-    raise unittest.SkipTest("PyMuPDF 不可用，整组 PDF 源图形测试跳过")
+from pdf_test_support import pymupdf, CHART_A, draw_chart, draw_table
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills/tech-doc-translator/scripts'
 PREPARE = SCRIPTS / 'prepare_pdf_source.py'
 VERIFY = SCRIPTS / 'verify_pdf_source.py'
 
-CHART_A = (40, 40, 220, 190)
 CHART_B = (40, 40, 220, 190)
-
-
-def draw_chart(page, labels, offset=0):
-    """画一个无大面积外框的小矢量图（柱 + 轴 + 标签 + 图例）。"""
-    base = pymupdf.Point(60, 160)
-    for i, label in enumerate(labels[:2]):
-        rect = pymupdf.Rect(base.x + i * 45, base.y - 60 - i * 20 + offset,
-                            base.x + i * 45 + 30, base.y + offset)
-        page.draw_rect(rect, fill=(0.7, 0.7, 0.9))
-        page.insert_text((rect.x0 + 8, base.y + 12 + offset), label,
-                         fontsize=8)
-    page.draw_line(pymupdf.Point(50, base.y + offset),
-                   pymupdf.Point(200, base.y + offset), color=(0,))
-    page.draw_line(pymupdf.Point(50, 70 + offset),
-                   pymupdf.Point(50, base.y + offset), color=(0,))
-    page.insert_text((70, 60 + offset), labels[2], fontsize=8)  # 图例
-    page.insert_text((120, 60 + offset), "Normalized Runtime", fontsize=8)
-
-
-def draw_table(page):
-    """同页表格边框与单元格（不属于任何图）。"""
-    x0, y0 = 260, 60
-    for r in range(4):
-        for c in range(3):
-            rect = pymupdf.Rect(x0 + c * 60, y0 + r * 20,
-                                x0 + (c + 1) * 60, y0 + (r + 1) * 20)
-            page.draw_rect(rect, color=(0,))
-            page.insert_text((rect.x0 + 4, rect.y1 - 6),
-                             "H%d%d" % (r, c), fontsize=8)
 
 
 def build_pdf(path, with_legend=True):

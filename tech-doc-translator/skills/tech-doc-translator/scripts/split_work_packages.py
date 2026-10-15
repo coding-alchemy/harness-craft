@@ -3,6 +3,7 @@
 
 用法：
     python3 split_work_packages.py <source.md> <wps_dir> <trans_dir> [strategy]
+        [--source-adaptation <依据.json> [--source-adaptation <依据.json> ...]]
 
 strategy:
     h2              按 H2 小节切分（默认）
@@ -13,6 +14,9 @@ strategy:
 结构边界与依赖：
     - 代码围栏（含长反引号/波浪线）、行内/块级公式、表格、段落、列表
       （含嵌套子项）、引用、定义与脚注定义均为原子块，切点只落在块间；
+    - 公式覆盖区间由共享 scan_math 一次扫描确认：块级公式跨行覆盖行
+      并入不可拆范围（公式内形似标题/列表/脚注的原文不参与结构识别），
+      候选切点不得落入公式跨度；未解决数学定界阻断拆包，不产生可分派包；
     - 脚注、普通引用链接与引用式图片的定义按引用依赖扩大连续范围，
       跨节依赖合并相邻范围，引用与定义不会被拆进不同包；
     - 图片与其后的图题段落绑定，不在切点两侧分离；
@@ -23,20 +27,32 @@ section_id / fragment_index 基础上补充：strategy / section_instance（同�
 小节按实例区分）/ source_line_start-end / source_char_start-end（包正文
 在源文件中的确切范围，字符区间含首不含尾）/ fragment_digest（包正文
 sha256）/ content_blocks（headings、paragraphs、list_items、tables、
-code_fences 计数）。续片正文是真实源切片，不注入重复标题；小节上下文
-只存在于元数据。
+code_fences 计数）/ source_adaptation（LaTeXML 来源依据引用，仅该来源
+拆包时附加；保留现有 source_char_start/end 与 fragment_digest）。续片
+正文是真实源切片，不注入重复标题；小节上下文只存在于元数据。
+
+--source-adaptation <依据.json>：LaTeXML 来源拆包时显式引用当前来源
+依据；脚本独立重读依据，核对源全文公式与依据绑定（漏参数/不符/未解决
+项不清空拒绝拆包），再按依据声明的原始快照做完整独立对账（身份+摘要+
+全量正文，正文被替换即拒绝，不降级、不抽查），并在每个包 frontmatter
+附加同一引用。可重复传入（多快照 F7/§7.5）：按给定顺序把当前源切片
+（每片行数对得上依据记录的 markdown 范围事实、sha256 证明无缝未漂移；
+覆盖不完整/漂移/顺序错误如实拒绝），逐片对账后合并整文视图；单个用法
+行为不变。多快照时包 frontmatter 以 source_adaptations 列表登记全部
+依据引用。
 
 拆分后脚本自检：包区间无重叠无缺口、按 source_order 还原与源逐字节一致；
 自检失败时不写出任何工作包。源与译文目标必须分离，重复拆包不改写译文。
 """
 import hashlib
 import os
+import json
 import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _verification import fenced_line_numbers
+from _verification import fenced_line_numbers, scan_math
 
 _SKILL_DIR = Path(__file__).resolve().parent.parent
 _RULES_PATH = str(_SKILL_DIR / "references" / "translation_conventions.md")
@@ -77,8 +93,14 @@ class _Unit:
         self.merged_count = merged_count
 
 
-def _parse_blocks(lines, fenced):
-    """把行序列切成原子块，覆盖全部非空行；返回按起点排序的 Block 列表。"""
+def _parse_blocks(lines, fenced, protected=frozenset()):
+    """把行序列切成原子块，覆盖全部非空行；返回按起点排序的 Block 列表。
+
+    protected 为共享公式扫描确认的块级公式覆盖行（1 起）：这些行
+    与围栏同样视为不可拆——整段连续 protected 行合成一个 math_block，
+    段落/脚注定义/块标记/列表不再把它们吸收或跨越，公式内部形似
+    标题/列表/脚注的原文不会被切成切点。
+    """
     blocks = []
     n = len(lines)
     i = 0
@@ -89,6 +111,13 @@ def _parse_blocks(lines, fenced):
             while j < n and (j + 1) in fenced:
                 j += 1
             blocks.append(Block('code_fence', i, j))
+            i = j + 1
+            continue
+        if line_no in protected:
+            j = i
+            while j < n and (j + 1) in protected:
+                j += 1
+            blocks.append(Block('math_block', i, j))
             i = j + 1
             continue
         s = lines[i].strip()
@@ -105,6 +134,7 @@ def _parse_blocks(lines, fenced):
                 nxt = lines[j + 1]
                 if nxt.strip() == '':
                     cont = j + 2 < n and (j + 3) not in fenced and (
+                        (j + 3) not in protected) and (
                         lines[j + 2].startswith('  ')
                         or lines[j + 2].startswith('\t'))
                     if cont:
@@ -122,6 +152,7 @@ def _parse_blocks(lines, fenced):
             j = i
             while (j + 1 < n and lines[j + 1].strip() != ''
                    and (j + 2) not in fenced
+                   and (j + 2) not in protected
                    and not _HEADING_RE.match(lines[j + 1])):
                 j += 1
             blocks.append(Block('block_marker', i, j))
@@ -153,6 +184,8 @@ def _parse_blocks(lines, fenced):
                         j += 2
                         continue
                     break
+                if (j + 2) in protected:
+                    break
                 if _LIST_RE.match(nxt) or nxt.startswith(' ') or nxt.startswith('\t'):
                     j += 1
                     continue
@@ -163,6 +196,7 @@ def _parse_blocks(lines, fenced):
         j = i
         while (j + 1 < n and lines[j + 1].strip() != ''
                and (j + 2) not in fenced
+               and (j + 2) not in protected
                and not _HEADING_RE.match(lines[j + 1])
                and not _LIST_RE.match(lines[j + 1])
                and not _TABLE_RE.match(lines[j + 1].strip())
@@ -282,16 +316,18 @@ def _dependency_units(lines, fenced, seeds):
     return _merge_overlapping(units)
 
 
-def _parse_sections(lines, fenced):
+def _parse_sections(lines, fenced, protected=frozenset()):
     """按真实 H2 小节划分；返回 [(section_id, instance, start, end)]。
 
     start/end 为 0 起含端行号，范围覆盖全部行；导语区仅含 H1 与空白时
     并入第一个 H2 小节，含实质导语时自成 '[top]' 小节；同名小节按
-    instance（1 起）区分。
+    instance（1 起）区分。块级公式覆盖行（protected）内的标题样式
+    行属公式原文，不参与小节切分。
     """
     n = len(lines)
     h2_lines = [p for p in range(n)
-                if (p + 1) not in fenced and _H2_RE.match(lines[p])]
+                if (p + 1) not in fenced and (p + 1) not in protected
+                and _H2_RE.match(lines[p])]
     if not h2_lines:
         title = '[top]'
         for p in range(n):
@@ -333,9 +369,13 @@ def _char_range(lines, start, end):
     return char_start, char_end
 
 
-def _count_units(lines, start, end, fenced):
-    """基于块解析的结构计数（headings/paragraphs/list_items/tables/code_fences）。"""
-    blocks = _parse_blocks(lines, fenced)
+def _count_units(lines, start, end, fenced, protected=frozenset()):
+    """基于块解析的结构计数（headings/paragraphs/list_items/tables/code_fences）。
+
+    块级公式（math_block）属正文内容，计入 paragraphs；围栏计数仍只
+    含真实代码围栏。
+    """
+    blocks = _parse_blocks(lines, fenced, protected)
     counts = {'headings': 0, 'paragraphs': 0, 'list_items': 0,
               'tables': 0, 'code_fences': 0}
     for b in blocks:
@@ -343,7 +383,8 @@ def _count_units(lines, start, end, fenced):
             continue
         if b.kind == 'heading':
             counts['headings'] += 1
-        elif b.kind in ('paragraph', 'figure', 'blockquote', 'block_marker'):
+        elif b.kind in ('paragraph', 'figure', 'blockquote', 'block_marker',
+                        'math_block'):
             counts['paragraphs'] += 1
         elif b.kind == 'table':
             counts['tables'] += 1
@@ -367,15 +408,16 @@ def _count_blocks(lines):
                         fenced_line_numbers(text))
 
 
-def _unit_kind(lines, fenced, unit):
-    blocks = [b for b in _parse_blocks(lines, fenced)
+def _unit_kind(lines, fenced, unit, protected=frozenset()):
+    blocks = [b for b in _parse_blocks(lines, fenced, protected)
               if b.start >= unit.start and b.end <= unit.end]
     if len(blocks) == 1:
         return blocks[0].kind
     return '依赖闭包'
 
 
-def _candidates(lines, fenced, units, strategy, max_chars):
+def _candidates(lines, fenced, units, strategy, max_chars,
+                protected=frozenset()):
     """把每个依赖闭包范围展开为候选包范围 (start, end, fragment_index, over_limit)。"""
     candidates = []
     over_limit_reports = []
@@ -384,7 +426,7 @@ def _candidates(lines, fenced, units, strategy, max_chars):
         if strategy == 'h2' or size <= max_chars:
             candidates.append((unit.start, unit.end, 0, False))
             continue
-        blocks = [b for b in _parse_blocks(lines, fenced)
+        blocks = [b for b in _parse_blocks(lines, fenced, protected)
                   if b.start >= unit.start and b.end <= unit.end]
         groups = _dependency_units(
             lines, fenced, [(b.start, b.end) for b in blocks])
@@ -399,8 +441,8 @@ def _candidates(lines, fenced, units, strategy, max_chars):
             if k + 1 < len(groups):
                 groups[k + 1].start = groups[k].start
                 del groups[k]
-            elif groups:
-                # 末尾孤立标题并入前一组
+            elif k > 0:
+                # 末尾孤立标题有前一组才合并；唯一标题组整体保留
                 groups[k - 1].end = groups[k].end
                 del groups[k]
         for k in range(len(groups) - 1):
@@ -414,7 +456,8 @@ def _candidates(lines, fenced, units, strategy, max_chars):
                 over_limit_reports.append(
                     '行 %d-%d 因单个不可拆块（%s）超限保留整包: 实际 %d 字符（目标 %d）'
                     % (grp.start + 1, grp.end + 1,
-                       _unit_kind(lines, fenced, grp), grp_size, max_chars))
+                       _unit_kind(lines, fenced, grp, protected),
+                       grp_size, max_chars))
                 if current is not None:
                     candidates.append((current[0], current[1],
                                        fragment_index, False))
@@ -437,7 +480,39 @@ def _candidates(lines, fenced, units, strategy, max_chars):
     return candidates, over_limit_reports
 
 
-def split(source_path, out_dir, trans_dir, strategy):
+def full_source_reconcile_admission(payload, source_text):
+    """拆包/恢复/合并准入的完整原始源对账（不降级、不抽查代替全量）。
+
+    以依据声明的原始快照 path 重读原文（缺失/不可读即返回差异），先
+    validate_adaptation 独立核对身份与快照摘要，再 reconcile_latexml_to_
+    markdown 对原始快照与当前源全文做独立全量对账（依据记录实际确认选
+    区 selection，F2/§7.5：按 selected 选区解析后准入只对选区对账；旧
+    依据无 selection 键时回落 None 保持整文行为；表格映射随依据）。
+    返回差异列表（空 = 通过），由调用方按各自契约拒绝。
+    """
+    import _latexml_source as latexml
+    from _source_reconcile import reconcile_latexml_to_markdown
+    snapshot = payload.get('snapshot') or {}
+    snap_path = snapshot.get('path')
+    if not isinstance(snap_path, str) or not snap_path:
+        return ['来源依据缺 snapshot.path，无法定位原始快照做完整对账']
+    try:
+        with open(snap_path, encoding='utf-8') as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return ['原始快照不可读，无法完整对账: %s（%s）' % (snap_path, exc)]
+    problems = latexml.validate_adaptation(
+        payload, raw_html=raw, snapshot_path=snap_path)
+    if problems:
+        return list(problems)
+    selection = payload.get('selection') if 'selection' in payload else None
+    return reconcile_latexml_to_markdown(
+        raw, source_text, selection, payload,
+        table_conversions=payload.get('table_conversions'))
+
+
+def split(source_path, out_dir, trans_dir, strategy,
+          source_adaptation=None, project_context=None):
     if not os.path.isfile(source_path):
         sys.exit('源文件不存在: %s' % source_path)
     if strategy != 'h2' and not strategy.startswith('chars:'):
@@ -460,15 +535,117 @@ def split(source_path, out_dir, trans_dir, strategy):
     if source_abs.startswith(out_abs + os.sep) or source_abs.startswith(trans_abs + os.sep):
         sys.exit('源文件位于输出/译文目录内，可能被覆盖: %s' % source_path)
 
-    doc = open(source_path, encoding='utf-8').read()
+    import _pdf_math
+    doc = _pdf_math.read_document(source_path)
+    if _pdf_math.metadata(doc).get('pdf_formula_contract') and not project_context:
+        sys.exit('PDF确认数学拆包需要显式 --project-context 来源准入，不降级')
+    pdf_view=None
+    if project_context:
+        import recover_work_packages as rwp
+        context=rwp.load_project_context(project_context,source_path)
+        pdf_view=context.get('_pdf_view')
+    source_prefix = ''
+    if pdf_view:
+        head = re.match(r'^---\n.*?\n---\n\n?', doc, re.S)
+        if head:
+            source_prefix, doc = doc[:head.end()], doc[head.end():]
     lines = doc.split('\n')
     fenced = fenced_line_numbers(doc)
 
-    sections = _parse_sections(lines, fenced)
+    adaptation_abs = None
+    scan_context = None
+    if pdf_view:
+        scan_context=_pdf_math.context(pdf_view['checklist'])
+    if source_adaptation:
+        # 当前源预检：独立重读来源依据，公式事实与依据绑定（逐字）；
+        # 未解决项未清空或绑定不符即拒绝，不降级为普通来源拆包。
+        # source_adaptation 为单路径（旧行为）或有序路径列表（多快照
+        # F7/§7.5：接受重复 --source-adaptation，按序切片校验后合并为
+        # 整文视图，单依据用法行为完全不变）。
+        import _latexml_source as latexml
+        adaptation_paths = [source_adaptation] \
+            if isinstance(source_adaptation, str) \
+            else list(source_adaptation)
+        adaptation_abs = [os.path.realpath(p) for p in adaptation_paths]
+        if len(adaptation_abs) == 1:
+            adaptation_abs = adaptation_abs[0]
+        if isinstance(adaptation_abs, str):
+            try:
+                payload = latexml.load_adaptation(adaptation_abs)
+            except ValueError as exc:
+                sys.exit('拆分拒绝: %s' % exc)
+            md_problems = latexml.recorded_markdown_problems(
+                doc, payload, label='来源依据 %s' % adaptation_abs)
+            if md_problems:
+                sys.exit('拆分拒绝: %s' % '；'.join(md_problems))
+            if payload.get('unresolved'):
+                sys.exit('拆分拒绝: 来源依据含未解决项 %s（须主 Agent 回源补齐后'
+                         '重新解析，不产生可分派包）'
+                         % [u.get('node') for u in payload['unresolved']][:5])
+            _spans, bind_problems = latexml.bound_math_spans(
+                doc, payload, full=True, label='当前源')
+            if bind_problems:
+                sys.exit('拆分拒绝: 当前源与来源依据不符（不降级为普通来源）: %s'
+                         % '；'.join(bind_problems[:5]))
+            # 准入追加完整原始源对账（身份+摘要+全量独立对账，不抽查、不降级）：
+            # 普通正文被替换等损伤只在独立对账下可定位，此处须与准入同口径拒绝
+            admission_diffs = full_source_reconcile_admission(payload, doc)
+            if admission_diffs:
+                sys.exit('拆分拒绝: 当前源与原始快照完整对账失败（不降级为普通来'
+                         '源，不产生可分派包）: %s'
+                         % '；'.join(admission_diffs[:5]))
+            # 限定扫描上下文（D2）：已确认多行行内公式的跨行识别贯穿安全切点
+            scan_context = latexml.scan_context_from_payload(payload)
+        else:
+            try:
+                payloads = [latexml.load_adaptation(p)
+                            for p in adaptation_abs]
+            except ValueError as exc:
+                sys.exit('拆分拒绝: %s' % exc)
+            if any(p.get('unresolved') for p in payloads):
+                bad = next(p for p in payloads if p.get('unresolved'))
+                sys.exit('拆分拒绝: 来源依据含未解决项 %s（须主 Agent 回源补齐后'
+                         '重新解析，不产生可分派包）'
+                         % [u.get('node') for u in bad['unresolved']][:5])
+            try:
+                _pieces, payload = latexml.multi_admission_view(
+                    doc, payloads, list(adaptation_abs))
+            except ValueError as exc:
+                sys.exit('拆分拒绝: %s' % exc)
+            _spans, bind_problems = latexml.bound_math_spans(
+                doc, payload, full=True, label='当前源')
+            if bind_problems:
+                sys.exit('拆分拒绝: 当前源与来源依据整文视图不符（不降级为普通'
+                         '来源）: %s' % '；'.join(bind_problems[:5]))
+            scan_context = latexml.scan_context_from_payload(payload)
+
+    # 共享公式事实：未解决定界阻断拆包（不产生可分派包）；块级公式覆盖
+    # 行并入不可拆范围，切点不得落入公式跨度（行内公式单行存在，行粒度
+    # 切点天然不切入；块级公式跨行，其覆盖行受保护）
+    math_scan = scan_math(doc, source_context=scan_context)
+    if math_scan.issues:
+        details = '；'.join('L%d %r（%s）' % (issue.start_line, issue.raw,
+                                            issue.reason)
+                           for issue in math_scan.issues[:5])
+        sys.exit('拆分拒绝: 存在未解决数学定界，不产生可分派包: %s'
+                 % details)
+    protected = set()
+    if pdf_view:
+        for a,z in _pdf_math.dependency_ranges(pdf_view):
+            a-=len(source_prefix);z-=len(source_prefix)
+            protected.update(range(doc.count('\n',0,a)+1,doc.count('\n',0,z-1)+2))
+    for span in math_scan.spans:
+        # 块级公式与已确认多行行内公式（D2）的覆盖行都不可切入；
+        # 单行跨度行粒度切点天然不切入
+        end_line = doc.count('\n', 0, span.end - 1) + 1
+        if end_line > span.start_line:
+            protected.update(range(span.start_line, end_line + 1))
+
+    sections = _parse_sections(lines, fenced, protected)
     units = _dependency_units(lines, fenced,
                               [(s, e) for _, _, s, e in sections])
     candidates, over_limit_reports = _candidates(
-        lines, fenced, units, strategy, max_chars)
+        lines, fenced, units, strategy, max_chars, protected)
 
     # chars 策略下把候选范围按目标体量组包；超限范围独立成包且不再吸收后续内容
     packages = []
@@ -521,11 +698,17 @@ def split(source_path, out_dir, trans_dir, strategy):
         fragment_index = pkg['fragments'][0][0]
         digest = hashlib.sha256(body.encode('utf-8')).hexdigest()
         char_start, char_end = _char_range(lines, start, end)
-        counts = _count_units(lines, start, end, fenced)
+        char_start += len(source_prefix)
+        char_end += len(source_prefix)
+        counts = _count_units(lines, start, end, fenced, protected)
         target_abs = os.path.join(trans_abs, 'wp_%03d.md' % index)
         header = _make_header(source_abs, target_abs, index, strategy, sid,
-                              instance, fragment_index, start, end,
-                              char_start, char_end, digest, counts)
+                              instance, fragment_index,
+                              start + source_prefix.count('\n'), end + source_prefix.count('\n'),
+                              char_start, char_end, digest, counts,
+                              adaptation_abs)
+        if pdf_view:
+            header=header[:-4]+'pdf_formula_contract: '+_pdf_math.CONTRACT+'\nproject_context: '+json.dumps(os.path.realpath(project_context))+'\n---\n'
         path = os.path.join(out_abs, 'wp_%03d.md' % index)
         with open(path, 'w', encoding='utf-8') as f:
             f.write(header)
@@ -540,7 +723,7 @@ def split(source_path, out_dir, trans_dir, strategy):
 
 def _make_header(source_path, target_path, source_order, strategy, section_id,
                  section_instance, fragment_index, line_start, line_end,
-                 char_start, char_end, digest, counts):
+                 char_start, char_end, digest, counts, source_adaptation=None):
     lines = [
         "---",
         "source_file: %s" % source_path,
@@ -562,21 +745,45 @@ def _make_header(source_path, target_path, source_order, strategy, section_id,
         "source_char_start: %d" % char_start,
         "source_char_end: %d" % char_end,
         "fragment_digest: %s" % digest,
-        "---",
-        "",
     ]
+    if isinstance(source_adaptation, list):
+        # 多快照来源（F7/§7.5）：包按序登记全部依据引用（JSON 列表），
+        # 恢复/合并据此核对本次参数集合一致
+        import json as _json
+        lines.append("source_adaptations: %s" % _json.dumps(
+            list(source_adaptation), ensure_ascii=False))
+    elif source_adaptation:
+        # D4：包只附加同一来源依据引用，不复制授权 span 列表
+        lines.append("source_adaptation: %s" % source_adaptation)
+    lines.extend(["---", ""])
     return '\n'.join(lines)
 
 
 def main():
-    if len(sys.argv) < 4 or len(sys.argv) > 5:
+    import recover_work_packages as rwp
+    argv,project_context = rwp.extract_project_context(sys.argv[1:])
+    source_adaptation = []
+    rest = []
+    index = 0
+    while index < len(argv):
+        if argv[index] == '--source-adaptation':
+            if index + 1 >= len(argv):
+                sys.exit('--source-adaptation 需要依据文件路径')
+            source_adaptation.append(argv[index + 1])
+            index += 2
+        else:
+            rest.append(argv[index])
+            index += 1
+    argv = rest
+    if len(argv) < 3 or len(argv) > 4:
         sys.exit(__doc__)
-    source_path = sys.argv[1]
-    out_dir = sys.argv[2]
-    trans_dir = sys.argv[3]
-    strategy = sys.argv[4] if len(sys.argv) > 4 else 'h2'
+    source_path = argv[0]
+    out_dir = argv[1]
+    trans_dir = argv[2]
+    strategy = argv[3] if len(argv) > 3 else 'h2'
 
-    written = split(source_path, out_dir, trans_dir, strategy)
+    written = split(source_path, out_dir, trans_dir, strategy,
+                    source_adaptation or None,project_context)
     for p in written:
         print('  %s' % p)
 
