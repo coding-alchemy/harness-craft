@@ -23,3 +23,7 @@ Harness Craft 是一个 Harness 工具箱，用于沉淀可复用的 Agent Skill
 ### [agent-token-audit](./agent-token-audit/README.md)
 
 V0.3：按任务、会话或整体范围读取 Codex、ZCode 的本地 token 记录，展示输入、输出、缓存、费用估算和来源支持的性能指标。支持 Harness Skill、本地网页与 Python CLI，提供默认官网价格、明确更新、快捷时间范围、按需明细及 Markdown/CSV/JSON 导出；当前限制见模块说明。
+
+### [frontend-design-workflow](./frontend-design-workflow/README.md)
+
+前端设计工作流 Skill，支持已有页面优化、新页面设计、参考截图风格迁移与仅评估，按需读取视觉方法，并将实际使用、能力缺口和结果保存为独立任务记录。也可回顾历史记录，提出建议并关联获授权改进后的结果。完整 Skill 位于 `frontend-design-workflow/skills/frontend-design-workflow/`，可直接读取或完整复制使用。

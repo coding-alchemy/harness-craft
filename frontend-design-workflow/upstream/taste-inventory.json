@@ -1,0 +1,736 @@
+[
+  {
+    "name": "adapt",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "4d8218605f1aa3e5eaecc6ffcd1903a7197c96c59292a4f43f140de117e0237d"
+      }
+    ]
+  },
+  {
+    "name": "animate",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "47d3ccc5399dfdc5bc4f851a681b2d0f128a6e1a86008143f88dd0e3dc44c2fd"
+      }
+    ]
+  },
+  {
+    "name": "audit",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "877a126d91e1f72137ea94309282beca2fc756167aa38d27fd8e8eac70dc79d6"
+      }
+    ]
+  },
+  {
+    "name": "bolder",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "026ce7b1924d8dd7d6040b71b7719f9e466b6a07aea2c68df70e56acaa5a8585"
+      }
+    ]
+  },
+  {
+    "name": "brandkit",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "b0c4837e1bd140ca816ae54948754ddd2ac1e2a4d3619363777a80caf00b2ede"
+      }
+    ]
+  },
+  {
+    "name": "clarify",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "fadbe45be1fdd0920be57def2ea2af2dc4518de3044f94ffd14ff3fca169bec5"
+      }
+    ]
+  },
+  {
+    "name": "colorize",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "2d81a77fac9642dd4f9cf38c800f353b99dd326b31b2aa924d30e4f25f61b027"
+      }
+    ]
+  },
+  {
+    "name": "cosmic-glass-dashboard",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "a19cd5ecdb640157e0d96972bc73e35323be24b7031ecab80ae0ba1ec5bb483c"
+      },
+      {
+        "file": "starter.html",
+        "sha256": "a23129886bc8f6a95c71eb49fbd82745390543959fe844d11ff65f548e7d5637"
+      },
+      {
+        "file": "theme.css",
+        "sha256": "9a0e2e6264be83676e1de713672cde7037bc24aa2a289fccd463d0ee7a54afd2"
+      }
+    ]
+  },
+  {
+    "name": "critique",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "327b96d8032bbe91a726bfe08e5e5b60bcaca7b1142848c12e88a95854cdc392"
+      },
+      {
+        "file": "reference/cognitive-load.md",
+        "sha256": "7653f0a2f60f6d0471581f4b84c24df5408e70f8e2b727a6cdf3872dcf42676f"
+      },
+      {
+        "file": "reference/heuristics-scoring.md",
+        "sha256": "c047724521f6f73e2eecacf62e77498848370a8e4a0b32c900bd87ae9f1134ea"
+      },
+      {
+        "file": "reference/personas.md",
+        "sha256": "9941b4bb0205e295ca2baa470db4b25e835ab090e42eaa502dc2a38edf1835ca"
+      }
+    ]
+  },
+  {
+    "name": "delight",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "e0f4dcd49a0b47042f6cfa85e2e5d4af2612e2cc9dadac1e41ced324acc92af9"
+      }
+    ]
+  },
+  {
+    "name": "design-taste-frontend",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "a23a9e4e74a87e3f458d53cbff60adbc666e7a1e8633d43f9e213111e48f69b0"
+      }
+    ]
+  },
+  {
+    "name": "distill",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "adc707d18ce3a02e31a043426ac414953c3806ca8f13078ef944769ba786a34e"
+      }
+    ]
+  },
+  {
+    "name": "emil-design-eng",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "433b5a239cda18e0576e4e558532e7e53512e21fafe5b85db4894c28ec399b72"
+      }
+    ]
+  },
+  {
+    "name": "full-output-enforcement",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "e5bf48b1ae561511439cf71672209a10a88cee0968cc925909ff861dfa0a96a7"
+      }
+    ]
+  },
+  {
+    "name": "gpt-taste",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "2e64c269953f2656c21bf5a0fa6b4568e82fe0c72b36e8f84758e090349966a5"
+      }
+    ]
+  },
+  {
+    "name": "harden",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "6595a00f6cc66f80fadf840c99a95ce51342588c0a9d1f55fc868ccf51e86575"
+      }
+    ]
+  },
+  {
+    "name": "high-end-visual-design",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "e1e32f5e2d420872c6c7332b53d5ff7721946766b78c4822b424c2d512c8fdbc"
+      }
+    ]
+  },
+  {
+    "name": "image-to-code",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "4c060a8064a8b13380bc2ef3d6e6a1d0b1e316aa093cd9807d0ce9e4eeb037fa"
+      }
+    ]
+  },
+  {
+    "name": "imagegen-frontend-mobile",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "8a33389979f3074fa0926678e266ad2eb9234624472254469fc1ad916b9caa24"
+      }
+    ]
+  },
+  {
+    "name": "imagegen-frontend-web",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "6b5c2256522fdba1e3313eafa3d743b960a7b13ec029d3e6586e04b23327c1f8"
+      }
+    ]
+  },
+  {
+    "name": "impeccable",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "b590bd8b023a71b64550d04da896c63dd99d9658f4584e87244ff47a41784768"
+      },
+      {
+        "file": "reference/adapt.md",
+        "sha256": "82d2dc7fbeb868bec99828f32ba82d90efa0ceaa07dcedca78879b9b6f1da07f"
+      },
+      {
+        "file": "reference/animate.md",
+        "sha256": "9e6f096e50be90b314f33a27b16018d406af1d61b237825580f87b1485e9e1d3"
+      },
+      {
+        "file": "reference/audit.md",
+        "sha256": "3f0c9ad6cc5884574df870d2dc6ad2a20103232d2cea80fb7b1a4b0d441cce62"
+      },
+      {
+        "file": "reference/bolder.md",
+        "sha256": "99f995bdedbc2f2647947b77da772e2cb75e245a20e12164eadc835233ee4bcb"
+      },
+      {
+        "file": "reference/brand.md",
+        "sha256": "838f4faf0aab11b5d8732874d8824da347f1cedb2c45edc226b7282ea3c7c851"
+      },
+      {
+        "file": "reference/clarify.md",
+        "sha256": "7f4141dbb25ba18bc775dd38adb0be1e111290ee7aa4f3cc28a847e438157041"
+      },
+      {
+        "file": "reference/cognitive-load.md",
+        "sha256": "944365dec799c122e89407c56a322a120c2401e27e41d745b57fbfbabe89da42"
+      },
+      {
+        "file": "reference/color-and-contrast.md",
+        "sha256": "87e0e1ee4268839d8eb9a194de6dd66d747c286a56f92a22d6f8266ca13984e6"
+      },
+      {
+        "file": "reference/colorize.md",
+        "sha256": "0abf6fd144dc88f497fee365103c73a40e60b3d12329427689e428a3106b059f"
+      },
+      {
+        "file": "reference/craft.md",
+        "sha256": "5b4741215839d14eaeef688a17330027b28619137203979d77c483f7d0133d27"
+      },
+      {
+        "file": "reference/critique.md",
+        "sha256": "1488a4dce2c36b44bb18e1313395889d25b0947fd2622fccda8c91973ae661bd"
+      },
+      {
+        "file": "reference/delight.md",
+        "sha256": "280ec04d065f9eef99189e76a8a2a343281f4a41d67454dd0c9f985842b05798"
+      },
+      {
+        "file": "reference/distill.md",
+        "sha256": "26331f3afd2d59fc4322f7e2b39544be72749c78aecfe7d1aef48f62eec0c588"
+      },
+      {
+        "file": "reference/document.md",
+        "sha256": "9edeaf75a407538ec2e387db77a53c15e5cd41a4858e008119346145809c86df"
+      },
+      {
+        "file": "reference/extract.md",
+        "sha256": "4d4723d0b76a2153dafd29d54a16311ec5400c76815585a0004dc7c1cf6f692f"
+      },
+      {
+        "file": "reference/harden.md",
+        "sha256": "ba240a70671f7d0bf7ee4893585b5f6b281e98f15a289678be4837bdae2b24c6"
+      },
+      {
+        "file": "reference/heuristics-scoring.md",
+        "sha256": "ab9df337000d79bd44da3ab29d8260a75e1ef3331ba7c2995d580979520a1bb9"
+      },
+      {
+        "file": "reference/interaction-design.md",
+        "sha256": "b11b318017acf39998e092a49b1a38c8fe44d7dd16dfa525d509cda2a25688a3"
+      },
+      {
+        "file": "reference/layout.md",
+        "sha256": "e44625b2e83d20ce80ebb3145d2b325dfdcd2b86db08b91f8392c7e31758b7b7"
+      },
+      {
+        "file": "reference/live.md",
+        "sha256": "aa1e366e1e46e1c5181ad02c88dc70dfebab46f82942f87d48dae39a3d9f9a62"
+      },
+      {
+        "file": "reference/motion-design.md",
+        "sha256": "6c7697aa18887407f168fa72e65265e5d9857bffa8445e74d98ba1344b5e017d"
+      },
+      {
+        "file": "reference/onboard.md",
+        "sha256": "0d871444769f48a86db68b8b480bb6bfa61bef42d3784e65c248d7e5a555a085"
+      },
+      {
+        "file": "reference/optimize.md",
+        "sha256": "ea436784d13616449dc5875f144fc8baeb05101296f16ed6bc1ed3784c7b2332"
+      },
+      {
+        "file": "reference/overdrive.md",
+        "sha256": "70565c33dd51a9cdd5dc6b71874f49f22c384b89576a3752483fe7cb47e28237"
+      },
+      {
+        "file": "reference/personas.md",
+        "sha256": "979c8b812ecab0f9180c244cedcb17a3b840fcf76ee1472fb69ff095b6f58c0d"
+      },
+      {
+        "file": "reference/polish.md",
+        "sha256": "090140e051315e0bb436bb64e44fa18d50ad87ba88cf99f37f7ac0f7d9683842"
+      },
+      {
+        "file": "reference/product.md",
+        "sha256": "e955b22fe8db598899b553e0966f8d736f3885c92711c9759b5f04bbfdb9097b"
+      },
+      {
+        "file": "reference/quieter.md",
+        "sha256": "533c1ff689571fa005574bf7aff836ac42978d111ae38a0cb52a854dff0d4eef"
+      },
+      {
+        "file": "reference/responsive-design.md",
+        "sha256": "fefc1acaf1d293c74374c62c8c75629efa0660387315474d6302dc74b7f3ead0"
+      },
+      {
+        "file": "reference/shape.md",
+        "sha256": "feff21fdacc809af5bb4989ed7e3eed0e6ed4c57cb3b5177c95f2ffc0de8c504"
+      },
+      {
+        "file": "reference/spatial-design.md",
+        "sha256": "6e104d26025d4fba99f7bb538f8479f0d34877ce7cdf94481d08aea6a352bb6b"
+      },
+      {
+        "file": "reference/teach.md",
+        "sha256": "233b8d65758c2b894d386feefc7940019ec65d3ec3b770e4dd3cbd1593540007"
+      },
+      {
+        "file": "reference/typeset.md",
+        "sha256": "e0ae9b846b5d3c0a529ad88257ffb5173057f0941c661c8560bebd1b462521b4"
+      },
+      {
+        "file": "reference/typography.md",
+        "sha256": "d08a05014d5009a5f1cc156236ba64a1d24463bb1e7141bdcca9269139d9ea64"
+      },
+      {
+        "file": "reference/ux-writing.md",
+        "sha256": "20be4fe822a77558e8e169514ac7e6685d51703537b899e262f542fe99ed6af9"
+      },
+      {
+        "file": "scripts/cleanup-deprecated.mjs",
+        "sha256": "5b1a36e3241e14ba8645881e8f07255748ca7f7a158a11e1df99043357a4b6d2"
+      },
+      {
+        "file": "scripts/command-metadata.json",
+        "sha256": "d7167de1e3c242eb3788389f7c856914d05aef8e38271f9fc1aa48005992621a"
+      },
+      {
+        "file": "scripts/design-parser.mjs",
+        "sha256": "6e7b463344cdf59353acaf48f554ac0aad5a0a46cb1237a0d1a697ddc7759eab"
+      },
+      {
+        "file": "scripts/detect-csp.mjs",
+        "sha256": "2d80520bef13cb93107699714bc0d2be5a2787a9aa079ecec91b94508a8125a4"
+      },
+      {
+        "file": "scripts/impeccable-paths.mjs",
+        "sha256": "a76f32f44e5664b4bc2767f71275749f6c9bb4b5a83d674fb349ead5ae9305d4"
+      },
+      {
+        "file": "scripts/is-generated.mjs",
+        "sha256": "ed5b0b00e99ed385db541c7a068cb85f72456a4b6aa7a5460037d24b58bd90cd"
+      },
+      {
+        "file": "scripts/live-accept.mjs",
+        "sha256": "92c0a973866a6c69795713e3562d8b4dcb57db95ab7603edac29cde656cc0a83"
+      },
+      {
+        "file": "scripts/live-browser-session.js",
+        "sha256": "dddcb8b941f7460aa6a134f7d456b1820747172c12e01de36dab3265b1065cff"
+      },
+      {
+        "file": "scripts/live-browser.js",
+        "sha256": "d022aea7a3ec35df374865c3f10b0b722d60aa2dce7442f9664a627250ad68cc"
+      },
+      {
+        "file": "scripts/live-complete.mjs",
+        "sha256": "ada702f177432c9645bf2675b8f69ac5f6be5b63f4540eb161159a247eddd697"
+      },
+      {
+        "file": "scripts/live-completion.mjs",
+        "sha256": "67f11f7823b366946cae6b9b4794dec40199951d3d2bd57af759fd1511030f45"
+      },
+      {
+        "file": "scripts/live-inject.mjs",
+        "sha256": "f4d9dfba7cb9350b5e298c8ed6cb4ee46473483644f873fb87181ea07babf06c"
+      },
+      {
+        "file": "scripts/live-poll.mjs",
+        "sha256": "02910a4d3547ca685198df4940f08f6b69efbcdb7633206c16f256ff54ae478e"
+      },
+      {
+        "file": "scripts/live-resume.mjs",
+        "sha256": "741b6799a406b835ccaffb396d6c12109ee596659eb751d2e8865b4fc5a08e3f"
+      },
+      {
+        "file": "scripts/live-server.mjs",
+        "sha256": "8db37f313b421f1a167e682fba8a64c49dd383bf8fac43da8d9db650efe89c27"
+      },
+      {
+        "file": "scripts/live-session-store.mjs",
+        "sha256": "f3146096b4dfb95ca36a7a669ae9904db83d327da06b9f532ee056d0076fdbac"
+      },
+      {
+        "file": "scripts/live-status.mjs",
+        "sha256": "bb8a936387a53a6c8eee0c5848b5fda9a6ab60098011e110379d2db47529fbc6"
+      },
+      {
+        "file": "scripts/live-wrap.mjs",
+        "sha256": "062bf8ce9f9d5040174e4316189dd5e8b0122757ba755985257cb14b221aba92"
+      },
+      {
+        "file": "scripts/live.mjs",
+        "sha256": "afc30c259057fd96c72b77e165971017348b9837a221701c599c8c1475b632ce"
+      },
+      {
+        "file": "scripts/load-context.mjs",
+        "sha256": "ece13459c80423a8cba49e97419c8bfbb9e0c6cb9ede1bf7ffcebaf11db7bea8"
+      },
+      {
+        "file": "scripts/modern-screenshot.umd.js",
+        "sha256": "bb36665889124a0b6e15f16045265737449c3bdcf2712cdb08af3cfa01563e2b"
+      },
+      {
+        "file": "scripts/pin.mjs",
+        "sha256": "89a7056adfaca280519a1cc679b2e33f083300c3ed02a4fe7c71cf4d8c443bb6"
+      }
+    ]
+  },
+  {
+    "name": "industrial-brutalist-ui",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "fffbaac8597f07679e9d87145533567658aedba3b5eca6f16a7075a333048caa"
+      }
+    ]
+  },
+  {
+    "name": "layout",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "2bc3f90b39c819157756220df92c45e0ead9690a0d49f4087286320aebd46a17"
+      }
+    ]
+  },
+  {
+    "name": "minimalist-ui",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "36bc7328f085405f43b476938e62460fa573bf7e984e949e072bcf014831a44c"
+      }
+    ]
+  },
+  {
+    "name": "optimize",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "02183edcc94de3f0208fd993fc4ac1e328c9f5a65f32a7439c964ea841acd1e0"
+      }
+    ]
+  },
+  {
+    "name": "overdrive",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "3e526b9f6d6814b71f23dd91426e0b7cfa7ae07e5f8e7063dc0ec48acac11a88"
+      }
+    ]
+  },
+  {
+    "name": "polish",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "8d9749d77b82d040ce035b4949ef64c17b86fb56e1970b531c22c087635c40db"
+      }
+    ]
+  },
+  {
+    "name": "quieter",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "7aab720070510182ebc00157f89e02f7fbcc96653a3520d5e172db9d118e0f99"
+      }
+    ]
+  },
+  {
+    "name": "redesign-existing-projects",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "98ad3e5b051bfb71b2795f7e8a6aa0d32b51ee095606c098a4b2822ac07926c9"
+      }
+    ]
+  },
+  {
+    "name": "shape",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "98d07a205316d2f7ab556644446a2de1e609746f75daee5ebca926ecbbe621f6"
+      }
+    ]
+  },
+  {
+    "name": "stitch-design-taste",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "DESIGN.md",
+        "sha256": "0ab6740c4ebb1966dbceddb823a66d4bf027e960efbd73faca56cbf8370ae2ad"
+      },
+      {
+        "file": "SKILL.md",
+        "sha256": "1cd55cf8643f3828bc9a3aaadb5da97ee28f98f745b7071d7e217ffeab92fd2a"
+      }
+    ]
+  },
+  {
+    "name": "typeset",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "5668819ccd89c27b2d6634a674a630beb41357c17b3c4a7e209084efe50170b7"
+      }
+    ]
+  },
+  {
+    "name": "ui-ux-pro-max",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "07b87b8998b51b9c234df031e31aa2a85cf86abeaa05efd984c2f66ca7f06d68"
+      },
+      {
+        "file": "data/charts.csv",
+        "sha256": "b754c0efffcf54cb889114a9314be1d5af6ceebe65c4c436d713b52018e752c9"
+      },
+      {
+        "file": "data/colors.csv",
+        "sha256": "4cc0df2785f340b8bd0ace50bd4068dc13a7c4c6fa4d9d2723271244ce904614"
+      },
+      {
+        "file": "data/icons.csv",
+        "sha256": "351fe61ba45b8146c66de6ea7d67297654639d79a94f537b4d0bad570058c28f"
+      },
+      {
+        "file": "data/landing.csv",
+        "sha256": "010e1e46db271b94e0af6f18973bea86ddba62feeccd62aeeaa6ed40e2ae2db1"
+      },
+      {
+        "file": "data/products.csv",
+        "sha256": "5359e3037dcb84e99c792ea13dd44f5b78ab6a53557afb309cf19140512aaf5b"
+      },
+      {
+        "file": "data/react-performance.csv",
+        "sha256": "904c8afcda229629545912dde0e8ac37503757131f0169f80b016f1f58c4fd3f"
+      },
+      {
+        "file": "data/stacks/astro.csv",
+        "sha256": "ad18dae3ab6d148d37d144592df80dc1825b6c9e86d9d2d68fdda77434206a37"
+      },
+      {
+        "file": "data/stacks/flutter.csv",
+        "sha256": "e470e6bc2bcd8562667cc764d1e1afb0be0a30ca4dc9ec12fa18b19d46f156bd"
+      },
+      {
+        "file": "data/stacks/html-tailwind.csv",
+        "sha256": "1f004891dd189f6bc2a7717401e3100244326e7e2f3963a79bf7b2349d85e091"
+      },
+      {
+        "file": "data/stacks/jetpack-compose.csv",
+        "sha256": "6c8fd4b0391c342c12b0af15610cd5becbeccaef0bbe8dcfc01d928c3195d93e"
+      },
+      {
+        "file": "data/stacks/nextjs.csv",
+        "sha256": "06a8e8c13bd44696c6ebb4cb6c4d8dea440e3de8cce77616512529ed29258f0c"
+      },
+      {
+        "file": "data/stacks/nuxt-ui.csv",
+        "sha256": "05d6e74501b2b6a636faed32450622759f49a5bcafad971f5f4e7eba0eb7be71"
+      },
+      {
+        "file": "data/stacks/nuxtjs.csv",
+        "sha256": "f7a3f2d9542856d00199f85c6c023b7c284cc698e2e6e12d61afce2edacb24d6"
+      },
+      {
+        "file": "data/stacks/react-native.csv",
+        "sha256": "a08ca77fcf6b6d9531982dce465366296013bfcf12d2938ac72ad57cf0c4f085"
+      },
+      {
+        "file": "data/stacks/react.csv",
+        "sha256": "b6e3eb0e4c9c01bd00ffb951d5ca224a19d488b4544c75436f48cf92ff12bf45"
+      },
+      {
+        "file": "data/stacks/shadcn.csv",
+        "sha256": "395c2e415ef6f48a474acccdc8eb2c7258a6ed751a5037ba171a2d8823e02ded"
+      },
+      {
+        "file": "data/stacks/svelte.csv",
+        "sha256": "bc8d158994a8bdf412830a9dd5e5a5534edd2f367a6e50e0ebd4d76f592dfa3f"
+      },
+      {
+        "file": "data/stacks/swiftui.csv",
+        "sha256": "e87cb9eee208bb753bdab96d4a261c7f830c4317ee90ec098316b248fc32be85"
+      },
+      {
+        "file": "data/stacks/vue.csv",
+        "sha256": "9b793c3f4eec85f77a758c09322f2b62f3b3ca549bb713ccf0849ef885934395"
+      },
+      {
+        "file": "data/styles.csv",
+        "sha256": "ad3c3236134d833bda01a2faf31ddeaaa1dbd5005fa430dec571fa91b26e5fea"
+      },
+      {
+        "file": "data/typography.csv",
+        "sha256": "64695e05ac335ba534aff396c4ba9241c642f80ea53b424251d2669b71c4772b"
+      },
+      {
+        "file": "data/ui-reasoning.csv",
+        "sha256": "58fc52fff69f62709f8c7dd460de6f6693699ea820f24287f3301a427c2b554e"
+      },
+      {
+        "file": "data/ux-guidelines.csv",
+        "sha256": "1870ee048f2a2bdd60709f8f7adf7f3b6dcad560bc005c8b2915a8ac8639820d"
+      },
+      {
+        "file": "data/web-interface.csv",
+        "sha256": "10bfc24e09a6a15db8309e6ef9b6881e1d4af97dffb7c99418aefb8e30df7d54"
+      },
+      {
+        "file": "scripts/core.py",
+        "sha256": "5459d1f04eea03dfb913742d0c03edc5065ac67f6227e4807fa87699662588cb"
+      },
+      {
+        "file": "scripts/design_system.py",
+        "sha256": "4da1d341f3c7749df51b51db4a543a48a427c3c746eb0e9882a1ab86acf3bb54"
+      },
+      {
+        "file": "scripts/search.py",
+        "sha256": "a449e57060ef5134e98e62fd11f6e240153afd68c27dab89cbb72a3ce55f1498"
+      }
+    ]
+  },
+  {
+    "name": "website",
+    "commit": "acbb3e9c9051e096cb9e5e5cc1af88d56bc05459",
+    "acquired": "2026-10-16",
+    "files": [
+      {
+        "file": "SKILL.md",
+        "sha256": "32017325bcaa2f7f1f3398ad32b6fdf1170a9d36b212a4d6b282fb169fb878e3"
+      }
+    ]
+  }
+]
