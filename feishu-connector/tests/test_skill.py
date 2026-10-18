@@ -9,6 +9,36 @@ class SkillContractTests(unittest.TestCase):
             / "skills" / "feishu-notify" / "SKILL.md"
         ).read_text(encoding="utf-8")
 
+    def test_codex_preparation_precedes_shared_send_contract(self):
+        preparation = self.skill.split("## Codex 对话级准备", 1)[1].split("## 调用合同", 1)[0]
+        for required in (
+            "仅 Codex", "其他 Harness 保持现有 argv/stdin", "不新增首次测试",
+            "不启动、恢复或继续任务", "规则本身不授权前置测试卡片",
+            "已发送但待确认则继续等待，不重发", "先暂停后续执行",
+            "收件确认不批准需求、设计或执行计划", "Approve for me",
+            'approvals_reviewer = "auto_review"', "信息不足只询问缺项",
+            "选择前不发送测试", "当前环境不可用", "不建议新的持久 `prefix_rule`",
+            "用户明确确认真实收件并认可该固定目标", "本对话飞书测试已确认",
+            "新对话（包括分叉）重新测试", "恢复同一对话可复用其明确记录",
+            "归属不明时不能推定已确认", "清除本对话确认",
+            "不为此重复收件测试", "不自动再次发起", "目标归属证据不足",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, preparation)
+
+    def test_codex_test_card_uses_existing_explicit_task(self):
+        import json
+        preparation = self.skill.split("## Codex 对话级准备", 1)[1].split("## 调用合同", 1)[0]
+        payload = json.loads(preparation.split("```json", 1)[1].split("```", 1)[0])
+        self.assertEqual(payload, {
+            "flow": "task", "status": "success", "project": "Codex",
+            "conversation": "飞书通知测试",
+            "content": "这是当前 Codex 对话的飞书通知测试。请回到本对话确认已收到，并认可当前配置的固定接收人用于本次请求的通知。",
+        })
+        self.assertIn("测试卡片不代替原消息或任务终态通知", preparation)
+        self.assertIn("投递状态不明时明确报告状态不明", self.skill)
+        self.assertNotIn("并触发新的审批", self.skill)
+
     def test_uses_bundled_entry_script(self):
         self.assertIn("scripts/feishu_notify.py", self.skill)
 
@@ -255,7 +285,7 @@ class SkillContractTests(unittest.TestCase):
                 with self.subTest(document=document, required=required):
                     self.assertIn(required, text)
 
-    def test_readme_v14_summary_states_task_and_permission_contract(self):
+    def test_readme_current_version_summary_states_task_and_permission_contract(self):
         root = Path(__file__).resolve().parents[1]
         readme = (root / "README.md").read_text(encoding="utf-8")
         current_version = readme.split("## 当前版本", 1)[1].split(
@@ -272,7 +302,7 @@ class SkillContractTests(unittest.TestCase):
             "`config` 等离线诊断仍可在沙箱内执行。"
         )
 
-        self.assertIn("**V1.4**", current_version)
+        self.assertIn("**V1.5**", current_version)
         self.assertIn(task_summary, current_version)
         self.assertIn(expected_summary, current_version)
 

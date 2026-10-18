@@ -64,6 +64,14 @@ chmod 600 ~/.config/feishu-connector/config.json
 
 项目 JSON **禁止**包含 `appSecret`。配置优先级为环境变量 > 项目 JSON > 全局 JSON。
 
+## Codex 离席通知的额外条件
+
+取得 Open ID 只完成飞书目标配置，不代表 Codex 已验证该目标归属，也不授予无人值守外发权限。V1.5 已实现仅限 Codex 的首次测试与确认；配置继续只使用现有 `recipient.openId`，不要添加未知字段，严格配置校验会拒绝它们。
+
+已批准的[无人值守授权设计](../specs/2026-08-30-feishu-unattended-notification-authorization-design.md)为 Codex 复用 Auto-review，并保留每对话首次真实收件确认；其他 Harness 保持当前已实现行为，不新增首次测试。首次流程不再要求切到人工审批或保存命令前缀，同对话确认后不重复测试，新对话与分叉重新测试，恢复同一对话可复用明确记录；行为以源 Skill 为准，首次及三种离席终态已获真实回执；新对话、分叉与同对话恢复已核对；其余指令分支经无网络模拟核对，实际上下文压缩后的确认保留仍未实测。
+
+安装器和连接器不会自动修改 Codex policy、命令规则、网络 allowlist 或组织配置。固定接收人配置在同一对话期间须保持不变；修改接收人后应明确要求重新测试。Auto-review 不授予网络权限，也不保证后续调用通过；当前环境是否可离席使用，需要按设计完成真实链路验收。参见 [OpenAI Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review)。
+
 ## 常见问题
 
 - 找不到目标用户或查询缺少权限：确认已申请 `contact:user.id:readonly`、数据权限覆盖目标用户，并在 API 调试台中选择了同一个企业自建应用；变更后需发布应用版本。

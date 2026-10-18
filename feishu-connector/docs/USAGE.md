@@ -2,6 +2,8 @@
 
 本连接器向一个已配置 Open ID 发送消息：显式 `send` 为纯文本，`rich` 为通用 Markdown 卡片，`task` 为自包含 interactive Markdown 任务卡片。直接 argv 与非 Codex stdin 兼容，Codex Shell 发送使用审批可见命令。运行时仅需 Python 3.9+。
 
+> **当前限制：** V1.5 已提供 Codex 对话级首次收件测试与确认。安装、首次及三种离席终态、新对话、分叉和同对话恢复已核对；实际上下文压缩后的确认保留仍未实测。Auto-review 若因接收人归属或具体 payload 授权不足而拒绝，消息不会发送；重新安装 Skill、压缩正文或重试不能替代目标授权。
+
 ## 安装和最小配置
 
 ```bash
@@ -62,11 +64,19 @@ python3 "$ENTRY" task --auto --status confirm --project "HETU" --conversation "�
 
 Codex 先在网络隔离沙箱中把现有四种白名单 JSON 写入 `prepare-shell` 的 stdin，取得完整命令；只移除 stdout 最后的一个换行，再把其余命令原样作为设置 `sandbox_permissions=require_escalated` 的真实发送调用。真实审批命令因此包含消息类型和全部动态字段，不再使用审批后才写入正文的 `stdin` 发送路径。
 
+`prepare-shell` 成功只证明命令可安全展示，不证明接收人已经获得用户或组织授权，也不保证 Auto-review 会批准。当前版本不能把“执行完飞书通知我”视为可验证的离席送达承诺。
+
 该路径要求 POSIX 操作系统和 POSIX Shell，已在 macOS/Linux 验证；PowerShell 与 `cmd.exe` 不受支持。生成的完整命令按 UTF-8 计上限为 96 KiB（98,304 字节），包含解释器和入口路径、选项和引用开销，以及项目根与动态字段，不是正文字数限制。超限、平台不支持、准备失败、命令无法提交或审批拒绝时均不发送、不截断、不拆分、不回退 stdin、文件或环境变量；仅满足上述一次隐私脱敏重写条件时，才可重新准备并重新申请审批。
 
 ### 非 Codex stdin 兼容入口
 
 不存在审批前 payload 可见性要求的非 Codex 环境仍可使用现有 `stdin` 四种白名单；该兼容入口不得用于 Codex 的真实发送。
+
+## 离席无人值守通知
+
+V1.5 已落实[无人值守授权设计](../specs/2026-08-30-feishu-unattended-notification-authorization-design.md)：仅 Codex 在已授权任务要求通知或直接指定消息时，先核实 Auto-review，再发一次固定测试卡片。用户确认真实收件并认可固定接收人后才开始或继续原任务；未确认时等待，再次要求通知也不重发。同对话确认后不重复测试，新对话与分叉重测，恢复同一对话可复用明确记录；用户声明接收人变更时重新测试。其他 Harness 保持现有行为，不新增首次测试。仓库自动通知仍用 `task --auto`，不插入测试。[执行计划](../specs/plans/feishu-unattended-notification-authorization/README.md)跟踪剩余验收：安装及首次、三种离席终态已核对，新对话、分叉与同对话恢复已核对；其余指令分支经无网络模拟核对，实际上下文压缩后的确认保留仍未实测。完整路由与失败处理以源 Skill 为准。
+
+通知请求不构成原任务的执行授权；没有正在执行的任务时，按仓库规则只通知前一任务当前状态。首次测试也不授予未来正文的审批豁免。安装器不改写 Codex policy、规则或网络权限；休眠、进程退出、断网和后续审批拒绝仍可能使通知无法送达。
 
 ## 自动通知与验证
 
