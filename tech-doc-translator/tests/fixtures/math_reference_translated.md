@@ -24,8 +24,8 @@ __global__ void kernel(int* a) {
 
 | Parameter | Meaning |
 | --- | --- |
-| alpha | 缩放因子 |
-| beta | 偏置项 |
+| `alpha` | 缩放因子 |
+| `beta` | 偏置项 |
 
 ##### 1.1.1.1.1. Deep Notes（深层注释）
 

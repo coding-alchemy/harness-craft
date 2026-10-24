@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 
 from _verification import check_image_file
+from _pdf_dependencies import require_module
 
 
 # 初始告警阈值：保守工程提示值，不是 Chromium 内存上限。
@@ -53,10 +54,7 @@ def bitmap_facts(path):
     if not ok:
         return "unknown", None, None, False
     if kind in ("PNG", "JPEG", "GIF", "WEBP"):
-        try:
-            from PIL import Image
-        except ImportError:
-            return kind, None, None, False
+        Image = require_module('PIL.Image', 'requirements.txt')
         try:
             image = Image.open(path)
         except Exception:  # noqa: BLE001

@@ -121,6 +121,35 @@ class RecoveryTest(unittest.TestCase):
         self.assertEqual(len(reusable), 2)
         self.assertEqual(pending, [])
 
+    def test_table_checker_change_requires_real_rereview(self):
+        evidence = self._evidence(['wp_001.md', 'wp_002.md'])
+        evidence['wp_001.md']['checker']['_source_reconcile.py'] = '0' * 64
+        reusable, missing, invalidated, pending, _ = self.run_recover(evidence)
+        self.assertEqual([p['name'] for p in reusable], ['wp_002.md'])
+        self.assertEqual([p['name'] for p in pending], ['wp_001.md'])
+        self.assertIn('校验脚本身份', pending[0]['reason'])
+
+    def test_table_damage_cannot_reuse_current_evidence(self):
+        source = Path(self.tmp) / 'table-source.md'
+        source.write_text('# T\n\n[TABLE]\nH | Value\n--- | ---\nA | `x`\nB | `y`\n')
+        packs = Path(self.tmp) / 'table-wps'
+        targets = Path(self.tmp) / 'table-trans'
+        paths = swp.split(str(source), str(packs), str(targets), 'h2')
+        meta, body = self._front(paths[0])
+        doc = '# T\n\n| H | Value |\n|---|---|\n| A | `x` |\n| B | `y` |\n'
+        Path(meta['target_file']).write_text(doc.replace('| B | `y` |\n', ''))
+        # 即便伪造当前摘要与 done，也必须真实执行逐格检查。
+        entry = {'source_digest': meta['fragment_digest'],
+                 'target_digest': recover._sha256(Path(meta['target_file']).read_text()),
+                 'resource_digests': [], 'source_resource_digests': [],
+                 'checker': recover._script_identity(), 'strong_tokens': [],
+                 'review': {'semantic': 'done', 'unresolved': []}}
+        evidence = self._write_evidence({Path(paths[0]).name: entry})
+        reusable, _, invalidated, _, _ = recover.recover(
+            str(source), str(packs), str(targets), 'h2', evidence, [], [])
+        self.assertEqual(reusable, [])
+        self.assertTrue(any('行数或列位不一致' in item['reason'] for item in invalidated), invalidated)
+
     def test_source_change_invalidates_only_affected_package(self):
         # A3：源数字 32→64
         with open(self.src, 'w', encoding='utf-8') as f:

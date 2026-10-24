@@ -23,7 +23,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 
 ## 依赖
 
-`<SKILL目录>` 指本 `SKILL.md` 所在目录；本文的脚本、翻译约定、共享词库和依赖声明都通过 `<SKILL目录>` 内路径定位，不依赖仓库层级。脚本依赖 `beautifulsoup4`、`tinycss2` 与 `markdown-it-py`（表格块按实际渲染语义核验），按 `requirements.txt` 用目标解释器安装：`python3 -m pip install -r <SKILL目录>/requirements.txt`（`python -m pip` 与运行解释器保持一致，不直接用 `pip`）。兼容环境为 Python >=3.10（`tinycss2` 1.5.x 包元数据要求，已在 Python 3.12 验证）。PDF 导出模式按需安装 `<SKILL目录>/requirements-pdf.txt`，普通翻译不安装。PDF 源处理按需安装 `<SKILL目录>/requirements-pdf-source.txt`（普通 HTML 翻译与 PDF 导出均不安装），工作流、坐标口径、清单 schema 与依赖探测见 `<SKILL目录>/references/pdf_source.md`。
+`<SKILL目录>` 指本 `SKILL.md` 所在目录；本文的脚本、翻译约定、共享词库和依赖声明都通过 `<SKILL目录>` 内路径定位，不依赖仓库层级。先以 `python3 -m venv <工作区外环境>` 创建独立环境，再用 `<环境>/bin/python -m pip install -r <SKILL目录>/requirements.txt` 安装普通翻译依赖，并用同一解释器运行脚本。依赖包括 `beautifulsoup4`、`tinycss2`、Pillow 与 `markdown-it-py`（表格块按实际渲染语义核验）。兼容环境为 Python >=3.10，已在 Python 3.12 验证。PDF 导出按需追加 `requirements-pdf.txt` 及浏览器，隔离安装与依赖预检见 [PDF 环境说明](references/pdf_export.md#依赖与环境)，普通翻译不安装。PDF 源处理按需追加 `requirements-pdf-source.txt`（普通 HTML 翻译与 PDF 导出均不安装），工作流、坐标口径、清单 schema 与依赖探测见 `<SKILL目录>/references/pdf_source.md`。
 
 ## 已有 Markdown 的 PDF 导出
 
@@ -62,6 +62,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
    - 结构通过后回源复核数字与单位、否定和条件、指代与交叉引用、术语首现；语义或术语修改后重跑相关结构检查。数字与单位复核辅助用 `--numeric-review`（可选 `--numeric-policy` 项目约定）显式启用：差异逐项修译或按项目口径登记闭合，包证据与最终交付的消费方式见 `<SKILL目录>/references/numeric_review.md`。
 6. **按交付合同合并**
    - 只合并构成同一目标交付物的工作包或页面；不同完整章节默认独立交付。只有用户或项目交付模板明确要求时，才额外生成跨章节合集。
+   - 含格内围栏代码的中间工作包显式用 `--table-code-stage intermediate` 保留并核验坐标标记；经当前复核后由合并入口 `--finalize-table-code` 转为可读格位说明。最终家族核验和 PDF 均使用最终规则；阶段、任务及恢复合同见 [工作包辅助入口](references/workflow_helpers.md#待复核逐包登记与实际消费)。
    - 对需要合并的产物，只做围栏感知的拼接或结构调整，禁止不感知围栏的全局空白压缩；按最终交付路径重新运行全量校验。
 7. **术语合并与交付**
    - 主 Agent 逐条裁决候选术语后集中写入 `术语表.md` 与最终文件；未经裁决的候选不得自动入库。
@@ -91,7 +92,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 工作包编排：
 - 使用强 token 候选、自足任务、逐包证据、官方目录或显式批次辅助前，完整读取 [工作包与交付辅助入口](references/workflow_helpers.md)。它们复用当前来源、计数和资格消费；硬检查只产生待复核，主 Agent 实际逐包回源后登记，合并后仍独立验收成品。
 - 拆分：`<SKILL目录>/scripts/split_work_packages.py <source.md> <wps_dir> <trans_dir> [h2|chars:N]`；`chars:N` 的 N 是目标体量而非硬上限：完整结构优先，单个不可拆块超限时保留整包并报告实际体量与范围。拆分脚本自检包区间无缝且按序还原与源逐字节一致后才可分派；续片正文是真实源切片（不注入重复标题），小节上下文只在 frontmatter（section_id/section_instance/fragment_index/source_line_start-end/fragment_digest）中
-- 合并译文：`<SKILL目录>/scripts/merge_work_packages.py <out.md> <wp_*.md>... --source <source.md> --strategy <h2|chars:N> --source-packages <wps_dir> --review-evidence <evidence.json> [--scope <order_csv>] [--image-map <map.json>] [--delivery-root <dir>]`；必须提供当前源、策略与源包映射重建的全量依据，缺包/重复/额外/异源/错误顺序按原因拒绝，每包 target_file 对照源包权威映射（交换现存目标、指向无关现存文件同样拒绝），逆序实参按源顺序装配；`--review-evidence` 必需，范围内每包须持有与当前源资源、当前文件绑定的有效复核资格，缺失/过期/不匹配/未完成即拒绝，不能因省略参数绕过；显式 `--scope` 才允许局部交付。候选先在最终目录语境通过对照当前源的全量硬检查（含源译图片出现次数对账与每次出现的来源身份核对，身份含 SVG/CSS 依赖内容），写出后再从实际路径复验，失败恢复原成品、不留下声称有效的新成品
+- 合并译文：`<SKILL目录>/scripts/merge_work_packages.py <out.md> <wp_*.md>... --source <source.md> --strategy <h2|chars:N> --source-packages <wps_dir> --review-evidence <evidence.json> [--scope <order_csv>] [--image-map <map.json>] [--delivery-root <dir>]`；必须提供当前源、策略与源包映射重建的全量依据，缺包/重复/额外/异源/错误顺序按原因拒绝，每包 target_file 对照源包权威映射（交换现存目标、指向无关现存文件同样拒绝），逆序实参按源顺序装配；`--review-evidence` 必需，范围内每包须持有与当前源资源、当前文件绑定的有效复核资格，缺失/过期/不匹配/未完成即拒绝，不能因省略参数绕过；显式 `--scope` 才允许局部交付。候选先在最终目录语境通过对照当前源的全量硬检查（含源译图片出现次数对账与每次出现的来源身份核对，身份含 SVG/CSS 依赖内容），在最终目录暂存并 flush/fsync，独立重读复验后原子替换；失败保持原成品、首次失败不留最终文件
 - 合并术语：`<SKILL目录>/scripts/merge_glossary.py <术语表.md> <out.md> <conflicts.md> [--approve 批准词表.txt] [--pending 待定.md] <candidates*.md>`；只有列入批准词表的候选才写入，其余进入待定文件
 - 恢复：`<SKILL目录>/scripts/recover_work_packages.py <source.md> <wps_dir> [trans_dir] [strategy] [--review-evidence <evidence.json>] [--strong-token <token>]...`；从当前源在临时目录重建预期，只读旧源包，按源片段摘要与唯一目标对应，绝不覆盖旧包。只复用当前源与译文均通过片段范围硬检查、且持有与当前源资源/当前文件/资源/校验脚本身份/口径绑定的有效复核证据（`--review-evidence`，主 Agent 独立回源复核后产生）的工作包；源图片等资源被替换（字节变化、不改 Markdown）同样使旧证据失效；无证据或证据失效输出待复核，补齐证据后重新运行即可升级；源变化、硬检查失败或确定损伤列入失效需重做。待复核包不计作完成，不进入可直接交付的合并
 
@@ -108,7 +109,13 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 
 ## 并发与升级复核
 
-- 并发不写固定数值：服从用户当前上限，结合宿主能力、账户当前负载、在途任务与近期限流表现动态决定；限流后等待在途数下降再补派。
+- 在已获授权使用子 Agent 的翻译任务中，初始并发上限 C 服从用户当前上限与宿主能力，结合账户负载及在途任务决定，不规定固定起始数量。
+- 每个新的宿主停滞或限流事件自动下调 `C = max(1, ceil(C / 2))`，无需逐次确认；用户暂停或上限 0 优先。按宿主事件身份或“执行者 + 同一次未恢复故障”去重，反复观察同一故障不再次减半，不把通用错误码当限流依据。
+- 宿主明确停滞可直接触发；否则默认观察窗 10 分钟，至少两次宿主状态观察且无新进展、完成或正常长操作依据。mtime 单信号不足，等待用户、已知长操作和主动暂停不算停滞。状态不明可保守降上限，但不能认定旧执行者已退出。
+- 限流优先遵守宿主 Retry-After；未提供时冷却 60 秒，新尝试再次限流时将冷却翻倍，最多 10 分钟；更长的宿主要求不截短。同一次故障的重复观察不重新加倍。冷却期间停止补派。
+- 上限下降立即停止超额补派，在途数量随完成 / 退出减少，不强杀健康任务。C=1 仍故障时暂停无效补派并报告；不自动升并发。
+- 目标始终保持唯一写者。可请求取消确已停滞的任务，但取消未确认或状态不明时不释放目标，不启动同目标第二写者。收到终止确认或确认撤销写权后，按当前源、规则和已有恢复入口核对 draft / target 与复核资格，再决定接续；保留健康成果，不因文件存在判完成，不默认全量重译。
+- 在当前任务记录宿主状态依据、事件身份、降前后 C、在途数、冷却与实际分派 / 接续动作。区分自然事件、受控测试输入和实际宿主操作，按项目批准的验收口径核对；自然限流未发生明确记为未实测，不人为消耗额度制造事件；不建立独立调度服务。
 - 用户要求切换更强模型或更高推理深度时，不默认重做全部工作：主 Agent 先复核页面清单闭合、解析损伤和校验脚本盲区，再复用通过复核的产物，只重做已证明失效的部分。
 
 ## 每类参与者写权限

@@ -3,6 +3,7 @@
 
 用法：
     python3 merge_api.py <manifest.txt> <site_root> <out.md> [--display-src <dir>]
+        [--navigation-record <source_record.json>]
 
 规则：
 - 清单每行一个相对 HTML 路径。
@@ -13,6 +14,8 @@
   绑定不一致（出现序号错位、资源身份不符）直接失败，不按 basename 猜测。
 - 页面之间用单独一行的 `---` 分隔。
 - 不做全局空白压缩，保留代码围栏内容。
+- 显式导航记录用快照及 covers 证明源对象归属；仅最终合章转换链接，
+  翻译页保留原 ID / 目标，候选核验后原子替换输出。
 """
 import argparse
 import filecmp
@@ -21,10 +24,11 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 
 from _html_fidelity import DISPLAY_MAP_VERSION
 from _image_binding import bind_page, load_parse_map
-from _verification import fenced_line_numbers, in_code_span, line_code_spans
+from _verification import fenced_line_numbers, in_code_span, line_code_spans, resource_identity_digest
 
 
 _IMAGE_RE = re.compile(r'(!\[[^\]]*\]\()([^)]+)(\))')
@@ -156,15 +160,27 @@ def _bind_display_entries(page_rel, page_map, translated_body, site_root,
         by_occurrence[entry['occurrence']] = entry
     for entry in page_undetermined:
         by_occurrence[entry['occurrence']] = entry
-    # 路径一致性核对始终执行：映射 image 必须解析为译文该次出现的
-    # 同一资源（防止映射字段被改指其他文件）；字节级身份由绑定核心的
-    # resource_sha256 比对承担。
+    from _source_reconcile import snapshot_image_facts
+    facts=[]
+    if any(entry.get('source_node') for entry in by_occurrence.values()):
+        with open(os.path.join(site_root,page_rel),encoding='utf-8') as handle:
+            facts=snapshot_image_facts(handle.read(),'api') or []
+    original_by_node={fact['node']:fact for fact in facts}
+    # 映射仍从原快照资源基点定位；译包内的受验证复制可换路径，须与原
+    # 文件有同一递归内容身份，不能按 basename 或可修改的映射摘要猜测。
     for position, entry in by_occurrence.items():
         if position < 1 or position > len(legacy_path_checks):
             continue
         entry_source = _source_image(site_root, page_rel, entry['image'])
+        fact=original_by_node.get(entry.get('source_node'))
+        if entry.get('source_node') and (fact is None or os.path.realpath(entry_source) != os.path.realpath(
+                _source_image(site_root,page_rel,fact['source_ref']))):
+            raise ValueError('显示尺寸映射第 %d 次出现与译文资源不符（原快照节点错绑，页面 %s）' % (position,page_rel))
         if os.path.abspath(entry_source) != os.path.abspath(
-                legacy_path_checks[position - 1]):
+                legacy_path_checks[position - 1]) and (
+                fact is None or
+                resource_identity_digest(entry_source) is None or
+                resource_identity_digest(entry_source) != resource_identity_digest(legacy_path_checks[position - 1])):
             raise ValueError(
                 '显示尺寸映射第 %d 次出现与译文资源不符（页面 %s）'
                 % (position, page_rel))
@@ -176,6 +192,7 @@ def main():
     parser.add_argument('manifest')
     parser.add_argument('site_root')
     parser.add_argument('out')
+    parser.add_argument('--navigation-record', help='既有 source_record：快照及 covers 证明源页到章归属')
     parser.add_argument(
         '--display-src',
         help='解析期 <页名>.images_display.json 所在目录；提供后才关联显示尺寸')
@@ -187,6 +204,10 @@ def main():
         pages = [line.strip() for line in f if line.strip()]
 
     output_dir = os.path.dirname(os.path.abspath(out_path))
+    navigation = None
+    if args.navigation_record:
+        from _api_navigation import load_navigation
+        navigation = load_navigation(args.navigation_record, site_root)
     bodies = []
     assets = {}
     page_display_batches = []  # [(确定条目, 未确定条目, 该页图片数)]，按清单顺序
@@ -197,6 +218,9 @@ def main():
         raw_body = open(tp, encoding='utf-8').read()
         body = raw_body.strip()
         try:
+            if navigation is not None:
+                from _api_navigation import transform_page
+                body = transform_page(body, p, navigation, out_path)
             body = _localize_images(body, site_root, p, assets)
             if args.display_src:
                 page_map = _load_page_display_map(args.display_src, p)
@@ -239,7 +263,25 @@ def main():
         if os.path.abspath(source) != os.path.abspath(destination):
             shutil.copy2(source, destination)
 
-    open(out_path, 'w', encoding='utf-8').write('\n\n---\n\n'.join(bodies) + '\n')
+    candidate='\n\n---\n\n'.join(bodies) + '\n'
+    staged=None
+    try:
+        with tempfile.NamedTemporaryFile('w',encoding='utf-8',dir=output_dir,
+                                         prefix='.api-merge-',delete=False) as handle:
+            staged=handle.name;handle.write(candidate);handle.flush();os.fsync(handle.fileno())
+        actual=open(staged,encoding='utf-8').read()
+        if actual!=candidate:raise ValueError('API 合并候选重读不符')
+        if navigation is not None:
+            from _api_navigation import verify_page
+            from verify_api_translation import _split_pages
+            pieces=_split_pages(actual)
+            if len(pieces)!=len(pages):raise ValueError('API 合并候选页面范围改变')
+            for page,piece in zip(pages,pieces):
+                errors=verify_page(navigation[page]['source'],piece,page,navigation,out_path)
+                if errors:raise ValueError('API 合并候选导航核验失败: '+'；'.join(errors))
+        os.replace(staged,out_path)
+    finally:
+        if staged and os.path.exists(staged):os.unlink(staged)
     if args.display_src:
         # 新交付布局：交付级映射固定写入 export/ 子目录，条目引用相对
         # 映射目录解析（../images/...），不再写根目录副本。
@@ -248,7 +290,7 @@ def main():
         os.makedirs(export_dir, exist_ok=True)
         with open(display_path, 'w', encoding='utf-8') as handle:
             json.dump({'version': DISPLAY_MAP_VERSION,
-                       'markdown': os.path.basename(out_path),
+                       'markdown': os.path.relpath(os.path.abspath(out_path), export_dir),
                        'entries': display_entries,
                        'undetermined': display_undetermined},
                       handle, ensure_ascii=False, indent=2)

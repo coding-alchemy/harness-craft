@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from markdown_it import MarkdownIt
 
 from _verification import _ESCAPABLE_PUNCT, _protected_inline_spans, \
-    file_sha256, parse_inline_code_spans, resource_identity_digest
+    file_sha256, resource_identity_digest, scan_math
 
 
 # 内联 CSS width 属性（仅取 width 声明；max-width 等不作为显示宽度依据）。
@@ -26,9 +26,22 @@ _INLINE_HEIGHT_RE = re.compile(
 
 DISPLAY_MAP_VERSION = 1
 
-# render_inline 内受保护行内代码的占位哨兵（不含空白，外层空白/标点
+# render_inline 内受保护代码及公式的占位哨兵（不含空白，外层空白/标点
 # 整理与 strip 不会改写其内容；\x00 不会出现在正常 HTML 文本中）。
 _CODE_TOKEN_FMT = '\x00%d\x00'
+
+
+def strip_math_wrapper(body):
+    r"""仅剥除一对最外层 \(…\)/\[…\]，保留内部定界。"""
+    if ((body.startswith(r'\(') and body.endswith(r'\)'))
+            or (body.startswith(r'\[') and body.endswith(r'\]'))):
+        return body[2:-2].strip()
+    return body
+
+
+def inline_math_text(node):
+    """行内换行折叠，水平空白保留。"""
+    return re.sub(r'\s*\n\s*', ' ', strip_math_wrapper(node.get_text().strip()))
 
 # 富容器内按行内内容处理的标签；其余真实元素视为块级子节点。
 _INLINE_TAGS = frozenset({
@@ -617,13 +630,17 @@ class HtmlFidelity:
         self._pre_blocks = []
         self._unknown_footnote = unknown_footnote
         self.image_display = []  # 按输出顺序登记的图片显示尺寸条目
+        self.inline_image = None  # 家族显式提供图片选择；缺省保持原行内合同
+        self.expand_tables = False
+        self.table_conversions = []
         self._soup = None
         self.snapshot_dir = snapshot_dir  # 快照 HTML 所在目录（高度推导与 resource_base 用）
 
     def parse(self, raw):
-        """保护代码内容后解析 HTML；每次调用重置 `<pre>` 占位池。"""
+        """保护代码后解析 HTML；每次重置本页代码池、图片及表转换事实。"""
         self._pre_blocks = []
         self.image_display = []
+        self.table_conversions = []
 
         def protect_pre(match):
             body = clean_code_html(match.group(2))
@@ -650,7 +667,7 @@ class HtmlFidelity:
         entry['image'] = src_as_written
         self.image_display.append(entry)
 
-    def write_display_map(self, out_md_path, snapshot_path):
+    def display_map_payload(self, out_md_path, snapshot_path):
         """把解析期登记的显示尺寸写入 <stem>.images_display.json。
 
         有条目才写文件；条目与未确定项分开列示，供翻译与导出链路对账。
@@ -679,6 +696,12 @@ class HtmlFidelity:
         }
         if self.snapshot_dir is not None:
             payload['resource_base'] = os.path.realpath(self.snapshot_dir)
+        return payload
+
+    def write_display_map(self, out_md_path, snapshot_path):
+        payload = self.display_map_payload(out_md_path, snapshot_path)
+        if payload is None:
+            return None
         path = os.path.splitext(out_md_path)[0] + '.images_display.json'
         with open(path, 'w', encoding='utf-8') as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -760,21 +783,19 @@ class HtmlFidelity:
         self_href = (copied.get('href', '').strip()
                      if copied.name == 'a' else None)
         if 'math' in (copied.get('class') or []):
-            # 元素自身即公式容器（span/div.math）；内部换行折叠为单空格，
-            # 保持 $…$ 跨度在同一行内（对账口径空白不敏感）
-            body = copied.get_text().strip()
-            if body.startswith(r'\(') and body.endswith(r'\)'):
-                body = body[2:-2].strip()
-            if body.startswith(r'\[') and body.endswith(r'\]'):
-                body = body[2:-2].strip()
-            return '$' + re.sub(r'\s+', ' ', body) + '$'
+            return '$' + inline_math_text(copied) + '$'
+        code_spans = []
+        if self.inline_image is not None:
+            for original, image in zip(element.find_all('img'), copied.find_all('img')):
+                rendered = self.inline_image(original)
+                if rendered:
+                    code_spans.append(rendered)
+                    image.replace_with(_CODE_TOKEN_FMT % (len(code_spans) - 1))
+                else:
+                    image.decompose()
         for math in copied.find_all(class_='math'):
-            body = math.get_text().strip()
-            if body.startswith(r'\(') and body.endswith(r'\)'):
-                body = body[2:-2].strip()
-            if body.startswith(r'\[') and body.endswith(r'\]'):
-                body = body[2:-2].strip()
-            math.replace_with('$' + body + '$')
+            code_spans.append('$' + inline_math_text(math) + '$')
+            math.replace_with(_CODE_TOKEN_FMT % (len(code_spans) - 1))
         for ref in copied.find_all(class_='footnote-reference'):
             number = re.sub(r'\D', '', ref.get_text(strip=True))
             ref.replace_with(
@@ -783,10 +804,21 @@ class HtmlFidelity:
             text = superscript.get_text(strip=True)
             if re.fullmatch(r'\[\d+\]|\(\d+\)', text):
                 superscript.replace_with('[^%s]' % text.strip('[]()'))
-        code_spans = []
         for code in copied.find_all('code'):
             code_spans.append(markdown_inline_code(code.get_text()))
             code.replace_with(_CODE_TOKEN_FMT % (len(code_spans) - 1))
+        for node in list(copied.find_all(string=True)):
+            if type(node) is not NavigableString:
+                continue
+            raw = re.sub(r'\s*\n\s*', ' ', str(node))
+            # 字面转义括号不是数学定界；掩蔽保留原偏移与内部字符。
+            masked = raw.replace(r'\[', 'xx').replace(r'\]', 'xx')
+            spans = scan_math(masked).spans
+            for span in reversed(spans):
+                code_spans.append(raw[span.start:span.end])
+                raw = (raw[:span.start] + _CODE_TOKEN_FMT % (len(code_spans) - 1)
+                       + raw[span.end:])
+            node.replace_with(raw)
         for link in copied.find_all('a', href=True):
             label = link.get_text(' ', strip=True)
             href = link.get('href', '').strip()
@@ -853,7 +885,9 @@ class HtmlFidelity:
         text = ''
         for frag in frags:
             if isinstance(frag, str):
-                part = re.sub(r'\s+', ' ', frag)
+                wrapper = BeautifulSoup('<span></span>', 'html.parser').span
+                wrapper.append(str(frag))
+                part = self.render_inline(wrapper)
             else:
                 part = self.render_inline(frag)
             if not part:
@@ -864,7 +898,7 @@ class HtmlFidelity:
         spans = []
         pieces = []
         cursor = 0
-        for _content, (start, end) in parse_inline_code_spans(text):
+        for start, end in _protected_inline_spans(text):
             pieces.append(text[cursor:start])
             pieces.append('\x00%d\x00' % len(spans))
             spans.append(text[start:end])
@@ -992,7 +1026,10 @@ class HtmlFidelity:
                     if bullet and not first_text_done:
                         out.append(bullet.rstrip())
                         first_text_done = True
+                    before = len(out)
                     emit_image(item, out)
+                    for idx in range(before, len(out)):
+                        out[idx] = self._indented_block(out[idx], indent)
             elif name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
                 if bullet and not first_text_done:
                     out.append(bullet.rstrip())
@@ -1067,7 +1104,7 @@ class HtmlFidelity:
         return (tag.name == 'aside'
                 and ('doc-footnote' in role or 'footnote' in cls.split()))
 
-    def footnote_aside_lines(self, tag):
+    def footnote_aside_lines(self, tag, render_block=None, emit_image=None):
         """把脚注 aside 渲染为脚注定义条目（[FOOTNOTE-LIST] 组）。
 
         标签定位与正文行内序列化分离：标签常包在 `.label` 容器内（Sphinx
@@ -1080,6 +1117,17 @@ class HtmlFidelity:
         """
         label_re = r'^[\[(]\s*(\d+)\s*[\])]'
         label_tag = tag.find(class_='label')
+        if render_block is not None:
+            if label_tag is None or label_tag.parent is not tag:
+                raise ValueError('富脚注缺少可独立定位的 label: %s' % tag.get('id'))
+            match = re.fullmatch(label_re, label_tag.get_text(' ', strip=True))
+            if match is None:
+                raise ValueError('富脚注标签无法识别: %s' % label_tag)
+            lines = ['\n[FOOTNOTE-LIST]']
+            self.rich_container_lines(tag, lines, bullet='  [[%s]] ' % match[1],
+                                      indent='  ', render_block=render_block,
+                                      emit_image=emit_image, skip={label_tag})
+            return lines
         if label_tag is not None:
             label_text = label_tag.get_text(' ', strip=True)
             match = re.match(label_re + r'\s*$', label_text)
@@ -1139,6 +1187,10 @@ class HtmlFidelity:
         几格（1 起，含表头行）。任一单元格含无法可靠表示的跨行/跨列时
         抛出 TableStructureError，不静默展平。
         """
+        if self.expand_tables:
+            return self.grid_table_block(tag)
+        if tag.find('table') is not None:
+            raise TableStructureError('嵌套表无法直接表示，已阻断分派')
         caption = tag.find('caption')
         if caption is not None and caption.find_parent('table') is tag:
             caption_text = self.render_inline(caption)
@@ -1193,6 +1245,77 @@ class HtmlFidelity:
             lines.append(fenced)
         return lines
 
+    def grid_table_block(self, tag):
+        """显式 v2 网格：源 DOM 格坐标与覆盖坐标分开，代码只登记原点。"""
+        ordinal = len(self.table_conversions) + 1
+        if tag.find('table') is not None:
+            raise TableStructureError('表 #%d 含嵌套表，不能网格展开' % ordinal)
+        rows = [r for r in tag.find_all('tr') if r.find_parent('table') is tag]
+        if not rows:
+            raise TableStructureError('表 #%d 没有实际行' % ordinal)
+        grid, image_cells, mappings, codes = {}, {}, [], []
+        for row_no, row in enumerate(rows, 1):
+            column = 1
+            cells = [c for c in row.find_all(['th', 'td']) if c.find_parent('tr') is row]
+            for dom_col, cell in enumerate(cells, 1):
+                while (row_no, column) in grid:
+                    column += 1
+                spans = []
+                for attr in ('rowspan', 'colspan'):
+                    raw = cell.get(attr, '1')
+                    if not re.fullmatch(r'[1-9]\d*', str(raw).strip()):
+                        raise TableStructureError('表 #%d r=%d c=%d %s=%r 无法解释'
+                                                  % (ordinal, row_no, dom_col, attr, raw))
+                    spans.append(int(str(raw).strip()))
+                rowspan, colspan = spans
+                if row_no + rowspan - 1 > len(rows):
+                    raise TableStructureError('表 #%d r=%d c=%d rowspan 越界'
+                                              % (ordinal, row_no, dom_col))
+                image_start = len(self.image_display)
+                raw_text = self.render_inline(cell, escape_backslashes=True)
+                displays = self.image_display[image_start:]
+                del self.image_display[image_start:]
+                text = raw_text.replace('|', r'\|')
+                targets = []
+                origin = {'table': ordinal, 'row': row_no, 'col': column}
+                for r in range(row_no, row_no + rowspan):
+                    for c in range(column, column + colspan):
+                        if (r, c) in grid:
+                            raise TableStructureError('表 #%d r=%d c=%d 覆盖冲突'
+                                                      % (ordinal, r, c))
+                        grid[r, c] = '**%s**' % text if cell.name == 'th' and r > 1 and text else text
+                        image_cells[r, c] = displays
+                        targets.append({'table': ordinal, 'row': r, 'col': c})
+                mapping = {'row': row_no, 'col': dom_col, 'rowspan': rowspan,
+                           'colspan': colspan, 'targets': targets}
+                fences = self.cell_fences(cell)
+                if fences:
+                    mapping['code_target'] = origin
+                    codes.extend((row_no, column, n, fence) for n, fence in enumerate(fences, 1))
+                mappings.append(mapping)
+                column += colspan
+        width = max((c for r, c in grid), default=0)
+        if width == 0:
+            raise TableStructureError('表 #%d 没有实际单元格' % ordinal)
+        lines = []
+        caption = tag.find('caption', recursive=False)
+        if caption is not None:
+            lines.append('\n[TABLE-CAPTION] %s #' % self.render_inline(caption))
+        for r in range(1, len(rows) + 1):
+            lines.append(('\n' if r == 1 else '') + '| ' + ' | '.join(
+                grid.get((r, c), '') for c in range(1, width + 1)) + ' |')
+            if r == 1:
+                lines.append('| ' + ' | '.join(['---'] * width) + ' |')
+            for c in range(1, width + 1):
+                for display in image_cells.get((r, c), []):
+                    item = copy.deepcopy(display)
+                    item['occurrence'] = len(self.image_display) + 1
+                    self.image_display.append(item)
+        for r, c, n, fence in codes:
+            lines.extend(['', '[TABLE-CODE r=%d c=%d#%d]' % (r, c, n), fence])
+        self.table_conversions.append({'locate': {'table': ordinal}, 'cells': mappings})
+        return lines
+
     def definition_list(self, tag, render_block=None, emit_image=None):
         """渲染定义列表；dd 内嵌代码等块级内容按源序保留在条目内。"""
         terms = tag.find_all('dt', recursive=False)
@@ -1203,7 +1326,8 @@ class HtmlFidelity:
         lines = [
             '\n[FOOTNOTE-LIST]' if is_footnote else '\n[DEF-LIST]'
         ]
-        for term, definition in zip(tag.find_all('dt'), tag.find_all('dd')):
+        for term, definition in zip(tag.find_all('dt', recursive=False),
+                                    tag.find_all('dd', recursive=False)):
             # 非脚注术语按行内语义序列化：术语中的行内代码等语义保留
             term_text = (term.get_text(' ', strip=True) if is_footnote
                          else self.render_inline(term))

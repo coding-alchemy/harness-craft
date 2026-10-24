@@ -959,36 +959,42 @@ def check_fragment(view,start,end,target,approved_extra_math=()):
         return verify(view['checklist'],doc,view['text'],view['mapping'],target,(start,end),approved_extra_math)
 
 
-def translation_view(source_path, project_context):
+def translation_view(source_path, project_context, *, with_context=False):
     """从正式全源或机械源包准入；包头仅定位，不授予自身资格。"""
     from pathlib import Path
     import recover_work_packages as rwp
     text=read_document(source_path)
     meta=metadata(text)
+    def result(view, span, current=None):
+        return (view, span, current) if with_context else (view, span)
     if meta.get('pdf_formula_contract') and not project_context:
         raise ValueError('PDF确认数学核验需要显式 --project-context，不降级')
     if not project_context:
-        return None,None
+        return result(None,None)
     full_source=meta.get('source_file',source_path).strip('"')
     current=rwp.load_project_context(project_context,full_source)
     view=current.get('_pdf_view')
+    table_view=current.get('_table_view')
     if view is None:
         if meta.get('pdf_formula_contract'):
             raise ValueError('声明确认数学但项目上下文不是对应PDF来源')
-        return None,None
-    if meta.get('pdf_formula_contract')!=CONTRACT:
+        if table_view is None:
+            return result(None,None,current)
+    if view is not None and meta.get('pdf_formula_contract')!=CONTRACT:
         raise ValueError('源/包缺少当前数学合同，不降级')
+    source_text=(view if view is not None else table_view)['text']
     if 'source_file' in meta:
-        if not meta.get('project_context') or Path(json.loads(meta['project_context'])).resolve()!=Path(project_context).resolve():
+        if (view is not None or meta.get('project_context')) and (
+                not meta.get('project_context') or Path(json.loads(meta['project_context'])).resolve()!=Path(project_context).resolve()):
             raise ValueError('包项目来源声明冲突')
         a,z=int(meta['source_char_start']),int(meta['source_char_end'])
         _,body=rwp._frontmatter(source_path)
-        if body!=view['text'][a:z]:
+        if not (0 <= a < z <= len(source_text)) or body!=source_text[a:z]:
             raise ValueError('实际源包与当前全源字符范围不符')
         if meta.get('fragment_digest')!=hashlib.sha256(body.encode()).hexdigest():
             raise ValueError('源包摘要未绑定实际正文')
-        return view,(a,z)
-    return view,(0,len(view['text']))
+        return result(view,(a,z),current)
+    return result(view,(0,len(source_text)),current)
 
 
 def policy(view,start,end):

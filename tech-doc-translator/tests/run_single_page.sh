@@ -1455,3 +1455,5 @@ grep -q '未闭合' "$TMP/worklist_broken.err" \
 test ! -e "$TMP/worklist_broken.txt" \
   || { echo "错误：未闭合围栏仍产出了清单文件"; exit 1; }
 echo "长反引号/波浪线围栏注释不导出；源摘要不变；未闭合围栏明确诊断"
+
+python3 test_html_math_fidelity.py

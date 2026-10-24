@@ -8,6 +8,9 @@ export PYTHONDONTWRITEBYTECODE=1
 cd "$(dirname "$0")"
 python3 test_pdf_structure.py
 python3 test_pdf_integrity.py
+python3 test_pdf_footnote_notes.py
+python3 test_pdf_dependency_preflight.py
+python3 test_compose_image_maps.py
 EXPORT="../skills/tech-doc-translator/scripts/export_pdf.py"
 VERIFY="../skills/tech-doc-translator/scripts/verify_pdf.py"
 FIXTURE_IMAGE="fixtures/valid_1x1.png"
@@ -306,6 +309,24 @@ cat > "$TMP/comp/a_first.md" <<'MD'
 [^1]: B 章注文。
 MD
 
+make_book_decl "$TMP/comp_decl.json" "$TMP/comp/z_second.md" "$TMP/comp/a_first.md"
+echo "==> CUDA 08：旧跨章裸片段回退样本明确失败"
+if python3 "$EXPORT" --output "$TMP/out/legacy_fallback.pdf" --work-dir "$TMP/work_legacy_fallback" \
+  --view-declaration "$TMP/comp_decl.json" \
+  "$TMP/comp/z_second.md" "$TMP/comp/a_first.md" >"$TMP/legacy_fallback.log" 2>&1; then
+  echo "错误：裸片段仍跨章回退"; exit 1
+fi
+grep -q 'broken-internal-link.*a_first.md:5' "$TMP/legacy_fallback.log" || {
+  cat "$TMP/legacy_fallback.log"; echo "错误：未定位本章缺失的裸片段"; exit 1;
+}
+# 此样本原文明确写“跨章跳转：第二章 A”，据此写明目标文件；不猜唯一同名章。
+python3 - "$TMP/comp/a_first.md" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]);text=p.read_text()
+old='](#第二章-a顺序测试)';assert text.count(old)==1
+p.write_text(text.replace(old,'](z_second.md#第二章-a顺序测试)'))
+PY
 make_book_decl "$TMP/comp_decl.json" "$TMP/comp/z_second.md" "$TMP/comp/a_first.md"
 python3 "$EXPORT" --output "$TMP/out/comp.pdf" --work-dir "$TMP/work_comp" \
   --view-declaration "$TMP/comp_decl.json" \
@@ -3855,7 +3876,9 @@ for name, codes in font_codes.items():
     # Chromium 可能以 <..> Tj 或 TJ 数组绘制；按字形编码整体替换该页
     # 所有数字 1 字形（页面上其他 1 也一起变化，不影响负例判定）。
     pattern = re.compile(rb"<0*%X>" % src_code)
-    contents, n = pattern.subn(b"<%X>" % dst7, contents)
+    contents, n = pattern.subn(
+        lambda match: b"<" + ("%0*X" % (len(match.group(0)) - 2, dst7)).encode() + b">",
+        contents)
     changed += n
 assert changed >= 1, "代码行数字字形未被改写"
 stream = DecodedStreamObject()

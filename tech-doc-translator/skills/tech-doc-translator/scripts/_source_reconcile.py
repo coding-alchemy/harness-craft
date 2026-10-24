@@ -52,6 +52,8 @@ _SRC_MATH_WRAP_RE = re.compile(r'\\\(|\\\)|\\\[|\\\]')
 _FENCE_LINE_RE = re.compile(r'^\s*(`{3,}|~{3,})')
 _TABLE_CODE_MARKER_RE = re.compile(
     r'^\[TABLE-CODE r=(\d+) c=(\d+)#(\d+)\]$')
+_TABLE_CODE_NOTE_RE = re.compile(r'^本表第 (\d+) 行、第 (\d+) 列的代码 (\d+)：$')
+_TABLE_CAPTION_LINE_RE = re.compile(r'\s*(?:\*\*)?(?:\[TABLE-CAPTION\]|(?:Table\s+|表\s*)[0-9A-Za-z])')
 _MD_LIST_MARKER_RE = re.compile(r'^(\s*)-(?: (\S.*?))?\s*$')
 
 # 实际 Markdown 的真实行内阅读（CommonMark）：强调、反斜线转义、链接
@@ -131,7 +133,7 @@ def _norm_reading(text, source_context=None, **kwargs):
     return result if already_read else str(result)
 
 
-def _protected_reading(text, source_context=None, keep_math=False, table=False):
+def _protected_reading(text, source_context=None, keep_math=False, table=False, preserve_roles=True):
     """共享扫描先保护公式，再且仅再做一次普通行内阅读。"""
     spans = scan_math(text, source_context=source_context).spans
     parts = []
@@ -140,7 +142,7 @@ def _protected_reading(text, source_context=None, keep_math=False, table=False):
         parts.extend((text[cursor:span.start], '\ue006%d\ue007' % index))
         cursor = span.end
     parts.append(text[cursor:])
-    reading = _md_inline_reading(''.join(parts), preserve_roles=True)
+    reading = _md_inline_reading(''.join(parts), preserve_roles=preserve_roles)
     def restore(match):
         span = spans[int(match.group(1))]
         value = span.raw if keep_math else span.expr
@@ -481,21 +483,18 @@ def _family_math_expectation(node, family):
     已确认的表示：包装去除（\(…\)/\[…\]）、实体解码（DOM get_text）
     与行内格式空白序列化。序列化口径与各家族渲染器一致：paginated/
     reference 的 div.math 为块级（$$\n…\n$$，t = get_text(' ', strip=True)），
-    paginated 为单行 $$…$$；api 的 div.math 为行内（$\s*\n\s* 折叠）；
+    paginated 为单行 $$…$$；api 的 div.math 为行内；
     其余（single 家族全部节点与各家族 span.math）走 render_inline 的
-    行内序列化（\s+ 折叠 + 包装去除）。块级首尾排版空白在事实提取时
+    行内序列化（换行折叠 + 一对最外层包装去除）。块级首尾排版空白在事实提取时
     归一（strip），内部逐字节保留。
     """
     if node.name == 'div' and family in ('paginated', 'reference'):
         body = _strip_math_wrappers(node.get_text(' ', strip=True))
         expr = body if family == 'paginated' else '\n' + body + '\n'
         return 'block', expr.strip()
-    if node.name == 'div' and family == 'api':
-        body = re.sub(r'\s*\n\s*', ' ', node.get_text()).strip()
-        return 'inline', body
     body = node.get_text().strip()
     body = _strip_math_wrappers(body)
-    return 'inline', re.sub(r'\s+', ' ', body)
+    return 'inline', re.sub(r'\s*\n\s*', ' ', body)
 
 
 def _footnote_label(text):
@@ -506,18 +505,22 @@ def _footnote_label(text):
 def _literal_math_exprs(text):
     """文本节点中的字面公式流 (kind, expr)；转义括号 `\\[…\\]` 是
     字面文字而非公式定界（与解析侧的剥离口径一致），行内格式空白
-    序列化（\\s+ 折叠为单空格）是家族合同允许的表示转换——两侧都
+    序列化仅折叠换行，保留水平空白——两侧都
     在序列化后的文字上运行同一次共享扫描，类型与原表达式逐字节比较。"""
-    serialized = _WS_RE.sub(' ', text)
-    stripped = serialized.replace('\\[', ' ').replace('\\]', ' ')
-    return [(span.kind, span.expr.strip() if span.kind == 'block'
-             else span.expr) for span in scan_math(stripped).spans]
+    serialized = re.sub(r'\s*\n\s*', ' ', text)
+    stripped = serialized.replace('\\[', 'xx').replace('\\]', 'xx')
+    result = []
+    for span in scan_math(stripped).spans:
+        width = 1 if span.kind == 'inline' else 2
+        expr = serialized[span.start + width:span.end - width]
+        result.append((span.kind, expr.strip() if width == 2 else expr))
+    return result
 
 
 def _literal_math_issues(text):
     """文本节点字面公式扫描的未解决定界（原偏移在序列化后的文字上）。"""
-    serialized = _WS_RE.sub(' ', text)
-    stripped = serialized.replace('\\[', ' ').replace('\\]', ' ')
+    serialized = re.sub(r'\s*\n\s*', ' ', text)
+    stripped = serialized.replace('\\[', 'xx').replace('\\]', 'xx')
     return list(scan_math(stripped).issues)
 
 
@@ -558,6 +561,34 @@ def _rendered_raw_ancestors(node):
         if parent.name in ('pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
             return True
     return False
+
+
+def _api_tab_pairs(container):
+    """独立读取一组标签与面板关系，不消费适配端的渲染顺序。"""
+    design = 'sd-tab-set' in (container.get('class') or [])
+    if design:
+        labels = container.find_all(class_='sd-tab-label', recursive=False)
+        panels = container.find_all(class_='sd-tab-content', recursive=False)
+    else:
+        def owned(node):
+            return next((p for p in node.parents if isinstance(p, Tag)
+                         and 'sphinx-tabs' in (p.get('class') or [])), None) is container
+        labels = [node for node in container.find_all(True)
+                  if (node.get('role') == 'tab' or 'sphinx-tabs-tab' in (node.get('class') or []))
+                  and owned(node)]
+        panels = [node for node in container.find_all(True)
+                  if (node.get('role') == 'tabpanel' or 'sphinx-tabs-panel' in (node.get('class') or []))
+                  and owned(node)]
+    if not labels or len(labels) != len(panels):
+        raise ValueError('标签页来源关系不完整: %s' % container.get('class'))
+    pairs = []
+    for ordinal, label in enumerate(labels):
+        target = label.get('aria-controls')
+        matches = [p for p in panels if p.get('id') == target] if target else [panels[ordinal]]
+        if len(matches) != 1 or any(p is matches[0] for _, p in pairs):
+            raise ValueError('标签页来源面板无法唯一定位: %s' % target)
+        pairs.append((label, matches[0]))
+    return pairs
 
 
 class _SourceFacts:
@@ -697,7 +728,8 @@ class _SourceFacts:
                                   expr))
                 continue
             if isinstance(node, str):
-                if node.find_parent(class_='math') is not None:
+                if (node.find_parent(class_='math') is not None
+                        or node.find_parent('code') is not None):
                     continue
                 order = self._index[id(node)]
                 sub = sub_by_index.get(order, 0)
@@ -818,15 +850,16 @@ class _SourceFacts:
         for dl in self.root.find_all('dl'):
             if _in_pre(dl) or dl.find_parent('table') is not None:
                 continue
-            dts = dl.find_all('dt')
+            dts = dl.find_all('dt', recursive=False)
             if not dts or not all(
                     re.fullmatch(r'\[\d+\]|\(\d+\)|\d+',
                                  dt.get_text(strip=True)) for dt in dts):
                 continue
-            dds = dl.find_all('dd')
+            dds = dl.find_all('dd', recursive=False)
             for dt, dd in zip(dts, dds):
                 defs.append((_footnote_label(dt.get_text()),
-                             _norm_text(dd.get_text(' '))))
+                             self._footnote_prose(dd) if self.family == 'api'
+                             else _norm_text(dd.get_text(' '))))
         for aside in self.root.find_all('aside'):
             if _in_pre(aside):
                 continue
@@ -837,9 +870,17 @@ class _SourceFacts:
             text = re.sub(r'\s+', ' ', aside.get_text(' ', strip=True))
             match = re.match(r'^[\[(]\s*(\d+)\s*[\])]\s*(.*)$', text)
             if match:
-                defs.append((match.group(1), _norm_text(match.group(2),
-                                                            unwrap_links=False)))
+                defs.append((match.group(1), self._footnote_prose(aside)
+                             if self.family == 'api' else _norm_text(
+                                 match.group(2), unwrap_links=False)))
         return defs
+
+    def _footnote_prose(self, node):
+        # 富脚注的代码、列表、表格和图片由各自事实对账；独立保留全部正文段落。
+        copied = copy.deepcopy(node)
+        for label in copied.find_all(class_='label'):
+            label.decompose()
+        return ' '.join(text for kind, text in self._content_seq(copied) if kind == 'text')
 
     @staticmethod
     def _is_admonition(el):
@@ -913,8 +954,7 @@ class _SourceFacts:
         # 一条缩进流；被任何会产出内容的部分隔开时才重新编号。处于同一
         # li/dd 容器内的同层连续列表同样连续编号。
         group_counts = {}
-        transparent = {'ul', 'ol', 'div', 'section', 'article', 'main',
-                       'body', 'blockquote'}
+        transparent = {'ul', 'ol', 'div', 'section', 'article', 'main', 'body'}
         top_lists = []
         for lst in self.root.find_all(['ul', 'ol']):
             if _in_pre(lst) or lst.find_parent('table') is not None:
@@ -933,7 +973,7 @@ class _SourceFacts:
                  and not self._flat[i].strip())
                 or (isinstance(self._flat[i], Tag)
                     and self._flat[i].name in transparent)
-                for i in range(prev_end, start))
+                for i in range(prev_end + 1, start))
             if not merged:
                 run_id += 1
             run_of[id(lst)] = run_id
@@ -953,7 +993,10 @@ class _SourceFacts:
             context_ancestor = None
             ancestor = li.parent
             while ancestor is not None and getattr(ancestor, 'name', None):
-                if ancestor.name in ('li', 'dd', 'dt'):
+                if ancestor.name in ('li', 'dd', 'dt') or (
+                        self.family == 'api' and ancestor.name == 'aside'
+                        and (ancestor.get('role') == 'doc-footnote'
+                             or 'footnote' in (ancestor.get('class') or []))):
                     level += 1
                     if context_ancestor is None:
                         context_ancestor = ancestor
@@ -1019,6 +1062,24 @@ class _SourceFacts:
                 if not isinstance(child, Tag):
                     continue
                 if child.name in ('script', 'style', 'noscript'):
+                    continue
+                if self.family == 'api' and (
+                        'sd-tab-label' in (child.get('class') or [])
+                        or child.get('role') == 'tab'
+                        or 'sphinx-tabs-tab' in (child.get('class') or [])):
+                    flush()
+                    seq.append(('text', _norm_text('**[Tab: %s]**' %
+                                child.get_text(' ', strip=True))))
+                    continue
+                if self.family == 'api' and child.name == 'div' and (
+                        'sd-tab-set' in (child.get('class') or [])
+                        or 'sphinx-tabs' in (child.get('class') or [])):
+                    flush()
+                    for label, panel in _api_tab_pairs(child):
+                        seq.append(('text', _norm_text('**[Tab: %s]**' %
+                                    label.get_text(' ', strip=True))))
+                        walk(panel)
+                        flush()
                     continue
                 if _SourceFacts._is_admonition(child):
                     # 提示框由提示框流对账，其文字不计入项内顺序
@@ -1131,9 +1192,12 @@ class _SourceFacts:
         self.cell_pre_orders = {}
         # 格元素 → (表序号, 行, 列)；供映射一对多展开推导内容倍数
         self._cell_positions = {}
+        image_refs = {fact['order']: fact['src'] for fact in self.image_facts}
         for ordinal, table in enumerate(tables, start=1):
             rows = []
             cells_spans = {}
+            headers = {}
+            links = {}
             codes = {}
             for row in table.find_all('tr'):
                 if row.find_parent('table') is not table:
@@ -1147,6 +1211,11 @@ class _SourceFacts:
                     col_no += 1
                     self._cell_positions[id(cell)] = (ordinal, row_no, col_no)
                     cells.append(self._cell_text(cell))
+                    headers[row_no, col_no] = cell.name == 'th'
+                    links[row_no, col_no] = [(a['href'], tuple(image_refs[self._index[id(img)]]
+                        for img in a.find_all('img') if self._index.get(id(img)) in image_refs))
+                        for a in cell.find_all('a', href=True) if 'footnote-reference' not in (a.get('class') or [])
+                        and a.find_parent(class_='footnote-reference') is None]
                     cells_spans[(row_no, col_no)] = (
                         self._span_value(cell, 'rowspan'),
                         self._span_value(cell, 'colspan'))
@@ -1155,7 +1224,7 @@ class _SourceFacts:
                             self._index[id(pre)], ordinal)
                         codes[(row_no, col_no, order)] = \
                             clean_code_html(pre.decode_contents()).rstrip('\n')
-                if cells:
+                if cells or self.family == 'api':
                     rows.append(cells)
             records.append({
                 'ordinal': ordinal,
@@ -1163,6 +1232,9 @@ class _SourceFacts:
                 'rows': rows,
                 'spans': cells_spans,
                 'codes': codes,
+                'headers': headers,
+                'links': links,
+                'nested': table.find('table') is not None,
             })
         return records
 
@@ -1173,16 +1245,16 @@ class _SourceFacts:
             if _in_pre(dl) or dl.find_parent('table') is not None:
                 # 表格单元格内的定义列表随单元格文字渲染
                 continue
-            if dl.find_parent('figcaption') is not None:
+            if dl.find_parent('figcaption') is not None and self.family != 'api':
                 # 图例定义列表随图题整段行内序列化输出，术语流不重复计入
                 continue
-            dts = dl.find_all('dt')
+            dts = dl.find_all('dt', recursive=False)
             if not dts:
                 continue
             if all(re.fullmatch(r'\[\d+\]|\(\d+\)|\d+',
                                 dt.get_text(strip=True)) for dt in dts):
                 continue  # 脚注列表由 footnote_defs 对账
-            dds = dl.find_all('dd')
+            dds = dl.find_all('dd', recursive=False)
             for dt, dd in zip(dts, dds):
                 pairs.append((_norm_text(dt.get_text(' ', strip=True),
                                           unwrap_links=False),
@@ -1234,7 +1306,7 @@ class _MarkdownFacts:
         return tagged
 
     def _tagged_math(self):
-        stripped = self.text.replace('\\[', ' ').replace('\\]', ' ')
+        stripped = self.text.replace('\\[', 'xx').replace('\\]', 'xx')
         line_starts = {}
         offset = 0
         for line_no, line in enumerate(stripped.split('\n'), start=1):
@@ -1245,7 +1317,9 @@ class _MarkdownFacts:
         return [(self._md_section(span.start_line), span.start_line,
                  max(0, span.start - line_starts.get(span.start_line, 0)),
                  span.kind,
-                 span.expr.strip() if span.kind == 'block' else span.expr)
+                 (_strip_math_wrappers(self.text[span.start + 2:span.end - 2].strip())
+                  if span.kind == 'block'
+                  else self.text[span.start + 1:span.end - 1]))
                 for span in scan.spans
                 if span.start_line not in self._heading_lines]
 
@@ -1272,7 +1346,7 @@ class _MarkdownFacts:
         return [(self._md_section(line_no), line_no, start, 'image', src)
                 for line_no, _kind, start, _end, src in entries]
 
-    def footnote_streams(self):
+    def footnote_streams(self, rich=False):
         refs = []
         for line_no, line in enumerate(self.lines, start=1):
             if line_no in self.fenced:
@@ -1280,6 +1354,35 @@ class _MarkdownFacts:
             for match in re.finditer(r'\[\^([^\]]+)\](?!:)', line):
                 refs.append(_footnote_label(match.group(1)))
         defs = []
+        if rich:
+            table_lines = set().union(*(r['row_lines'] for r in self.table_records()))
+            current, base_indent = None, 0
+            in_fn = False
+            for line_no, line in enumerate(self.lines, start=1):
+                if line_no in self.fenced or not line.strip():
+                    continue
+                stripped = line.strip()
+                indent = len(line) - len(line.lstrip(' '))
+                if stripped == '[FOOTNOTE-LIST]':
+                    in_fn, current = True, None
+                    continue
+                if not in_fn:
+                    continue
+                match = re.match(r'^\s+\[+\s*(\d+)\s*\]+\s*(.*)$', line)
+                if match:
+                    current = [_footnote_label(match[1]), _norm_text(match[2])]
+                    defs.append(current)
+                    base_indent = indent
+                elif indent <= base_indent and _MD_LIST_MARKER_RE.match(line):
+                    in_fn, current = False, None
+                elif indent == 0:
+                    in_fn, current = False, None
+                elif current is not None and indent == base_indent \
+                        and line_no not in table_lines \
+                        and not re.fullmatch(r'[-| :]+', stripped) \
+                        and not re.match(r'^(\[[A-Z]|!\[|\*\*|[-*+]\s|\d+[.)]\s)', stripped):
+                    current[1] = (current[1] + ' ' + _norm_text(stripped)).strip()
+            return refs, [tuple(item) for item in defs]
         in_fn = False
         for line_no, line in enumerate(self.lines, start=1):
             if line_no in self.fenced:
@@ -1348,8 +1451,15 @@ class _MarkdownFacts:
         结束列表。
         """
         records = []
+        table_lines=set()
+        for table in self.table_records():
+            table_lines.update(range(table['start_line'],table['group_end_line']+1))
         marker_lines = set()
         for line_no, line in enumerate(self.lines, start=1):
+            if line_no in table_lines:
+                continue  # 格位及格代码由独立表记录核对，不属于列表正文。
+            if line_no not in self.fenced and re.fullmatch(r'\s*<a\s+id="[^"]+"></a>\s*',line):
+                continue
             if line_no in self.fenced:
                 continue
             if _MD_LIST_MARKER_RE.match(line) is not None:
@@ -1381,6 +1491,10 @@ class _MarkdownFacts:
             return None
 
         for line_no, line in enumerate(self.lines, start=1):
+            if line_no in table_lines:
+                continue
+            if line_no not in self.fenced and re.fullmatch(r'\s*<a\s+id="[^"]+"></a>\s*',line):
+                continue
             if line_no in self.fenced:
                 if line_no in fences:
                     if line.startswith(' '):
@@ -1420,6 +1534,9 @@ class _MarkdownFacts:
                 context_alive = False
                 last_ordinal = {}
                 continue
+            if def_region is not None and line_no in marker_lines \
+                    and len(line)-len(line.lstrip(' ')) <= def_region+2:
+                def_region=None
             if def_region is not None and line_no not in marker_lines:
                 if not stripped:
                     continue
@@ -1512,6 +1629,9 @@ class _MarkdownFacts:
             if self._source_context is not None:
                 return _norm_reading(_protected_reading(text, self._source_context, keep_math=True, table=gfm),
                                      source_context=self._source_context)
+            if gfm:
+                return _norm_text(_protected_reading(text, keep_math=True, preserve_roles=False),
+                                  unwrap_links=False, reading=True)
             return _norm_text(text, resolve_escapes=True)
 
         merged_lines = {}
@@ -1536,13 +1656,12 @@ class _MarkdownFacts:
                 continue
             line = merged_lines.get(line_no, line)
             if line_no in self.fenced:
-                # 围栏结束当前表格区域（其后的 [TABLE-CODE] 归属按标记行
-                # 独立匹配，不依赖 current）；围栏正文永不成为表格行
+                # 围栏不属于格行；相邻代码组在行读取完成后统一解析。
                 current = None
                 continue
             stripped = line.strip()
             if stripped == '[TABLE]':
-                current = {'ordinal': len(records) + 1, 'start_line': line_no, 'rows': [],
+                current = {'ordinal': len(records) + 1, 'start_line': line_no, 'rows': [], 'raw_rows': [],
                            'codes': {}, 'marker_lines': [], 'row_lines': set()}
                 records.append(current)
                 continue
@@ -1554,22 +1673,20 @@ class _MarkdownFacts:
                 current = None
                 continue
             if stripped.startswith('[TABLE-CODE'):
-                match = _TABLE_CODE_MARKER_RE.match(stripped)
-                if match is None:
-                    current['marker_lines'].append(
-                        (line_no, None, 'TABLE-CODE 标记格式无效: %s'
-                         % stripped))
-                    continue
-                key = tuple(int(group) for group in match.groups())
-                current['marker_lines'].append((line_no, key, None))
+                continue
+            if current.get('rows_closed') and stripped:
+                current = None
                 continue
             if not stripped and line:
                 # 单列全空单元格行（渲染端以单个空格输出，与零长空行区分）
+                current['raw_rows'].append([''])
                 current['rows'].append([_norm_text('',
                                                    decode_heading_escape=True)])
                 current['row_lines'].add(line_no)
                 continue
             if not stripped:
+                if current['rows']:
+                    current['rows_closed'] = True
                 if current.get('single_column') and not line:
                     # 空行结束单列表格的行收集（单列行无列界记号）；
                     # 记录保留以继续接受其后的 [TABLE-CODE] 标记
@@ -1589,6 +1706,7 @@ class _MarkdownFacts:
                 # 逐格按实际阅读核对：格位序列化对 \+ASCII 标点按阅读语义
                 # 加写（\\ 阅读为一个反斜线），此处解析回阅读文字，与源
                 # 格字面文字一致（F1：非首格字面反斜线可读可验）
+                current['raw_rows'].append(cells)
                 current['rows'].append(
                     [cell_reading(cell) for cell in cells])
                 current['row_lines'].add(line_no)
@@ -1596,6 +1714,7 @@ class _MarkdownFacts:
                     current.get('single_column') or not current['rows']):
                 # 单列表格行（无列界记号）：自首行起进入单列模式，空行结束
                 current['single_column'] = True
+                current['raw_rows'].append([line])
                 current['rows'].append([cell_reading(line)])
                 current['row_lines'].add(line_no)
             else:
@@ -1607,7 +1726,7 @@ class _MarkdownFacts:
             if token.type == 'table_open':
                 lines = set(range(token.map[0] + 1, token.map[1] + 1))
                 current_gfm = None if lines & covered else {
-                    'start_line': token.map[0] + 1, 'rows': [], 'codes': {},
+                    'start_line': token.map[0] + 1, 'rows': [], 'raw_rows': [], 'codes': {},
                     'marker_lines': [], 'row_lines': lines, 'gfm': True}
                 if current_gfm is not None:
                     records.append(current_gfm)
@@ -1615,38 +1734,56 @@ class _MarkdownFacts:
                 current_gfm = None
             elif current_gfm is not None and token.type == 'tr_open':
                 current_gfm['rows'].append([])
+                current_gfm['raw_rows'].append([])
             elif current_gfm is not None and token.type == 'inline':
+                current_gfm['raw_rows'][-1].append(token.content)
                 current_gfm['rows'][-1].append(cell_reading(token.content, gfm=True))
         records.sort(key=lambda record: record['start_line'])
+        fences = {block.start_line: block for block in scan_code_fences(self.text).blocks}
         for ordinal, record in enumerate(records, 1):
             record['ordinal'] = ordinal
-            if record.get('gfm'):
-                end = records[ordinal]['start_line'] if ordinal < len(records) else len(self.lines) + 1
-                for line_no in range(max(record['row_lines']) + 1, end):
-                    match = _TABLE_CODE_MARKER_RE.match(self.lines[line_no - 1].strip())
-                    if match:
-                        record['marker_lines'].append((line_no, tuple(int(g) for g in match.groups()), None))
-        fences = sorted(scan_code_fences(self.text).blocks,
-                        key=lambda block: block.start_line)
-        used_fences = set()
-        for record in records:
+            record['marker_lines'] = []
             record['code_fence_lines'] = set()
-            for line_no, key, error in record['marker_lines']:
-                if error is not None:
-                    record.setdefault('errors', []).append(error)
+            record['group_end_line'] = max((line + merged_lines.get(line, '').count('\n')
+                for line in record['row_lines']), default=record['start_line'])
+            cursor = record['group_end_line'] + 1
+            while cursor <= len(self.lines):
+                raw = self.lines[cursor - 1].strip()
+                if not raw:
+                    cursor += 1
                     continue
-                fence = next((block for block in fences
-                              if block.start_line > line_no
-                              and block.start_line not in used_fences), None)
-                if fence is not None:
-                    used_fences.add(fence.start_line)
-                    record['code_fence_lines'].add(fence.start_line)
-                body = fence.body if fence else None
-                if fence is not None and record.get('gfm'):
+                match = _TABLE_CODE_MARKER_RE.fullmatch(raw) or _TABLE_CODE_NOTE_RE.fullmatch(raw)
+                if not match:
+                    if record['codes'] and cursor in fences:
+                        record.setdefault('errors', []).append('L%d 表格代码组多出无归属围栏' % cursor)
+                    break
+                key = tuple(int(value) for value in match.groups())
+                record['marker_lines'].append((cursor, key, None))
+                marker_line = cursor
+                cursor += 1
+                while cursor <= len(self.lines) and not self.lines[cursor - 1].strip():
+                    cursor += 1
+                fence = fences.get(cursor)
+                if fence is None:
+                    record.setdefault('errors', []).append('L%d 格内代码标记后缺少紧随围栏' % marker_line)
+                    break
+                row, col, number = key
+                if not (1 <= row <= len(record['rows']) and 1 <= col <= len(record['rows'][row - 1])):
+                    record.setdefault('errors', []).append('L%d 格内代码坐标越界 %r' % (marker_line, key))
+                if key in record['codes']:
+                    record.setdefault('errors', []).append('L%d 格内代码坐标重复 %r' % (marker_line, key))
+                expected = 1 + sum(r == row and c == col for r, c, _ in record['codes'])
+                if number != expected:
+                    record.setdefault('errors', []).append('L%d 格内代码序号不连续 %r' % (marker_line, key))
+                body = fence.body
+                if record.get('gfm') and self._source_context is not None:
                     indent = re.match(r' *', self.lines[fence.start_line - 1]).group()
                     body = '\n'.join(line[len(indent):] if line.startswith(indent) else line
                                      for line in body.split('\n'))
                 record['codes'][key] = body
+                record['code_fence_lines'].add(fence.start_line)
+                record['group_end_line'] = fence.end_line
+                cursor = fence.end_line + 1
         return records
 
     def terms(self):
@@ -1676,6 +1813,149 @@ class _MarkdownFacts:
         return pairs
 
 
+def markdown_table_facts(text, source_context=None):
+    """复用独立输出读取；拆包、计数与翻译门禁采用相同实际格位。"""
+    records = _MarkdownFacts(text, source_context).table_records()
+    lines = text.splitlines()
+    for record in records:
+        record['caption'] = None
+        for line in reversed(lines[:record['start_line'] - 1]):
+            if not line.strip() or re.fullmatch(r'\s*<a\s+[^>]*></a>\s*', line):
+                continue
+            if _TABLE_CAPTION_LINE_RE.match(line):
+                record['caption'] = line.strip()
+            break
+    return records
+
+
+def _grid_header_role(text):
+    """v2 非首行 th 的整格 strong 表示；局部/分离强调不是整格角色。"""
+    tokens = [token for token in _MD_INLINE_READ.parseInline(text)[0].children or []
+              if token.type != 'text' or token.content]
+    if not tokens or tokens[0].type != 'strong_open' or tokens[-1].type != 'strong_close':
+        return False
+    depth = 0
+    for token in tokens[:-1]:
+        if token.type in ('strong_open', 'strong_close'):
+            depth += token.nesting
+        if depth == 0:
+            return False
+    return depth == 1
+
+
+def _mapped_table_headers(source, mapping, section_id=None):
+    """从已准入的原DOM及v2映射读取角色；不从Markdown强调猜th。"""
+    if not mapping or mapping.get('version') != 2:
+        return set()  # v1人工表示没有v2整格strong合同。
+    headers = set()
+    for item in mapping['tables']:
+        original, problems = _locate_source_table(item, source.table_records, section_id)
+        if problems:
+            raise ValueError('来源表头不可定位: ' + '；'.join(problems))
+        for cell in item['cells']:
+            row, col = cell['row'], cell['col']
+            if original['headers'].get((row, col)) and original['rows'][row-1][col-1]:
+                headers.update((target['table'], target['row'], target['col'])
+                               for target in cell['targets'] if 'table' in target and target['row'] > 1)
+    return headers
+
+
+def compare_translation_tables(source, translated, *, exact=False,
+                               source_context=None, header_cells=()):
+    """翻译检查格位及逐格硬不变量；确定性中文转换额外核对实际格值。"""
+    from _verification import parse_inline_code_spans, link_targets, image_references
+    src = markdown_table_facts(source, source_context)
+    doc = markdown_table_facts(translated, source_context)
+    header_cells = set(header_cells)
+
+    def cell_math(text, gfm):
+        return [(span.kind, decode_table_math(span.expr, parsed=True)
+                 if gfm and source_context is not None else span.expr)
+                for span in scan_math(text, source_context=source_context).spans]
+    diffs = []
+    if len(src) != len(doc):
+        diffs.append('表格数不一致: 源 %d vs 译 %d' % (len(src), len(doc)))
+    for index, (s, d) in enumerate(zip(src, doc), 1):
+        label = '表#%d（源 L%d / 译 L%d）' % (index, s['start_line'], d['start_line'])
+        diffs.extend(label + ' ' + error for record in (s, d)
+                     for error in record.get('errors', []))
+        if s['codes'] != d['codes']:
+            diffs.append(label + ' 格内代码归属或内容不一致')
+        if [len(r) for r in s['rows']] != [len(r) for r in d['rows']]:
+            diffs.append(label + ' 行数或列位不一致')
+            continue
+        if exact and s['caption'] != d['caption']:
+            diffs.append(label + ' 确定性转换改变题注归属')
+        if exact and s['rows'] != d['rows']:
+            diffs.append(label + ' 确定性转换改变格值或顺序')
+        for row, (sr, dr) in enumerate(zip(s['raw_rows'], d['raw_rows']), 1):
+            for col, (sc, dc) in enumerate(zip(sr, dr), 1):
+                if (index, row, col) in header_cells:
+                    if not _grid_header_role(dc):
+                        diffs.append('%s r=%d c=%d 表头角色丢失' % (label, row, col))
+                if bool(sc.strip()) != bool(dc.strip()):
+                    diffs.append('%s r=%d c=%d 空格位状态不一致' % (label, row, col))
+                for name, read in (
+                    ('行内代码', lambda text: [value for value, _ in parse_inline_code_spans(text)]),
+                    ('链接', link_targets),
+                    # 路径可迁移；逐次资源身份由调用方已有的全局门禁核对。
+                    ('图片格位', lambda text: len(image_references(text))
+                     + len(image_marker_spans(text))),
+                ):
+                    if read(sc) != read(dc):
+                        diffs.append('%s r=%d c=%d %s 不一致' % (label, row, col, name))
+                if cell_math(sc, s.get('gfm')) != cell_math(dc, d.get('gfm')):
+                    diffs.append('%s r=%d c=%d 公式 不一致' % (label, row, col))
+    return diffs
+
+
+def table_code_problems(text, stage='final', source_context=None):
+    """仅解释实际独立标记/说明行；围栏及行内代码中的字面记法不参与。"""
+    if stage not in ('final', 'intermediate', 'source'):
+        raise ValueError('未知 table-code-stage: %s' % stage)
+    facts = markdown_table_facts(text, source_context)
+    owned = {line for record in facts for line, _, _ in record['marker_lines']}
+    fenced = fenced_line_numbers(text)
+    problems = ['表#%d %s' % (record['ordinal'], error)
+                for record in facts for error in record.get('errors', [])]
+    for line, raw in enumerate(text.splitlines(), 1):
+        if line in fenced:
+            continue
+        value = raw.strip()
+        marker = value.startswith('[TABLE-CODE')
+        note = _TABLE_CODE_NOTE_RE.fullmatch(value)
+        if not marker and not note:
+            continue
+        if line not in owned:
+            problems.append('L%d 孤儿或无效格内代码标记/说明' % line)
+        if marker and stage == 'final':
+            problems.append('L%d 最终成品残留 TABLE-CODE 标记' % line)
+    return problems
+
+
+def finalize_table_code(text, source_context=None, header_cells=()):
+    """在已核验中间中文上只替换标记行，格位说明留在最终正文内。"""
+    problems = table_code_problems(text, 'intermediate', source_context)
+    if problems:
+        raise ValueError('；'.join(problems))
+    lines = text.splitlines(keepends=True)
+    for record in markdown_table_facts(text, source_context):
+        for line, key, _ in record['marker_lines']:
+            if not _TABLE_CODE_MARKER_RE.fullmatch(lines[line - 1].strip()):
+                continue
+            original = lines[line - 1]
+            indent = original[:len(original) - len(original.lstrip())]
+            ending = '\r\n' if original.endswith('\r\n') else '\n' if original.endswith('\n') else ''
+            lines[line - 1] = indent + '本表第 %d 行、第 %d 列的代码 %d：' % key + ending
+    result = ''.join(lines)
+    problems = compare_translation_tables(text, result, exact=True, source_context=source_context,
+                                          header_cells=header_cells)
+    problems.extend(table_code_problems(result, source_context=source_context))
+    if problems:
+        raise ValueError('；'.join(problems))
+    return result
+
+
 def snapshot_image_facts(raw_html, family, section_id=None):
     """从原始快照独立提取结构化图片事实，按文档顺序返回字典列表。
 
@@ -1690,6 +1970,20 @@ def snapshot_image_facts(raw_html, family, section_id=None):
     if facts.root is None:
         return None
     return list(facts.image_facts)
+
+
+def snapshot_grid_image_counts(raw_html, family, section_id=None):
+    """v2 图片投影次数来自独立 DOM 跨度，不能由尺寸映射自报。"""
+    source = _SourceFacts(raw_html, family, section_id)
+    records = {record['ordinal']: record for record in source.table_records}
+    counts = {}
+    for fact in source.image_facts:
+        cell = source.mapped_cell_of(fact['order'])
+        spans = records[cell[0]]['spans'][cell[1:]] if cell else (1, 1)
+        if not all(isinstance(n, int) and n > 0 for n in spans):
+            raise ValueError('图片所在格含无效跨度: %s' % fact['node'])
+        counts[fact['node']] = spans[0] * spans[1]
+    return counts
 
 
 def snapshot_image_stream(raw_html, family, section_id=None):
@@ -1777,6 +2071,8 @@ def _table_record_diffs(src_records, md_records, mapped_src, claimed_md,
     for i in range(min(len(src_rest), len(md_rest))):
         source, output = src_rest[i], md_rest[i]
         prefix = '表格第 %d 张' % (i + 1)
+        if source.get('nested'):
+            diffs.append('%s 含未解释嵌套表，已阻断分派' % prefix)
         for error in output.get('errors', []):
             diffs.append('%s %s' % (prefix, error))
         unexplained = sorted(
@@ -1867,12 +2163,16 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
     cell_table_targets = {}
     note_targets = {}
     if not isinstance(table_conversions, dict) \
-            or table_conversions.get('version') != 1 \
+            or table_conversions.get('version') not in (1, 2) \
             or not isinstance(table_conversions.get('tables'), list):
-        return (['逐表转换映射结构无效（需 version=1 与 tables 数组）'],
+        return (['逐表转换映射结构无效（需 version=1/2 与 tables 数组）'],
                 mapped_src, claimed_md, cell_target_counts,
                 cell_table_targets, note_targets)
     digest = table_conversions.get('snapshot_sha256')
+    grid_mode = table_conversions['version'] == 2
+    if grid_mode and not isinstance(digest, str):
+        return (['v2 逐表转换映射必须绑定 snapshot_sha256'],
+                mapped_src, claimed_md, cell_target_counts, cell_table_targets, note_targets)
     if digest is not None:
         actual = hashlib.sha256(raw_html.encode('utf-8')).hexdigest()
         if digest != actual:
@@ -1893,6 +2193,39 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
             diffs.append('转换映射重复声明源表 #%d' % record['ordinal'])
             continue
         mapped_src.add(record['ordinal'])
+        expected_grid, occupied = {}, {}
+        if grid_mode:
+            if record.get('nested'):
+                diffs.append('源表 #%d 含嵌套表，不能网格展开' % record['ordinal'])
+            # 独立从原 DOM 格事实重建，不调用 HtmlFidelity 的生成网格。
+            for row_no, row in enumerate(record['rows'], 1):
+                cursor = 1
+                for col_no, text in enumerate(row, 1):
+                    while (row_no, cursor) in occupied:
+                        cursor += 1
+                    rs, cs = record['spans'][row_no, col_no]
+                    if not all(isinstance(n, int) and n > 0 for n in (rs, cs)) \
+                            or row_no + rs - 1 > len(record['rows']):
+                        diffs.append('源表 #%d 格 %s 跨度非法或越界'
+                                     % (record['ordinal'], (row_no, col_no)))
+                        continue
+                    positions = []
+                    for r in range(row_no, row_no + rs):
+                        for c in range(cursor, cursor + cs):
+                            if (r, c) in occupied:
+                                diffs.append('源表 #%d 覆盖格 %s 冲突' % (record['ordinal'], (r, c)))
+                            occupied[r, c] = (row_no, col_no)
+                            positions.append({'table': record['ordinal'], 'row': r, 'col': c})
+                    expected_grid[row_no, col_no] = positions
+                    cursor += cs
+            output = next((r for r in md.table_records() if r['ordinal'] == record['ordinal']), None)
+            width = max((c for r, c in occupied), default=0)
+            if output is None or not output.get('gfm') or len(output['rows']) != len(record['rows']) \
+                    or any(len(row) != width for row in output['rows']):
+                diffs.append('源表 #%d v2 输出必须为保留全部行列的真实 GFM 网格' % record['ordinal'])
+            elif any(output['rows'][r-1][c-1] for r in range(1, len(record['rows'])+1)
+                     for c in range(1, width+1) if (r, c) not in occupied):
+                diffs.append('源表 #%d 无覆盖洞被填入内容' % record['ordinal'])
         cells = entry.get('cells')
         if not isinstance(cells, list) or not cells:
             diffs.append('源表 #%d 转换映射 cells 必须是非空数组'
@@ -1930,6 +2263,25 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
                 diffs.append('源表 #%d 格 %s targets 必须是数组'
                              % (record['ordinal'], position))
                 continue
+            if grid_mode:
+                expected = expected_grid.get(position, [])
+                if targets != expected:
+                    diffs.append('源表 #%d 格 %s v2 覆盖声明不符（包括空格位）'
+                                 % (record['ordinal'], position))
+                has_code = any(key[:2] == position for key in record['codes'])
+                if (has_code and (not expected or cell.get('code_target') != expected[0])) \
+                        or (not has_code and 'code_target' in cell):
+                    diffs.append('源表 #%d 格 %s v2 code_target 须唯一对应含代码格原点'
+                                 % (record['ordinal'], position))
+                if record.get('headers', {}).get(position):
+                    for target in expected:
+                        out = next((r for r in md.table_records() if r['ordinal'] == target['table']), None)
+                        r, c = target['row'], target['col']
+                        if out and r > 1 and r <= len(out['rows']) and c <= len(out['rows'][r-1]) \
+                                and out['rows'][r-1][c-1]:
+                            if not _grid_header_role(out['raw_rows'][r-1][c-1]):
+                                diffs.append('源表 #%d th 分组在输出 r=%d c=%d 未保留加粗区别'
+                                             % (record['ordinal'], r, c))
             has_table_target = False
             note_target_count = 0
             for target in targets:
@@ -2028,7 +2380,8 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
             cell = declared_positions.get((crow, ccol))
             if cell is None:
                 continue  # 不存在的格位已另行报告
-            for target in cell.get('targets', []):
+            code_targets = [cell.get('code_target')] if grid_mode else cell.get('targets', [])
+            for target in code_targets:
                 if isinstance(target, dict) and 'table' in target:
                     declared_codes.setdefault(
                         (target['table'], target['row'], target['col']),
@@ -2106,6 +2459,7 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
         return ['%s 未找到 article/main/body 选区' % html_label]
 
     diffs = []
+    diffs.extend(table_code_problems(md_text, 'source'))
     # 未解决数学定界：源与解析两侧都不得忽略；忠实解析含未闭合定界的
     # 输入同样阻断分派（不能用剩余跨度相等消除未解决项）
     for issue in src.math_issues:
@@ -2177,16 +2531,60 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
             src_inside.append(entry)
         else:
             src_content.append(entry)
-    md_inside, md_note, md_content = [], [], []
+    md_note, md_content = [], []
     for entry in (md.code + md.math + md.images + md.inline_code):
         if entry[3] == 'code' and entry[1] in claimed_fence_lines:
             continue
         if entry[1] in claimed_row_lines:
-            md_inside.append(entry)
+            continue
         elif any(start <= entry[1] <= end for start, end in note_ranges):
             md_note.append(entry)
         else:
             md_content.append(entry)
+    if src.family == 'api':
+        source_links = [(link.get('href'), tuple(src._image_src(image)
+                        for image in link.find_all('img') if src._image_src(image)))
+                        for link in src.root.find_all('a', href=True) if not _in_pre(link)
+                        and (src.mapped_cell_of(src._index[id(link)]) or (None,))[0] not in mapped_src
+                        and any(src._image_src(image) for image in link.find_all('img'))]
+        output_links = []
+        reader = _MarkdownIt('commonmark')
+        for number, line in enumerate(md.lines, start=1):
+            if number in md.fenced or number in claimed_row_lines:
+                continue
+            for inline in reader.parseInline(line.strip()):
+                active = None
+                for token in inline.children or []:
+                    if token.type == 'link_open':
+                        active = [token.attrGet('href'), []]
+                    elif token.type == 'image' and active is not None:
+                        active[1].append(token.attrGet('src'))
+                    elif token.type == 'link_close' and active is not None:
+                        if active[1]:
+                            output_links.append((active[0], tuple(active[1])))
+                        active = None
+        diffs += _stream_diffs('链接图片', source_links, output_links, html_label, md_label)
+        # 标签与代码 / 图片在同一有序事实流中；只比较标签集合会漏掉错绑面板。
+        for container in src.root.find_all('div'):
+            if _in_pre(container) or not ({'sd-tab-set', 'sphinx-tabs'}
+                                         & set(container.get('class') or [])):
+                continue
+            for label, panel in _api_tab_pairs(container):
+                start = src._index[id(label)]
+                end = max([start] + [src._index[id(n)] for n in label.descendants
+                                     if id(n) in src._index])
+                position = src._index[id(panel)]
+                src_content = [(entry[0], position, entry[1] - start, entry[3], entry[4])
+                               if start <= entry[1] <= end else entry for entry in src_content]
+                src_content.append((src._section_of(label), position, -1,
+                                    'tab-label', _norm_text(label.get_text(' ', strip=True))))
+        for number, line in enumerate(md.lines, start=1):
+            if number in md.fenced:
+                continue
+            match = re.fullmatch(r'\s*\*\*\[Tab: (.*)\]\*\*\s*', line)
+            if match:
+                md_content.append((md._md_section(number), number, 0,
+                                   'tab-label', _norm_text(match[1])))
     cell_content = {}
     for entry in sorted(src_inside, key=lambda item: (item[1], item[2])):
         cell_content.setdefault(src.mapped_cell_of(entry[1]), []).append(
@@ -2204,31 +2602,40 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
         for lines in note_targets.get(cell, ()):
             expected_by_note.setdefault(lines, []).extend(contents)
     # 输出侧归属：声明输出表的行内容按 ' | ' 列界定位到输出格位
-    row_lookup = {}
-    cell_bounds = {}
+    actual_by_target = {}
+    expected_links, actual_links = {}, {}
+    source_tables = {r['ordinal']: r for r in src.table_records}
+    for (table, row, col), targets in sorted(cell_table_targets.items()):
+        for target in targets:
+            expected_links.setdefault(target, []).extend(source_tables[table].get('links', {}).get((row,col), []))
     for record in md_tables:
         if record['ordinal'] not in claimed_md:
             continue
-        for row_no, line_no in enumerate(sorted(record['row_lines']),
-                                         start=1):
-            row_lookup[line_no] = (record['ordinal'], row_no)
-            bounds = []
-            cursor = 0
-            for cell_text in md.lines[line_no - 1].split(' | '):
-                bounds.append((cursor, cursor + len(cell_text)))
-                cursor += len(cell_text) + 3
-            cell_bounds[line_no] = bounds
-    actual_by_target = {}
-    for entry in sorted(md_inside, key=lambda item: (item[1], item[2])):
-        ordinal, row_no = row_lookup[entry[1]]
-        col_no = len(cell_bounds[entry[1]])
-        for index, (_start, end) in enumerate(cell_bounds[entry[1]],
-                                              start=1):
-            if entry[2] < end:
-                col_no = index
-                break
-        actual_by_target.setdefault((ordinal, row_no, col_no),
-                                    []).append((entry[3], entry[4]))
+        for row_no, row in enumerate(record['raw_rows'], 1):
+            for col_no, text in enumerate(row, 1):
+                pairs, active = [], None
+                for token in _MarkdownIt('commonmark').parseInline(text)[0].children or []:
+                    if token.type == 'link_open':
+                        active = [token.attrGet('href'), []]
+                    elif token.type == 'image' and active is not None:
+                        active[1].append(token.attrGet('src'))
+                    elif token.type == 'link_close' and active is not None:
+                        pairs.append((active[0], tuple(active[1])))
+                        active = None
+                if pairs:
+                    actual_links[record['ordinal'], row_no, col_no] = pairs
+                facts = [(start, 'inline-code', _norm_code_text(content))
+                         for content, (start, end) in parse_inline_code_spans(text)]
+                facts += [(span.start, span.kind, decode_table_math(span.expr, parsed=True)
+                           if record.get('gfm') and src._mathml_alttext else span.expr)
+                          for span in scan_math(text).spans]
+                facts += [(start, 'image', path) for line, start, end, path in image_reference_spans(text)]
+                if facts:
+                    actual_by_target[record['ordinal'], row_no, col_no] = [
+                        (kind, value) for start, kind, value in sorted(facts)]
+    for position in sorted(set(expected_links) | set(actual_links)):
+        if expected_links.get(position, []) != actual_links.get(position, []):
+            diffs.append('映射表格链接归属不一致 表#%d r=%d c=%d' % position)
     # 逐格有序比较：格内出现顺序（流程前后/左右对照）与格位共同参与，
     # 同格两张图片交换必须检出（A27 等数乱序失败）；多源格按源格
     # （表序、行、列）顺序、输出格内按行列序拼接
@@ -2255,7 +2662,7 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
                 % (lines + (html_label, expected[:4], md_label, actual[:4])))
     diffs += _section_ordered_diffs('内容', src_content, md_content,
                                     html_label, md_label)
-    md_refs, md_defs = md.footnote_streams()
+    md_refs, md_defs = md.footnote_streams(rich=src.family == 'api')
     # 脚注引用次数按映射倍数解释：colspan/共享值展开到多个输出格时，
     # 格内引用随格文字一起重复，次数由声明目标数推导，不全局忽略
     src_refs = [label for label, _order in cell_runs(

@@ -217,6 +217,7 @@ def verify(doc_text, src_text, strong_tokens, approved_extra_math=(),
         m in doc_text for m in ('[TABLE]', '[IMG:', '[FIGURE]', '[FIGCAP]'))
     fails = []
     warns = []
+    scan_context = None
     doc = doc_text
     src = src_text
     if doc_dir is None:
@@ -279,7 +280,7 @@ def verify(doc_text, src_text, strong_tokens, approved_extra_math=(),
         src_scan = scan_math(src)
         math_diffs, math_warns = compare_math_spans(
             src_scan.spans, doc_scan.spans, src_label, doc_label,
-            approved_extra_exprs=approved_extra_math, doc_text=doc)
+            approved_extra_exprs=approved_extra_math, doc_text=doc, src_text=src)
         fails.extend('公式逐项核对: %s' % d for d in math_diffs)
         fails.extend(math_issue_fails(src_scan.issues, src_label))
         fails.extend(math_issue_fails(doc_scan.issues, doc_label))
@@ -420,6 +421,9 @@ def verify(doc_text, src_text, strong_tokens, approved_extra_math=(),
         warns.append('数字辅助: 未启用 --numeric-review，此项未检查'
                      '（原人工数字复核义务不变）')
 
+    from _source_reconcile import compare_translation_tables, table_code_problems
+    fails.extend(table_code_problems(doc, source_context=scan_context))
+    fails.extend(compare_translation_tables(src, doc, source_context=scan_context))
     return fails, warns
 
 

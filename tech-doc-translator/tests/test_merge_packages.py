@@ -7,6 +7,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]
@@ -118,6 +119,54 @@ class MergePackagesTest(unittest.TestCase):
         return merge.merge(
             os.path.join(self.tmp, 'out.md'), inputs, self.src, 'h2',
             self.wps, self.evidence, None, (), (), None, None)
+
+    def test_atomic_publish_failures_preserve_old_or_absent_target(self):
+        target = Path(self.tmp) / 'out.md'
+        inputs = [self.targets[name] for name in sorted(TRANS)]
+        for existing in (True, False):
+            for operation in ('fsync', 'replace'):
+                with self.subTest(existing=existing, operation=operation):
+                    if existing:
+                        target.write_bytes(b'old valid output')
+                    else:
+                        target.unlink(missing_ok=True)
+                    with mock.patch.object(merge.os, operation, side_effect=OSError('injected failure')):
+                        with self.assertRaises(OSError):
+                            self._merge(inputs)
+                    self.assertEqual(target.read_bytes() if target.exists() else None,
+                                     b'old valid output' if existing else None)
+                    self.assertEqual(list(Path(self.tmp).glob('.merge-*.md')), [])
+
+    def test_staged_recheck_rejection_keeps_old_target(self):
+        target = Path(self.tmp) / 'out.md'
+        target.write_bytes(b'old valid output')
+        with mock.patch.object(merge, '_candidate_check_failures',
+                               side_effect=[([], []), (['damaged candidate'], [])]):
+            with self.assertRaises(ValueError):
+                self._merge([self.targets[name] for name in sorted(TRANS)])
+        self.assertEqual(target.read_bytes(), b'old valid output')
+        self.assertEqual(list(Path(self.tmp).glob('.merge-*.md')), [])
+
+    def test_temporary_write_failure_keeps_old_or_absent_target(self):
+        target = Path(self.tmp) / 'out.md'
+        for existing in (True, False):
+            if existing:
+                target.write_bytes(b'old valid output')
+            else:
+                target.unlink(missing_ok=True)
+            original = merge.tempfile.NamedTemporaryFile
+
+            def failing_file(*args, **kwargs):
+                handle = original(*args, **kwargs)
+                handle.write = mock.Mock(side_effect=OSError('disk full'))
+                return handle
+
+            with mock.patch.object(merge.tempfile, 'NamedTemporaryFile', failing_file):
+                with self.assertRaisesRegex(OSError, 'disk full'):
+                    self._merge([self.targets[name] for name in sorted(TRANS)])
+            self.assertEqual(target.read_bytes() if target.exists() else None,
+                             b'old valid output' if existing else None)
+            self.assertEqual(list(Path(self.tmp).glob('.merge-*.md')), [])
 
     def test_correct_mapping_merges(self):
         received = self._merge([self.targets[name] for name in sorted(TRANS)])

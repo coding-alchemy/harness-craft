@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """按独立全量范围合并工作包译文（R3 / 已批准 D3）。
 
+表格代码：--finalize-table-code 在已核验中间包上转为可读格位说明；不改原包。
+
 用法：
     python3 merge_work_packages.py <out.md> <trans_wp_001.md> [<trans_wp_002.md> ...]
         --source <source.md> --strategy <h2|chars:N> --source-packages <wps_dir>
@@ -30,7 +32,7 @@
       两者都不可用而候选含图时报告“来源身份未核验”并失败。
     - 装配只拼接包正文（不把续片元数据变成正文，不改代码示例），候选
       先在最终目录语境通过对照当前源的全量硬检查（标题/代码/公式/脚注/
-      图片/强 token），写出后再从实际路径复验；复验失败恢复原成品，
+      图片/强 token），暂存文件独立重读复验后原子替换；失败保持原成品，
       首次失败不留下声称有效的成品。
 """
 import glob as _glob
@@ -111,7 +113,7 @@ def _candidate_check_failures(candidate_text, source_text, out_dir,
                               delivery_root, image_digests, strong_tokens,
                               approved_extra_math, label, source_dir=None,
                               source_adaptation=None, full=True,
-                              adaptation_payload=None, pdf_view=None, source_ranges=None):
+                              adaptation_payload=None, pdf_view=None, source_ranges=None, header_cells=()):
     """候选/成品在最终语境下对照当前源的全量硬检查；返回 (失败, 告警)。
 
     图片完整通过必须建立每次出现的来源身份对应：优先 --image-map，其次
@@ -126,6 +128,7 @@ def _candidate_check_failures(candidate_text, source_text, out_dir,
                                  heading_entries(candidate_text),
                                  '源文', label):
         fails.append('标题核对: %s' % diff)
+    scan_context = None
     code_src,code_doc=source_text,candidate_text
     if pdf_view:
         import _pdf_math
@@ -157,9 +160,8 @@ def _candidate_check_failures(candidate_text, source_text, out_dir,
         # 宿主（脚注定义等）内字面公式源侧按 bound_math_spans 逐字进入比较，
         # 译侧同口径保留（两侧对称，与 verify_reference_translation 一致）：
         # 脚注公式损伤由本比较发现，不预先丢弃
-        doc_scan = scan_math(
-            candidate_text,
-            source_context=latexml.scan_context_from_payload(payload))
+        scan_context = latexml.scan_context_from_payload(payload)
+        doc_scan = scan_math(candidate_text, source_context=scan_context)
         src_spans, bind_problems = latexml.precise_math_spans(
             source_text, source_adaptation, full=full, label='源文',
             payload=payload)
@@ -178,10 +180,14 @@ def _candidate_check_failures(candidate_text, source_text, out_dir,
         math_diffs, _ = compare_math_spans(
             src_scan.spans, doc_scan.spans,
             '源文', label, approved_extra_exprs=approved_extra_math,
-            doc_text=candidate_text)
+            doc_text=candidate_text, src_text=source_text)
         fails.extend('公式逐项核对: %s' % d for d in math_diffs)
         fails.extend(math_issue_fails(src_scan.issues, '源文'))
         fails.extend(math_issue_fails(doc_scan.issues, label))
+    from _source_reconcile import compare_translation_tables, table_code_problems
+    fails.extend(table_code_problems(candidate_text, source_context=scan_context))
+    fails.extend(compare_translation_tables(source_text, candidate_text,
+                                            source_context=scan_context, header_cells=header_cells))
     fn_diffs, _ = ([],[]) if pdf_view else footnote_diffs(source_text, candidate_text, '源文', label)
     fails.extend(fn_diffs)
     src_count = image_occurrence_count(source_text)
@@ -209,7 +215,8 @@ def _candidate_check_failures(candidate_text, source_text, out_dir,
 def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
           scope=None, strong_tokens=(), approved_extra_math=(),
           delivery_root=None, image_digests=None, source_adaptation=None,
-          numeric_review=False, numeric_policy=None, project_context=None):
+          numeric_review=False, numeric_policy=None, project_context=None,
+          finalize_code=False):
     source_abs = os.path.abspath(source_path)
     if not os.path.isfile(source_abs):
         sys.exit('输入不足: 当前源不存在: %s' % source_path)
@@ -220,6 +227,7 @@ def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
         sys.exit('输入不足: --scope 局部范围与 --image-map 全量出现身份不兼容')
 
     context = rwp.load_project_context(project_context, source_abs)
+    code_stage = rwp.table_code_stage(context, 'intermediate' if finalize_code else None)
     strong_tokens, approved_extra_math, source_adaptation, numeric_review, numeric_policy = rwp.effective_options(
         context, strong_tokens, approved_extra_math, source_adaptation, numeric_review, numeric_policy)
     import _pdf_math
@@ -416,7 +424,7 @@ def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
         facts = rwp.package_facts(
             expected[key], trans_body, received_path, source_abs,
             strong_tokens, approved_extra_math, project, numeric_review,
-            numeric_policy_abs, context)
+            numeric_policy_abs, context, code_stage)
         bad = rwp.package_binding_problems(entry_of(evidence, name), facts, trans_body)
 
         if bad:
@@ -431,6 +439,15 @@ def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
         if body:
             parts.append(body)
     candidate = '\n\n'.join(parts) + '\n'
+    source_ranges=[(expected[key]['char_start'],expected[key]['char_end']) for key in ordered_keys] if scope else None
+    header_cells = rwp.table_headers(context, source_ranges)
+    if finalize_code:
+        from _source_reconcile import finalize_table_code
+        code_context = None
+        if adaptation_payload:
+            import _latexml_source as latexml
+            code_context = latexml.scan_context_from_payload(adaptation_payload)
+        candidate = finalize_table_code(candidate, code_context, header_cells)
 
     # 6) 候选在最终目录语境下对照当前源（全量=整篇源；局部=范围内源切片）
     if scope:
@@ -440,12 +457,11 @@ def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
     out_abs = os.path.abspath(out_path)
     out_dir = os.path.dirname(out_abs)
     pdf_view=context.get('_pdf_view') if context else None
-    source_ranges=[(expected[key]['char_start'],expected[key]['char_end']) for key in ordered_keys] if scope else None
     fails, warns = _candidate_check_failures(
         candidate, source_slice, out_dir, delivery_root, image_digests,
         strong_tokens, approved_extra_math, '候选', source_dir=source_dir,
         source_adaptation=adaptation_abs, full=not scope,
-        adaptation_payload=adaptation_payload,pdf_view=pdf_view,source_ranges=source_ranges)
+        adaptation_payload=adaptation_payload,pdf_view=pdf_view,source_ranges=source_ranges,header_cells=header_cells)
     if fails:
         print('候选未通过最终目录语境检查，不写出成品：')
         for f in fails:
@@ -456,33 +472,33 @@ def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
     for w in warns:
         print('WARN:', w)
 
-    # 7) 写出后再从实际路径复验；失败恢复原成品，首次失败不留新成品
-    previous = None
-    if os.path.exists(out_abs):
-        previous = open(out_abs, 'rb').read()
-    with open(out_abs, 'w', encoding='utf-8') as f:
-        f.write(candidate)
-    written = _pdf_math.read_document(out_abs,exact=bool(pdf_view))
-    fails, warns = _candidate_check_failures(
-        written, source_slice, out_dir, delivery_root, image_digests,
-        strong_tokens, approved_extra_math, '实际成品', source_dir=source_dir,
-        source_adaptation=adaptation_abs, full=not scope,
-        adaptation_payload=adaptation_payload,pdf_view=pdf_view,source_ranges=source_ranges)
-    if fails:
-        if previous is not None:
-            with open(out_abs, 'wb') as f:
-                f.write(previous)
-            print('实际路径复验失败，已恢复原成品：')
-        else:
-            os.remove(out_abs)
-            print('实际路径复验失败，不留下新成品：')
-        for f in fails:
-            print('  FAIL:', f)
-        for w in warns:
-            print('  WARN:', w)
-        sys.exit(1)
-    for w in warns:
-        print('WARN:', w)
+    # 7) 独立重读暂存文件并检查后原子发布；写入/检查/替换失败均不碰旧目标。
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                dir=out_dir, prefix='.merge-', suffix='.md', delete=False) as handle:
+            staged = handle.name
+            handle.write(candidate)
+            handle.flush()
+            os.fsync(handle.fileno())
+        written = _pdf_math.read_document(staged, exact=bool(pdf_view))
+        fails, warns = _candidate_check_failures(
+            written, source_slice, out_dir, delivery_root, image_digests,
+            strong_tokens, approved_extra_math, '暂存成品', source_dir=source_dir,
+            source_adaptation=adaptation_abs, full=not scope,
+            adaptation_payload=adaptation_payload, pdf_view=pdf_view,
+            source_ranges=source_ranges,header_cells=header_cells)
+        if fails:
+            raise ValueError('暂存成品复验失败，旧成品保持：' + '；'.join(fails))
+        for warning in warns:
+            print('WARN:', warning)
+        if os.path.exists(out_abs):
+            os.chmod(staged, os.stat(out_abs).st_mode & 0o777)
+        os.replace(staged, out_abs)
+        staged = None
+    finally:
+        if staged is not None and os.path.exists(staged):
+            os.unlink(staged)
 
     print('已合并 %d 个工作包 -> %s%s' % (
         len(ordered_keys), out_abs,
@@ -502,6 +518,8 @@ def entry_of(evidence, name):
 
 def main():
     argv, project_context = rwp.extract_project_context(sys.argv[1:])
+    finalize_code = '--finalize-table-code' in argv
+    argv = [item for item in argv if item != '--finalize-table-code']
     argv, strong_tokens = extract_strong_tokens(argv)
     argv, approved_extra_math = extract_approved_extra_math(argv)
     argv, image_map, delivery_root = extract_image_options(argv)
@@ -563,7 +581,7 @@ def main():
               evidence_path, scope, strong_tokens, approved_extra_math,
               delivery_root, image_digests,
               source_adaptation or None,
-              numeric_review, numeric_policy, project_context)
+              numeric_review, numeric_policy, project_context, finalize_code)
     except ValueError as exc:
         sys.exit('合并拒绝: %s' % exc)
 

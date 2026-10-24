@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 cd "$(dirname "$0")/.."
+python3 tests/test_api_containers.py
+python3 tests/test_grid_tables.py
+python3 tests/test_api_navigation.py
+python3 tests/test_api_native_container_regressions.py
 FIXTURE_SITE="tests/fixtures/multipage_site"
 DISCOVER="skills/tech-doc-translator/scripts/discover_pages.py"
 PARSE="skills/tech-doc-translator/scripts/parse_api_html.py"
@@ -94,7 +99,7 @@ from pathlib import Path
 out = Path(sys.argv[1])
 payload = json.loads((out / 'export' / 'images_display.json')
                      .read_text(encoding='utf-8'))
-assert payload['markdown'] == 'merged_api.md', payload['markdown']
+assert payload['markdown'] == '../merged_api.md', payload['markdown']
 entries = {e['occurrence']: e for e in payload['entries']}
 assert set(entries) == {1, 2}, payload['entries']
 assert entries[1]['markdown'] == '../merged_api.md', entries[1]
@@ -506,6 +511,8 @@ cat > "$T04SITE/trans_index.md" <<'MD'
 # API T04（API 文档）
 
 入口页译文。
+
+[详情](t04_page.html)
 MD
 cat > "$T04SITE/trans_t04_page.md" <<'MD'
 # T04 API Page
@@ -654,3 +661,5 @@ fi
 grep -q '缺失或不可读' "$TMP/oh_absent.err" \
   || { echo "错误：缺文件诊断缺失"; cat "$TMP/oh_absent.err"; exit 1; }
 echo "API 家族缺文件明确失败"
+
+python3 tests/test_api_single_page.py

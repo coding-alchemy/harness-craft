@@ -29,6 +29,10 @@
                                                           // 匹配的快照；两级同时声明须为同一映射
          "per_stem_map": "docs/source_en.images_display.json",  // 单快照旧写法（有图时关联两级映射）
          "table_conversions": "docs/table_conversions.json",    // 可选逐表转换映射
+                                                                // 多快照优先在每个 snapshots[]
+                                                                // 声明自己的 table_conversions 路径；
+                                                                // 旧条目级仅凭摘要唯一归属，
+                                                                // 两级并存须为同一映射
          "source_adaptation": "docs/source_adaptation.json",    // 可选：LaTeXML 来源依据
                                                                 // （version:1/format:latexml；
                                                                 //  预检独立核对快照摘要/论文身份/对应；
@@ -313,12 +317,13 @@ CHECK_SHARED_DEPS = {
     "verify_pdf": ("verify_pdf.py", "export_pdf.py", "_verification.py",
                    "_html_fidelity.py", "_source_reconcile.py",
                    "_image_binding.py", "_image_preflight.py",
+                   "_pdf_dependencies.py",
                    "_latexml_source.py"),
     "verify_translation": ("verify_translation.py", "_verification.py",
                            "_official_headings.py", "_html_fidelity.py",
                            "_source_reconcile.py", "_latexml_source.py",
                            "_numeric_review.py", "_pdf_math.py", "_pdf_source.py",
-                           "recover_work_packages.py"),
+                           "recover_work_packages.py", "_api_navigation.py"),
     "verify_paginated_translation": ("verify_paginated_translation.py",
                                      "_verification.py",
                                      "_official_headings.py",
@@ -335,7 +340,7 @@ CHECK_SHARED_DEPS = {
     "verify_api_translation": ("verify_api_translation.py",
                                "_verification.py", "_official_headings.py",
                                "_html_fidelity.py", "_source_reconcile.py",
-                               "_numeric_review.py"),
+                               "_numeric_review.py", "_api_navigation.py"),
     "verify_pdf_source": ("verify_pdf_source.py", "_pdf_source.py", "_pdf_math.py",
                           "_verification.py", "_numeric_review.py", "_source_reconcile.py",
                           "_html_fidelity.py"),
@@ -453,6 +458,9 @@ def _source_identity(entry, rooted):
                     "path": snap["per_stem_map"]["path"],
                     "sha256": _digest_or_none(
                         rooted(snap["per_stem_map"]["path"]))}),
+            **({'table_conversions': {'path': snap['table_conversions']['path'],
+                'sha256': _digest_or_none(rooted(snap['table_conversions']['path']))}}
+               if snap.get('table_conversions') else {}),
         } for snap in entry["snapshots"]],
         "table_conversions": (
             None if not entry.get("table_conversions") else {
@@ -1080,6 +1088,52 @@ def _run_pdf_source_reconcile(root, entry, problems):
     }
 
 
+def _bind_table_maps(snapshots, declarations, legacy, rooted, problems, label):
+    """表映射只归属一份快照，复用原来源记录而不猜目录 / 表号。"""
+    bound = [None] * len(snapshots)
+    def load(path):
+        if not isinstance(path, str) or not path:
+            raise ValueError('table_conversions 必须是非空路径')
+        with open(rooted(path), encoding='utf-8') as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict) or payload.get('version') not in (1, 2) \
+                or not isinstance(payload.get('tables'), list):
+            raise ValueError('表映射需 version=1/2 与 tables 数组: %s' % path)
+        return payload
+    def bind(index, path, payload):
+        digest = payload.get('snapshot_sha256')
+        if (payload['version'] == 2 and not isinstance(digest, str)) \
+                or (digest is not None and digest != snapshots[index]['snapshot_sha256']):
+            raise ValueError('快照 #%d 表映射摘要不符: %s' % (index+1, path))
+        if bound[index] is not None and os.path.realpath(rooted(bound[index]['path'])) != os.path.realpath(rooted(path)):
+            raise ValueError('快照 #%d 两级 table_conversions 声明不一致' % (index+1))
+        if bound[index] is None:
+            bound[index] = {'path': path, 'sha256': sha256_file(rooted(path))}
+    try:
+        for index, path in enumerate(declarations):
+            if path is not None:
+                bind(index, path, load(path))
+        if legacy is not None:
+            payload = load(legacy)
+            matches = ([0] if len(snapshots) == 1 else [i for i, snap in enumerate(snapshots)
+                if payload.get('snapshot_sha256') == snap['snapshot_sha256']])
+            if len(matches) != 1:
+                raise ValueError('entry 级表映射无法凭摘要对应唯一快照: %s' % legacy)
+            bind(matches[0], legacy, payload)
+        owners = {}
+        for index, info in enumerate(bound):
+            if info is None:
+                continue
+            actual = os.path.realpath(rooted(info['path']))
+            if actual in owners:
+                raise ValueError('同一表映射被快照 #%d / #%d 重复消费: %s'
+                                 % (owners[actual]+1, index+1, info['path']))
+            owners[actual] = index
+    except (OSError, ValueError) as exc:
+        problems.append('%s 表映射归属失败: %s' % (label, exc))
+    return bound
+
+
 def check_source_chains(root, record, problems, *, source_only=False):
     """源链预检（§4.7）：解析 Markdown → 同版本快照、家族/版本与选区。
 
@@ -1133,6 +1187,7 @@ def check_source_chains(root, record, problems, *, source_only=False):
         snapshots = []
         snap_map_decls = []
         snap_adapt_decls = []
+        snap_table_decls = []
         for snap in _source_list(entry.get("snapshots"), label + " 的 snapshots", problems):
             if not isinstance(snap, dict) or not isinstance(
                     snap.get("snapshot"), str):
@@ -1166,9 +1221,15 @@ def check_source_chains(root, record, problems, *, source_only=False):
             })
             snap_map_decls.append(map_decl)
             snap_adapt_decls.append(adapt_decl)
+            snap_table_decls.append(snap.get('table_conversions'))
         if not snapshots:
             problems.append("%s 未声明任何快照" % label)
             continue
+        table_maps = _bind_table_maps(snapshots, snap_table_decls,
+                                     entry.get('table_conversions'), rooted, problems, label)
+        for snap, info in zip(snapshots, table_maps):
+            if info is not None:
+                snap['table_conversions'] = info
         # per-stem 映射声明（§9.4.1）：快照级声明绑定各自快照；entry 级
         # 旧声明在单快照时绑定唯一快照，多快照时按映射记录的来源对应
         # 实际快照（核实来源与上下文后归属，不能自动复制给其他页面）；
@@ -1356,18 +1417,33 @@ def check_source_chains(root, record, problems, *, source_only=False):
                 label, snap_index, snap["snapshot"])
             fact_by_node = {fact["node"]: fact
                             for fact in (facts["images"] if facts else [])}
+            expected_nodes = Counter(fact_by_node.keys())
+            if snap.get('table_conversions'):
+                try:
+                    with open(rooted(snap['table_conversions']['path']), encoding='utf-8') as handle:
+                        table_mapping = json.load(handle)
+                    if table_mapping.get('version') == 2:
+                        snapshot_path = rooted(snap['snapshot'])
+                        if table_mapping.get('snapshot_sha256') != sha256_file(snapshot_path):
+                            raise ValueError('v2 表映射快照摘要不符')
+                        from _source_reconcile import snapshot_grid_image_counts
+                        with open(snapshot_path, encoding='utf-8', newline='') as handle:
+                            expected_nodes = Counter(snapshot_grid_image_counts(
+                                handle.read(), family, snap.get('section_id')))
+                except (OSError, ValueError) as exc:
+                    problems.append('%s 的表格图片投影不可核对: %s' % (snap_label, exc))
             items = [item for item in (payload.get("entries", [])
                                        + payload.get("undetermined", []))
                      if isinstance(item, dict)]
             item_nodes = [item.get("source_node") for item in items]
             if (any(not isinstance(node, str) or not node
                     for node in item_nodes)
-                    or sorted(item_nodes) != sorted(fact_by_node)):
+                    or Counter(item_nodes) != expected_nodes):
                 problems.append(
                     "%s 的条目与快照实际图片出现不对应（缺证明）：映射记录"
                     " %s，快照实际 %s" % (snap_label, sorted(
                         str(node) for node in item_nodes),
-                                          sorted(fact_by_node)))
+                                          sorted(expected_nodes.elements())))
                 continue
             for item in items:
                 fact = fact_by_node[item["source_node"]]
@@ -1653,6 +1729,19 @@ def run_source_reconcile(root, record, source_entries, problems):
         return rel if os.path.isabs(rel) else os.path.normpath(
             os.path.join(root_abs, rel))
 
+    def table_conversions(snap, label):
+        info = snap.get('table_conversions')
+        if info is None:
+            return None
+        try:
+            if sha256_file(rooted(info['path'])) != info['sha256']:
+                raise ValueError('表映射在准入后变化')
+            with open(rooted(info['path']), encoding='utf-8') as handle:
+                return json.load(handle)
+        except (OSError, ValueError) as exc:
+            problems.append('%s 的快照 %s 表映射不可读: %s' % (label, snap['snapshot'], exc))
+            return None
+
     results = []
     for entry in source_entries:
         if entry.get("family") == PDF_SOURCE_FAMILY:
@@ -1679,27 +1768,19 @@ def run_source_reconcile(root, record, source_entries, problems):
             if md_lines is not None and ranges is None:
                 ranges = _snapshot_ranges(entry["snapshots"], parsed_path,
                                           problems, label)
-            conversions = None
-            if entry.get("table_conversions"):
-                conversion_path = rooted(entry["table_conversions"])
-                try:
-                    conversions = json.load(
-                        open(conversion_path, encoding="utf-8"))
-                except (OSError, ValueError) as exc:
-                    problems.append(
-                        "%s 的逐表转换映射不可读: %s（%s）"
-                        % (label, entry["table_conversions"], exc))
-                    continue
             diffs = []
             if md_lines is not None and ranges is not None:
                 for index, (snap, adapt, (start, end)) in enumerate(zip(
                         entry["snapshots"], adaptations, ranges)):
                     if adapt is None:
                         continue
+                    conversions = table_conversions(snap, label)
+                    if snap.get('table_conversions') and conversions is None:
+                        continue
                     snapshot_path = rooted(snap["snapshot"])
                     try:
                         snap_raw = open(snapshot_path,
-                                        encoding="utf-8").read()
+                                        encoding="utf-8", newline="").read()
                     except OSError as exc:
                         problems.append("%s 对账读取失败: %s"
                                         % (label, exc))
@@ -1736,25 +1817,18 @@ def run_source_reconcile(root, record, source_entries, problems):
                                       problems, label)
         diffs = []
         if md_lines is not None and ranges is not None:
-            for snap, (start, end) in zip(entry["snapshots"], ranges):
+            for index, (snap, (start, end)) in enumerate(zip(entry["snapshots"], ranges), 1):
                 snapshot_path = rooted(snap["snapshot"])
-                conversions = None
-                if entry.get("table_conversions"):
-                    conversion_path = rooted(entry["table_conversions"])
-                    try:
-                        conversions = json.load(
-                            open(conversion_path, encoding="utf-8"))
-                    except (OSError, ValueError) as exc:
-                        problems.append(
-                            "%s 的逐表转换映射不可读: %s（%s）"
-                            % (label, entry["table_conversions"], exc))
-                        continue
+                conversions = table_conversions(snap, label)
+                if snap.get('table_conversions') and conversions is None:
+                    continue
                 try:
-                    diffs += reconcile_html_to_markdown(
-                        open(snapshot_path, encoding="utf-8").read(),
+                    diffs += [('快照 #%d: %s' % (index, diff) if len(entry['snapshots']) > 1 else diff)
+                              for diff in reconcile_html_to_markdown(
+                        open(snapshot_path, encoding="utf-8", newline="").read(),
                         "\n".join(md_lines[start - 1:end]),
                         entry["family"], section_id=snap.get("section_id"),
-                        table_conversions=conversions)
+                        table_conversions=conversions)]
                 except OSError as exc:
                     problems.append("%s 对账读取失败: %s" % (label, exc))
         if diffs:
@@ -1865,6 +1939,22 @@ def compute_delivery_identity(root, record, source_entries=None):
     return identity
 
 
+def table_role_source(entry, root):
+    """已准入角色来源的运行时身份；沿用源链，不另存角色登记。"""
+    if entry['family'] == PDF_SOURCE_FAMILY:
+        return None
+    def dep(path):
+        path = os.path.realpath(_rooted(root, path))
+        return [path, _digest_or_none(path)]
+    return {'family': entry['family'], 'source_version': entry['source_version'],
+            'parsed': dep(entry['parsed_markdown']),
+            'snapshots': [{'snapshot': dep(snap['snapshot']),
+                           'section_id': snap.get('section_id'), 'range': list(span),
+                           'table_conversions': dep(snap['table_conversions']['path'])
+                           if snap.get('table_conversions') else None}
+                          for snap, span in zip(entry['snapshots'], entry['ranges'])]}
+
+
 def align_sources_with_checks(source_entries, input_checks, problems,
                               mode=None, root=None):
     """检查实际使用的英文输入与声明源链一一对应，双向都不缺不悬空。
@@ -1896,10 +1986,22 @@ def align_sources_with_checks(source_entries, input_checks, problems,
         for check in checks:
             facts = check.get("facts") or {}
             files = facts.get("files") or {}
-            for path, _digest in files.get("sources") or []:
+            for index, (path, _digest) in enumerate(files.get("sources") or []):
                 entry = declared.get(path)
                 if not entry:
                     continue
+                grid_roles = False
+                for snap in entry.get('snapshots') or []:
+                    if snap.get('table_conversions'):
+                        with open(_rooted(root, snap['table_conversions']['path']), encoding='utf-8') as handle:
+                            grid_roles |= json.load(handle).get('version') == 2
+                if grid_roles:
+                    consumed = facts.get('params', {}).get('table_role_sources') or []
+                    if index >= len(consumed) or consumed[index] != table_role_source(entry, root):
+                        problems.append('核验 %s 的正式 v2 来源未消费相符的角色依据'
+                                        '（--project-context / --navigation-record）：%s；'
+                                        '须匹配当前来源、快照、映射及范围'
+                                        % (check.get('tool'), path))
                 adaptations = [a for a in
                                (entry.get("_source_adaptations") or [])
                                if a is not None]
@@ -1958,6 +2060,9 @@ def _parse_tool_args(tool, args, problems, order, root_abs=None):
     if tool == "verify_pdf_source":
         # 受约束 PDF 核验入口：Namespace 归一为与翻译家族一致的事实字典
         parsed = vars(parsed)
+    if isinstance(parsed, dict) and parsed.get('table_code_stage') == 'intermediate':
+        problems.append('核验记录 #%d 交付禁止使用中间表格代码阶段' % order)
+        return None
     return parsed
 
 
@@ -2099,14 +2204,15 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             import _pdf_math
             context_path=_rooted(root_abs,parsed['project_context'])
             facts['files']['project_context']=dep(context_path)
-            payload=json.load(open(context_path,encoding='utf-8'))
-            facts['files']['source_record']=dep(os.path.join(payload['project_root'],payload['source_record']))
             try:
-                view,_=_pdf_math.translation_view(_rooted(root_abs,parsed['src_path']),context_path)
+                view,span,current=_pdf_math.translation_view(
+                    _rooted(root_abs,parsed['src_path']),context_path,with_context=True)
+                facts['files']['source_record']=dep(os.path.join(current['project_root'],current['source_record']))
+                facts['params']['table_role_sources']=[current['_role_source']]
                 if view:
                     facts['files']['confirmed_math_source']=[dep(view['pdf'])]
-            except (ValueError,KeyError,TypeError) as exc:
-                problems.append('PDF来源核验准入拒绝: '+str(exc))
+            except (OSError,ValueError,KeyError,TypeError) as exc:
+                local_problems.append('核验来源上下文准入拒绝: '+str(exc))
         if parsed.get("numeric_review"):
             # 数字辅助（R5/§4.7）：真实参数与口径进入统一检查事实；
             # 口径文件或参数变化使旧复核绑定不符而失效（D3/D4）。
@@ -2129,6 +2235,22 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             facts["files"]["toc"] = dep(parsed["toc_path"])
             facts["params"]["site_root"] = os.path.realpath(
                 _rooted(root_abs, parsed["site_root"]))
+            if parsed.get('navigation_record'):
+                facts['files']['navigation_record']=dep(parsed['navigation_record'])
+                nav_path=_rooted(root_abs,parsed['navigation_record'])
+                nav_record=json.load(open(nav_path,encoding='utf-8'))
+                nav_problems=[]
+                nav_paths=source_dependency_paths(nav_record['delivery_root'],nav_record,nav_problems)
+                if nav_problems:raise ValueError('导航依赖不可核对: '+'；'.join(nav_problems))
+                facts['files']['navigation_sources']=[[str(path),sha256_file(path)] for path in sorted(nav_paths)]
+                from _api_navigation import load_navigation
+                pages=load_navigation(nav_path, facts['params']['site_root'])
+                with open(_rooted(root_abs,parsed['manifest_path']),encoding='utf-8') as handle:
+                    manifest=[line.strip() for line in handle if line.strip()]
+                translated=facts['files']['translated'][0]
+                facts['params']['table_role_sources']=[
+                    pages[page]['role_source'] if page in pages and str(pages[page]['chapter'])==translated else None
+                    for page in manifest]
         if parsed.get("official_headings_file"):
             # 官方标题文件作为实际依赖（D5）：规范化路径 + 内容摘要 +
             # 加载后的有效原题与确认范围口径；同路径改内容使相关旧

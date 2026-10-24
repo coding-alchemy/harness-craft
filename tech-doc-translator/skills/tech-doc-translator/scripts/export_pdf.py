@@ -23,23 +23,31 @@ import unicodedata
 from html import escape
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+from _pdf_dependencies import PdfDependencyError, preflight_browser, dependency_message, require_module
 
-from bs4 import BeautifulSoup, Comment, NavigableString, Tag
-from markdown_it import MarkdownIt
-from markdown_it.token import Token
+try:
+    from bs4 import BeautifulSoup, Comment, NavigableString, Tag
+    from markdown_it import MarkdownIt
+    from markdown_it.token import Token
 
-from _html_fidelity import reason_code
-from _image_preflight import (
-    Occurrence,
-    bitmap_facts,
-    classify_occurrences,
-    coverage_diagnostics,
-    coverage_summary,
-    decode_budget,
-    undetermined_binding_diagnostics,
-)
-from _verification import (fenced_line_numbers, math_issue_fails, scan_math,
-                           markdown_table_row_lines, table_math_spans)
+    from _html_fidelity import reason_code
+    from _image_preflight import (
+        Occurrence,
+        bitmap_facts,
+        classify_occurrences,
+        coverage_diagnostics,
+        coverage_summary,
+        decode_budget,
+        undetermined_binding_diagnostics,
+    )
+    from _verification import (fenced_line_numbers, scan_code_fences, math_issue_fails, scan_math,
+                               markdown_table_row_lines, table_math_spans)
+except ImportError as exc:
+    message = dependency_message(getattr(exc, 'name', None) or 'HTML/Markdown',
+                                 str(exc), 'requirements.txt')
+    if __name__ == '__main__':
+        raise SystemExit(message)
+    raise PdfDependencyError(message) from exc
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets" / "pdf"
 REPORT_NAME = "export_report.json"
@@ -1595,7 +1603,9 @@ def build_print_toc(toc_chapter, chapters, diagnostics, include_sections):
                 )
 
     # 章级在前、节级随后并入所属章；按文档目标顺序重排为打印顺序。
-    by_target = {e["target"]: e for e in entries}
+    by_target = {}
+    for entry in entries:
+        by_target.setdefault(entry["target"], entry)
     ordered = []
     for entry in entries:
         if entry["level"] == 1:
@@ -1606,7 +1616,11 @@ def build_print_toc(toc_chapter, chapters, diagnostics, include_sections):
             ]:
                 if section not in ordered:
                     ordered.append(section)
-    entries = [by_target[e["target"]] for e in ordered]
+    entries = []
+    for entry in ordered:
+        unique = by_target[entry["target"]]
+        if unique not in entries:
+            entries.append(unique)
 
     # 范围外链接：目录文件中全部未纳入导出的本地文档链接都记录待处置，
     # 不生成伪内部链接（分篇导出时未纳入章的链接在这里显式报告）。
@@ -2061,8 +2075,7 @@ def _footnote_render_extents(text, scan_context=None, math_spans=None):
     markdown = MarkdownIt("commonmark", {"html": False})
     markdown.enable("table")
     if "[^" in text:
-        from mdit_py_plugins.footnote import footnote_plugin
-        markdown.use(footnote_plugin)
+        markdown.use(require_module('mdit_py_plugins.footnote').footnote_plugin)
     tokens = markdown.parse("".join(masked), {})
     line_starts = [0]
     for match in re.finditer("\n", text):
@@ -2509,6 +2522,33 @@ def build_markdown(math_sink, chapter_prefix, math_spans, text,
     markdown = MarkdownIt("commonmark", {"html": False})
     markdown.enable("table")
     markdown.enable("strikethrough")
+    # The parser's supported container format indents fence markers while
+    # retaining raw code bytes. CommonMark otherwise terminates a list fence
+    # at an outdented body line and misreads subsequent labels as code.
+    raw_fences = {}
+    for block in scan_code_fences(text).blocks:
+        indent = len(block.opener) - len(block.opener.lstrip(' '))
+        if indent and any(line.strip() and
+                          len(line) - len(line.lstrip(' ')) < indent
+                          for line in block.body.split('\n')):
+            raw_fences[block.start_line - 1] = block
+
+    def raw_fence_rule(state, startLine, endLine, silent):
+        block = raw_fences.get(startLine)
+        if block is None:
+            return False
+        if silent:
+            return True
+        token = state.push("fence", "code", 0)
+        token.info = block.info
+        token.content = block.body + "\n"
+        token.markup = block.fence_char * block.fence_length
+        token.map = [startLine, block.end_line]
+        state.line = block.end_line
+        return True
+
+    markdown.block.ruler.before("fence", "pdf_raw_fence", raw_fence_rule,
+                                {"alt": ["paragraph", "list", "blockquote"]})
     markdown.inline.ruler.before("escape", "math_inline", math_inline_rule)
     # alt=["paragraph"]：列表项等容器内段落从标记行起吸后续行，块级
     # 规则须能终止段落认领行首块级公式（严格全局偏移比对不变）
@@ -2534,15 +2574,14 @@ def build_markdown(math_sink, chapter_prefix, math_spans, text,
     markdown.add_render_rule("math_inline", render_math_inline)
     markdown.add_render_rule("math_block", render_math_block)
     if "[^" in text:
-        from mdit_py_plugins.footnote import footnote_plugin
-        markdown.use(footnote_plugin)
+        markdown.use(require_module('mdit_py_plugins.footnote').footnote_plugin)
     markdown.core.ruler.before("inline", "pdf_deep_headings", split_deep_headings)
     markdown.inline.ruler.before("html_inline", "pdf_anchor", parse_anchor)
     markdown.add_render_rule("pdf_anchor", render_anchor)
 
     if not highlight:
         return markdown, None
-    from pygments import highlight as pygments_highlight
+    pygments_highlight = require_module('pygments').highlight
     from pygments.formatters import HtmlFormatter
     from pygments.lexers import get_lexer_by_name
     from pygments.util import ClassNotFound
@@ -2775,6 +2814,11 @@ def parse_chapter(chapter):
     （issues）带原位置拒绝导出，合法跨度（含相邻行内与数字邻接）全部
     进入既有渲染，与四族译文/拆包/对账的结论一致。
     """
+    from _source_reconcile import table_code_problems
+    problems = table_code_problems(chapter.projected_text,
+        source_context=getattr(chapter, 'math_scan_context', None))
+    if problems:
+        raise ExportError('最终表格代码检查失败: ' + '；'.join(problems))
     table_math_starts=None
     if getattr(chapter,'pdf_math_confirmed',False):
         import _pdf_math
@@ -3195,12 +3239,7 @@ def resolve_links(chapter, chapters, diagnostics, unlink_targets=()):
         """返回 (加前缀片段, 状态)；状态为 ok/missing/ambiguous。"""
         if fragment in chapter.targets:
             return own_prefix + fragment, "ok"
-        owners = [c for c in chapters if fragment in c.targets]
-        if not owners:
-            return None, "missing"
-        if len(owners) > 1:
-            return None, "ambiguous"
-        return owners[0].prefix + fragment, "ok"
+        return None, "missing"
 
     for anchor in soup.find_all("a"):
         if anchor.find_parent("nav", class_="print-toc") is not None:
@@ -3700,6 +3739,10 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
            provenance_map_path=None, translation_record_path=None,
            view_declaration_path=None, source_adaptation_path=None):
     work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import verify_pdf  # 候选必经的真实核验器（含 uniseg / pypdf），打印前加载。
+    except PdfDependencyError as exc:
+        raise ExportError(str(exc)) from exc
     diagnostics = []
     report = {"diagnostics": diagnostics}
 
@@ -4004,6 +4047,11 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                 file=sys.stderr,
             )
         return 1
+
+    try:
+        preflight_browser()
+    except PdfDependencyError as exc:
+        raise ExportError(str(exc)) from exc
 
     # 预算与覆盖提示在内联/解码开始前输出（承诺的提前提示）：此后任何
     # 内联或浏览器失败，用户已能看见逐章覆盖与两种口径的预算估算。
@@ -4471,7 +4519,7 @@ def main(argv=None):
             view_declaration_path=args.view_declaration,
             source_adaptation_path=args.source_adaptation,
         )
-    except ExportError as exc:
+    except (ExportError, PdfDependencyError) as exc:
         print("FAIL: %s" % exc, file=sys.stderr)
         return 1
 
