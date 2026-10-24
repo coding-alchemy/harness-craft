@@ -633,6 +633,11 @@ def footnote_definition_block(lines, line_no, cross=None):
     return '\n'.join(body), last_content, cursor
 
 
+def markdown_list_count(text):
+    """按实际 Markdown 块读取有序/无序项；代码示例不计。"""
+    return sum(token.type == 'list_item_open' for token in _TABLE_ROWS_MD.parse(text))
+
+
 def markdown_table_tokens(text):
     """实际块规则读取正文和既有脚注正文，不在块解析前改写公式。"""
     lines = text.splitlines()
@@ -704,7 +709,7 @@ def table_math_spans(spans, text, decode_entities=False):
 
 
 def compare_math_spans(src_spans, doc_spans, src_label='源文', doc_label='译文',
-                       approved_extra_exprs=(), doc_text=None, precise=False):
+                       approved_extra_exprs=(), doc_text=None, precise=False, src_text=None):
     """按（类型、顺序、原表达式）逐项比较公式。
 
     返回 (diffs, warns)：diffs 非空即硬失败；warns 为回源定性告警
@@ -723,6 +728,8 @@ def compare_math_spans(src_spans, doc_spans, src_label='源文', doc_label='译�
     """
     diffs = []
     warns = []
+    if src_text is not None:
+        src_spans = table_math_spans(src_spans, src_text, decode_entities=precise)
     if doc_text is not None:
         doc_spans = table_math_spans(doc_spans, doc_text, decode_entities=precise)
 
@@ -1870,6 +1877,18 @@ def missing_images(text, base_dir, allow_cwd=False):
             continue
         missing.append(source)
     return missing
+
+
+def extract_table_code_stage(argv):
+    argv = list(argv)
+    if '--table-code-stage' not in argv:
+        return argv, None
+    index = argv.index('--table-code-stage')
+    if index + 1 >= len(argv) or argv[index + 1] not in ('final', 'intermediate'):
+        raise SystemExit('--table-code-stage 需要 final 或 intermediate')
+    stage = argv[index + 1]
+    del argv[index:index + 2]
+    return argv, stage
 
 
 def residual_markers(text, markers):

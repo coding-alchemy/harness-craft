@@ -18,10 +18,16 @@ import unicodedata
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-import pypdf
 from collections import Counter
-from markdown_it import MarkdownIt
-from uniseg.linebreak import line_break_boundaries
+from _pdf_dependencies import PdfDependencyError, require_module, dependency_message
+try:
+    pypdf = require_module('pypdf')
+    MarkdownIt = require_module('markdown_it', 'requirements.txt').MarkdownIt
+    line_break_boundaries = require_module('uniseg.linebreak').line_break_boundaries
+except PdfDependencyError as exc:
+    if __name__ == '__main__':
+        raise SystemExit(str(exc))
+    raise
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import export_pdf as exporter  # noqa: E402  复用同一解析层，另有独立原始扫描交叉核对
@@ -271,7 +277,7 @@ def code_span_intervals(chunk_lines):
     return intervals
 
 
-def scan_translator_notes(text):
+def scan_translator_notes(text, with_offsets=False):
     """独立扫描正文中已标识译注，保留代码和原文引用中的同形文字。
 
     返回 [(原始行号, 片段)]；用核验侧 CommonMark 实例重建代码块与引用
@@ -280,6 +286,11 @@ def scan_translator_notes(text):
     """
     found = []
     lines = text.split("\n")
+    line_offsets = []
+    offset = 0
+    for line in lines:
+        line_offsets.append(offset)
+        offset += len(line) + 1
     protected_lines = {
         line
         for token in _AUTHORIZED_STRUCTURE.parse(text)
@@ -307,7 +318,11 @@ def scan_translator_notes(text):
                 for index, (number, _line) in enumerate(chunk)
                 if starts[index] <= match.start() < starts[index] + len(_line) + 1
             )
-            found.append((line_no, match.group(0)))
+            if with_offsets:
+                begin = line_offsets[chunk[0][0] - 1] + match.start()
+                found.append((line_no, match.group(0), begin, begin + len(match.group(0))))
+            else:
+                found.append((line_no, match.group(0)))
         chunk = []
 
     for number, line in enumerate(lines, start=1):
@@ -973,7 +988,8 @@ def derive_toc_expectations(chapters, include_sections, failures=None):
         heading = next(
             (h for h in included.headings if h["id"] == target_id), None
         )
-        if heading is not None:
+        if (heading is not None and
+                heading["id"] != included.headings[0]["id"]):
             section = {
                 "level": 2, "title": heading["text"],
                 "chapter_index": included.index,
@@ -1010,7 +1026,8 @@ def derive_toc_expectations(chapters, include_sections, failures=None):
             heading = next(
                 (h for h in included.headings if h["text"].startswith(number)), None
             )
-            if heading is not None:
+            if (heading is not None and
+                    heading["id"] != included.headings[0]["id"]):
                 candidate = {
                     "level": 2, "title": heading["text"],
                     "chapter_index": included.index,
@@ -1409,67 +1426,65 @@ def check_projection(chapters, report, pdf, failures,
                     )
 
 
-def _visible_remainder(line_text, fragment=None):
-    """行内删除片段后的可见文字（导出渲染口径）：代码标记、链接标记不
-    进入 PDF 可见文本，直接比较原始 Markdown 行会误报连带删除。
-    fragment 为 None 时删除该行全部已标识译注片段（译注场景：只删
-    当前一处会把同行其他译注的合法缺席误报为连带删除）；行内 code
-    中的同形文字按合同保留。译注内嵌行内 code/强调等标记时被拆成
-    多个文本节点，须按块聚合子孙文本节点后匹配（与导出侧
-    strip_translator_notes 同口径，否则漏删致误报连带删除）。"""
-    if fragment is not None:
-        remainder = line_text.replace(fragment, "")
-        if len(normalize(remainder)) < 4:
-            return ""
-        html = exporter._HEAD_STRUCTURE_MD.render(remainder)
-        soup = exporter.BeautifulSoup(html, "html.parser")
-        return normalize(soup.get_text(" ", strip=True))
-    html = exporter._HEAD_STRUCTURE_MD.render(line_text)
-    soup = exporter.BeautifulSoup(html, "html.parser")
-    skip = exporter.TRANSLATOR_NOTE_SKIP_ANCESTORS
-    for element in soup.find_all(
-            ["p", "h1", "h2", "h3", "h4", "h5", "h6",
-             "li", "dt", "dd", "th", "td"]):
-        if element.find(["p", "ul", "ol", "table", "pre"]):
-            continue  # 容器元素，等叶子节点自己出现
-        if element.find_parent(skip):
-            continue
-        nodes = [
-            node for node in element.find_all(string=True)
-            if not isinstance(node, exporter.Comment) and str(node)
-        ]
-        joined = "".join(str(node) for node in nodes)
-        if not exporter.TRANSLATOR_NOTE_RE.search(joined):
-            continue
-        spans = []
-        offset = 0
-        for node in nodes:
-            spans.append((offset, offset + len(str(node))))
-            offset += len(str(node))
-        edits = []
-        for match in exporter.TRANSLATOR_NOTE_RE.finditer(joined):
-            begin = match.start()
-            if any(
-                    node.find_parent(skip) is not None and s <= begin < e
-                    for node, (s, e) in zip(nodes, spans)):
-                continue  # 行内代码中的同形文字保留
-            for node, (s, e) in zip(nodes, spans):
-                if s < match.end() and begin < e:
-                    edits.append(
-                        (node, max(begin, s) - s, min(match.end(), e) - s))
-        by_node = {}
-        for node, local_start, local_end in edits:
-            by_node.setdefault(id(node), [node, []])[1].append(
-                (local_start, local_end))
-        for node, node_edits in by_node.values():
-            text = str(node)
-            for local_start, local_end in sorted(node_edits, reverse=True):
-                text = text[:local_start] + text[local_end:]
-            node.replace_with(text)
-    remainder = normalize(soup.get_text(" ", strip=True))
-    if len(remainder) < 4:
+def _visible_remainder(line_text, fragment):
+    """显式视图声明的单行片段排除；译注另用整章上下文。"""
+    remainder = line_text.replace(fragment, "")
+    if len(normalize(remainder)) < 4:
         return ""
-    return remainder
+    html = exporter._HEAD_STRUCTURE_MD.render(remainder)
+    return normalize(exporter.BeautifulSoup(html, "html.parser").get_text(" ", strip=True))
+
+
+def _note_remainders(chapter):
+    """从原 Markdown 独立删除获准区间，以整章脚注角色渲染保留正文。"""
+    notes = scan_translator_notes(chapter.text, with_offsets=True)
+    if not notes:
+        return {}
+    context = getattr(chapter, 'math_scan_context', None)
+    original_md, _ = exporter.build_markdown([], chapter.prefix,
+        exporter.scan_math(chapter.text, source_context=context).spans,
+        chapter.text, highlight=False)
+    original_env = {}
+    original_md.render(chapter.text, original_env)
+    footnotes = original_env.get('footnotes', {}).get('refs', {})
+    expected = chapter.text
+    for _, fragment, begin, end in reversed(notes):
+        expected = expected[:begin] + '\n' * fragment.count('\n') + expected[end:]
+    markdown, _ = exporter.build_markdown([], chapter.prefix,
+        exporter.scan_math(expected, source_context=context).spans,
+        expected, highlight=False)
+    env = {}
+    tokens = markdown.parse(expected, env)
+    for token in tokens:
+        for child in token.children or []:
+            if child.type == 'footnote_ref' and child.meta.get('label') is not None:
+                # 标签只用于对应原章角色；显示序号来自实际整章解析事实。
+                child.meta['id'] = footnotes[':' + child.meta['label']]
+    owners = {}
+    for line, _, _, _ in notes:
+        owner = next((tokens[index - 1] for index, token in enumerate(tokens)
+                      if token.type == 'inline' and token.map
+                      and token.map[0] <= line - 1 < token.map[1]), None)
+        if owner is None:
+            # GFM 格的 inline 无 map；取包含原行的真实表格 token 范围。
+            for index, token in enumerate(tokens):
+                if token.type == 'table_open' and token.map and token.map[0] <= line - 1 < token.map[1]:
+                    owner = token
+                    break
+        if owner is not None:
+            key = str(id(owner))
+            owner.attrSet('data-note-source', key)
+            owners[line] = key
+    soup = exporter.BeautifulSoup(markdown.renderer.render(tokens, markdown.options, env), 'html.parser')
+    remainders = {}
+    for line, _, _, _ in notes:
+        block = soup.find(attrs={'data-note-source': owners.get(line)}) if line in owners else None
+        if block:
+            for backlink in block.select('a.footnote-backref'):
+                backlink.decompose()  # 自动生成导航由链接门禁负责，不属于原正文。
+        value = normalize(block.get_text(' ', strip=True)) if block else ''
+        remainders[line] = value if len(value) >= 4 else ''
+    return remainders
 
 
 def check_translator_notes(chapters, report, pdf, failures):
@@ -1498,6 +1513,7 @@ def check_translator_notes(chapters, report, pdf, failures):
     if pdf is None:
         return
     view_text = export_view_visible_text(chapters)
+    remainders = {str(chapter.path): _note_remainders(chapter) for chapter in chapters}
     for item in expected:
         context = {"input": item["input"], "line": item["line"]}
         token = normalize(item["fragment"])
@@ -1518,7 +1534,7 @@ def check_translator_notes(chapters, report, pdf, failures):
             c.text.split("\n") for c in chapters
             if str(c.path) == item["input"]
         )
-        remainder = _visible_remainder(source_lines[item["line"] - 1])
+        remainder = remainders[item["input"]].get(item["line"], "")
         if remainder and remainder not in pdf.norm_text:
             failures.append(
                 {
@@ -4898,6 +4914,8 @@ def run_verification(args):
     绑定的政策仍是必需输入；缺失或不可解析按 export-evidence-missing
     失败，不回落到任何旧报告。
     """
+    if getattr(args, 'visual_aid', False) and _load_aid_renderer() is None:
+        raise PdfDependencyError(dependency_message('PyMuPDF', requirements='requirements-pdf-source.txt'))
     work_dir = Path(args.work_dir).expanduser()
     report_path = work_dir / REPORT_NAME
     report = None
@@ -5137,7 +5155,11 @@ def main(argv=None):
     args = parse_args(argv)
     work_dir = Path(args.work_dir).expanduser()
 
-    machine_pass, verify_report = run_verification(args)
+    try:
+        machine_pass, verify_report = run_verification(args)
+    except PdfDependencyError as exc:
+        print('FAIL: %s' % exc, file=sys.stderr)
+        return 1
     (work_dir / VERIFY_NAME).write_text(
         json.dumps(verify_report, ensure_ascii=False, indent=2), encoding="utf-8"
     )

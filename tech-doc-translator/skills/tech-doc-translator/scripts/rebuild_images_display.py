@@ -35,9 +35,11 @@
 写入 --work-dir（默认系统临时目录，属工作区外）。
 """
 import argparse
+import copy
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -540,11 +542,150 @@ def rebuild(manifest_path, output_path, work_dir, fetch=False):
     return payload
 
 
+def _checked_map_items(payload, map_path, protected_paths=None):
+    """按映射自身基点核对交付出现、来源身份与尺寸；不补签缺失证明。"""
+    validate_delivery_map(payload, map_path)
+    base = os.path.realpath(os.path.dirname(os.path.abspath(map_path)))
+    documents, snapshots, coverage = {}, {}, {}
+    checked = []
+
+    def document(label):
+        if not isinstance(label, str) or not label:
+            raise RebuildError('%s: 条目缺少 markdown 归属' % map_path)
+        markdown = os.path.realpath(os.path.join(base, label))
+        if markdown not in documents:
+            with open(markdown, encoding='utf-8') as handle:
+                documents[markdown] = _markdown_occurrences(handle.read())
+            coverage[markdown] = {'entries': [], 'undetermined': []}
+        if protected_paths is not None:
+            protected_paths.add(markdown)
+        return markdown, documents[markdown]
+
+    if payload.get('markdown') is not None:
+        document(payload['markdown'])
+    for kind in ('entries', 'undetermined'):
+        for original in payload[kind]:
+            item = copy.deepcopy(original)
+            label = item.get('markdown', payload.get('markdown'))
+            markdown, refs = document(label)
+            occurrence = item['occurrence']
+            if occurrence < 1 or occurrence > len(refs):
+                raise RebuildError('%s#%d: 出现序号越界' % (markdown, occurrence))
+            image = os.path.realpath(os.path.join(base, item['image']))
+            actual, reason = resolve_delivery_image(
+                refs[occurrence - 1], os.path.dirname(markdown),
+                delivery_root=os.path.commonpath([base, os.path.dirname(markdown)]))
+            if actual is None or os.path.realpath(actual) != image:
+                raise RebuildError('%s#%d: 图片引用不符（%s）'
+                                   % (markdown, occurrence, reason or item['image']))
+            if not item.get('sha256') or file_sha256(image) != item['sha256']:
+                raise RebuildError('%s#%d: 交付图片摘要不符' % (markdown, occurrence))
+            source = item.get('source')
+            if not isinstance(source, dict) or not all(
+                    isinstance(source.get(key), str) and source[key]
+                    for key in ('snapshot', 'snapshot_sha256', 'resource_base',
+                                'node', 'resource_sha256')):
+                raise RebuildError('%s#%d: 来源身份不完整，请按清单回补'
+                                   % (markdown, occurrence))
+            if not all(os.path.isabs(source[key])
+                       for key in ('snapshot', 'resource_base')):
+                raise RebuildError('%s: 来源基点不明确，请按清单回补' % map_path)
+            snapshot = os.path.realpath(source['snapshot'])
+            resource_base = os.path.realpath(source['resource_base'])
+            if snapshot not in snapshots:
+                with open(snapshot, encoding='utf-8') as handle:
+                    fidelity = HtmlFidelity()
+                    soup = fidelity.parse(handle.read())
+                snapshots[snapshot] = (fidelity, soup, file_sha256(snapshot))
+            fidelity, soup, snapshot_digest = snapshots[snapshot]
+            if snapshot_digest != source['snapshot_sha256']:
+                raise RebuildError('%s: 来源快照摘要不符' % snapshot)
+            node = re.fullmatch(r'img\[(\d+)\]', source['node'])
+            images = soup.find_all('img')
+            if node is None or int(node[1]) >= len(images):
+                raise RebuildError('%s: 来源节点不存在 %s' % (snapshot, source['node']))
+            img = images[int(node[1])]
+            source_ref = img.get('data-light') or img.get('src') or ''
+            source_path = _snapshot_source_path(resource_base, source_ref)
+            source_files, delivered_files = {}, {}
+            digest = resource_identity_digest(source_path, _memo=source_files)
+            delivered_digest = resource_identity_digest(image, _memo=delivered_files)
+            if digest is None or digest != source['resource_sha256'] \
+                    or delivered_digest != digest:
+                raise RebuildError('%s#%d: 来源资源身份不符（错图或换图）'
+                                   % (markdown, occurrence))
+            if protected_paths is not None:
+                protected_paths.update((snapshot, os.path.realpath(source_path), image))
+                protected_paths.update(source_files)
+                protected_paths.update(delivered_files)
+            fidelity.image_display = []
+            fidelity.note_image(img, source_ref, snapshot_dir=resource_base)
+            known, unknown = shaped_display_entries(fidelity.image_display)
+            expected = (known if kind == 'entries' else unknown)
+            fields = ('width', 'derived') if kind == 'entries' else (
+                'reason_code', 'reason', 'height')
+            if not expected or any(item.get(key) != expected[0].get(key)
+                                   for key in fields):
+                raise RebuildError('%s#%d: 尺寸依据与当前来源不符'
+                                   % (markdown, occurrence))
+            source.update(snapshot=snapshot, resource_base=resource_base)
+            coverage[markdown][kind].append(item)
+            checked.append((kind, item, markdown, image))
+    for markdown, items in coverage.items():
+        check_full_coverage(markdown, items, len(documents[markdown]))
+    return checked
+
+
+def compose_maps(paths, output_path, work_dir):
+    """组合原位有效的章映射，所有交付路径改为相对最终映射目录。"""
+    output_path = os.path.abspath(output_path)
+    base = os.path.realpath(os.path.dirname(output_path))
+    payload = {'version': DISPLAY_MAP_VERSION, 'entries': [], 'undetermined': []}
+    protected = {os.path.realpath(path) for path in paths}
+    if os.path.realpath(output_path) in protected:
+        raise RebuildError('组合输出不得覆盖输入章映射: %s' % output_path)
+
+    def protect_output():
+        if os.path.realpath(output_path) in protected or (
+                os.path.exists(output_path) and any(
+                    os.path.exists(path) and os.path.samefile(output_path, path)
+                    for path in protected)):
+            raise RebuildError('组合输出不得覆盖受保护的来源或交付文件: %s' % output_path)
+
+    history = _delivery_map_history(output_path)
+    for path in paths:
+        source_map = load_parse_map(path)
+        for kind, item, markdown, image in _checked_map_items(source_map, path, protected):
+            source = item['source']
+            _merge_proof(history, (source['snapshot'], source['snapshot_sha256'],
+                                  source['resource_base'], source['node']),
+                         source['resource_sha256'])
+            item['markdown'] = os.path.relpath(markdown, base)
+            item['image'] = os.path.relpath(image, base)
+            payload[kind].append(item)
+    # 规范化后再检查同文档的重复 / 冲突；不按 basename 或输入次序取舍。
+    validate_delivery_map(payload, output_path)
+    for kind in ('entries', 'undetermined'):
+        payload[kind].sort(key=lambda item: (item['markdown'], item['occurrence']))
+    protect_output()
+    os.makedirs(base, exist_ok=True)
+    # 同目录暂存确保 os.replace 为同文件系统原子发布；回调重读当前资源。
+    with tempfile.TemporaryDirectory(prefix='.compose-images-', dir=base) as staging:
+        def validate(candidate):
+            _checked_map_items(candidate, output_path, protected)
+            protect_output()
+        atomic_write_json(payload, output_path, staging,
+                          validator=validate)
+    return payload
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='四类源家族共用的图片显示尺寸映射回补入口')
-    parser.add_argument('--manifest', required=True,
-                        help='回补清单（声明本次范围与同版本来源）')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--manifest', help='回补清单（声明本次范围与同版本来源）')
+    mode.add_argument('--compose-map', action='append',
+                      help='原位有效的交付章映射（可重复，与 --manifest 互斥）')
     parser.add_argument('--output', required=True,
                         help='交付级 images_display.json 目标路径')
     parser.add_argument('--work-dir', default=None,
@@ -552,12 +693,17 @@ def main():
     parser.add_argument('--fetch-missing', action='store_true',
                         help='显式获准补抓清单声明的缺失快照（默认只读本地）')
     args = parser.parse_args()
+    if args.compose_map and args.fetch_missing:
+        parser.error('--compose-map 不补抓来源；缺失输入须先按清单回补')
 
     work_dir = args.work_dir or tempfile.mkdtemp(prefix='rebuild-images-')
     try:
-        payload = rebuild(args.manifest, args.output, work_dir,
-                          fetch=args.fetch_missing)
-    except (RebuildError, BindingError) as exc:
+        if args.compose_map:
+            payload = compose_maps(args.compose_map, args.output, work_dir)
+        else:
+            payload = rebuild(args.manifest, args.output, work_dir,
+                              fetch=args.fetch_missing)
+    except (RebuildError, BindingError, OSError, ValueError) as exc:
         diagnostics = os.path.join(work_dir, 'rebuild_error.txt')
         try:
             with open(diagnostics, 'w', encoding='utf-8') as handle:

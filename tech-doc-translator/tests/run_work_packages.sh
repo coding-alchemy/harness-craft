@@ -2,6 +2,10 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+python3 test_grid_work_packages.py
+python3 test_table_header_roles.py
+python3 test_multi_snapshot_tables.py
+python3 test_rule_task_refresh.py
 ROOT="../skills/tech-doc-translator"
 SPLIT="$ROOT/scripts/split_work_packages.py"
 MERGE_WP="$ROOT/scripts/merge_work_packages.py"
@@ -788,4 +792,8 @@ echo "源图恢复原内容后同一证据重新可复用"
 echo "==> Ticket 05 工作包、术语与恢复闭环回归全部通过"
 
 echo "==> 翻译留痕 06：交付完成统一检查（目录允许清单/持久证据/复核闭合）"
-PYTHONDONTWRITEBYTECODE=1 python3 test_delivery_evidence.py 2>&1 | tail -1
+PYTHONDONTWRITEBYTECODE=1 python3 test_delivery_evidence.py
+python3 test_table_integrity.py
+python3 test_table_code_lifecycle.py
+python3 test_merge_packages.py
+python3 test_recovery.py

@@ -35,13 +35,16 @@ def task(context, exp, source_path, output_path):
     if digests is None:raise ValueError('当前源资源身份不可核验')
     command=[str(python),str(script),exp['target'],exp['path'],'--fragment',
              '--image-map',str(Path(output_path).resolve()),*options]
-    if context.get('_pdf_view'):
+    if context.get('_pdf_view') or context.get('_table_view'):
         command+=['--project-context',context['_path']]
     meta=exp['meta']
     count_fields=('headings','paragraphs','list_items','tables','code_fences','inline_math','block_math','images','footnotes')
     counts={key:meta[key] for key in count_fields if key in meta}
     if not counts:raise ValueError('当前拆包脚本未提供可靠计数')
     conversions=[]
+    table_policy = rwp.table_policy(context, exp)
+    table_paths = context.get('_table_view',{}).get('paths', [])
+    table_map = (table_paths[0] if len(table_paths)==1 else table_paths) or None
     for item in context.get('structural_conversions',[]):
         if item.get('package')!=name:continue
         if not item.get('basis') or not item.get('source') or not item.get('target') or item['source'] not in exp['body']:
@@ -66,9 +69,15 @@ def task(context, exp, source_path, output_path):
         '保留 frontmatter 映射；不得写源、其他包、术语表、目录、全局映射或交付说明。',
         '','## 输出合同','',
         '按上述模板翻译全部正文并保持官方原题。代码逐字保真；公式按原类型和表达式；图片按源身份落到目标目录内，资源由主 Agent 预先准备；保留脚注引用/定义关系。',
-        '源中的 [TABLE] 等解析结构须按适用约定重建为真实 Markdown 表格，保持各格内容、公式及关联；不要把解析残留标记照留到成品。',
+        '源中的 [TABLE] 等解析结构须重建为真实 Markdown 表格，保持各格内容、公式及关联。',
+        ('当前为中间工作包：保留并核对 [TABLE-CODE r=R c=C#N] 与紧随围栏，不能删除归属；主 Agent 最终合并时转换为可读格位说明。'
+         if rwp.table_code_stage(context) == 'intermediate' else
+         '当前为最终阶段：实际 TABLE-CODE 标记须已转为可读格位说明，不能裸删标记或保留解析残留。'),
         '已获准额外公式、具体转换和所选术语只采用当前引用依据；遇不能适配的结构先报告，不自行豁免。',
+        '保留来源对象的独立 <a id="…"></a> 锚点及其块边界，不能移入表格数据区。翻译页保留原链接目标（含题注 [#](#id)）；仅交付合章按明确 navigation-record 转换命名空间及跨章路径。PDF 裸 #id 只查当前章，缺失时回源处理，不能借外章同名对象通过。',
         '本包已批准的具体转换（空表示没有）：'+json.dumps(conversions,ensure_ascii=False,sort_keys=True),
+        '本包原 DOM 表格及转换映射（只读，空表示不涉及）：'+json.dumps(table_policy,ensure_ascii=False,sort_keys=True),
+        '完整表映射只读位置：'+str(table_map or '无'),
         '','## 完成合同','',
         '当前脚本计数：'+json.dumps(counts,ensure_ascii=False,sort_keys=True),
         '未列出的结构未由当前拆包脚本计数；不得当作零。实际公式、图片、脚注按源及当前检查核对，不能可靠识别则报告。',
@@ -80,7 +89,8 @@ def task(context, exp, source_path, output_path):
         '检查通过和任务回报只供主 Agent 定位，不能授予语义复核/恢复/合并资格。主 Agent 分派前须再次核对当前事实。']
     return {'package':name,'source':exp['path'],'target':exp['target'],'digests':digests,
             'source_facts':{'meta':meta,'body':exp['body']},
-            'context_refs':refs,'structural_conversions':conversions,
+            'context_refs':refs,'structural_conversions':conversions,'table_conversions':table_policy,
+            'table_map':table_map,
             'command':command,'task':'\n'.join(lines)+'\n'}
 
 
@@ -115,6 +125,9 @@ def task_changes(previous, current):
         raise ValueError('历史任务未保留具体转换合同，不能推测旧口径')
     compare('已批准具体转换', json.dumps(previous['structural_conversions'], ensure_ascii=False, sort_keys=True),
             json.dumps(current['structural_conversions'], ensure_ascii=False, sort_keys=True))
+    compare('本包表格转换依据', json.dumps(previous.get('table_conversions'), ensure_ascii=False, sort_keys=True),
+            json.dumps(current.get('table_conversions'), ensure_ascii=False, sort_keys=True))
+    compare('完整表映射引用', str(previous.get('table_map')), str(current.get('table_map')))
     compare('当前核验命令', json.dumps(previous['command'], ensure_ascii=False),
             json.dumps(current['command'], ensure_ascii=False))
     return {'previous_package': previous['package'], 'current_package': current['package'],
@@ -154,7 +167,19 @@ def main():
         context,exp,result=current();output=Path(args.output).resolve()
         protected=rwp.protected_inputs(context,[exp],args.source)
         if previous_path:
-            protected.update((previous_path,Path(previous['source']).resolve()))
+            protected.update((previous_path,Path(previous['source']).resolve(),Path(previous['target']).resolve()))
+            historical_refs=[ref['path'] for refs in previous['context_refs'].values() for ref in refs]
+            old_maps=previous.get('table_map') or []
+            if isinstance(old_maps,str):old_maps=[old_maps]
+            historical_refs+=old_maps
+            old_command=previous['command']
+            for i,flag in enumerate(old_command[:-1]):
+                if flag in ('--strong-token-file','--numeric-policy','--source-adaptation','--image-map','--project-context'):
+                    historical_refs.append(old_command[i+1])
+            for ref in historical_refs:
+                path=Path(ref)
+                if not path.is_absolute():raise ValueError('历史输入基点不可确定')
+                protected.add(path.resolve())
         if output in protected:raise ValueError('任务输出与受保护输入/译文冲突')
         old=output.read_bytes() if output.exists() else None
         def guard():

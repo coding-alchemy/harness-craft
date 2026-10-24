@@ -24,6 +24,23 @@
 
 ## 文件格式
 
+### 跨章组合
+
+交付映射必须仍位于原来的基点；不能先搬到 `export/` 再修文件名前缀。多章合订时用同一回补入口组合：
+
+```bash
+python3 <SKILL目录>/scripts/rebuild_images_display.py \
+  --compose-map <第一章/export/images_display.json> \
+  --compose-map <第二章/export/images_display.json> \
+  --output <交付根/export/images_display.json>
+```
+
+`--compose-map` 可重复，与 `--manifest` 互斥；不补抓、不搬图。每份章映射先按自身位置核对 Markdown、实际图片出现、交付摘要、源快照 / 节点 / 资源身份和尺寸依据，再把 `markdown`、`image` 改写为相对最终映射目录的完整路径。`source.snapshot`、`source.resource_base` 保留规范化绝对路径；`derived.resource` 仍相对对应 `source.resource_base`，不改成相对组合映射。同名异图与同图不同宽度分别按文档内 occurrence 保留；`undetermined` 保持未确定。重复声明同文档同 occurrence（即使相同）、错图、漏图、来源 / 尺寸漂移均拒绝，旧输出与输入章映射保留。来源基点缺失或映射已搬移时，用原 `--manifest` 从快照及最终 Markdown 回补，不猜基点。
+
+覆盖范围包含顶层 `markdown` 及条目声明的各文档；清空某章两类条目不能移除其覆盖义务，无图片的文档仍可声明零次出现。组合输出不得覆盖输入映射、引用的原快照、源图、Markdown、交付图片及其递归资源依赖；路径别名按实际文件身份核对，候选复核后才发布。
+
+组合候选在目标同目录暂存，重读并复核当前资源后原子替换。导出与核验均显式传入同一最终 `--images-display <交付根/export/images_display.json>`，无需在不同 cwd 修改章映射。
+
 解析期文件（每个源 Markdown 一个，`<输出名>.images_display.json`）：
 
 ```json

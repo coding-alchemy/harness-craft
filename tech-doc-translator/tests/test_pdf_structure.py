@@ -665,6 +665,19 @@ class TocNavigationTests(unittest.TestCase):
         self.assertEqual([(e['level'], e['title']) for e in entries],
                          [(1, '1. 简介'), (2, '1.1. 基础')])
 
+    def test_first_h2_is_not_both_chapter_and_section(self):
+        chapters = self.build('- [基础](a.md#11-基础)\n', include_b=False,
+                              order=('a.md',))
+        chapters[1].path.write_text('## 1.1. 基础\n\n正文。\n')
+        chapters[1] = exporter.Chapter(2, chapters[1].path)
+        exporter.parse_chapter(chapters[1])
+        entries, _ = self.entries(chapters, sections=True)
+        self.assertEqual([(e['level'], e['title']) for e in entries],
+                         [(1, '1.1. 基础')])
+        expected = verifier.derive_toc_expectations(chapters, True)
+        self.assertEqual([(e['level'], e['title']) for e in expected],
+                         [(1, '1.1. 基础')])
+
     def test_same_title_distinct_targets_keep_independent_identity(self):
         chapters = self.build(
             '[tdt-toc-start]: #\n\n'
@@ -881,6 +894,22 @@ class LongTokenParagraphLayoutTests(unittest.TestCase):
              str(chapter)])
         ok, report = verifier.run_verification(args)
         self.assertTrue(ok, report.get('failures'))
+
+
+class RawContainerFenceTests(unittest.TestCase):
+    def test_tab_fences_keep_raw_bodies_and_parent_list(self):
+        from bs4 import BeautifulSoup
+        text = ('- Parent.\n\n  **[Tab: One]**\n\n'
+                '  ```cpp\none();\n    nested();\n  ```\n\n'
+                '  **[Tab: Two]**\n\n  ```\ntwo();\n  ```\n\n'
+                '  After.\n')
+        markdown, _ = exporter.build_markdown([], '', [], text, highlight=False)
+        soup = BeautifulSoup(markdown.render(text), 'html.parser')
+        codes = soup.find_all('pre')
+        self.assertEqual([p.get_text() for p in codes],
+                         ['one();\n    nested();\n', 'two();\n'])
+        self.assertTrue(all(p.find_parent('li') is not None for p in codes))
+        self.assertIn('After.', soup.li.get_text())
 
 
 if __name__ == '__main__':

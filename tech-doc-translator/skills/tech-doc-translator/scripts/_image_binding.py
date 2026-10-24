@@ -182,14 +182,16 @@ def check_full_coverage(markdown_label, items, total_occurrences):
                occurrences[:8] or '无', total_occurrences))
 
 
-def atomic_write_json(payload, output_path, work_dir):
+def atomic_write_json(payload, output_path, work_dir, validator=None):
     """候选写入 work_dir，重读校验后原子替换目标；失败不触碰旧文件。"""
     validate_delivery_map(payload, output_path)
     os.makedirs(work_dir, exist_ok=True)
     candidate = os.path.join(work_dir, 'candidate.images_display.json')
     with open(candidate, 'w', encoding='utf-8') as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
-    validate_delivery_map(load_parse_map(candidate), output_path)
+    candidate_payload = validate_delivery_map(load_parse_map(candidate), output_path)
+    if validator is not None:
+        validator(candidate_payload)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     os.replace(candidate, output_path)
     return output_path

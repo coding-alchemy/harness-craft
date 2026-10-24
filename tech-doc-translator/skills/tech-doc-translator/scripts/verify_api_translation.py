@@ -5,6 +5,7 @@
     python3 verify_api_translation.py <merged.md> <manifest.txt> <official_toc.txt> <site_root> <src1.md> [<src2.md> ...]
         [--official-headings-file <文件>]
         [--approved-extra-math <表达式>]...
+        [--navigation-record <source_record.json>]
 
 --official-headings-file 提供 UTF-8 官方原题清单文件（每行一项，按官方
 页面顺序）；与 manifest/TOC/site root/源路径可并存，角色不变。原 TOC
@@ -36,7 +37,6 @@ import re
 import subprocess
 import sys
 
-from bs4 import BeautifulSoup
 from _official_headings import (
     extract_official_headings_option,
     load_official_headings,
@@ -61,6 +61,7 @@ from _verification import (
     resolve_delivery_image,
     scan_code_fences,
     scan_math,
+    markdown_list_count,
     strong_token_report,
 )
 
@@ -75,36 +76,13 @@ def _resolve_image(site_root, page_rel, src):
 
 
 def _visible_html_images(site_root, page_rel):
-    """从原始 HTML 统计应交付的图片：暗亮对只计一个。"""
+    """复用独立来源的 API 暗亮选择，包含 figure 外的行内图片。"""
+    from _source_reconcile import snapshot_image_facts
     path = os.path.join(site_root, page_rel)
-    soup = BeautifulSoup(open(path, encoding='utf-8').read(), 'html.parser')
-    imgs = soup.find_all('img')
-    # 分组：figure 内图片优先按容器去重，其余单独计数
-    seen = set()
-    visible = []
-    for fig in soup.find_all('figure'):
-        fig_imgs = fig.find_all('img')
-        light = [i for i in fig_imgs if i.get('data-light') or 'only-light' in ' '.join(i.get('class') or [])]
-        dark = [i for i in fig_imgs if i.get('data-dark') or 'only-dark' in ' '.join(i.get('class') or [])]
-        if light:
-            visible.append(_resolve_image(site_root, page_rel, _image_src(light[0])))
-        elif dark:
-            visible.append(_resolve_image(site_root, page_rel, _image_src(dark[0])))
-        else:
-            for i in fig_imgs:
-                visible.append(_resolve_image(site_root, page_rel, _image_src(i)))
-        for i in fig_imgs:
-            seen.add(id(i))
-    for i in imgs:
-        if id(i) not in seen:
-            visible.append(_resolve_image(site_root, page_rel, _image_src(i)))
-    return [v for v in visible if v]
-
-
-def _image_src(img):
-    if img.get('data-light'):
-        return img['data-light']
-    return img.get('src', '')
+    with open(path, encoding='utf-8') as handle:
+        facts = snapshot_image_facts(handle.read(), 'api')
+    return [resolved for fact in (facts or [])
+            if (resolved := _resolve_image(site_root, page_rel, fact['source_ref']))]
 
 
 def _split_pages(text):
@@ -127,7 +105,7 @@ def run_checks(merged_text, merged_dir, manifest, official, site_root,
                src_texts, *, merged_label, delivery_root=None,
                image_digests=None, approved_extra_math=(),
                strong_tokens=(), official_headings=(),
-               numeric_review=False, numeric_policy=None):
+               numeric_review=False, numeric_policy=None, navigation_record=None):
     """多页 API 检查核心：接收候选文本与实际目标目录，返回 (失败诊断, 告警)。
 
     merged_text 可来自工作区外临时候选（草稿预检）；merged_dir 必须是
@@ -139,6 +117,11 @@ def run_checks(merged_text, merged_dir, manifest, official, site_root,
     """
     fails = []
     warns = []
+    navigation=None
+    if navigation_record:
+        from _api_navigation import load_navigation
+        try:navigation=load_navigation(navigation_record,site_root)
+        except (OSError,ValueError,KeyError) as exc:return ['导航来源: '+str(exc)],warns
 
     if not manifest:
         raise SystemExit('empty manifest')
@@ -173,6 +156,23 @@ def run_checks(merged_text, merged_dir, manifest, official, site_root,
                                      src_label, doc_label):
             fails.append('页 %s 标题对照: %s' % (page_rel, diff))
 
+        from _source_reconcile import compare_translation_tables, table_code_problems
+        from _api_navigation import links
+        if navigation is not None:
+            from _api_navigation import verify_page
+            chapter=os.path.join(merged_dir,merged_label)
+            try:
+                fails.extend(verify_page(src_text,trans_text,page_rel,navigation,chapter))
+            except (ValueError,KeyError) as exc:fails.append('页 %s 导航: %s' % (page_rel,exc))
+        else:
+            from _api_navigation import compare_anchors
+            fails.extend('页 %s %s' % (page_rel,diff) for diff in compare_anchors(src_text,trans_text))
+            if links(src_text)!=links(trans_text):fails.append('页 %s 原链接目标或出现顺序改变' % page_rel)
+            fails.extend('页 %s 表格核对: %s' % (page_rel, diff)
+                         for diff in compare_translation_tables(src_text, trans_text))
+        fails.extend('页 %s 表格代码: %s' % (page_rel, problem)
+                     for problem in table_code_problems(trans_text))
+
         # 代码围栏
         source_fences = scan_code_fences(src_text)
         translated_fences = scan_code_fences(trans_text)
@@ -190,7 +190,7 @@ def run_checks(merged_text, merged_dir, manifest, official, site_root,
         doc_scan = scan_math(trans_text)
         math_diffs, _ = compare_math_spans(
             src_scan.spans, doc_scan.spans, src_label, doc_label,
-            approved_extra_exprs=approved_extra_math, doc_text=trans_text)
+            approved_extra_exprs=approved_extra_math, doc_text=trans_text, src_text=src_text)
         for diff in math_diffs:
             fails.append('页 %s 公式逐项核对: %s' % (page_rel, diff))
         for issue_fail in math_issue_fails(src_scan.issues, src_label) + \
@@ -205,6 +205,10 @@ def run_checks(merged_text, merged_dir, manifest, official, site_root,
             fails.append('页 %s 强 token %s' % (page_rel, diff))
         for warn in token_warns:
             warns.append('页 %s 强 token %s' % (page_rel, warn))
+
+        warns.append('页 %s 覆盖率 列表项: 源 %d / 译 %d（差值供人工判断）'
+                     % (page_rel, markdown_list_count(src_text),
+                        markdown_list_count(trans_text)))
 
         # 图片：按出现顺序以来源文件摘要核对身份（不依赖 basename），
         # 交付引用解析、离线类型与暗亮出现数一并核验
@@ -302,7 +306,13 @@ def parse_args(argv, *, base_dir=None):
     argv, strong_tokens = extract_strong_tokens(argv, base_dir=base_dir, files=token_files)
     argv, image_map, delivery_root = extract_image_options(argv)
     argv, numeric_review, numeric_policy = extract_numeric_review_options(argv)
-    if len(argv) < 6:
+    navigation_record=None
+    if '--navigation-record' in argv:
+        position=argv.index('--navigation-record')
+        if position+1>=len(argv):raise SystemExit('--navigation-record 缺少路径')
+        navigation_record=argv[position+1];argv=argv[:position]+argv[position+2:]
+        if '--navigation-record' in argv:raise SystemExit('--navigation-record 只能声明一次')
+    if len(argv) < 5:
         sys.exit(__doc__)
     return {
         'merged_path': argv[0],
@@ -318,6 +328,7 @@ def parse_args(argv, *, base_dir=None):
         'delivery_root': delivery_root,
         'numeric_review': numeric_review,
         'numeric_policy': numeric_policy,
+        'navigation_record': navigation_record,
     }
 
 
@@ -354,7 +365,7 @@ def main():
         approved_extra_math=approved_extra_math,
         strong_tokens=strong_tokens, official_headings=official_headings,
         numeric_review=parsed['numeric_review'],
-        numeric_policy=parsed['numeric_policy'])
+        numeric_policy=parsed['numeric_policy'],navigation_record=parsed['navigation_record'])
 
     print('校验: %s' % os.path.basename(merged_path))
     for w in warns:

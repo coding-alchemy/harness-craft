@@ -6,6 +6,7 @@
         [--review-evidence <evidence.json>] [--strong-token <token>]...
         [--approved-extra-math <表达式>]...
         [--source-adaptation <依据.json> [--source-adaptation <依据.json> ...]]
+        [--table-code-stage final|intermediate]
         [--numeric-review] [--numeric-policy <UTF-8 项目约定文件>]
 
 --numeric-review 显式启用包级数字与单位复核核对（R5/§4.7）：证据须含
@@ -117,7 +118,8 @@ def _source_resource_digests(body, base_dir):
 
 def _fragment_hard_checks(src_body, trans_body, trans_path, strong_tokens,
                           approved_extra_math, source_adaptation=None,
-                          adaptation_payload=None, pdf_view=None, source_range=None):
+                          adaptation_payload=None, pdf_view=None, source_range=None,
+                          table_code_stage='final', header_cells=()):
     """片段范围的硬检查；返回 (fails, warns)。
 
     source_adaptation 提供时公式按来源依据精确核对（逐字表达式与已确认
@@ -126,6 +128,8 @@ def _fragment_hard_checks(src_body, trans_body, trans_path, strong_tokens,
     """
     fails = []
     warns = []
+    from _api_navigation import compare_anchors
+    fails.extend(compare_anchors(src_body,trans_body))
     if pdf_view:
         import _pdf_math
         try:
@@ -133,6 +137,7 @@ def _fragment_hard_checks(src_body, trans_body, trans_path, strong_tokens,
         except (ValueError,KeyError,IndexError,TypeError) as exc:
             fails.append('PDF确认数学片段核验: '+str(exc))
 
+    scan_context = None
     code_src,code_doc=src_body,trans_body
     if pdf_view:
         scan_context=_pdf_math.context(pdf_view['checklist'])
@@ -157,9 +162,8 @@ def _fragment_hard_checks(src_body, trans_body, trans_path, strong_tokens,
         # 宿主（脚注定义等）内字面公式源侧按 bound_math_spans 逐字进入比较，
         # 译侧同口径保留（两侧对称，与 verify_reference_translation 一致）：
         # 脚注公式损伤由本比较发现，不预先丢弃
-        doc_scan = scan_math(
-            trans_body,
-            source_context=latexml.scan_context_from_payload(payload))
+        scan_context = latexml.scan_context_from_payload(payload)
+        doc_scan = scan_math(trans_body, source_context=scan_context)
         src_spans, bind_problems = latexml.precise_math_spans(
             src_body, source_adaptation, full=False, label='源片段',
             payload=payload)
@@ -179,7 +183,7 @@ def _fragment_hard_checks(src_body, trans_body, trans_path, strong_tokens,
         math_diffs, math_warns = compare_math_spans(
             src_scan.spans, doc_scan.spans,
             '源片段', '译文', approved_extra_exprs=approved_extra_math,
-            doc_text=trans_body)
+            doc_text=trans_body, src_text=src_body)
         fails.extend('公式逐项核对: %s' % d for d in math_diffs)
         fails.extend(math_issue_fails(src_scan.issues, '源片段'))
         fails.extend(math_issue_fails(doc_scan.issues, '译文'))
@@ -231,6 +235,10 @@ def _fragment_hard_checks(src_body, trans_body, trans_path, strong_tokens,
     if src_counts['tables'] and not doc_counts['tables']:
         fails.append('可证明截断: 表格全部丢失（源 %d 张）'
                      % src_counts['tables'])
+    from _source_reconcile import compare_translation_tables, table_code_problems
+    fails.extend(table_code_problems(trans_body, table_code_stage, scan_context))
+    fails.extend(compare_translation_tables(src_body, trans_body,
+                                            source_context=scan_context, header_cells=header_cells))
     return fails, warns
 
 
@@ -251,11 +259,14 @@ def _script_identity():
     return {
         'recover_work_packages.py': file_sha256(os.path.abspath(__file__)),
         '_verification.py': file_sha256(os.path.join(base, '_verification.py')),
+        '_source_reconcile.py': file_sha256(os.path.join(base, '_source_reconcile.py')),
+        'verify_translation.py': file_sha256(os.path.join(base, 'verify_translation.py')),
         'split_work_packages.py': file_sha256(os.path.join(base, 'split_work_packages.py')),
         # LaTeXML 来源适配/合同实现（D4）：适配器身份变化使旧复核失效
         '_latexml_source.py': file_sha256(os.path.join(base, '_latexml_source.py')),
         'build_review_evidence.py': file_sha256(os.path.join(base, 'build_review_evidence.py')),
         '_pdf_math.py': file_sha256(os.path.join(base, '_pdf_math.py')),
+        '_api_navigation.py': file_sha256(os.path.join(base, '_api_navigation.py')),
     }
 
 
@@ -391,6 +402,8 @@ def evidence_binding_problems(entry, source_digest, trans_body, resources,
 
 def check_options(context):
     argv = list(context.get('check_args', []))
+    from _verification import extract_table_code_stage
+    argv, _ = extract_table_code_stage(argv)
     argv, tokens = extract_strong_tokens(argv, base_dir=context['_root'])
     argv, extra = extract_approved_extra_math(argv)
     argv, adaptations = extract_source_adaptation(argv)
@@ -399,6 +412,14 @@ def check_options(context):
         raise ValueError('未知包检查参数: %s' % argv)
     root = Path(context['_root'])
     return tokens, extra, [str((root/p).resolve()) for p in adaptations], numeric, str((root/policy).resolve()) if policy else None
+
+
+def table_code_stage(context=None, explicit=None):
+    from _verification import extract_table_code_stage
+    _, configured = extract_table_code_stage((context or {}).get('check_args', []))
+    if context and explicit and explicit != (configured or 'final'):
+        raise ValueError('实际 table-code-stage 与项目配置不一致')
+    return configured or explicit or 'final'
 
 
 def effective_options(context, strong_tokens, extra_math, adaptation, numeric, policy):
@@ -455,6 +476,10 @@ def load_project_context(path, source_path):
         raise ValueError('来源人工裁决范围与当前声明不符')
     matching = next(e for e in entries if os.path.realpath(e.get('_parsed_abs','')) == os.path.realpath(source_path))
     source_binding = {k: matching[k] for k in ('parsed_sha256','source_version','snapshots')}
+    table_view = source_table_view(matching, record['delivery_root'], source_path)
+    if matching.get('table_conversions'):
+        source_binding['table_conversions'] = delivery._source_identity(
+            matching, lambda rel: str(Path(record['delivery_root'])/rel))['table_conversions']
     pdf_view=None
     if matching['family']=='pdf-source':
         import _pdf_math
@@ -465,9 +490,89 @@ def load_project_context(path, source_path):
     if review.get('binding') != source_binding:
         raise ValueError('主 Agent 来源裁决未绑定当前源/版本/快照及确认事实；历史 PASS 不授予资格')
     context['_source_version'] = matching['source_version']
+    context['_role_source'] = delivery.table_role_source(matching, record['delivery_root'])
     if pdf_view:
         context['_pdf_view']=pdf_view
+    if table_view is not None:
+        context['_table_view'] = table_view
     return context
+
+
+def source_table_view(entry, root, source_path):
+    """全源已准入后，各快照局部表事实投影到合并源范围。"""
+    if not any(snap.get('table_conversions') for snap in entry['snapshots']):
+        return None
+    from _source_reconcile import _SourceFacts, _locate_source_table, markdown_table_facts, _mapped_table_headers
+    text = Path(source_path).read_text(encoding='utf-8')
+    lines = text.splitlines(keepends=True)
+    source_lines = text.split('\n')
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    tables, paths, headers = [], [], []
+    for snapshot, (start, end) in zip(entry['snapshots'], entry['ranges']):
+        info = snapshot.get('table_conversions')
+        if info is None:
+            continue
+        path = Path(root, info['path']).resolve()
+        if file_sha256(path) != info['sha256']:
+            raise ValueError('表映射在准入后变化: %s' % path)
+        paths.append(str(path))
+        mapping = json.loads(path.read_text(encoding='utf-8'))
+        raw = Path(root, snapshot['snapshot']).read_bytes().decode('utf-8')
+        source = _SourceFacts(raw, entry['family'], snapshot.get('section_id'))
+        piece = '\n'.join(source_lines[start-1:end])
+        records = {r['ordinal']: r for r in markdown_table_facts(piece)}
+        def full_range(first, last):
+            return [offsets[start + first - 2], offsets[min(start + last - 1, len(offsets)-1)]]
+        for ordinal, row, col in _mapped_table_headers(source, mapping, snapshot.get('section_id')):
+            record = records[ordinal]
+            headers.append((full_range(record['start_line'], record['group_end_line'])[0], row, col))
+        for item in mapping['tables']:
+            original, problems = _locate_source_table(item, source.table_records, snapshot.get('section_id'))
+            if problems:
+                raise ValueError('局部表事实不可定位: ' + '；'.join(problems))
+            ranges = []
+            for ordinal in sorted({t['table'] for cell in item['cells'] for t in cell['targets'] if 'table' in t}):
+                record = records[ordinal]
+                ranges.append(full_range(record['start_line'], record['group_end_line']))
+            ranges += [full_range(*t['note']) for cell in item['cells'] for t in cell['targets'] if 'note' in t]
+            cells = [[r, c, *original['spans'][r,c], original.get('headers', {}).get((r,c), False),
+                      original['rows'][r-1][c-1], [body for (cr,cc,n), body in sorted(original['codes'].items())
+                                                if (cr,cc) == (r,c)]] for r,c in sorted(original['spans'])]
+            tables.append({'ranges': ranges, 'mapping': item, 'version': mapping['version'],
+                           'source': {'snapshot': os.path.realpath(Path(root, snapshot['snapshot'])),
+                                      'section_id': snapshot.get('section_id'), 'cells': cells}})
+    starts = [offsets[record['start_line']-1] for record in markdown_table_facts(text)] if headers else []
+    return {'path': paths[0] if len(paths)==1 else None, 'paths': paths, 'tables': tables,
+            'text': text, 'headers': headers, 'table_starts': starts}
+
+
+def table_headers(context, source_ranges=None):
+    """沿用当前源字符范围投影到片段/合并后的表序；不写入持久格式。"""
+    view = (context or {}).get('_table_view')
+    if view is None:
+        return set()
+    starts = view['table_starts']
+    if source_ranges is not None:
+        starts = [pos for start, end in source_ranges for pos in starts if start <= pos < end]
+    ordinals = {pos: number for number, pos in enumerate(starts, 1)}
+    return {(ordinals[pos], row, col) for pos, row, col in view['headers'] if pos in ordinals}
+
+
+def table_policy(context, exp):
+    view = (context or {}).get('_table_view')
+    if view is None:
+        return None
+    relevant = [item for item in view['tables'] if any(
+        start < exp['char_end'] and exp['char_start'] < end for start, end in item['ranges'])]
+    if not relevant:
+        return None
+    versions = sorted({item['version'] for item in relevant})
+    return {'version': versions[0] if len(versions)==1 else versions,
+            'reader': {'_source_reconcile.py': file_sha256(
+                Path(__file__).with_name('_source_reconcile.py'))},
+            'tables': [{key: value for key, value in item.items() if key != 'ranges'} for item in relevant]}
 
 
 def context_refs(context, field, name):
@@ -621,11 +726,13 @@ def current_packages(source_path, wps_dir, strategy, scope=None, adaptation=None
 
 def package_facts(exp, trans_body, target, source_path, strong_tokens=(),
                   approved_extra_math=(), project=None, numeric_review=False,
-                  numeric_policy=None, context=None):
+                  numeric_policy=None, context=None, code_stage=None):
     """当前包事实唯一构造；源与候选各自取事实，不授予复核资格。"""
     policy = (project(exp['char_start'], exp['char_end'])
               if project is not None else None)
     policy = dict(policy or {})
+    if table_code_stage(context, code_stage) == 'intermediate':
+        policy['table_code_stage'] = 'intermediate'
     # 只绑定实际适用的获准额外公式；目标摘要仍独立覆盖全部正文。
     applicable = sorted(set(approved_extra_math).intersection(
         span.expr for span in scan_math(trans_body).spans))
@@ -633,6 +740,9 @@ def package_facts(exp, trans_body, target, source_path, strong_tokens=(),
         policy['approved_extra_math'] = applicable
     if context:
         policy.update(context_policy(context, exp['name'], exp['body'], trans_body))
+        table = table_policy(context, exp)
+        if table is not None:
+            policy['table_conversions'] = table
         if context.get('_pdf_view'):
             import _pdf_math
             policy.update(_pdf_math.policy(context['_pdf_view'],exp['char_start'],exp['char_end']))
@@ -663,7 +773,8 @@ def package_binding_problems(entry, facts, trans_body):
 
 def recover(source_path, wps_dir, trans_dir, strategy, evidence_path=None,
             strong_tokens=(), approved_extra_math=(), source_adaptation=None,
-            numeric_review=False, numeric_policy=None, project_context=None):
+            numeric_review=False, numeric_policy=None, project_context=None,
+            code_stage=None):
     """返回 (reusable, missing, invalidated, pending, reports)。
 
     reusable/missing/invalidated/pending 元素含 name/order/reason。
@@ -673,6 +784,7 @@ def recover(source_path, wps_dir, trans_dir, strategy, evidence_path=None,
     import _pdf_math
     source_text = _pdf_math.read_document(source_path)
     context = load_project_context(project_context, source_path)
+    code_stage = table_code_stage(context, code_stage)
     strong_tokens, approved_extra_math, source_adaptation, numeric_review, numeric_policy = effective_options(
         context, strong_tokens, approved_extra_math, source_adaptation, numeric_review, numeric_policy)
     evidence = _load_evidence(evidence_path)
@@ -816,7 +928,9 @@ def recover(source_path, wps_dir, trans_dir, strategy, evidence_path=None,
             exp['body'], trans_body, target, strong_tokens,
             approved_extra_math, adaptation_abs,
             adaptation_payload=adaptation_payload,
-            pdf_view=(context or {}).get('_pdf_view'),source_range=(exp['char_start'],exp['char_end']))
+            pdf_view=(context or {}).get('_pdf_view'),source_range=(exp['char_start'],exp['char_end']),
+            table_code_stage=code_stage,
+            header_cells=table_headers(context, [(exp['char_start'],exp['char_end'])]))
         if fails:
             invalidated.append({'name': name, 'order': exp['order'],
                                 'reason': '硬检查失败: ' + '；'.join(fails[:3])})
@@ -833,7 +947,7 @@ def recover(source_path, wps_dir, trans_dir, strategy, evidence_path=None,
             continue
         facts = package_facts(exp, trans_body, target, source_path,
                               strong_tokens, approved_extra_math, project,
-                              numeric_review, numeric_policy_abs, context)
+                              numeric_review, numeric_policy_abs, context, code_stage)
         bad = package_binding_problems(entry, facts, trans_body)
 
         if bad:
@@ -848,6 +962,8 @@ def recover(source_path, wps_dir, trans_dir, strategy, evidence_path=None,
 
 def main():
     argv, project_context = extract_project_context(sys.argv[1:])
+    from _verification import extract_table_code_stage
+    argv, code_stage = extract_table_code_stage(argv)
     argv, strong_tokens = extract_strong_tokens(argv)
     argv, approved_extra_math = extract_approved_extra_math(argv)
     argv, numeric_review, numeric_policy = extract_numeric_review_options(argv)
@@ -887,7 +1003,7 @@ def main():
         source_path, wps_dir, trans_dir, strategy, evidence_path,
         strong_tokens, approved_extra_math,
         source_adaptation or None,
-        numeric_review, numeric_policy, project_context)
+        numeric_review, numeric_policy, project_context, code_stage)
 
     print('\n=== 中断恢复报告 ===')
     print('可复用 (%d):' % len(reusable))

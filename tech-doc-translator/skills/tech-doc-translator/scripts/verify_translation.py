@@ -7,6 +7,7 @@
         [--approved-extra-math <表达式>]... [--strong-token <token>]...
         [--image-map <map.json>] [--delivery-root <dir>] [--fragment]
         [--source-adaptation <依据.json> [--source-adaptation <依据.json> ...]]
+        [--table-code-stage final|intermediate]（intermediate 仅配合 --fragment）
         [--numeric-review] [--numeric-policy <UTF-8 项目约定文件>]
 
 官方标题只需编号 + 英文原题（如 "1. Introduction"），顺序传入。
@@ -61,6 +62,7 @@ from _verification import (
     residual_markers,
     scan_code_fences,
     scan_math,
+    markdown_list_count,
     source_occurrence_digests,
     strong_token_report,
 )
@@ -77,7 +79,7 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
                strong_tokens=(), approved_extra_math=(), fragment=False,
                source_adaptation=None, source_adaptations=None,
                numeric_review=False, numeric_policy=None,
-               pdf_view=None, source_range=None):
+               pdf_view=None, source_range=None, table_code_stage='final', header_cells=()):
     """通用单页检查核心：接收候选文本与实际目标目录，返回 (失败数, 输出行)。
 
     doc_text 可来自工作区外临时候选（草稿预检）；doc_dir 必须是最终
@@ -96,6 +98,12 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
     source_adaptations = list(source_adaptations)
     fail = 0
     lines = []
+    from _api_navigation import compare_anchors
+    for problem in compare_anchors(src_text,doc_text):
+        fail+=1;lines.append(problem+' FAIL')
+    if table_code_stage == 'intermediate' and not fragment:
+        return 1, ['中间表格代码阶段仅允许 --fragment 工作包核验 FAIL']
+    scan_context = None
     doc = doc_text
     src = src_text
     doc_headings = heading_entries(doc)
@@ -201,6 +209,7 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
     code_doc,code_src=doc,src
     if pdf_view:
         import _pdf_math
+        scan_context = _pdf_math.context(pdf_view['checklist'])
         code_doc=_pdf_math.footnote_view(doc,_pdf_math.context(pdf_view['checklist']))[0]
         code_src=_pdf_math.footnote_view(src,_pdf_math.context(pdf_view['checklist']))[0]
     doc_fences = scan_code_fences(code_doc)
@@ -279,7 +288,7 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
         src_scan = scan_math(src)
         math_diffs, math_warns = compare_math_spans(
             src_scan.spans, doc_scan.spans, src_label, doc_label,
-            approved_extra_exprs=approved_extra_math, doc_text=doc)
+            approved_extra_exprs=approved_extra_math, doc_text=doc, src_text=src)
         fails_issues = (math_issue_fails(src_scan.issues, src_label)
                         + math_issue_fails(doc_scan.issues, doc_label))
     for diff in math_diffs:
@@ -308,14 +317,21 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
             lines.append('链接目标: 源 %d / 译 %d PASS' %
                          (len(link_targets(src)), len(link_targets(doc))))
 
+    from _source_reconcile import compare_translation_tables, table_code_problems
+    for problem in table_code_problems(doc, table_code_stage, scan_context):
+        fail += 1
+        lines.append('表格代码: ' + problem + ' FAIL')
+    for diff in compare_translation_tables(src, doc, source_context=scan_context, header_cells=header_cells):
+        fail += 1
+        lines.append('表格核对: ' + diff + ' FAIL')
+
     # 9) 内容块覆盖率（信息性）
     if src:
         pairs = [
             ('代码围栏', len(src_fences.blocks), len(doc_fences.blocks)),
             ('提示框', src.count('ADMONITION'), doc.count('> **注（Note）**') + doc.count('> **警告（Warning）**') + doc.count('> **重要（Important）**')),
             ('公式', len(re.findall(r'\$[^$\n]+\$', src)), len(re.findall(r'\$[^$\n]+\$', doc))),
-            ('列表项', len([l for l in src.splitlines() if l.startswith('  - ')]),
-             len([l for l in doc.splitlines() if l.strip().startswith(('- ', '* '))])),
+            ('列表项', markdown_list_count(src), markdown_list_count(doc)),
         ]
         for name, s, d in pairs:
             lines.append('覆盖率 %s: 源 %d / 译 %d（差值供人工判断）' % (name, s, d))
@@ -365,6 +381,8 @@ def parse_args(argv, *, base_dir=None):
     argv, image_map, delivery_root = extract_image_options(argv)
     argv, source_adaptations = extract_source_adaptation(argv)
     argv, numeric_review, numeric_policy = extract_numeric_review_options(argv)
+    from _verification import extract_table_code_stage
+    argv, table_code_stage = extract_table_code_stage(argv)
     fragment = '--fragment' in argv
     argv = [a for a in argv if a != '--fragment']
     if len(argv) < 2:
@@ -384,6 +402,7 @@ def parse_args(argv, *, base_dir=None):
         'image_map': image_map,
         'delivery_root': delivery_root,
         'fragment': fragment,
+        'table_code_stage': table_code_stage or 'final',
         'source_adaptation': source_adaptations[0] if source_adaptations
         else None,
         'source_adaptations': source_adaptations,
@@ -413,8 +432,10 @@ def main():
         _path, official = load_official_headings(
             parsed['official_headings_file'])
     import _pdf_math
+    import recover_work_packages as rwp
     try:
-        pdf_view,source_range=_pdf_math.translation_view(src_path,parsed['project_context'])
+        pdf_view,source_range,current=_pdf_math.translation_view(
+            src_path,parsed['project_context'],with_context=True)
     except (ValueError,KeyError,IndexError,TypeError) as exc:
         sys.exit('PDF来源核验拒绝: '+str(exc))
     doc = _pdf_math.read_document(doc_path,exact=bool(pdf_view))
@@ -428,7 +449,9 @@ def main():
         approved_extra_math=approved_extra_math, fragment=fragment,
         source_adaptations=parsed['source_adaptations'],
         numeric_review=parsed['numeric_review'],
-        numeric_policy=parsed['numeric_policy'],pdf_view=pdf_view,source_range=source_range)
+        numeric_policy=parsed['numeric_policy'],pdf_view=pdf_view,source_range=source_range,
+        table_code_stage=parsed['table_code_stage'],
+        header_cells=rwp.table_headers(current, [source_range] if source_range else None))
     print('\n'.join(lines))
     sys.exit(0 if fail == 0 else 1)
 

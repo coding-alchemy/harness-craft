@@ -37,7 +37,9 @@ def current(args):
             raise ValueError('译文缺少源包映射元数据: %s' % target)
         fails, warns = rwp._fragment_hard_checks(exp['body'], body, target,
                 tokens, extra, adaptation, adaptation_payload=payload,
-                pdf_view=context.get('_pdf_view'),source_range=(exp['char_start'],exp['char_end']))
+                pdf_view=context.get('_pdf_view'),source_range=(exp['char_start'],exp['char_end']),
+                table_code_stage=rwp.table_code_stage(context),
+                header_cells=rwp.table_headers(context, [(exp['char_start'],exp['char_end'])]))
         fails.extend(image_occurrence_fails(
             body, str(Path(target).parent), expected_digests=rwp._source_resource_digests(
                 exp['body'], str(Path(args.source).resolve().parent)), label='译文包'))

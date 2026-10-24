@@ -52,7 +52,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _verification import fenced_line_numbers, scan_math
+from _verification import fenced_line_numbers, scan_math, scan_code_fences
 
 _SKILL_DIR = Path(__file__).resolve().parent.parent
 _RULES_PATH = str(_SKILL_DIR / "references" / "translation_conventions.md")
@@ -60,7 +60,6 @@ _RULES_PATH = str(_SKILL_DIR / "references" / "translation_conventions.md")
 _HEADING_RE = re.compile(r'^#{1,6}\s+')
 _H2_RE = re.compile(r'^##\s+(?!#)')
 _LIST_RE = re.compile(r'^\s*(?:[*+-]\s+|\d+[.)]\s+)')
-_TABLE_RE = re.compile(r'^\|')
 _QUOTE_RE = re.compile(r'^>')
 _FOOTNOTE_DEF_RE = re.compile(r'^\[\^([^\]]+)\]:')
 _FOOTNOTE_REF_RE = re.compile(r'\[\^([^\]\s]+)\](?!:)')
@@ -101,6 +100,10 @@ def _parse_blocks(lines, fenced, protected=frozenset()):
     段落/脚注定义/块标记/列表不再把它们吸收或跨越，公式内部形似
     标题/列表/脚注的原文不会被切成切点。
     """
+    from _source_reconcile import markdown_table_facts
+    tables = markdown_table_facts('\n'.join(lines))
+    table_ends = {record['start_line'] - 1: record['group_end_line'] - 1
+                  for record in tables}
     blocks = []
     n = len(lines)
     i = 0
@@ -148,6 +151,11 @@ def _parse_blocks(lines, fenced, protected=frozenset()):
             blocks.append(Block('footnote_def', i, j))
             i = j + 1
             continue
+        if i in table_ends:
+            j = table_ends[i]
+            blocks.append(Block('table', i, j))
+            i = j + 1
+            continue
         if _BLOCK_MARK_RE.match(s):
             j = i
             while (j + 1 < n and lines[j + 1].strip() != ''
@@ -156,13 +164,6 @@ def _parse_blocks(lines, fenced, protected=frozenset()):
                    and not _HEADING_RE.match(lines[j + 1])):
                 j += 1
             blocks.append(Block('block_marker', i, j))
-            i = j + 1
-            continue
-        if _TABLE_RE.match(s):
-            j = i
-            while j + 1 < n and _TABLE_RE.match(lines[j + 1].strip()):
-                j += 1
-            blocks.append(Block('table', i, j))
             i = j + 1
             continue
         if _QUOTE_RE.match(s):
@@ -199,7 +200,7 @@ def _parse_blocks(lines, fenced, protected=frozenset()):
                and (j + 2) not in protected
                and not _HEADING_RE.match(lines[j + 1])
                and not _LIST_RE.match(lines[j + 1])
-               and not _TABLE_RE.match(lines[j + 1].strip())
+               and (j + 1) not in table_ends
                and not _QUOTE_RE.match(lines[j + 1].strip())
                and not _FOOTNOTE_DEF_RE.match(lines[j + 1].strip())
                and not _BLOCK_MARK_RE.match(lines[j + 1].strip())):
@@ -223,7 +224,22 @@ def _parse_blocks(lines, fenced, protected=frozenset()):
             continue
         bound.append(block)
         k += 1
-    return bound
+    # 对象前的独立来源锚点随对象拆包，不能留在上一包末尾。
+    from _api_navigation import ANCHOR
+    attached=[];k=0
+    while k<len(bound):
+        block=bound[k]
+        if all(not lines[p].strip() or ANCHOR.fullmatch(lines[p]) for p in range(block.start,block.end+1)) and k+1<len(bound):
+            start=block.start;k+=1
+            while k+1<len(bound) and all(not lines[p].strip() or ANCHOR.fullmatch(lines[p]) for p in range(bound[k].start,bound[k].end+1)):
+                k+=1
+            target=bound[k]
+            if _CAPTION_RE.match(lines[target.start]) and k+1<len(bound) and bound[k+1].kind=='table':
+                k+=1;target=bound[k]
+            attached.append(Block(target.kind,start,target.end))
+        else:attached.append(block)
+        k+=1
+    return attached
 
 
 def _footnote_labels(lines, start, end, fenced):
@@ -337,10 +353,18 @@ def _parse_sections(lines, fenced, protected=frozenset()):
         return [(title, 1, 0, n - 1)]
 
     first = h2_lines[0]
-    non_blank = [lines[p] for p in range(0, first) if lines[p].strip()]
+    from _api_navigation import ANCHOR
+    non_blank = [lines[p] for p in range(0, first) if lines[p].strip() and not ANCHOR.fullmatch(lines[p])]
     preamble_trivial = (not non_blank) or (
         len(non_blank) == 1 and non_blank[0].startswith('# '))
 
+    starts={}
+    for heading in h2_lines:
+        start=heading;cursor=heading-1
+        while cursor>=0 and (not lines[cursor].strip() or ANCHOR.fullmatch(lines[cursor])):
+            if ANCHOR.fullmatch(lines[cursor]):start=cursor
+            cursor-=1
+        starts[heading]=start
     cuts = list(h2_lines)
     if not preamble_trivial:
         cuts.insert(0, 0)
@@ -348,8 +372,8 @@ def _parse_sections(lines, fenced, protected=frozenset()):
     out = []
     seen = {}
     for k, cut in enumerate(cuts):
-        start = 0 if (k == 0 and preamble_trivial) else cut
-        end = (cuts[k + 1] - 1) if k + 1 < len(cuts) else n - 1
+        start = 0 if (k == 0 and preamble_trivial) else starts.get(cut,cut)
+        end = (starts.get(cuts[k + 1],cuts[k + 1]) - 1) if k + 1 < len(cuts) else n - 1
         sid = '[top]' if (cut == 0 and not preamble_trivial) \
             else lines[cut].lstrip('#').strip()
         seen[sid] = seen.get(sid, 0) + 1
@@ -394,6 +418,11 @@ def _count_units(lines, start, end, fenced, protected=frozenset()):
             counts['list_items'] += sum(
                 1 for p in range(b.start, b.end + 1)
                 if (p + 1) not in fenced and _LIST_RE.match(lines[p]))
+    from _source_reconcile import markdown_table_facts
+    counts['tables'] = sum(start <= record['start_line'] - 1 <= end
+                          for record in markdown_table_facts('\n'.join(lines)))
+    counts['code_fences'] = sum(start <= block.start_line - 1 <= end
+                               for block in scan_code_fences('\n'.join(lines)).blocks)
     return counts
 
 

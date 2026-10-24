@@ -53,6 +53,7 @@ from _verification import (
     residual_markers,
     scan_code_fences,
     scan_math,
+    markdown_list_count,
     source_occurrence_digests,
     strong_token_checked_items,
     strong_token_report,
@@ -166,7 +167,7 @@ def check_math(merged_text, src_text, approved_extra_math,
     doc_scan = scan_math(merged_text)
     math_diffs, math_warns = compare_math_spans(
         src_scan.spans, doc_scan.spans, src_label, merged_label,
-        approved_extra_exprs=approved_extra_math, doc_text=merged_text)
+        approved_extra_exprs=approved_extra_math, doc_text=merged_text, src_text=src_text)
     for diff in math_diffs:
         fails += 1
         msgs.append('公式逐项核对: %s FAIL' % diff)
@@ -295,9 +296,7 @@ def coverage_warnings(merged_text, src_text):
         ('提示框', src_text.count('ADMONITION'),
          merged_text.count('> **注（Note）**') + merged_text.count('> **警告（Warning）**') + merged_text.count('> **重要（Important）**')),
         ('公式', len(re.findall(r'\$[^$\n]+\$', src_text)), len(re.findall(r'\$[^$\n]+\$', merged_text))),
-        ('列表项',
-         len([l for l in src_text.splitlines() if l.startswith('  - ')]),
-         len([l for l in merged_text.splitlines() if l.strip().startswith(('- ', '* '))])),
+        ('列表项', markdown_list_count(src_text), markdown_list_count(merged_text)),
     ]
     for name, s, d in pairs:
         msgs.append('覆盖率 %s: 源 %d / 译 %d（差值供人工判断）' % (name, s, d))
@@ -371,6 +370,13 @@ def run_checks(merged_text, src_texts, src_dirs, *, merged_dir,
                         '（原人工数字复核义务不变）')
 
     all_msgs.append('## 覆盖率警告（信息性）')
+    from _source_reconcile import compare_translation_tables, table_code_problems
+    code_problems = table_code_problems(merged_text)
+    total_fail += len(code_problems)
+    all_msgs.extend('表格代码: ' + problem + ' FAIL' for problem in code_problems)
+    table_diffs = compare_translation_tables(src_text, merged_text)
+    total_fail += len(table_diffs)
+    all_msgs.extend('表格核对: ' + diff + ' FAIL' for diff in table_diffs)
     all_msgs.extend(coverage_warnings(merged_text, src_text))
     all_msgs.append('')
     all_msgs.append('结果: %s'
