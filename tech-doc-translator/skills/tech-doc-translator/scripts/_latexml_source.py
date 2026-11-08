@@ -16,6 +16,7 @@
   引用；recover/merge 证据中的 check_policy 块只投影本包字符范围实际
   涉及的原节点/对应/裁决与适配器身份，无关事实变化不使本包证据失效。
 """
+import copy
 import hashlib
 import json
 import os
@@ -25,7 +26,7 @@ from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 from _html_fidelity import (HtmlFidelity, clean_code_html,
                             contains_block_content,
-                            escape_text_backslashes)
+                            escape_text_backslashes, image_object_ref)
 from _verification import (fenced_line_numbers, scan_code_fences, scan_math,
                            markdown_table_row_lines, table_math_spans, encode_table_math,
                            decode_table_math)
@@ -72,6 +73,8 @@ def classify_block(tag):
     # 参考文献条目列表（04/08）：逐条保留文字与源序
     if name == 'ul' and any('biblist' in c for c in cls):
         return 'biblist'
+    if name == 'ol' and 'ltx_enumerate' in cls:
+        return 'enumerate'
     # 简单无序列表（08）：条目行表示，嵌套/复杂列表仍为未支持容器
     if name == 'ul' and any('itemize' in c for c in cls):
         return 'itemize'
@@ -104,7 +107,7 @@ def classify_block(tag):
                   'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'figure',
                   'blockquote']):
         return 'supported'
-    if _HEADING_RE.fullmatch(name) or name in (
+    if image_object_ref(tag) or _HEADING_RE.fullmatch(name) or name in (
             'p', 'pre', 'blockquote', 'figure', 'img'):
         return 'supported'
     if name in ('div', 'section', 'article', 'main', 'blockquote'):
@@ -158,9 +161,57 @@ def _table_has_spans(table):
 def table_node_ids(root):
     '顶层表格（排除嵌套）的稳定命名（文档序，跨进程可重算）。'
     top = [n for n in root.find_all('table')
-           if n.find_parent('table') is None]
+           if n.find_parent('table') is None and n.find_parent('pre') is None]
     return {id(node): 'table[%d]' % ordinal
             for ordinal, node in enumerate(top, start=1)}
+
+
+def reference_data_tables(root):
+    return [table for table in root.find_all('table')
+            if table.find_parent('table') is None
+            and table.find_parent('pre') is None
+            and classify_block(table) != 'math-group']
+
+
+def reference_source_table_mappings(root, conversions):
+    """把数据表序号投影到既有原 DOM 序号；目标表仍使用实际输出序号。"""
+    if not isinstance(conversions, dict) or conversions.get('version') != 1:
+        return conversions
+    ordinals = {node: int(label[6:-1]) for node, label in table_node_ids(root).items()}
+    data = reference_data_tables(root)
+    tables = []
+    for entry in conversions.get('tables') or []:
+        if not isinstance(entry, dict):
+            tables.append(entry)
+            continue
+        locate = entry.get('locate') or {}
+        if not isinstance(locate, dict):
+            tables.append(entry)
+            continue
+        ordinal = locate.get('table')
+        target_tables = {target['table'] for cell in entry.get('cells') or []
+                         if isinstance(cell, dict)
+                         for target in cell.get('targets') or []
+                         if isinstance(target, dict) and isinstance(target.get('table'), int)}
+        table_id = locate.get('table_id')
+        source = None
+        if table_id:
+            matches = [(index, table) for index, table in enumerate(data, 1)
+                       if table.get('id') == table_id]
+            if len(matches) != 1:
+                raise ValueError('转换映射原表 ID %r 缺失或重复' % table_id)
+            index, source = matches[0]
+            if ordinal is not None and ordinal not in (index, ordinals[id(source)]):
+                raise ValueError('转换映射原表 ID %r 与表序号不符' % table_id)
+        elif isinstance(ordinal, int) and not isinstance(ordinal, bool) \
+                and target_tables == {ordinal} \
+                and 1 <= ordinal <= len(data):
+            # 新草稿用同一数据表序号登记本表的源定位与输出格；旧映射
+            # 可继续单独用 DOM 序号定位并明确实际输出表。
+            source = data[ordinal - 1]
+        tables.append({**entry, 'locate': {**locate, 'table': ordinals[id(source)]}}
+                      if source is not None else entry)
+    return {**conversions, 'tables': tables}
 
 
 def _span_value(cell, attr):
@@ -618,10 +669,10 @@ def plan_image_targets(root, substitutions=None):
     返回 {id(img): 'images/<name>'}，适配端与独立对账端共用同一规划。"""
     by_base = {}
     imgs = []
-    for img in root.find_all('img'):
+    for img in root.find_all(['img', 'object']):
         if img.find_parent('pre') is not None:
             continue
-        src = img.get('src') or ''
+        src = img.get('src') or image_object_ref(img)
         if not src:
             continue
         imgs.append(img)
@@ -647,9 +698,76 @@ def plan_image_targets(root, substitutions=None):
             continue
         name = product.rsplit('/', 1)[-1]
         for img in imgs:
-            if img.get('src') == entry.get('original_ref'):
+            if (img.get('src') or image_object_ref(img)) == entry.get('original_ref'):
                 targets[id(img)] = 'images/%s' % name
     return targets
+
+
+def publication_notes(heading):
+    """题名内的出版注独立于题名内容，按原 DOM 次序保留。"""
+    if heading.name != 'h1':
+        return []
+    return [note for note in heading.select('.ltx_pubnotes')
+            if note.find_parent(class_='ltx_pubnotes') is None]
+
+
+def publication_note_ids(root):
+    notes = [note for heading in root.find_all('h1')
+             for note in publication_notes(heading)]
+    return {id(note): 'pubnote[%d]' % number
+            for number, note in enumerate(notes, 1)}
+
+
+def enumerate_item_ids(root):
+    items = [item for item in root.find_all('li')
+             if item.find_parent('ol', class_='ltx_enumerate') is not None]
+    return {id(item): 'enum[%d]' % number
+            for number, item in enumerate(items, 1)}
+
+
+_LIST_BLOCK_RE = re.compile(r'\x02(\d+)\x02')
+
+
+def _list_item_blocks(node):
+    """按源序取需独立写出的列表、图及图片，保留整个块交给原处理入口。"""
+    for child in node.children:
+        if not isinstance(child, Tag) or child.name == 'pre':
+            continue
+        if (child.name in ('ol', 'ul', 'figure')
+                or (child.name == 'img' and child.get('src'))
+                or image_object_ref(child)):
+            yield child
+        else:
+            yield from _list_item_blocks(child)
+
+
+def enumerate_items(node):
+    """原序号和条目 DOM 分段；文字渲染与独立读取各自消费这些节点。"""
+    items = node.find_all('li', recursive=False)
+    ordered = node.name == 'ol'
+    descending = ordered and node.has_attr('reversed')
+    next_number = int(node.get('start', len(items) if descending else 1)) if ordered else 1
+    delimiter = '.'
+    for index, item in enumerate(items):
+        number = int(item.get('value', next_number)) if ordered else next_number
+        if ordered and not 0 <= number <= 999999999:
+            raise ValueError('有序列表 %s 的序号 %d 无法用 Markdown 表示'
+                             % (node.get('id', ''), number))
+        if ordered and index and (descending or number != next_number):
+            # CommonMark 只读取每段有序列表的首个编号；改变定界符使
+            # 跳号/倒序从当前位置开始新段，并保持同一嵌套缩进。
+            delimiter = ')' if delimiter == '.' else '.'
+        marker = '%d%s ' % (number, delimiter) if ordered else '- '
+        next_number = number - 1 if descending else number + 1
+        blocks = list(_list_item_blocks(item))
+        body = copy.deepcopy(item)
+        for index, child in enumerate(list(_list_item_blocks(body))):
+            child.replace_with(NavigableString('\x02%d\x02' % index))
+        for label in body.find_all(class_='ltx_tag_item', recursive=False):
+            if label.get_text(strip=True) in ('(%d)' % number, '%d.' % number,
+                                              '%d)' % number, str(number)):
+                label.extract()
+        yield item, marker, body, blocks
 
 
 def validate_resource_substitutions(payload, snapshot_dir,
@@ -1153,6 +1271,8 @@ class LatexmlAdapter(object):
         if root is None:
             raise ValueError('no <article>/<main>/<body> found')
         self.root = root
+        self._selected_table_conversions = reference_source_table_mappings(
+            root, self.table_conversions)
         # 节点命名在所有 DOM 变更前按原始文档序计算，与独立对账端口径一致
         self._p_ordinals = {id(n): 'p[%d]' % i for i, n in
                             enumerate(root.find_all('p'), start=1)}
@@ -1165,13 +1285,14 @@ class LatexmlAdapter(object):
         self._figcaption_ordinals = {
             id(n): 'figcaption[%d]' % i for i, n in
             enumerate(root.find_all('figcaption'), start=1)}
-        self._img_ordinals = {}
-        ordinal = 0
-        for img in root.find_all('img'):
-            if img.find_parent('pre') is not None:
-                continue
-            ordinal += 1
-            self._img_ordinals[id(img)] = 'img[%d]' % ordinal
+        self._img_ordinals = {
+            id(node): '%s[%d]' % (name, ordinal)
+            for name in ('img', 'object')
+            for ordinal, node in enumerate(
+                (node for node in root.find_all(name)
+                 if node.find_parent('pre') is None), 1)}
+        self._pubnote_ids = publication_note_ids(root)
+        self._enumerate_ids = enumerate_item_ids(root)
         self._container_ids = container_node_ids(root)
         self._paragraph_div_ids = paragraph_div_ids(root)
         self._group_ids = group_node_ids(root)
@@ -1254,19 +1375,28 @@ class LatexmlAdapter(object):
         cur_marks = []
         cursor = 0
         did_split = False
+        first_line = text.lstrip('\n')
+        indent = ' ' * (len(first_line) - len(first_line.lstrip(' ')))
 
         def cur_len():
             return sum(len(part) for part in cur_text)
 
+        def piece_prefix():
+            # 列表内首块可紧邻标号；后续拆段保留内容列。公式跨度本身逐字写出。
+            if indent and not pieces and not text.startswith('\n'):
+                return indent
+            return '\n' + indent
+
         def close_piece():
             """收尾当前文字片段；块级拆出的文字片段与图片拆段同一字
-            节约定（strip + '\\n' 前缀，标记随内容平移不被裁切）。"""
+            节约定（保留块缩进，标记随内容平移不被裁切）。"""
             content = ''.join(cur_text)
             if not content.strip():
                 return
             lead_ws = len(content) - len(content.lstrip())
-            text_out = '\n' + content.strip()
-            shift = 1 - lead_ws
+            prefix = piece_prefix()
+            text_out = prefix + content.strip()
+            shift = len(prefix) - lead_ws
             pieces.append(_Piece(
                 text_out, meta, False,
                 [(k, s + shift, e + shift) for k, s, e in cur_marks]))
@@ -1285,8 +1415,9 @@ class LatexmlAdapter(object):
                 cur_text.append(front)
                 close_piece()
                 cur_text, cur_marks = [], []
-                pieces.append(_Piece('\n' + occ['raw'], meta, True,
-                                     [(key, 1, 1 + len(occ['raw']))]))
+                prefix = piece_prefix()
+                pieces.append(_Piece(prefix + occ['raw'], meta, True, [
+                    (key, len(prefix), len(prefix) + len(occ['raw']))]))
             else:
                 cur_text.append(front)
                 start = cur_len()
@@ -1467,13 +1598,22 @@ class LatexmlAdapter(object):
         name = child.name
         cls = ' '.join(child.get('class') or [])
         if _HEADING_RE.fullmatch(name):
+            original_notes = publication_notes(child)
+            title_node = copy.deepcopy(child) if original_notes else child
+            notes = [note.extract() for note in publication_notes(title_node)]
             text = fidelity.clean_heading(fidelity.heading_text(
-                child, escape_backslashes=True))
+                title_node, escape_backslashes=True))
             self._emit('\n' + fidelity.heading_line(
                 int(name[1]), text), {
                 'type': 'heading', 'node': self._h_ordinals[id(child)],
                 'section': section_of(self.root, child),
                 'level': int(name[1])})
+            for original, note in zip(original_notes, notes):
+                text = fidelity.paragraph_text(note, escape_backslashes=True)
+                if text:
+                    self._emit('\n' + text, {
+                        'type': 'paragraph', 'node': self._pubnote_ids[id(original)],
+                        'section': section_of(self.root, child)})
         elif name == 'p':
             self._paragraph_host(child, {
                 'type': 'paragraph',
@@ -1482,7 +1622,7 @@ class LatexmlAdapter(object):
         elif name == 'pre':
             self._emit('\n```\n' + child.get_text().rstrip('\n')
                        + '\n```', {'type': 'code', 'node': None})
-        elif name == 'img':
+        elif name == 'img' or image_object_ref(child):
             ctx = self._fig_ctx[-1] if self._fig_ctx else (None, None)
             self._image(child, ctx[0], ctx[1])
         elif name == 'figcaption':
@@ -1500,6 +1640,8 @@ class LatexmlAdapter(object):
             self._biblist(child)
         elif classify_block(child) == 'itemize':
             self._itemize(child)
+        elif classify_block(child) == 'enumerate':
+            self._enumerate(child)
         elif classify_block(child) == 'listing':
             self._listing(child)
         elif classify_block(child) == 'algorithm':
@@ -1538,8 +1680,9 @@ class LatexmlAdapter(object):
         图片归属当前图上下文。图片-only 宿主（如图面板 flex 单元）只输出
         [IMG] 行，不产生空段落。拆出的文字片段保留宿主节点身份，对应区间
         在记录阶段合并为覆盖范围（§7.11.4：父范围不代替叶子精确对应）。"""
-        imgs = [img for img in child.find_all('img')
-                if img.find_parent('pre') is None and img.get('src')]
+        imgs = [img for img in child.find_all(['img', 'object'])
+                if img.find_parent('pre') is None
+                and (img.get('src') or image_object_ref(img))]
         if not imgs:
             # 按阅读语义加写原文字面反斜线与强调定界（复评 S1：裸 `*`/`_`
             # 会在真实阅读中丢字符），使实际阅读与原文字面一致
@@ -1548,11 +1691,10 @@ class LatexmlAdapter(object):
             if text:
                 self._emit('\n' + text, meta)
             return
-        import copy as _copy
-        copied = _copy.deepcopy(child)
-        copied_imgs = [img for img in copied.find_all('img')
+        copied = copy.deepcopy(child)
+        copied_imgs = [img for img in copied.find_all(['img', 'object'])
                        if img.find_parent('pre') is None
-                       and img.get('src')]
+                       and (img.get('src') or image_object_ref(img))]
         for index, img in enumerate(copied_imgs):
             img.replace_with(NavigableString('\x01%d\x01' % index))
         text = self.fidelity.paragraph_text(copied, escape_backslashes=True)
@@ -1675,7 +1817,7 @@ class LatexmlAdapter(object):
         ordinal = int(node_id.split('[')[1].rstrip(']')) \
             if node_id else None
         mapping = locate_table_mapping(table, ordinal,
-                                       (self.table_conversions or {}).get(
+                                       (self._selected_table_conversions or {}).get(
                                            'tables'))
         if mapping is None:
             # 表内已确认公式随宿主保留（不猜写、不丢弃），逐出现登记；
@@ -1756,6 +1898,47 @@ class LatexmlAdapter(object):
         if count == 0:
             self._unsupported_container(node)
 
+    def _enumerate(self, node, indent=0, leading_break='\n'):
+        """有序列表按原始 start 和内嵌层级写出，条目间的原序保持。"""
+        gap = leading_break
+        for item, marker, body, blocks in enumerate_items(node):
+            host = self._enumerate_ids[id(item)]
+            text = self.fidelity.render_inline(body, escape_backslashes=True)
+            continuation = indent + len(marker)
+            for part, segment in enumerate(_LIST_BLOCK_RE.split(text)):
+                if part % 2:
+                    block = blocks[int(segment)]
+                    start = len(self.emissions)
+                    if block.name in ('ol', 'ul'):
+                        self._enumerate(block, continuation, gap)
+                    else:
+                        self._dispatch_child(block, block.parent)
+                        for emission in self.emissions[start:]:
+                            if (emission.meta
+                                    and emission.meta.get('type') == 'figure-caption'):
+                                # 结束此前子列表，避免图题成为子项的惰性续行。
+                                emission.text = '\n' + emission.text
+                            emission.text = self.fidelity._indented_block(
+                                emission.text, ' ' * continuation)
+                        if start < len(self.emissions):
+                            first = self.emissions[start]
+                            first.text = gap + first.text.lstrip('\n')
+                    if start < len(self.emissions):
+                        gap = '\n'
+                    continue
+                segment = segment.strip()
+                if part and not segment:
+                    continue
+                prefix = (' ' * indent + marker if not part
+                          else ' ' * continuation)
+                self._emit(gap + (prefix + segment).rstrip(), {
+                    'type': 'paragraph', 'node': '%s.%d' % (host, part),
+                    'section': section_of(self.root, item),
+                    'conversion': {'style': 'ordered-item', 'prefix': prefix}})
+                # CommonMark 要求空条目标号紧邻其首个内容行。
+                gap = '' if not part and not segment else '\n'
+            gap = '\n'
+
     def _unsupported_container(self, child, node_id=None, reason=None):
         """未支持的内容性容器：保留为 [TAGNAME] 文字输出并登记
         unresolved（含保留内容核对依据），不静默丢弃、不声称已支持。
@@ -1778,7 +1961,7 @@ class LatexmlAdapter(object):
                                  '已保留原文' % child.name)})
 
     def _image(self, img, figure_id=None, sub_index=None):
-        src = img.get('src', '')
+        src = img.get('src') or image_object_ref(img)
         if not src:
             return
         reference = self._image_targets.get(id(img)) or (
@@ -1787,14 +1970,16 @@ class LatexmlAdapter(object):
                 for e in self.resource_substitutions
                 if isinstance(e, dict)}
         style = 'substituted' if src in subs else 'img-marker'
+        conversion = {'style': style, 'reference': reference, 'source_ref': src}
+        if img.name == 'object':
+            conversion.update(source_id=img.get('id'), width=img.get('width'),
+                              height=img.get('height'))
         self._emit('\n[IMG: %s]' % reference, {
             'type': 'image', 'node': self._img_ordinals.get(id(img)),
             'section': section_of(self.root, img),
             'figure': figure_id,
             'subfigure': sub_index,
-            'conversion': {'style': style,
-                           'reference': reference,
-                           'source_ref': src}})
+            'conversion': conversion})
         self.fidelity.note_image(img, reference)
         if style == 'substituted' and self.fidelity.image_display:
             entry = self.fidelity.image_display[-1]

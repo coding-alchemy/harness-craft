@@ -391,8 +391,8 @@ class InlineCodeSemanticsTest(unittest.TestCase):
         # 内容首/尾反引号与定界符隔离（成对空格填充），markdown-it 实际
         # 渲染为代码跨度；闭合符必须是完整等长反引号串
         from markdown_it import MarkdownIt
-        from _html_fidelity import markdown_inline_code, \
-            parse_inline_code_spans
+        from _html_fidelity import markdown_inline_code
+        from _verification import parse_inline_code_spans
         for value in ('`foo', 'foo`', 'a`b'):
             span = markdown_inline_code(value)
             rendered = MarkdownIt().render(span)

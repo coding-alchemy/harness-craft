@@ -47,6 +47,26 @@ def draw_chart(page, labels):
 
 
 class PdfSourceTranslationTests(unittest.TestCase):
+    def test_management_mask_preserves_offsets(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from _pdf_math import mask_management_fields
+        from export_pdf import project_management_fields
+
+        for fields in ('> **来源**：PDF\n> **抓取日期**：2026-11-08\n',
+                       '> **来源**：[PDF](https://example.org) `origin`\n> **抓取日期**：2026-11-08\n'):
+            original = ('# 题名\n\n' + fields
+                        + '\n正文中的来源为 `body`。\n\n> **抓取日期**：正文。\n')
+            body_start = original.index('正文中的')
+            masked = mask_management_fields(original)
+            self.assertEqual(len(original), len(masked))
+            self.assertEqual([i for i, c in enumerate(original) if c == '\n'],
+                             [i for i, c in enumerate(masked) if c == '\n'])
+            self.assertEqual(original[body_start:], masked[body_start:])
+            self.assertEqual('# 题名', masked.splitlines()[0])
+            self.assertEqual(['来源', '抓取日期'],
+                             [row['label'] for row in project_management_fields(original)[1]])
+            self.assertFalse(''.join(masked.splitlines()[2:4]).strip())
+
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()

@@ -4,6 +4,8 @@
 用法：
     python3 parse_reference_html.py <index.html> [section_id] <out.md>
         [--source-adaptation <依据.json> --adaptation-output <候选依据.json>]
+    python3 parse_reference_html.py <index.html> [section_id]
+        --inspect-output <新候选.json> [--source-adaptation <现有依据.json>]
 
 section_id 不提供时解析 <article> / <main> / <body>。
 
@@ -28,10 +30,12 @@ correspondences 不代替本次重建）。提供时：身份与快照摘要按�
     [FIGURE] caption              图题占位
     [TAGNAME] text                未显式处理的块级元素（不得静默丢弃）
 """
+import json
 import os
 import sys
 import re
 import tempfile
+from pathlib import Path
 from bs4 import Tag
 
 from _html_fidelity import (HtmlFidelity, contains_block_content,
@@ -269,7 +273,6 @@ def _display_map_text(fidelity, out_path, html_path):
     """把显示尺寸映射写入目标目录暂存文件并回读文本：派生路径由
     write_display_map 按暂存 Markdown 路径推导，'markdown' 字段回填为
     最终产物名（与直接写目标一致），文本交由 _publish_group 原子发布。"""
-    import json
 
     parent = os.path.dirname(out_path) or os.curdir
     tmp_md = staged = None
@@ -295,7 +298,6 @@ def _display_map_text(fidelity, out_path, html_path):
 
 def _adapted_main(html_path, section_id, out_path, args):
     """LaTeXML 来源分支：身份/摘要核对 → 适配候选 → 独立对账 → 通过才写出。"""
-    import json
 
     import _latexml_source as latexml
     from _source_reconcile import reconcile_latexml_to_markdown
@@ -397,10 +399,108 @@ def _adapted_main(html_path, section_id, out_path, args):
                  display_map) if display_map else '', adapt_out))
 
 
+def inspect_reference(html_path: str, section_id: str | None = None, *,
+                      source_adaptation_path: str | None = None) -> dict:
+    """只读来源和已有裁决，准备需回源确认的目标、资源和表格草稿。"""
+    import _latexml_source as latexml
+    from _html_fidelity import TableStructureError, resolve_snapshot_resource, table_grid_cells
+    from _source_reconcile import reference_anchor_targets, snapshot_image_facts
+    from _verification import resource_identity_digest, scan_math
+
+    snapshot = Path(html_path).absolute()
+    raw = snapshot.read_bytes().decode('utf-8')
+    digest = latexml.sha256_text(raw)
+    payload = {}
+    if source_adaptation_path:
+        payload = latexml.load_adaptation(source_adaptation_path)
+        problems = latexml.validate_adaptation(payload, raw_html=raw, snapshot_path=snapshot)
+        problems.extend(latexml.validate_resource_substitutions(
+            payload, str(snapshot.parent), payload['paper_identity']['version']))
+        if problems:
+            raise ValueError('来源依据核对失败: ' + '；'.join(problems))
+    soup = HtmlFidelity().parse(raw)
+    root = _select_root(soup, section_id)
+    anchors, unresolved = reference_anchor_targets(raw, section_id)
+    resources = []
+    substitutions = latexml.substitution_by_ref(payload)
+    for item in snapshot_image_facts(raw, 'reference', section_id) or []:
+        source_ref = item['source_ref']
+        path, problem = resolve_snapshot_resource(source_ref, str(snapshot.parent))
+        if path is None and source_ref in substitutions:
+            path = substitutions[source_ref]['product']['path']
+            problem = None
+        digest_resource = resource_identity_digest(path) if path else None
+        if path and not digest_resource:
+            problem = '源资源或递归依赖身份不可得'
+        resources.append({
+            **item, 'path': path, 'sha256': digest_resource, 'problem': problem,
+        })
+    tables = []
+    for ordinal, table in enumerate(latexml.reference_data_tables(root), 1):
+        if latexml.classify_block(table) != 'table-complex':
+            continue
+        try:
+            rows, width, layout = table_grid_cells(table, ordinal)
+            occupied = {(target['row'], target['col']) for _cell, entry in layout
+                        for target in entry['targets']}
+            if len(occupied) != rows * width:
+                row, column = next((r, c) for r in range(1, rows + 1)
+                                   for c in range(1, width + 1) if (r, c) not in occupied)
+                raise TableStructureError(
+                    '表 #%d r=%d c=%d 的跨度与实际行列不符，需回源裁决'
+                    % (ordinal, row, column))
+        except TableStructureError as exc:
+            unresolved.append({'node': 'table[%d]' % ordinal, 'reason': str(exc)})
+            continue
+        locate = {'table': ordinal}
+        if table.get('id'):
+            locate['table_id'] = table['id']
+        cells = []
+        for cell, entry in layout:
+            protected = (cell.find(['math', 'code', 'pre', 'img', 'object', 'a'])
+                         or scan_math(cell.get_text()).spans)
+            if protected:
+                entry['targets'] = entry['targets'][:1]
+            cells.append(entry)
+        tables.append({'locate': locate, 'cells': cells})
+    try:
+        _, _, pending, _, _ = latexml.adapt_latexml_snapshot(
+            raw, section_id, payload.get('decisions') or [], str(snapshot.parent),
+            table_conversions=payload.get('table_conversions'),
+            resource_substitutions=payload.get('resource_substitutions') or [])
+    except ValueError as exc:
+        unresolved.append({'node': section_id or 'root', 'reason': str(exc)})
+    else:
+        unresolved.extend(pending)
+    return {
+        'kind': 'reference-inspection',
+        'snapshot': {'path': str(snapshot.resolve()), 'sha256': digest},
+        'selection': section_id, 'unresolved': unresolved, 'resources': resources,
+        'anchors': anchors,
+        'table_conversions': {'version': 1, 'snapshot_sha256': digest, 'tables': tables},
+    }
+
+
+def _write_inspection(path, payload):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', dir=os.path.dirname(os.path.abspath(path)),
+                prefix='.reference-inspection-', delete=False) as handle:
+            temporary = handle.name
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write('\n')
+        os.link(temporary, path)
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+
+
 def main():
     argv = sys.argv[1:]
     source_adaptation = None
     adaptation_output = None
+    inspect_output = None
     rest = []
     index = 0
     while index < len(argv):
@@ -410,9 +510,26 @@ def main():
         elif argv[index] == '--adaptation-output' and index + 1 < len(argv):
             adaptation_output = argv[index + 1]
             index += 2
+        elif argv[index] == '--inspect-output' and index + 1 < len(argv):
+            inspect_output = argv[index + 1]
+            index += 2
         else:
             rest.append(argv[index])
             index += 1
+    if inspect_output is not None:
+        if len(rest) not in (1, 2) or adaptation_output is not None:
+            sys.exit('--inspect-output 仅接收快照和可选选区，不与正式输出同用')
+        try:
+            if os.path.lexists(inspect_output):
+                raise ValueError('检查候选须使用新路径，不能覆盖输入或已有文件')
+            candidate = inspect_reference(
+                rest[0], rest[1] if len(rest) == 2 else None,
+                source_adaptation_path=source_adaptation)
+            _write_inspection(inspect_output, candidate)
+        except (OSError, ValueError) as exc:
+            sys.exit('参考源准备失败: %s' % exc)
+        print('已写入参考源准备候选: %s' % inspect_output)
+        return
     if len(rest) < 2 or len(rest) > 3:
         sys.exit(__doc__)
     html_path = rest[0]

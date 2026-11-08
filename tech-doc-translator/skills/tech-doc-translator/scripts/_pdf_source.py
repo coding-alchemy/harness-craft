@@ -367,6 +367,22 @@ def fitz_rect(seq):
     return [round(float(v), 2) for v in seq]
 
 
+def glyph_center(char):
+    x0, y0, x1, y1 = char["bbox"]
+    return ((x0 + x1) / 2, (y0 + y1) / 2)
+
+
+def regional_glyphs(raw_blocks, rect):
+    """以原生字符序号和中心定位，不使用重新裁剪后的序号。"""
+    for bi, block in enumerate(raw_blocks):
+        for li, line in enumerate(block.get("lines", ())):
+            for si, span in enumerate(line["spans"]):
+                for ci, char in enumerate(span["chars"]):
+                    center = glyph_center(char)
+                    if rect.contains(center):
+                        yield (bi, li, si, ci), char["c"], center
+
+
 def page_content(page):
     """生成侧共同页面事实；独立核验不消费本次缓存。"""
     # 各原接口的 flags 会影响原生分块；分别缓存结果，不从其他视图补偿。
@@ -976,8 +992,9 @@ def load_checklist(path):
         fail("裁决清单不可读: %s（%s）" % (path, exc))
     if not isinstance(payload, dict) \
             or payload.get("version") != CHECKLIST_VERSION:
-        fail("裁决清单版本无效: %s（需 version=%d 的单一 JSON）"
-             % (path, CHECKLIST_VERSION))
+        version = payload.get("version") if isinstance(payload, dict) else type(payload).__name__
+        fail("裁决清单版本无效: %s（清单=%r，需 version=%d；解释器=%s）"
+             % (path, version, CHECKLIST_VERSION, sys.executable))
     return payload
 
 

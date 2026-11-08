@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/tech-doc-translator/scripts'))
 import verify_delivery as delivery_verifier
@@ -33,8 +34,10 @@ def run_export(root, extra=(), out_name=None):
            '--translation-record', 'source/acceptance_record.json']
     cmd += list(extra)
     cmd.append('01_章.md')
-    run = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
+    run = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True,
+                         timeout=60)
     run.out_name = out_name
+    run.work_dir = work
     return run
 
 
@@ -156,7 +159,7 @@ class ExportReadinessTests(unittest.TestCase):
         cls.build_record()
 
     @classmethod
-    def build_record(cls):
+    def build_record(cls, check_args=()):
         root = cls.root
         record = {
             'version': 1, 'mode': 'translation',
@@ -178,7 +181,7 @@ class ExportReadinessTests(unittest.TestCase):
                 'args': ['paper.pdf',
                          '--checklist', 'source/adjudication_checklist.json',
                          '--source-md', 'source/source_draft.md',
-                         '--translation', '01_章.md']}],
+                         '--translation', '01_章.md', *check_args]}],
         }
         problems = []
         entries = delivery_verifier.check_source_chains(root, record,
@@ -227,6 +230,52 @@ class ExportReadinessTests(unittest.TestCase):
         chapter = next(iter(coverage.values()))
         self.assertEqual(chapter['restored'], 1)
         self.assertEqual(chapter['missing'], 0)
+
+    def test_same_record_append_pdf(self):
+        import verify_pdf as pdf_verifier
+
+        record_path = self.root / 'source/acceptance_record.json'
+        inputs = [str(self.root / '01_章.md')]
+        before_ready, before = delivery_verifier.check_translation_readiness_cli(
+            record_path, inputs)
+        self.assertTrue(before_ready, before)
+        export = run_export(self.root)
+        self.assertEqual(export.returncode, 0, export.stderr)
+        pdf = self.root / export.out_name
+        pdf_args = ['--pdf', str(pdf), '--work-dir', str(export.work_dir),
+                    '--images-display', str(self.root / 'export/images_display.json'),
+                    *inputs]
+        record = json.loads(record_path.read_text())
+        record['mode'] = 'translation+pdf'
+        record['outputs'] = [{'path': pdf.name, 'sha256': delivery_verifier.sha256_file(pdf)}]
+        record['files'][pdf.name] = 'pdf'
+        record['checks'].append({'tool': 'verify_pdf', 'args': pdf_args})
+        record['reviews'].append({'kind': 'visual', 'target': pdf.name,
+                                  'status': 'pending'})
+        self.addCleanup(self.build_record)
+        record_path.write_text(json.dumps(record))
+
+        with patch.object(pdf_verifier, 'run_verification',
+                          side_effect=AssertionError('就绪不能启动 PDF 核验')):
+            after_ready, after = delivery_verifier.check_translation_readiness_cli(
+                record_path, inputs)
+        self.assertTrue(after_ready, after)
+        self.assertEqual(before['identity'], after['identity'])
+        machine_ok, report = pdf_verifier.run_verification(
+            pdf_verifier.parse_args(pdf_args))
+        self.assertTrue(machine_ok, report['failures'])
+
+    def test_pending_numeric_blocks_readiness(self):
+        target = self.root / '01_章.md'
+        original = target.read_text()
+        self.addCleanup(self.build_record)
+        self.addCleanup(target.write_text, original)
+        target.write_text(original.replace('工作正常。', '工作正常（42）。'))
+        self.build_record(['--numeric-review'])
+        ready, report = delivery_verifier.check_translation_readiness_cli(
+            self.root / 'source/acceptance_record.json', [str(target)])
+        self.assertFalse(ready, report)
+        self.assertIn('NUM[', ' '.join(report['reasons']))
 
     def test_scope_mismatch_rejected_as_insufficient(self):
         record = json.loads((self.root / 'source' /
@@ -312,12 +361,12 @@ class ExportReadinessTests(unittest.TestCase):
         original = delivery_verifier.check_translation_readiness_cli
         calls = []
 
-        def flaky(record_path, inputs):
+        def flaky(record_path, inputs, **kwargs):
             calls.append(1)
             if len(calls) > 1:
                 return False, {"ready": False, "reasons": [
                     "【漂移】导出期间输入变化（模拟）"]}
-            return original(record_path, inputs)
+            return original(record_path, inputs, **kwargs)
 
         delivery_verifier.check_translation_readiness_cli = flaky
         try:

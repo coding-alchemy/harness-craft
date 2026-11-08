@@ -94,6 +94,8 @@ JSON；check.report 字段可保留但不影响判断。导出报告与已绑定
 """
 import argparse
 from collections import Counter
+from contextlib import contextmanager
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -101,6 +103,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -168,6 +172,83 @@ class DeliveryError(ValueError):
     """交付检查失败。"""
 
 
+def new_run_context(progress=None):
+    """同一次顶层调用的已完成结果、当前职责和进度回调。"""
+    return {"completed": {}, "active": set(), "progress": progress}
+
+
+def stderr_progress(event):
+    label = "%s %s" % (event["event"], event["stage"])
+    if event["order"] is not None:
+        label += " #%d" % event["order"]
+    if event["target"]:
+        label += " %s" % event["target"]
+    if event["elapsed_seconds"] is not None:
+        label += " (%.2fs)" % event["elapsed_seconds"]
+    print("[progress] " + label, file=sys.stderr, flush=True)
+
+
+@contextmanager
+def progress_stage(run_context, stage, target, order=None, *, problems=None):
+    """报告一个正在执行的职责，yield 的回调可标记返回式失败。"""
+    progress = run_context["progress"] if run_context else None
+    initial_count = len(problems) if problems is not None else 0
+    failed = False
+    started = time.monotonic()
+
+    def fail_stage():
+        nonlocal failed
+        failed = True
+
+    def emit(event, elapsed):
+        if progress is not None:
+            progress({"stage": stage, "event": event, "target": str(target),
+                      "order": order, "elapsed_seconds": elapsed})
+
+    emit("start", None)
+    try:
+        yield fail_stage
+    except BaseException:
+        fail_stage()
+        raise
+    finally:
+        if problems is not None and len(problems) != initial_count:
+            fail_stage()
+        emit("fail" if failed else "end", time.monotonic() - started)
+
+
+@contextmanager
+def _active_check(run_context, key, stage, target):
+    active = run_context["active"]
+    if key in active:
+        raise DeliveryError("循环核验依赖: %s (%s)" % (stage, target))
+    active.add(key)
+    try:
+        yield
+    finally:
+        active.remove(key)
+
+
+def _cached_translation_step(run_context, key, stage, target, problems, action,
+                             *, order=None, succeeded=lambda _result: True):
+    completed = run_context["completed"]
+    if key in completed:
+        with progress_stage(run_context, stage, "%s（同次调用，身份未变，复用）"
+                            % target, order):
+            return completed[key]
+    with progress_stage(run_context, stage, target, order,
+                        problems=problems) as fail_stage:
+        with _active_check(run_context, key, stage, target):
+            initial_count = len(problems)
+            result = action()
+            if len(problems) == initial_count and succeeded(result):
+                if key is not None:
+                    completed[key] = result
+            else:
+                fail_stage()
+            return result
+
+
 def review_item_label(item, channel, index):
     """把报告待处置项转为稳定、可定位的 items 字符串。
 
@@ -201,6 +282,68 @@ def load_record(path):
         if key not in record:
             raise DeliveryError("交付记录缺少 %s" % key)
     return record
+
+
+def resolve_input_roles(root: str, record: dict) -> dict[str, str]:
+    """投影有序输入角色；仅有独立官方依据的目录可离开翻译覆盖。"""
+    files = record.get("files") or {}
+    manifests = record.get("toc_manifests", {})
+    if not isinstance(manifests, dict):
+        raise DeliveryError("目录依据 toc_manifests 必须是路径映射")
+    roles = {}
+    for rel in record.get("inputs") or []:
+        role = files.get(rel, "chapter")
+        if os.path.basename(rel) == TOC_NAME and role != "toc":
+            raise DeliveryError("目录 %s 须显式登记 toc 角色及官方依据" % rel)
+        if role not in ("chapter", "toc"):
+            raise DeliveryError("交付输入 %s 的角色 %s 不属于正文或目录" % (rel, role))
+        if role == "toc":
+            if rel != TOC_NAME:
+                raise DeliveryError("目录角色须使用 %s: %s" % (TOC_NAME, rel))
+            # 旧 PDF 独立导出记录保留原有目录合同。
+            if record.get("mode") != "pdf" or "toc_manifests" in record:
+                path = manifests.get(rel)
+                if not isinstance(path, str) or not path or not os.path.isfile(
+                        _rooted(root, path)):
+                    raise DeliveryError("目录 %s 缺少可读的官方依据 manifest" % rel)
+        roles[rel] = role
+    if set(manifests) - {rel for rel, role in roles.items() if role == "toc"}:
+        raise DeliveryError("目录依据映射包含不在有序输入中的目录角色")
+    return roles
+
+
+def _toc_facts(root, record, roles):
+    manifests = record.get("toc_manifests") or {}
+    if not manifests:
+        return {}
+    from build_toc import verify_toc
+
+    chapters = {os.path.realpath(_rooted(root, rel)) for rel, role in roles.items()
+                if role == "chapter"}
+    view = record.get("view_declaration")
+    if view:
+        view = os.path.realpath(_rooted(root, view))
+        try:
+            with open(view, encoding="utf-8") as handle:
+                declared = json.load(handle)
+            actual = [os.path.realpath(_rooted(root, rel)) for rel in roles]
+            if [os.path.realpath(item["path"]) for item in declared["inputs"]] != actual:
+                raise ValueError("视图声明不匹配记录的实际有序输入")
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise DeliveryError("目录视图声明无效: %s" % exc) from exc
+    facts = {}
+    checker = {name: _digest_or_none(os.path.join(SCRIPTS_DIR, name))
+               for name in ("build_toc.py", "export_pdf.py", "_verification.py")}
+    for rel, manifest in manifests.items():
+        try:
+            facts[rel] = verify_toc(_rooted(root, manifest), _rooted(root, rel),
+                                    view_declaration_path=view)
+        except ValueError as exc:
+            raise DeliveryError("目录 %s 核验失败: %s" % (rel, exc)) from exc
+        if any(entry["target_path"] not in chapters for entry in facts[rel]["entries"]):
+            raise DeliveryError("目录 %s 指向未纳入正文范围的章节" % rel)
+        facts[rel]["checker"] = checker
+    return facts
 
 
 def check_root_layout(root, record, problems, record_path=None):
@@ -1147,6 +1290,13 @@ def check_source_chains(root, record, problems, *, source_only=False):
 
     root_abs = os.path.realpath(root)
     entries = []
+    roles = None
+    if not source_only:
+        try:
+            roles = resolve_input_roles(root, record)
+        except DeliveryError as exc:
+            problems.append(str(exc))
+            return entries
 
     def rooted(rel):
         return rel if os.path.isabs(rel) else os.path.normpath(
@@ -1615,8 +1765,10 @@ def check_source_chains(root, record, problems, *, source_only=False):
         covered = set()
         for entry in entries:
             covered.update(entry["covers"])
-        for rel in record.get("inputs") or []:
-            if rel not in covered:
+        for rel, role in roles.items():
+            if role == "toc" and rel in covered:
+                problems.append("目录 %s 不能以译文身份声明源链覆盖" % rel)
+            if role == "chapter" and rel not in covered:
                 problems.append("交付输入 %s 缺少源链关联（漏关联）" % rel)
     # 两级映射要求由实际图片出现决定（§8.3/§9.3）：源链解析 Markdown 或
     # 其覆盖译文任一侧有实际图片出现，即须声明交付级映射；有图快照逐份
@@ -1626,7 +1778,9 @@ def check_source_chains(root, record, problems, *, source_only=False):
         from _verification import image_occurrence_count
 
         input_counts = {}
-        for rel in record.get("inputs") or []:
+        for rel, role in roles.items():
+            if role != "chapter":
+                continue
             path = rooted(rel)
             if os.path.isfile(path):
                 try:
@@ -1846,7 +2000,7 @@ def run_source_reconcile(root, record, source_entries, problems):
     return results
 
 
-def compute_delivery_identity(root, record, source_entries=None):
+def compute_delivery_identity(root, record, source_entries=None, *, purpose="full"):
     """完整依赖身份（§4.7/§9.3）：输入/产物、源链（逐快照资源）、两侧
     图片资源、映射、全部实际检查的真实 CLI 语义事实与文件依赖、共享
     脚本、术语读取/选择口径、依赖版本与样式政策的同一计算口径。
@@ -1871,15 +2025,29 @@ def compute_delivery_identity(root, record, source_entries=None):
         "environment": _environment_identity(),
         "glossary": _glossary_identity(root, record),
     }
+    if record.get("toc_manifests"):
+        roles = resolve_input_roles(root, record)
+        identity["toc"] = _toc_facts(root, record, roles)
     for rel in record.get("inputs") or []:
         path = rooted(rel)
         identity["inputs"][rel] = _digest_or_none(path)
         if os.path.isfile(path):
             identity["resources"]["inputs"][rel] = _resource_identities(
                 open(path, encoding="utf-8").read(), os.path.dirname(path))
-    for output in record.get("outputs", []):
-        rel = output.get("path")
-        identity["outputs"][rel] = _digest_or_none(rooted(rel or ""))
+    if purpose == "full":
+        for output in record.get("outputs", []):
+            rel = output.get("path")
+            identity["outputs"][rel] = _digest_or_none(rooted(rel or ""))
+        for review in record.get("reviews") or []:
+            if (not isinstance(review, dict) or review.get("kind") != REVIEW_VISUAL
+                    or review.get("status") != "reused"):
+                continue
+            try:
+                copies = _visual_reuse_artifacts(review.get("reuse"), root_abs)
+            except ValueError:
+                continue  # 复核门禁负责定位格式错误，候选仍可准备实际目检。
+            for path, _ in copies.values():
+                identity.setdefault("visual_reuse", {})[path] = _digest_or_none(path)
     if record.get("images_display"):
         identity["images_display"] = _digest_or_none(
             rooted(record["images_display"]))
@@ -1922,6 +2090,8 @@ def compute_delivery_identity(root, record, source_entries=None):
                 substitutions=_subs_list)
     for order, check in enumerate(record.get("checks") or [], start=1):
         tool = check.get("tool")
+        if purpose == "translation" and tool == "verify_pdf":
+            continue
         facts = None
         if tool in KNOWN_TOOLS:
             facts, _parsed = _check_facts(
@@ -1932,7 +2102,7 @@ def compute_delivery_identity(root, record, source_entries=None):
     identity["delivery_entry"] = {
         "script_sha256": _digest_or_none(
             os.path.join(SCRIPTS_DIR, "verify_delivery.py"))}
-    if "pdf" in record.get("mode", ""):
+    if purpose == "full" and "pdf" in record.get("mode", ""):
         style = os.path.join(os.path.dirname(SCRIPTS_DIR),
                              "assets/pdf/style.css")
         identity["style_policy"] = {"pdf_style_css": _digest_or_none(style)}
@@ -2108,20 +2278,26 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             facts["files"]["provenance"] = dep(parsed.provenance)
         if getattr(parsed, "view_declaration", None):
             facts["files"]["view_declaration"] = dep(parsed.view_declaration)
-        if getattr(parsed, "source_adaptation", None):
-            given_adaptations = list(parsed.source_adaptation)
-            if len(given_adaptations) == 1:
-                facts["files"]["source_adaptation"] = dep(
-                    given_adaptations[0])
-            else:
-                facts["files"]["source_adaptation"] = [
-                    dep(p) for p in given_adaptations]
         facts["files"]["unlink_target"] = [dep(p)
                                            for p in parsed.unlink_target]
         report_path = os.path.realpath(os.path.join(
             _rooted(root_abs, parsed.work_dir), pdf_verifier.REPORT_NAME))
         facts["files"]["export_report"] = [report_path,
                                            _digest_or_none(report_path)]
+        try:
+            with open(report_path, encoding="utf-8") as handle:
+                report = json.load(handle)
+        except (OSError, ValueError):
+            report = None
+        try:
+            adaptations = pdf_verifier.resolve_source_adaptations(
+                parsed, report if isinstance(report, dict) else {}, root=root_abs)
+        except (OSError, ValueError) as exc:
+            local_problems.append(f"核验记录 #{order} 来源依据拒绝：{exc}")
+            return None, None
+        if adaptations:
+            dependencies = [dep(path) for path in adaptations]
+            facts["files"]["source_adaptation"] = dependencies[0] if len(dependencies) == 1 else dependencies
         facts["params"] = {
             "toc_sections": bool(parsed.toc_sections),
             "require_display_map": bool(parsed.require_display_map),
@@ -2139,9 +2315,8 @@ def _check_facts(root_abs, tool, args, order, problems=None):
         if getattr(parsed, "view_declaration", None):
             parsed.view_declaration = _rooted(
                 root_abs, parsed.view_declaration)
-        if getattr(parsed, "source_adaptation", None):
-            parsed.source_adaptation = [
-                _rooted(root_abs, p) for p in parsed.source_adaptation]
+        parsed.source_adaptation = adaptations or None
+        parsed._delivery_root = root_abs
     elif tool == "verify_pdf_source":
         # 受约束 PDF 核验入口（§4.6）：真实参数解析的语义事实；golden、
         # 图片身份与强 token 口径经清单数据进入源链身份，这里登记
@@ -2336,12 +2511,27 @@ def _collect_numeric_pending(root_abs, facts, covered, pending_reviews,
     except ValueError as exc:
         problems.append("数字辅助: %s" % exc)
         return
+    groups = numeric.group_numeric_diffs(review)
     by_kind = pending_reviews.setdefault(
         covered, {}).setdefault(REVIEW_SEMANTIC, Counter())
-    by_kind.update(diff["id"] for diff in review["diffs"])
+    by_kind.update(diff["id"] for group in groups for diff in group["items"])
+    return groups
 
 
-def rerun_checks(root, record, problems):
+def rerun_checks(root, record, problems, *, purpose="full", run_context=None):
+    baseline = None
+    if run_context is not None:
+        source_problems = []
+        entries = check_source_chains(root, record, source_problems)
+        if not source_problems:
+            baseline = compute_delivery_identity(root, record, entries,
+                                                 purpose="translation")
+    return _rerun_checks(root, record, problems, purpose=purpose,
+                         run_context=run_context, baseline=baseline)
+
+
+def _rerun_checks(root, record, problems, *, purpose="full", run_context=None,
+                  baseline=None):
     """只重跑已知核验入口，取得本次机器证据；不向证据目录写入任何内容。
 
     模式绑定：含 PDF 的模式至少有一条 verify_pdf 记录且其 --pdf 按规范
@@ -2349,24 +2539,35 @@ def rerun_checks(root, record, problems):
     PDF 以同一核验计算函数在进程内复验（相对路径按交付根解释），本次
     结果即机器证据；翻译家族以交付根为 cwd 原样复跑，保存实际参数、
     检查器、输出与退出码。翻译家族检查必须覆盖交付记录声明的每个输入。
-    返回 (candidates, pending_reviews)：candidates 为待发布条目
+    返回 (candidates, pending_reviews, input_checks, pdf_checks)。
+    candidates 为待发布条目
     {order, entry, verify_report, export_report_path}。
     """
-    import verify_pdf as pdf_verifier
-
-    mode = record.get("mode")
+    if purpose not in ("translation", "full"):
+        raise ValueError("未知核验目的: %s" % purpose)
+    run_context = run_context if run_context is not None else new_run_context()
+    mode = "translation" if purpose == "translation" else record.get("mode")
     checks = record.get("checks") or []
     if not checks:
         problems.append("checks 为空：没有可复跑的核验记录，不构成完成依据")
         return [], {}, {}, {}
     root_abs = os.path.realpath(root)
+    try:
+        roles = resolve_input_roles(root, record)
+    except DeliveryError as exc:
+        problems.append(str(exc))
+        return [], {}, {}, {}
+    scope = (_translation_fingerprint(root, record, baseline)
+             if baseline is not None else None)
     # 输出绑定按规范化完整路径（basename 相同的其他目录 PDF 不能替验）
     pdf_outputs = {
         os.path.realpath(os.path.join(root_abs, o.get("path", ""))): o
-        for o in record.get("outputs", [])
+        for o in (record.get("outputs", []) if purpose == "full" else [])
         if str(o.get("path", "")).lower().endswith(".pdf")}
     record_inputs = {os.path.realpath(os.path.join(root_abs, rel))
-                     for rel in record.get("inputs") or []}
+                     for rel in roles}
+    toc_inputs = {os.path.realpath(os.path.join(root_abs, rel))
+                  for rel, role in roles.items() if role == "toc"}
     tools_used = set()
     verified_pdfs = set()
     covered_inputs = set()  # 翻译家族检查实际核验过的交付输入（P1-3）
@@ -2383,8 +2584,12 @@ def rerun_checks(root, record, problems):
     # 布局事项分别由 link/visual 复核处置。
     pending_reviews = {}
     candidates = []
-    for order, check in enumerate(checks, start=1):
+    ordered_checks = sorted(enumerate(checks, start=1),
+                            key=lambda item: item[1].get("tool") == "verify_pdf")
+    for order, check in ordered_checks:
         tool = check.get("tool")
+        if purpose == "translation" and tool == "verify_pdf":
+            continue
         args = check.get("args") or []
         if tool not in KNOWN_TOOLS:
             problems.append("未知的核验入口: %r（不执行记录中的任意命令）" % tool)
@@ -2398,6 +2603,8 @@ def rerun_checks(root, record, problems):
             continue
         entry = {"tool": tool, "args": args}
         if tool == "verify_pdf":
+            import verify_pdf as pdf_verifier
+
             # 直接调用的 PDF 计算也以交付根解释相对路径（与 cwd=交付根
             # 的子进程口径一致）；规范化完整路径只用于输出绑定比较。
             pdf_arg = facts["files"]["pdf"][0]
@@ -2425,6 +2632,13 @@ def rerun_checks(root, record, problems):
                     % (order, declared_map,
                        sorted(check_maps) or "（未显式绑定）"))
                 continue
+            if (record.get("toc_manifests")
+                    and toc_inputs.intersection(map(os.path.realpath, parsed.inputs))
+                    and facts["files"].get("view_declaration", [None])[0] != (
+                        os.path.realpath(_rooted(root_abs, record["view_declaration"]))
+                        if record.get("view_declaration") else None)):
+                problems.append("verify_pdf 记录 #%d 的视图声明与目录依据不一致" % order)
+                continue
             pdf_checks.setdefault(pdf_arg, []).append({
                 'order': order,
                 'tool': tool,
@@ -2432,7 +2646,13 @@ def rerun_checks(root, record, problems):
                 'shared_deps': facts["shared_deps"],
                 'facts': facts,
                 'args': list(args)})
-            machine_pass, report = pdf_verifier.run_verification(parsed)
+            pdf_key = (tool, root_abs, tuple(args), _identity_digest(facts))
+            with progress_stage(run_context, tool, pdf_arg, order) as fail_stage:
+                with _active_check(run_context, pdf_key, tool, pdf_arg):
+                    machine_pass, report = pdf_verifier.run_verification(
+                        parsed, run_context=run_context)
+                if not machine_pass:
+                    fail_stage()
             entry["exit_code"] = 0 if machine_pass else 1
             if not machine_pass:
                 summary = "; ".join(str(item.get("code"))
@@ -2484,13 +2704,32 @@ def rerun_checks(root, record, problems):
         else:
             # 翻译家族：记录参数原样传给真实 CLI，cwd=交付根；字面值
             # （官方标题/strong token/表达式）不拼路径。
-            run = subprocess.run(
-                [sys.executable, script] + list(args),
-                capture_output=True, text=True, cwd=root_abs)
+            covered = facts["files"]["translated"][0]
+            if covered in toc_inputs:
+                problems.append("核验记录 #%d 不能把目录当作译文: %s" % (order, covered))
+                continue
+
+            def run_family_check():
+                numeric = {}
+                groups = None
+                run = subprocess.run([sys.executable, script] + list(args),
+                                     capture_output=True, text=True, cwd=root_abs)
+                if run.returncode == 0 and facts["params"].get("numeric_review"):
+                    groups = _collect_numeric_pending(root_abs, facts, covered,
+                                                      numeric, problems)
+                return run, numeric.get(covered, {}).get(REVIEW_SEMANTIC), groups
+
+            check_key = ((tool, scope, tuple(args), _identity_digest(facts))
+                         if scope is not None else None)
+            run, numeric_pending, numeric_groups = _cached_translation_step(
+                run_context, check_key, tool, covered, problems, run_family_check,
+                order=order, succeeded=lambda result: result[0].returncode == 0)
+            if numeric_pending:
+                pending_reviews.setdefault(covered, {}).setdefault(
+                    REVIEW_SEMANTIC, Counter()).update(numeric_pending)
             entry["exit_code"] = run.returncode
             entry["stdout"] = run.stdout[-4000:]
             entry["stderr"] = run.stderr[-4000:]
-            covered = facts["files"]["translated"][0]
             covered_inputs.add(covered)
             input_checks.setdefault(covered, []).append({
                 'order': order,
@@ -2499,15 +2738,9 @@ def rerun_checks(root, record, problems):
                 'shared_deps': facts["shared_deps"],
                 'facts': facts,
             })
-            if facts["params"].get("numeric_review"):
-                # R5/§4.7 最终交付消费：从实际译文输入与本次核验的有序
-                # 源输入在进程内重算同一数字能力（不解析任何自由文本
-                # 输出），差异 ID 进入该目标的 semantic 待复核分类。
-                _collect_numeric_pending(root_abs, facts, covered,
-                                         pending_reviews, problems)
             candidates.append({
                 "order": order, "entry": entry, "verify_report": None,
-                "export_report_path": None})
+                "export_report_path": None, "numeric_groups": numeric_groups})
             if run.returncode != 0:
                 problems.append(
                     "核验入口复验失败: %s（exit %d）%s"
@@ -2529,7 +2762,9 @@ def rerun_checks(root, record, problems):
     # 至少一条翻译家族检查的译文参数实际覆盖，不能用指向其他目录正常
     # 文件的检查冒充对本交付的核验。
     if mode in ("translation", "translation+pdf"):
-        for rel in record.get("inputs") or []:
+        for rel, role in roles.items():
+            if role != "chapter":
+                continue
             real = os.path.realpath(os.path.join(root_abs, rel))
             if real not in covered_inputs:
                 problems.append(
@@ -2544,14 +2779,19 @@ def rerun_checks(root, record, problems):
                 problems.append(
                     "交付输入 %s 未被任何 PDF 核验覆盖：检查范围必须与实际"
                     "交付输入对应，不能凭其他文件的 PASS 完成" % rel)
+    candidates.sort(key=lambda item: item["order"])
     return candidates, pending_reviews, input_checks, pdf_checks
 
 
-def _binding_digest(binding):
-    """binding 的稳定摘要（问题定位用；比较仍用完整对象）。"""
+def _identity_digest(binding):
     return hashlib.sha256(json.dumps(
         binding, ensure_ascii=False, sort_keys=True).encode(
-            "utf-8")).hexdigest()[:16]
+            "utf-8")).hexdigest()
+
+
+def _binding_digest(binding):
+    """binding 的稳定短摘要（问题定位用；比较仍用完整对象）。"""
+    return _identity_digest(binding)[:16]
 
 
 def expected_review_binding(kind, target, root, record, source_entries,
@@ -2704,7 +2944,7 @@ def expected_review_binding(kind, target, root, record, source_entries,
         decl_digest = identity.get("view_declaration")
         if decl_declared and decl_digest is None:
             return None  # 已声明视图声明但摘要不可得：绑定不完整
-        return {
+        binding = {
             "target_sha256": target_digest,
             "ordered_inputs": ordered_inputs,
             "images_display": {
@@ -2727,12 +2967,148 @@ def expected_review_binding(kind, target, root, record, source_entries,
             "style_policy": identity.get("style_policy"),
             "delivery_entry": delivery_entry,
         }
+        toc = {rel: facts for rel, facts in (identity.get("toc") or {}).items()
+               if rel in ordered_inputs}
+        if toc:
+            binding["toc"] = toc
+        return binding
     return None
+
+
+def _review_scope(record, input_roles, *, translation_only=False):
+    chapters = [rel for rel in record.get("inputs") or []
+                if input_roles is None or input_roles[rel] == "chapter"]
+    if translation_only:
+        return chapters, {}
+    pdfs = {output.get("path"): output.get("sha256")
+            for output in record.get("outputs", [])
+            if str(output.get("path", "")).lower().endswith(".pdf")}
+    return chapters, pdfs
+
+
+def _visual_reuse_artifacts(reuse, root):
+    """Resolve the three saved artifacts against the current delivery root."""
+    if not isinstance(reuse, dict):
+        raise ValueError("缺少显式 reuse 证据")
+    copies = {}
+    for name, key in (("original_review", "record"), ("old_pdf", "path"),
+                      ("old_report", "path")):
+        entry = reuse.get(name)
+        path = entry.get(key) if isinstance(entry, dict) else None
+        digest = entry.get("sha256") if isinstance(entry, dict) else None
+        if (not isinstance(path, str) or not path or "\x00" in path
+                or os.path.isabs(path) or not isinstance(digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise ValueError("复用证据 %s 需要相对路径和 SHA-256" % name)
+        copies[name] = (os.path.realpath(_rooted(root, path)), digest)
+    return copies
+
+
+def _verified_reuse_json(path, digest):
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise ValueError("复用证据摘要不符：%s" % path)
+    payload = json.loads(data)
+    if not isinstance(payload, dict):
+        raise ValueError("复用证据不是 JSON 对象：%s" % path)
+    return payload
+
+
+def _visual_binding_without_artifacts(binding, pdf_path, pdf_digest):
+    """Remove only the PDF and report identities, after checking their own bindings."""
+    rest = deepcopy(binding)
+    if rest.pop("target_sha256") != pdf_digest:
+        raise ValueError("视觉绑定的成品摘要不符")
+    reports = []
+    for check in rest["checks"]:
+        files = check["facts"]["files"]
+        if check["tool"] != "verify_pdf" or files.pop("pdf") != [pdf_path, pdf_digest]:
+            raise ValueError("视觉核验未绑定其原成品")
+        path, digest = files.pop("export_report")
+        if not os.path.isabs(path) or not digest:
+            raise ValueError("视觉核验缺少报告身份")
+        reports.append((path, digest))
+    if not reports or any(pair != reports[0] for pair in reports):
+        raise ValueError("视觉核验需要一份共同的导出报告")
+    return rest, reports[0]
+
+
+def check_visual_reuse(review: dict, expected_binding: dict, pending_items: list,
+                       root: str, *, run_context=None) -> list[str]:
+    """Verify original closed evidence and current PDF equivalence before reuse."""
+    import verify_pdf as verifier
+
+    try:
+        reuse = review.get("reuse")
+        copies = _visual_reuse_artifacts(reuse, root)
+        reference = reuse["original_review"]
+        history = _verified_reuse_json(*copies["original_review"])
+        old_root = history["delivery_root"]
+        target = reference["target"]
+        if (reference["kind"] != REVIEW_VISUAL or history["version"] != RECORD_VERSION
+                or not os.path.isabs(old_root) or not target
+                or history["files"].get(target) != "pdf"):
+            raise ValueError("复用必须引用原交付记录中的视觉目标")
+        previous = [entry for entry in history["reviews"]
+                    if entry.get("kind") == REVIEW_VISUAL and entry.get("target") == target]
+        if len(previous) != 1:
+            raise ValueError("历史视觉复核必须唯一")
+        original = previous[0]
+        old_pdf, old_digest = copies["old_pdf"]
+        if [entry["sha256"] for entry in history["outputs"] if entry["path"] == target] != [old_digest]:
+            raise ValueError("旧 PDF 摘要与历史交付输出不符")
+        old_binding = original["binding"]
+        items = review.get("items", [])
+        if not (isinstance(items, list) and all(isinstance(item, str) for item in items)):
+            raise ValueError("当前视觉处置 items 格式错误")
+        needed = Counter(pending_items) | Counter(items)
+        if not _closed_review_covers(original, REVIEW_VISUAL, target, old_digest,
+                                     old_binding, needed) or original.get("reuse") is not None:
+            raise ValueError("必须使用实际 closed 的原视觉复核并覆盖当前处置项")
+        render = reuse["render"]
+        if _identity_digest(render) != _identity_digest(original.get("render")):
+            raise ValueError("渲染条件与实际原视觉复核不符")
+
+        old_target = os.path.realpath(_rooted(old_root, target))
+        new_pdf = os.path.realpath(_rooted(root, review["target"]))
+        new_digest = expected_binding["target_sha256"]
+        old_context, old_report = _visual_binding_without_artifacts(
+            old_binding, old_target, old_digest)
+        current_context, current_report = _visual_binding_without_artifacts(
+            expected_binding, new_pdf, new_digest)
+        if _identity_digest(old_context) != _identity_digest(current_context):
+            raise ValueError("原视觉复核与当前完整绑定存在其他差异")
+        if old_report[1] != copies["old_report"][1]:
+            raise ValueError("保存的旧报告与历史核验绑定不符")
+
+        old_export = _verified_reuse_json(*copies["old_report"])
+        current_export = _verified_reuse_json(*current_report)
+        for payload, target_path, digest in ((old_export, old_target, old_digest),
+                                             (current_export, new_pdf, new_digest)):
+            if (payload.pop("pdf_sha256") != digest
+                    or os.path.realpath(payload.pop("output_target")) != target_path):
+                raise ValueError("导出报告的成品路径或摘要不符")
+            payload.pop("candidate", None)
+        if _identity_digest(old_export) != _identity_digest(current_export):
+            raise ValueError("两份导出报告存在产物定位之外的差异")
+
+        if (_digest_or_none(old_pdf), _digest_or_none(new_pdf)) != (old_digest, new_digest):
+            raise ValueError("复用所用 PDF 不存在或摘要不符")
+        result = verifier.compare_pdf_pages(old_pdf, new_pdf, render)
+        if not result["equal"]:
+            raise ValueError("逐页视觉不等价，差异页：%s" % result["different_pages"])
+        if (_digest_or_none(old_pdf), _digest_or_none(new_pdf)) != (old_digest, new_digest):
+            raise ValueError("复用所用 PDF 在渲染期间发生变化")
+    except (AttributeError, KeyError, OSError, TypeError, ValueError,
+            verifier.PdfDependencyError) as exc:
+        return ["视觉复用 %r 被拒绝：%s；需实际目检" % (review.get("target"), exc)]
+    return []
 
 
 def check_reviews(record, problems, pending_reviews=None, root=None,
                    input_checks=None, pdf_checks=None, source_entries=None,
-                   identity=None):
+                   identity=None, *, purpose="full", input_roles=None):
     """按交付模式分别落实必需复核类别并绑定产物与待复核项（R4/4.7/4.9）。
 
     复核类别合法不等于必需复核齐全：translation 需要源全量对账+语义
@@ -2743,29 +3119,41 @@ def check_reviews(record, problems, pending_reviews=None, root=None,
     segment）必须由绑定该成品的闭合视觉复核逐项列明（items），不得
     笼统声明“已复核”。
     """
-    mode = record.get("mode")
+    translation_only = purpose == "translation"
+    mode = "translation" if translation_only else record.get("mode")
+    if input_roles is None and root is not None:
+        try:
+            input_roles = resolve_input_roles(root, record)
+        except DeliveryError as exc:
+            problems.append(str(exc))
+            return
     reviews = record.get("reviews") or []
+    if translation_only:
+        reviews = [review for review in reviews
+                   if isinstance(review, dict) and review.get("kind") in (
+                       REVIEW_SOURCE_RECONCILE, REVIEW_SEMANTIC)]
     if "pdf" in mode and not reviews:
         problems.append("PDF 模式必须引用已闭合的视觉复核记录，不能只靠机器通过")
-    pdf_outputs = {o.get("path"): o.get("sha256")
-                   for o in record.get("outputs", [])
-                   if str(o.get("path", "")).lower().endswith(".pdf")}
+    chapters, pdf_outputs = _review_scope(
+        record, input_roles, translation_only=translation_only)
     input_digests = {}
-    for rel in record.get("inputs") or []:
+    for rel in chapters:
         path = os.path.join(root, rel) if root else None
         input_digests[rel] = (sha256_file(path)
                               if path and os.path.isfile(path) else None)
-    declared = set(input_digests) | set(pdf_outputs) | {
-        o.get("path") for o in record.get("outputs", [])}
+    declared = set(input_digests)
+    if not translation_only:
+        declared.update(o.get("path") for o in record.get("outputs", []))
     valid_by_kind = {kind: set() for kind in KNOWN_REVIEW_KINDS}
     covered_items = {}  # (kind, target) -> 该复核逐项列明的事项及次数
     for review in reviews:
-        if review.get("status") != "closed":
+        kind = review.get("kind")
+        reused = kind == REVIEW_VISUAL and review.get("status") == "reused"
+        if review.get("status") != "closed" and not reused:
             problems.append(
                 "复核未闭合不能宣布完成: %r（%s）"
                 % (review.get("target"), review.get("status")))
             continue
-        kind = review.get("kind")
         if kind not in KNOWN_REVIEW_KINDS:
             problems.append("复核类别未知: %r（需 %s 之一）"
                             % (kind, "/".join(sorted(KNOWN_REVIEW_KINDS))))
@@ -2789,8 +3177,8 @@ def check_reviews(record, problems, pending_reviews=None, root=None,
                 continue
             if current_digest is None or digest != current_digest:
                 problems.append(
-                    "复核摘要与当前输入不符: %s（输入变化后旧证据失效）"
-                    % target)
+                    "%s复核摘要与当前输入不符: %s（输入变化后旧证据失效）"
+                    % ("【漂移】" if translation_only else "", target))
                 continue
         if target in pdf_outputs:
             if digest and digest != pdf_outputs[target]:
@@ -2817,11 +3205,24 @@ def check_reviews(record, problems, pending_reviews=None, root=None,
                     "的零散绑定字段不构成完整上下文，须重新复核"
                     % (target, kind, _binding_digest(expected)))
             elif declared_binding != expected:
-                problems.append(
-                    "复核 %r（%s）的 binding 与当前完整上下文不符（期望"
-                    "摘要 %s，记录摘要 %s）：依赖变化后旧结论失效，须重新"
-                    "复核" % (target, kind, _binding_digest(expected),
-                              _binding_digest(declared_binding)))
+                if translation_only:
+                    problems.append(
+                        "【漂移】输入 %s 的 %s 复核绑定与当前身份不符: %s"
+                        % (target, kind, "；".join(_binding_drift_summary(
+                            declared_binding, expected))))
+                else:
+                    problems.append(
+                        "复核 %r（%s）的 binding 与当前完整上下文不符（期望"
+                        "摘要 %s，记录摘要 %s）：依赖变化后旧结论失效，须重新"
+                        "复核" % (target, kind, _binding_digest(expected),
+                                  _binding_digest(declared_binding)))
+            elif reused and not problems:
+                pending = (pending_reviews or {}).get(
+                    os.path.realpath(_rooted(root, target)), {}).get(REVIEW_VISUAL, [])
+                reuse_problems = check_visual_reuse(review, expected, pending, root)
+                if reuse_problems:
+                    problems.extend(reuse_problems)
+                    continue
         if kind in valid_by_kind:
             valid_by_kind[kind].add(target)
         items = review.get("items")
@@ -2840,7 +3241,7 @@ def check_reviews(record, problems, pending_reviews=None, root=None,
     numeric_enabled_targets = set()
     root_abs = os.path.realpath(root) if root else None
     if root_abs:
-        for rel in record.get("inputs") or []:
+        for rel in chapters:
             abs_path = os.path.realpath(os.path.join(root_abs, rel))
             for check in (input_checks or {}).get(abs_path) or []:
                 params = (check.get("facts") or {}).get("params") or {}
@@ -2906,7 +3307,7 @@ def check_reviews(record, problems, pending_reviews=None, root=None,
                         % (rel, kind, len(uncovered), detail))
     # 按模式核对复核范围：翻译模式中每个输入均需源对账与语义复核。
     if mode in ("translation", "translation+pdf"):
-        for target in record.get("inputs") or []:
+        for target in chapters:
             missing = [kind for kind in (REVIEW_SOURCE_RECONCILE,
                                          REVIEW_SEMANTIC)
                        if target not in valid_by_kind[kind]]
@@ -2926,10 +3327,10 @@ def ensure_persistent(evidence_dir):
             raise DeliveryError(
                 "证据目录不得位于系统临时根（清理后无法回查）: %s" % evidence_dir)
     os.makedirs(evidence_dir, exist_ok=True)
-    probe = os.path.join(evidence_dir, ".write-probe")
-    with open(probe, "w", encoding="utf-8") as handle:
+    with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix=".write-probe-",
+            dir=evidence_dir) as handle:
         handle.write("ok")
-    os.remove(probe)
 
 
 def _new_batch_dir(evidence_dir):
@@ -3060,6 +3461,12 @@ def publish_evidence(evidence_dir, record, root, candidates,
     if missing:
         raise DeliveryError(
             "必需依赖摘要不可得，不能发布: %s" % "; ".join(missing[:5]))
+    index_path = os.path.join(evidence_dir, "delivery_index.json")
+    if any(os.path.realpath(index_path) in facts["dependencies"]
+           for facts in (baseline_identity.get("toc") or {}).values()):
+        raise DeliveryError("证据索引不能覆盖目录或其官方依据")
+    if os.path.realpath(index_path) in baseline_identity.get("visual_reuse", {}):
+        raise DeliveryError("证据索引不能覆盖视觉复用原件")
     baseline_reports = {}
     for check in baseline_identity.get("checks") or []:
         facts = check.get("facts") or {}
@@ -3144,7 +3551,6 @@ def publish_evidence(evidence_dir, record, root, candidates,
         "checks": checks_index,
         "reviews": record.get("reviews", []),
     }
-    index_path = os.path.join(evidence_dir, "delivery_index.json")
     tmp_path = os.path.join(evidence_dir,
                             ".delivery_index.json.%s.tmp" % uuid.uuid4().hex[:8])
     try:
@@ -3189,7 +3595,7 @@ def _binding_drift_summary(declared_binding, expected_binding):
     return drift
 
 
-def check_translation_readiness(root, record, target_inputs):
+def check_translation_readiness(root, record, target_inputs, *, run_context=None):
     """只读"翻译就绪"操作（§4.7）：导出生成前核对翻译验收身份。
 
     root：交付根（record["delivery_root"]）；record：翻译验收交付记录
@@ -3205,7 +3611,6 @@ def check_translation_readiness(root, record, target_inputs):
       参数）。只投影本次范围的翻译事实，不把待生成 PDF 身份写回。
     只读：不修改任何文件，不写状态库。
     """
-    reasons = []
     if not isinstance(record, dict) or record.get("version") != RECORD_VERSION:
         return False, {"ready": False,
                        "reasons": ["【证据不足】验收记录缺失或版本无效"
@@ -3232,77 +3637,109 @@ def check_translation_readiness(root, record, target_inputs):
             "不符（显式记录声明的范围须与实际输入一致）"
             % (declared, actual)]}
 
-    # 当前依赖身份与检查复跑（同一统一身份构造；依赖不可读即证据不足）
+    run_context = run_context if run_context is not None else new_run_context()
     problems = []
-    entries = check_source_chains(root, record, problems)
+    try:
+        with progress_stage(run_context, "source-preflight", root_abs,
+                            problems=problems):
+            entries = check_source_chains(root, record, problems)
+            if not problems:
+                check_pdf_source_pending(root, record, problems)
+        if not problems:
+            baseline = compute_delivery_identity(root, record, entries,
+                                                 purpose="translation")
+            _reconcile_for_run(root, record, entries, problems, baseline, run_context)
+        if not problems:
+            _, pending, input_checks, pdf_checks = _rerun_checks(
+                root, record, problems, purpose="translation",
+                run_context=run_context, baseline=baseline)
+            align_sources_with_checks(entries, input_checks, problems,
+                                      mode="translation", root=root)
+            with progress_stage(run_context, "reviews", root_abs,
+                                problems=problems):
+                check_reviews(record, problems, pending, root=root,
+                              input_checks=input_checks, pdf_checks=pdf_checks,
+                              source_entries=entries, identity=baseline,
+                              purpose="translation")
+    except DeliveryError as exc:
+        problems.append(str(exc))
     if problems:
-        return False, {"ready": False, "reasons": [
-            "【证据不足】当前来源依赖不可读或预检失败: %s"
-            % "；".join(problems[:3])]}
-    candidates, _pending, input_checks, pdf_checks = rerun_checks(
-        root, record, problems)
-    baseline = compute_delivery_identity(root, record, entries)
-    if problems:
-        return False, {"ready": False, "reasons": [
-            "【证据不足】当前依赖不可读或检查复跑失败: %s"
-            % "；".join(problems[:3])]}
-
-    reviews = record.get("reviews") or []
-    by_kind = {(r.get("kind"), r.get("target")): r for r in reviews
-               if isinstance(r, dict)}
-    for rel in declared:
-        current_digest = baseline.get("inputs", {}).get(rel)
-        for kind in (REVIEW_SOURCE_RECONCILE, REVIEW_SEMANTIC):
-            review = by_kind.get((kind, rel))
-            if review is None or review.get("status") != "closed":
-                reasons.append("【证据不足】输入 %s 缺少闭合的 %s 复核"
-                               % (rel, kind))
-                continue
-            if review.get("sha256") != current_digest:
-                reasons.append("【漂移】输入 %s 在验收后已变化（译文摘要 "
-                               "%s… ≠ 复核绑定 %s…），旧验收不可复用"
-                               % (rel, str(current_digest)[:12],
-                                  str(review.get("sha256"))[:12]))
-                continue
-            expected = expected_review_binding(
-                kind, rel, root, record, entries, input_checks,
-                pdf_checks, baseline)
-            if expected is None:
-                reasons.append("【证据不足】输入 %s 的 %s 复核无法构成"
-                               "完整绑定上下文（依赖缺摘要）" % (rel, kind))
-                continue
-            declared_binding = review.get("binding")
-            if not isinstance(declared_binding, dict):
-                reasons.append("【证据不足】输入 %s 的 %s 复核缺少完整 "
-                               "binding" % (rel, kind))
-                continue
-            if declared_binding != expected:
-                drift = _binding_drift_summary(declared_binding, expected)
-                reasons.append("【漂移】输入 %s 的 %s 复核绑定与当前身份"
-                               "不符: %s" % (rel, kind, "；".join(drift)))
-    if reasons:
+        reasons = [problem if problem.startswith("【漂移】")
+                   else "【证据不足】" + problem for problem in problems]
         return False, {"ready": False, "reasons": reasons}
+
+    projection = _translation_projection(root, record, entries, baseline)
+    return True, {"ready": True, "reasons": [],
+                  "identity": projection, "inputs": actual}
+
+
+def _translation_fingerprint(root, record, identity):
+    """身份只取有序翻译输入、实际检查及其依赖，排除成品、复核和样式。"""
+    dependencies = {key: value for key, value in identity.items()
+                    if key not in ("checks", "outputs", "style_policy",
+                                   "visual_reuse", "environment")}
+    dependencies["checks"] = [check for check in identity["checks"]
+                              if check["tool"] != "verify_pdf"]
+    dependencies["environment"] = {
+        key: identity["environment"].get(key) for key in TRANSLATION_ENV_KEYS}
+    return _identity_digest([os.path.realpath(root), record.get("inputs"),
+                             record.get("sources"), dependencies])
+
+
+def _reconcile_for_run(root, record, entries, problems, baseline, run_context):
+    scripts = ("_source_reconcile.py", "_html_fidelity.py", "_verification.py")
+    if any(entry["family"] == "reference" for entry in entries):
+        scripts += ("_latexml_source.py",)
+    if any(entry["family"] == PDF_SOURCE_FAMILY for entry in entries):
+        scripts += ("verify_pdf_source.py", "_pdf_source.py", "_pdf_math.py")
+    scope = _identity_digest([
+        os.path.realpath(root), record.get("sources"), baseline["sources"],
+        baseline["resources"].get("sources"), baseline["environment"],
+        [_digest_or_none(os.path.join(SCRIPTS_DIR, script)) for script in scripts],
+    ])
+    return _cached_translation_step(
+        run_context, ("source-reconcile", scope), "source-reconcile", root,
+        problems, lambda: run_source_reconcile(root, record, entries, problems))
+
+
+def compute_translation_identity(root, record, source_entries, *, input_roles=None):
+    """生成导出消费的只读翻译投影，不检查或读取追加的 PDF。"""
+    baseline = compute_delivery_identity(root, record, source_entries,
+                                         purpose="translation")
+    return _translation_projection(root, record, source_entries, baseline,
+                                   input_roles=input_roles)
+
+
+def _translation_projection(root, record, entries, baseline, *, input_roles=None):
+    root_abs = os.path.realpath(root)
     projection = {
-        "inputs": {rel: baseline["inputs"].get(rel) for rel in declared},
-        "checks": [{"order": check.get("order"), "tool": check.get("tool"),
-                    "exit_code": check.get("entry", {}).get("exit_code")}
-                   for check in candidates],
+        "inputs": baseline["inputs"],
+        # 保留既有报告的 checks 表示，完整的工具和参数由依赖摘要绑定。
+        "checks": [{"order": check["order"], "tool": None, "exit_code": 0}
+                   for check in baseline["checks"]],
         "sources": [{"family": entry.get("family"),
                      "parsed_markdown": entry.get("parsed_markdown"),
                      "source_version": entry.get("source_version"),
-                     # 二期 02-6：翻译加导出经此投影取得当前来源依据
-                     # （绝对路径），不自动搜索邻近文件。单快照投影唯一
-                     # 依据（行为不变）；多快照依据为逐快照列表，
-                     # source_adaptation 不取首份替全部来源（§4.6/F7）。
-                     **(_readiness_adaptation_projection(entry, root_abs)),
-                     } for entry in entries],
+                     **_readiness_adaptation_projection(entry, root_abs)}
+                    for entry in entries],
+        "dependencies_sha256": _translation_fingerprint(root, record, baseline),
     }
-    approvals={path: next((check["facts"]["params"]["approved_extra_math"]
-        for check in checks if check["facts"]["params"].get("approved_extra_math")), [])
-        for path, checks in input_checks.items()}
-    if any(approvals.values()):projection['approved_extra_math']=approvals
-    return True, {"ready": True, "reasons": [],
-                  "identity": projection, "inputs": actual}
+    approvals = {}
+    for check in baseline["checks"]:
+        facts = check.get("facts") or {}
+        formulas = (facts.get("params") or {}).get("approved_extra_math")
+        path = (facts.get("files") or {}).get("translated")
+        if path:
+            existing = approvals.setdefault(path[0], [])
+            if formulas and not existing:
+                approvals[path[0]] = formulas
+    if any(approvals.values()):
+        projection["approved_extra_math"] = approvals
+    if input_roles is None and baseline.get("toc"):
+        input_roles = resolve_input_roles(root, record)
+    if input_roles is not None:
+        projection["input_roles"] = input_roles
+    return projection
 
 
 def _readiness_adaptation_projection(entry, root_abs):
@@ -3332,19 +3769,23 @@ def _readiness_adaptation_projection(entry, root_abs):
             "source_adaptations": paths}
 
 
-def check_translation_readiness_cli(record_path, target_inputs):
+def check_translation_readiness_cli(record_path, target_inputs, *, run_context=None):
     """按记录路径装载并执行只读就绪检查（导出入口与测试共用）。"""
     try:
-        with open(record_path, encoding="utf-8") as handle:
-            record = json.load(handle)
-    except (OSError, ValueError) as exc:
+        with open(record_path, "rb") as handle:
+            raw = handle.read()
+        record = json.loads(raw)
+    except (OSError, ValueError, TypeError) as exc:
         return False, {"ready": False, "reasons": [
             "【证据不足】验收记录不可读: %s（%s）" % (record_path, exc)]}
     root = record.get("delivery_root") if isinstance(record, dict) else None
     if not root:
         return False, {"ready": False, "reasons": [
             "【证据不足】验收记录缺少 delivery_root"]}
-    return check_translation_readiness(root, record, target_inputs)
+    ready, report = check_translation_readiness(
+        root, record, target_inputs, run_context=run_context)
+    report["record_sha256"] = hashlib.sha256(raw).hexdigest()
+    return ready, report
 
 
 
@@ -3427,6 +3868,119 @@ def check_pdf_source_pending(root, record, problems):
                 scan_pending_markers(path, "译文输入 %s" % rel)
 
 
+def _delivery_checks(root, record, problems, run_context, *, record_path=None):
+    """正式交付和候选准备共用同一套硬检查与当前身份。"""
+    with progress_stage(run_context, "source-preflight", root, problems=problems):
+        check_root_layout(root, record, problems, record_path=record_path)
+        check_map_entries(root, record, problems)
+        check_identities(root, record, problems)
+        entries = check_source_chains(root, record, problems)
+    if problems:
+        return None
+    identity = compute_delivery_identity(root, record, entries)
+    source_report = _reconcile_for_run(
+        root, record, entries, problems, identity, run_context)
+    candidates, pending, inputs, pdfs = _rerun_checks(
+        root, record, problems, run_context=run_context, baseline=identity)
+    align_sources_with_checks(entries, inputs, problems,
+                              mode=record.get("mode"), root=root)
+    check_pdf_source_pending(root, record, problems)
+    return {
+        "identity": identity, "entries": entries, "source_report": source_report,
+        "candidates": candidates, "pending": pending, "inputs": inputs, "pdfs": pdfs,
+    }
+
+
+def prepare_reviews(root: str, record: dict, *, run_context=None) -> dict:
+    """生成当前待办的记录副本；任何候选写入由 CLI 单独执行。"""
+    candidate, _ = _prepare_reviews(root, record, run_context=run_context)
+    return candidate
+
+
+def _prepare_reviews(root, record, *, run_context=None):
+    run_context = run_context if run_context is not None else new_run_context()
+    problems = []
+    checked = _delivery_checks(root, record, problems, run_context)
+    if problems:
+        raise DeliveryError("候选复核前硬检查失败: " + "；".join(problems[:5]))
+    identity = checked["identity"]
+    missing = _identity_missing_digests(identity)
+    if missing:
+        raise DeliveryError("候选复核缺少必需依赖: " + "；".join(missing[:5]))
+    roles = resolve_input_roles(root, record)
+    chapters, outputs = _review_scope(record, roles)
+    targets = []
+    if record["mode"] in ("translation", "translation+pdf"):
+        targets.extend((kind, target) for target in chapters
+                       for kind in (REVIEW_SOURCE_RECONCILE, REVIEW_SEMANTIC))
+    link_orders = {
+        check["order"] for check in checked["candidates"]
+        if check["verify_report"] and (
+            check["verify_report"].get("internal_link_annots")
+            or check["verify_report"].get("external_uri_annots"))
+    }
+    for target in outputs:
+        targets.append((REVIEW_VISUAL, target))
+        path = os.path.realpath(_rooted(root, target))
+        checks_have_links = any(context["order"] in link_orders
+                                for context in checked["pdfs"].get(path, []))
+        if checks_have_links or checked["pending"].get(path, {}).get(REVIEW_LINK):
+            targets.append((REVIEW_LINK, target))
+    reviews = []
+    for kind, target in targets:
+        binding = expected_review_binding(
+            kind, target, root, record, checked["entries"],
+            checked["inputs"], checked["pdfs"], identity)
+        if binding is None:
+            raise DeliveryError("候选 %s（%s）缺少完整当前绑定" % (target, kind))
+        digest = identity["inputs"].get(target) or identity["outputs"].get(target)
+        path = os.path.realpath(_rooted(root, target))
+        items = checked["pending"].get(path, {}).get(kind, Counter())
+        old = next((review for review in record.get("reviews", [])
+                    if _closed_review_covers(review, kind, target, digest,
+                                             binding, items)), None)
+        if old is not None:
+            reviews.append(deepcopy(old))
+        else:
+            reviews.append({"kind": kind, "target": target, "status": "pending",
+                            "sha256": digest, "binding": binding, "note": "",
+                            "items": list(items.elements())})
+    if compute_delivery_identity(root, record, checked["entries"]) != identity:
+        raise DeliveryError("候选准备期间依赖身份变化，请重核当前输入")
+    candidate = deepcopy(record)
+    candidate["reviews"] = reviews
+    return candidate, checked["candidates"]
+
+
+def _closed_review_covers(review, kind, target, digest, binding, items):
+    if not isinstance(review, dict):
+        return False
+    old_items = review.get("items", [])
+    note = review.get("note")
+    return (review.get("kind") == kind and review.get("target") == target
+            and review.get("status") == "closed" and review.get("sha256") == digest
+            and review.get("binding") == binding and isinstance(note, str)
+            and bool(note.strip()) and isinstance(old_items, list)
+            and all(isinstance(item, str) for item in old_items)
+            and not (items - Counter(old_items)))
+
+
+def _write_new_review_candidate(path, record):
+    """用同目录临时文件发布一次；独占目标避免覆盖文件或跟随别名。"""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix=".review-candidate-",
+                dir=os.path.dirname(os.path.abspath(path)), delete=False) as handle:
+            temporary = handle.name
+            json.dump(record, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.link(temporary, path)
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+
+
 def _report_problems(problems):
     print("FAIL: 交付检查未通过（%d 项）" % len(problems), file=sys.stderr)
     for item in problems[:20]:
@@ -3437,12 +3991,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="交付完成统一检查：目录允许清单、身份、核验复跑与持久证据")
     parser.add_argument("--record", required=True, help="交付记录 JSON")
-    parser.add_argument("--evidence-dir", required=True,
-                        help="持久证据目录（须在工作区外且不在系统临时根）")
+    destination = parser.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--evidence-dir",
+                             help="持久证据目录（须在工作区外且不在系统临时根）")
+    destination.add_argument("--prepare-reviews", metavar="PATH",
+                             help="输出待复核候选到显式新路径")
     args = parser.parse_args(argv)
 
     problems = []
     record_digest = None
+    run_context = new_run_context(stderr_progress)
     try:
         record_digest = (sha256_file(args.record)
                          if os.path.isfile(args.record) else None)
@@ -3450,39 +4008,43 @@ def main(argv=None):
         root = record["delivery_root"]
         if not os.path.isdir(root):
             raise DeliveryError("交付根不存在: %s" % root)
+        if args.prepare_reviews is not None:
+            if os.path.lexists(args.prepare_reviews):
+                raise DeliveryError("复核候选须使用新路径，不覆盖已有文件或别名")
+            candidate, candidates = _prepare_reviews(root, record, run_context=run_context)
+            if sha256_file(args.record) != record_digest:
+                raise DeliveryError("候选准备期间交付记录变化，请重核当前输入")
+            _write_new_review_candidate(args.prepare_reviews, candidate)
+            for check in candidates:
+                groups = check.get("numeric_groups")
+                if groups:
+                    summary = "、".join("%s %d 项" % (g["category"], len(g["items"]))
+                                       for g in groups)
+                    print("数字候选 #%d: %s；逐项 ID 见候选 items"
+                          % (check["order"], summary), file=sys.stderr)
+            print("已准备待复核候选：%s" % args.prepare_reviews)
+            return 0
+
         ensure_persistent(args.evidence_dir)
-        check_root_layout(root, record, problems, record_path=args.record)
-        check_map_entries(root, record, problems)
-        check_identities(root, record, problems)
-        source_entries = check_source_chains(root, record, problems)
-        if problems:
-            # 范围/目录/身份/源链预检失败即停止，不执行核验复跑（§4.7）
-            _report_problems(problems)
-            return 1
-        baseline = compute_delivery_identity(root, record, source_entries)
-        # 通过预检后先做独立源全量对账（含逐表转换映射），再复跑核验
-        source_report = run_source_reconcile(
-            root, record, source_entries, problems)
-        candidates, pending_reviews, input_checks, pdf_checks = rerun_checks(
-            root, record, problems)
-        align_sources_with_checks(source_entries, input_checks, problems,
-                                  mode=record.get("mode"), root=root)
-        check_reviews(record, problems, pending_reviews, root=root,
-                      input_checks=input_checks, pdf_checks=pdf_checks,
-                      source_entries=source_entries, identity=baseline)
-        # R3/A10 完成门禁：PDF 源链未解决素材/待处理标记阻断发布
-        check_pdf_source_pending(root, record, problems)
-    except DeliveryError as exc:
+        checked = _delivery_checks(root, record, problems, run_context,
+                                   record_path=args.record)
+        if checked is not None:
+            with progress_stage(run_context, "reviews", root, problems=problems):
+                check_reviews(record, problems, checked["pending"], root=root,
+                              input_checks=checked["inputs"], pdf_checks=checked["pdfs"],
+                              source_entries=checked["entries"], identity=checked["identity"])
+    except (DeliveryError, OSError) as exc:
         print("FAIL: %s" % exc, file=sys.stderr)
         return 1
     if problems:
         _report_problems(problems)
         return 1
     try:
-        index_path = publish_evidence(
-            args.evidence_dir, record, root, candidates, baseline,
-            record_path=args.record, record_digest=record_digest,
-            source_entries=source_entries, source_report=source_report)
+        with progress_stage(run_context, "publish", args.evidence_dir):
+            index_path = publish_evidence(
+                args.evidence_dir, record, root, checked["candidates"], checked["identity"],
+                record_path=args.record, record_digest=record_digest,
+                source_entries=checked["entries"], source_report=checked["source_report"])
     except (DeliveryError, OSError) as exc:
         print("FAIL: %s" % exc, file=sys.stderr)
         return 1

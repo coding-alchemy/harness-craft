@@ -12,6 +12,7 @@ import json
 from html import escape
 import os
 import re
+from urllib.parse import unquote, urlsplit
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
@@ -19,8 +20,10 @@ from _html_fidelity import (
     _INLINE_TAGS,
     HtmlFidelity,
     clean_code_html,
+    image_object_ref,
     markdown_inline_code,
     protect_code_entities,
+    snapshot_image_tags,
 )
 from _verification import (
     SourceMathContext as _SourceMathContext,
@@ -780,7 +783,7 @@ class _SourceFacts:
                                       and not img.get('data-light')):
                 return None
             return img.get('data-light') or img.get('src', '')
-        return img.get('src', '')
+        return img.get('src') or image_object_ref(img)
 
     def _images(self):
         refs = []
@@ -788,11 +791,12 @@ class _SourceFacts:
         # 源节点序号与解析期映射的 source_node 同一命名空间：全文 img 中
         # 排除 pre 内图片后的文档序（HtmlFidelity 解析时 pre 被占位保护，
         # 其 find_all('img') 同样不含 pre 内图片）。
-        selectable = [img for img in self._soup.find_all('img')
-                      if not _in_pre(img)]
-        ordinals = {id(img): index
-                    for index, img in enumerate(selectable)}
-        for img in self.root.find_all('img'):
+        image_tags = snapshot_image_tags(self._soup, self.family)
+        ordinals = {
+            id(img): index for name in image_tags
+            for index, img in enumerate(
+                img for img in self._soup.find_all(name) if not _in_pre(img))}
+        for img in self.root.find_all(image_tags):
             if _in_pre(img):
                 continue
             source_ref = self._image_src(img)
@@ -809,7 +813,7 @@ class _SourceFacts:
             self.image_facts.append({
                 'section': self._section_of(img),
                 'order': self._index[id(img)],
-                'node': 'img[%d]' % ordinals[id(img)],
+                'node': '%s[%d]' % (img.name, ordinals[id(img)]),
                 'src': src,
                 'source_ref': source_ref,
             })
@@ -1972,6 +1976,55 @@ def snapshot_image_facts(raw_html, family, section_id=None):
     return list(facts.image_facts)
 
 
+def reference_anchor_targets(raw_html, section_id=None):
+    """读取实际内部链接目标与宿主，保留原 ID，定位歧义或范围外目标。"""
+    soup = BeautifulSoup(protect_code_entities(raw_html, skip_pre=True), 'html.parser')
+    root = (soup.find(id=section_id) if section_id else
+            (soup.find('article') or soup.find('main') or soup.find('body')))
+    if root is None:
+        raise ValueError('找不到参考快照选区: %s' % section_id)
+    references = set()
+    for link in root.find_all('a', href=True):
+        href = link['href'].strip()
+        if href.startswith('#') and len(href) > 1 and not _in_pre(link):
+            references.add(unquote(urlsplit(href).fragment))
+    targets = {}
+    for ordinal, node in enumerate([root, *root.find_all(True)], 1):
+        anchor_id = node.get('id')
+        if anchor_id in references and not _in_pre(node):
+            targets.setdefault(anchor_id, []).append((ordinal, node))
+
+    anchors, unresolved = [], []
+    for anchor_id, candidates in targets.items():
+        if len(candidates) != 1:
+            unresolved.append({'node': anchor_id, 'reason': '同一目标 ID 在选区重复'})
+            continue
+        ordinal, node = candidates[0]
+        ancestry = [node, *node.parents]
+        if any(tag.name in ('td', 'th') for tag in ancestry):
+            role = 'table-cell'
+        elif any('ltx_biblist' in (tag.get('class') or [])
+                 or 'ltx_bibitem' in (tag.get('class') or []) for tag in ancestry):
+            role = 'reference'
+        elif any(tag.name in ('figure', 'figcaption') for tag in ancestry):
+            role = 'figure'
+        elif any(tag.name == 'table' for tag in ancestry):
+            role = 'table'
+        elif any(re.fullmatch(r'h[1-6]', tag.name) for tag in ancestry):
+            role = 'heading'
+        else:
+            role = 'paragraph'
+        anchors.append({
+            'id': anchor_id, 'node': '%s[%d]' % (node.name, ordinal), 'role': role,
+            'source_excerpt': ' '.join(node.get_text(' ', strip=True).split())[:180],
+            'markdown': '<a id="%s"></a>' % escape(anchor_id, quote=True),
+        })
+    for missing in sorted(references - targets.keys()):
+        reason = ('目标不在选区' if soup.find(id=missing) is not None else '原快照缺少目标')
+        unresolved.append({'node': missing, 'reason': reason})
+    return anchors, unresolved
+
+
 def snapshot_grid_image_counts(raw_html, family, section_id=None):
     """v2 图片投影次数来自独立 DOM 跨度，不能由尺寸映射自报。"""
     source = _SourceFacts(raw_html, family, section_id)
@@ -2724,10 +2777,11 @@ def _latexml_src_stream(raw_html, section_id, decisions,
     不使用生成标记表，不按同文本反查。代码/TeX/内容性字符不随普通排版
     空白归一。
     """
-    from _latexml_source import (_MARK_RE, OccurrenceRegistry,
+    from _latexml_source import (_LIST_BLOCK_RE, _MARK_RE, OccurrenceRegistry,
                                  _expand_markers_inline,
                                  aside_node_ids as _lx_aside_node_ids,
                                  classify_block, container_node_ids,
+                                 enumerate_item_ids, enumerate_items,
                                  figure_node_ids as _lx_figure_node_ids,
                                  group_node_ids as _lx_group_node_ids,
                                  has_marker, mark_literal_occurrences,
@@ -2736,6 +2790,7 @@ def _latexml_src_stream(raw_html, section_id, decisions,
                                  plan_image_targets,
                                  listing_node_ids as _lx_listing_ids,
                                  prepare_math_dom, prepare_notes_dom,
+                                 publication_note_ids, publication_notes,
                                  render_mapped_table,
                                  section_of, table_cell_facts,
                                  table_node_ids as _lx_table_node_ids)
@@ -2771,13 +2826,14 @@ def _latexml_src_stream(raw_html, section_id, decisions,
     figcaption_ids = {id(node): 'figcaption[%d]' % ordinal
                       for ordinal, node in
                       enumerate(root.find_all('figcaption'), start=1)}
-    img_ids = {}
-    ordinal = 0
-    for img in root.find_all('img'):
-        if img.find_parent('pre') is not None:
-            continue
-        ordinal += 1
-        img_ids[id(img)] = 'img[%d]' % ordinal
+    img_ids = {
+        id(img): '%s[%d]' % (name, ordinal)
+        for name in ('img', 'object')
+        for ordinal, img in enumerate(
+            (img for img in root.find_all(name)
+             if img.find_parent('pre') is None), 1)}
+    pubnote_ids = publication_note_ids(root)
+    enumerate_ids = enumerate_item_ids(root)
     tokens = []
     hosts = []
     facts = {}
@@ -2871,16 +2927,20 @@ def _latexml_src_stream(raw_html, section_id, decisions,
     def _image_token(img, figure_id, sub_index):
         if img.find_parent('pre') is not None:
             return
-        src = img.get('src', '')
+        src = img.get('src') or image_object_ref(img)
         if not src:
             return
         reference = image_targets.get(id(img)) or (
             'images/%s' % src.rsplit('/', 1)[-1])
         _push(('img', reference), img_ids.get(id(img)))
-        _register(img_ids.get(id(img)), {
+        fact = {
             'type': 'image', 'reference': reference, 'source_ref': src,
             'figure': figure_id, 'subfigure': sub_index,
-            'section': section_of(root, img)})
+            'section': section_of(root, img)}
+        if img.name == 'object':
+            fact['object'] = dict(source_id=img.get('id'), width=img.get('width'),
+                                  height=img.get('height'), source_ref=src)
+        _register(img_ids.get(id(img)), fact)
 
     def _figure_caption_token(cap, figure_id, sub_index):
         cap_id = figcaption_ids.get(id(cap))
@@ -3175,6 +3235,40 @@ def _latexml_src_stream(raw_html, section_id, decisions,
         _emit_paragraph_tokens(frags, all_frags, node_id)
         _register_paragraph(node_id, all_frags, section)
 
+    def _enumerate_tokens(node, indent=0):
+        for item, marker, body, blocks in enumerate_items(node):
+            continuation = indent + len(marker)
+            parts = _LIST_BLOCK_RE.split(_direct_read(body))
+            first_token = len(tokens)
+            for part, segment in enumerate(parts):
+                if part % 2:
+                    block = blocks[int(segment)]
+                    if block.name in ('ol', 'ul'):
+                        _enumerate_tokens(block, continuation)
+                    else:
+                        start = len(hosts)
+                        walk(block.parent, only=block)
+                        for host in dict.fromkeys(hosts[start:]):
+                            fact = facts.get(host)
+                            if fact and (fact['type'] in ('image', 'figure-caption')
+                                         or 'list_prefix' in fact):
+                                fact['list_prefix'] = (
+                                    ' ' * continuation + fact.get('list_prefix', ''))
+                    continue
+                if part and not segment.strip():
+                    continue
+                prefix = (' ' * indent + marker if not part
+                          else ' ' * continuation)
+                node_id = '%s.%d' % (enumerate_ids[id(item)], part)
+                _flush_paragraph(
+                    marked_text_frags(prefix + segment.strip(), registry),
+                    node_id, section_of(root, item))
+                if node_id in facts:
+                    facts[node_id]['list_prefix'] = prefix
+            if not parts[0].strip() and len(tokens) > first_token + 1:
+                first_node = '%s.0' % enumerate_ids[id(item)]
+                facts[first_node]['list_starts_with_block'] = True
+
     def _paragraph_host_tokens(child, node_id):
         """段落宿主（p/div/aside）：行内图片在源位置成为独立 img token
         （08，与适配端 _paragraph_host 同序，不静默丢弃），前后文字段按
@@ -3182,17 +3276,18 @@ def _latexml_src_stream(raw_html, section_id, decisions,
         文字/公式片段，段界计一个空白银分，与适配端段落对应区间合并
         口径一致；图片本身由 img token 与图片对应独立核对）；无图片宿
         主照常登记。"""
-        imgs = [img for img in child.find_all('img')
-                if img.find_parent('pre') is None and img.get('src')]
+        imgs = [img for img in child.find_all(['img', 'object'])
+                if img.find_parent('pre') is None
+                and (img.get('src') or image_object_ref(img))]
         if not imgs:
             _flush_paragraph(_paragraph_frags(child), node_id,
                              section_of(root, child))
             return
         ctx = _fig_ctx[-1] if _fig_ctx else (None, None)
         copied = copy.deepcopy(child)
-        copied_imgs = [img for img in copied.find_all('img')
+        copied_imgs = [img for img in copied.find_all(['img', 'object'])
                        if img.find_parent('pre') is None
-                       and img.get('src')]
+                       and (img.get('src') or image_object_ref(img))]
         for index, img in enumerate(copied_imgs):
             img.replace_with(NavigableString('\x01%d\x01' % index))
         text = _direct_read(copied)
@@ -3230,9 +3325,10 @@ def _latexml_src_stream(raw_html, section_id, decisions,
                 continue
             kind_class = classify_block(child)
             name = child.name
-            if name in ('img', 'figcaption', 'figure'):
+            is_image = name == 'img' or bool(image_object_ref(child))
+            if is_image or name in ('figcaption', 'figure'):
                 ctx = _fig_ctx[-1] if _fig_ctx else (None, None)
-                if name == 'img':
+                if is_image:
                     _image_token(child, ctx[0], ctx[1])
                 elif name == 'figcaption':
                     _figure_caption_token(child, ctx[0], ctx[1])
@@ -3290,8 +3386,11 @@ def _latexml_src_stream(raw_html, section_id, decisions,
                 # 直接 DOM 阅读（不调用生成侧序列化出口，复评 S1）；
                 # headerlink 在阅读中本就不出现；标记逐字保留并展开为
                 # 实际写出文字（原 TeX 逐字）
+                originals = publication_notes(child)
+                title_node = copy.deepcopy(child) if originals else child
+                notes = [note.extract() for note in publication_notes(title_node)]
                 title_raw = _expand_markers_inline(
-                    _direct_read(child), registry)
+                    _direct_read(title_node), registry)
                 title = _norm_reading(
                     title_raw.replace('¶', '').replace('\uf0c1', ''),
                     mark_code=True,
@@ -3300,6 +3399,9 @@ def _latexml_src_stream(raw_html, section_id, decisions,
                 _register(h_ids[id(child)], {
                     'type': 'heading', 'level': int(name[1]),
                     'section': section_of(root, child)})
+                for original, note in zip(originals, notes):
+                    _flush_paragraph(_paragraph_frags(note),
+                                     pubnote_ids[id(original)], section_of(root, child))
                 continue
             if name == 'p':
                 _paragraph_host_tokens(child, p_ids.get(id(child)))
@@ -3316,6 +3418,9 @@ def _latexml_src_stream(raw_html, section_id, decisions,
                 continue
             if kind_class == 'math-group':
                 _math_group_tokens(child)
+                continue
+            if kind_class == 'enumerate':
+                _enumerate_tokens(child)
                 continue
             if kind_class == 'biblist':
                 for item in child.find_all('li', recursive=False):
@@ -3499,8 +3604,9 @@ def _latexml_md_stream(md_text, source_context=None,
         else:
             end_line = md_text.count('\n', 0, span.end - 1) + 1
             if end_line != span.start_line:
-                cross[span.start_line] = (span, end_line)
-                continue
+                previous = cross.get(span.start_line)
+                if previous is None or end_line > previous[1]:
+                    cross[span.start_line] = (span, end_line)
             line_base = line_offsets[span.start_line]
             inline_by_line.setdefault(span.start_line, []).append(
                 (span.start - line_base, span.end - line_base,
@@ -3516,23 +3622,31 @@ def _latexml_md_stream(md_text, source_context=None,
 
     _PLACEHOLDER_RE = re.compile('(\\d+)')
 
-    def _masked_reading_frags(prefix, frag_list, suffix):
-        """跨片段边界的真实阅读：数学/图片跨度先换成私用区占位符，整段
-        一次行内阅读（强调等成对语法跨跨度时仍能正确解码），再按占位符
-        切回（文字片段, 跨度片段）交错流。"""
-        masked = [prefix]
-        for index, _frag in enumerate(frag_list):
-            masked.append('%d' % index)
-        masked.append(suffix)
+    def _cross_end(first):
+        end = first
+        current = first
+        while current <= end:
+            if current in cross:
+                end = max(end, cross[current][1])
+            current += 1
+        return end
+
+    def _masked_reading_frags(value, spans):
+        """先保护整段实际数学和图片，再一次读取其余行内结构。"""
+        masked = []
+        cursor = 0
+        for index, (start, end, _frag) in enumerate(spans):
+            masked.extend([value[cursor:start], '\ue000%d\ue001' % index])
+            cursor = end
+        masked.append(value[cursor:])
         reading = _read(''.join(masked))
-        out = []
-        for position, part in enumerate(
-                _PLACEHOLDER_RE.split(reading)):
-            if position % 2 == 1:
-                out.append(frag_list[int(part)])
+        result = []
+        for position, part in enumerate(_PLACEHOLDER_RE.split(reading)):
+            if position % 2:
+                result.append(spans[int(part)][2])
             elif part:
-                out.append(('t', part))
-        return out
+                result.append(('t', part))
+        return result
 
     # 表格对应范围整体吸收为单个 ('table', node) token（内容与格位由
     # 逐格核对负责，04）；其区间来自声明范围本身，不参与出现→区间核对
@@ -3562,7 +3676,7 @@ def _latexml_md_stream(md_text, source_context=None,
             if line_no in cross:
                 # 标题内跨行公式（D2 逐字）：标题文字贯通重建到公式
                 # 跨度末行，与源侧哨兵口径重建的标题事实同一 _norm 比较
-                _span, end_line = cross[line_no]
+                end_line = _cross_end(line_no)
                 raw_lines = [lines[line_no - 1][len('#' * level) + 1:]]
                 raw_lines += lines[line_no:end_line]
                 title = '\n'.join(raw_lines)
@@ -3604,61 +3718,34 @@ def _latexml_md_stream(md_text, source_context=None,
                     ranges.append((span.end, _line_end(end_line)))
             line_no += 1
             continue
-        if line_no in cross:
-            span, end_line = cross[line_no]
-            col_start = span.start - line_offsets[line_no]
-            col_end = span.end - line_offsets[end_line]
-            frags = _masked_reading_frags(
-                line[:col_start], [('m', 'inline', span.raw)],
-                lines[end_line - 1][col_end:])
-            tokens.append(('pm', tuple(frags)))
-            ranges.append((line_offsets[line_no], _line_end(end_line)))
-            line_no = end_line + 1
-            continue
         if not line.strip():
             line_no += 1
             continue
-        spans = sorted((inline_by_line.get(line_no) or [])
-                       + (markers.get(line_no) or []))
+        end_line = _cross_end(line_no)
+        first = line_offsets[line_no]
+        last = _line_end(end_line)
+        segment = md_text[first:last]
+        spans = sorted(
+            (line_offsets[current] - first + start,
+             line_offsets[current] - first + end, frag)
+            for current in range(line_no, end_line + 1)
+            for start, end, frag in ((inline_by_line.get(current) or [])
+                                     + (markers.get(current) or [])))
         if spans:
-            frag_list = [frag for _start, _end, frag in spans]
-            segments = []
-            cursor = 0
-            for start, end, _frag in spans:
-                segments.append(line[cursor:start])
-                cursor = end
-            segments.append(line[cursor:])
-            images = [f for f in frag_list if f[0] == 'i']
-            if images and not ''.join(segments).strip() \
-                    and len(images) == len(frag_list):
+            images = [frag for _start, _end, frag in spans if frag[0] == 'i']
+            frags = _masked_reading_frags(segment, spans)
+            if len(images) == len(spans) and not any(
+                    frag[0] == 't' and frag[1].strip() for frag in frags):
                 for start, end, frag in spans:
                     tokens.append(('img', frag[1]))
-                    ranges.append((line_offsets[line_no] + start,
-                                   line_offsets[line_no] + end))
+                    ranges.append((first + start, first + end))
             else:
-                # 文字段按真实阅读取得（复评 S1）；跨度先换成私用区占位
-                # 符整段一次行内阅读，强调等成对语法跨跨度时仍能正确解
-                # 码，再按占位符切回交错片段流
-                masked = []
-                for index, segment in enumerate(segments[:-1]):
-                    masked.append(segment)
-                    masked.append('\ue000%d\ue001' % index)
-                masked.append(segments[-1])
-                reading = _read(''.join(masked))
-                frags = []
-                for position, part in enumerate(
-                        _PLACEHOLDER_RE.split(reading)):
-                    if position % 2 == 1:
-                        frags.append(frag_list[int(part)])
-                    elif part:
-                        frags.append(('t', part))
                 tokens.append(('pm', tuple(frags)))
-                ranges.append((line_offsets[line_no],
-                               _line_end(line_no)))
+                ranges.append((first, last))
         else:
             tokens.append(('p', _norm(_read(line))))
             ranges.append((line_offsets[line_no], _line_end(line_no)))
-        line_no += 1
+        line_no = end_line + 1
     return tokens, scan, ranges
 
 
@@ -3748,7 +3835,8 @@ def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
     删正文、漏节点、范围交叠、额外输出、错归属、无解释重复、等数替换、
     改类型都按各自目标原因失败；两侧不共享渲染遍历或“已输出”清单。
     """
-    from _latexml_source import (math_wrap, substitution_by_ref,
+    from _latexml_source import (math_wrap, reference_source_table_mappings,
+                                 substitution_by_ref,
                                  validate_adaptation,
                                  validate_resource_substitutions)
 
@@ -3762,6 +3850,16 @@ def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
         table_conversions = \
             ((adaptation or {}).get('table_conversions') or None) \
             if isinstance(adaptation, dict) else None
+    if table_conversions:
+        map_soup = BeautifulSoup(protect_code_entities(raw_html, skip_pre=True),
+                                 'html.parser')
+        map_root = (map_soup.find(id=section_id) if section_id else
+                    (map_soup.find('article') or map_soup.find('main') or map_soup.find('body')))
+        if map_root is not None:
+            try:
+                table_conversions = reference_source_table_mappings(map_root, table_conversions)
+            except ValueError as exc:
+                return diffs + ['%s 逐表映射定位失败: %s' % (html_label, exc)]
     (src_tokens, facts, confirmed, src_problems,
      occ_stream, hosts) = _latexml_src_stream(
         raw_html, section_id, decisions, decision_results,
@@ -4081,6 +4179,15 @@ def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
                 diffs.append('对应节点 %s 内容类型不符: 依据 paragraph vs '
                              '实际 %s' % (label, fact['type']))
                 continue
+            prefix = fact.get('list_prefix')
+            if prefix is not None and not (slice_text.startswith(prefix)
+                                           or slice_text == prefix.rstrip()):
+                diffs.append('列表项 %s 的序号或嵌套不符: %s L%d'
+                             % (label, md_label, md_text.count('\n', 0, start) + 1))
+            if (fact.get('list_starts_with_block')
+                    and re.compile(r'\n[ \t]*\n').match(md_text, end)):
+                diffs.append('列表项 %s 的首块被空行移出列表: %s L%d'
+                             % (label, md_label, md_text.count('\n', 0, start) + 1))
             expected = ''.join(
                 f[1] if f[0] == 't' else math_wrap(f[1], f[2])
                 for f in fact['frags'])
@@ -4093,6 +4200,11 @@ def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
                 diffs.append('对应节点 %s 内容类型不符: 依据 image vs 实际 %s'
                              % (label, fact['type']))
                 continue
+            if 'object' in fact and any(
+                    (entry.get('conversion') or {}).get(field) != value
+                    for field, value in fact['object'].items()):
+                diffs.append('对象图片 %s 的 ID、尺寸或原资源引用与原 DOM 不符'
+                             % label)
             for field in ('figure', 'subfigure'):
                 if entry.get(field) != fact.get(field):
                     diffs.append('图片 %s %s 归属不符: 依据 %r vs 独立重建 %r'
@@ -4103,6 +4215,9 @@ def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
             if slice_text.strip() != expected:
                 diffs.append('图片 %s 候选切片不符: %r vs %r'
                              % (label, slice_text.strip(), expected))
+            if 'list_prefix' in fact and slice_text != fact['list_prefix'] + expected:
+                diffs.append('图片 %s 的列表嵌套不符: %s L%d'
+                             % (label, md_label, md_text.count('\n', 0, start) + 1))
             declared_ref = (entry.get('conversion') or {}).get('reference')
             if declared_ref is not None \
                     and declared_ref != fact['reference']:
@@ -4120,6 +4235,10 @@ def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
                 diffs.append('对应节点 %s 内容类型不符: 依据 figure-caption '
                              'vs 实际 %s' % (label, fact['type']))
                 continue
+            prefix = fact.get('list_prefix')
+            if prefix is not None and not slice_text.startswith(prefix + '[FIGURE] '):
+                diffs.append('图题 %s 的列表嵌套不符: %s L%d'
+                             % (label, md_label, md_text.count('\n', 0, start) + 1))
             for field in ('figure', 'subfigure'):
                 if entry.get(field) != fact.get(field):
                     diffs.append('图题 %s %s 归属不符: 依据 %r vs 独立重建 '
@@ -4389,9 +4508,11 @@ def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
     # ---- 两侧有序流比较（删正文/漏公式/乱序/错归属/额外输出） ----
     for index, (src_tok, md_tok) in enumerate(zip(src_tokens, md_tokens)):
         if not _latexml_tok_eq(src_tok, md_tok):
-            diffs.append('正文流第 %d 项不一致: %s %r vs %s %r'
-                         % (index + 1, html_label, src_tok,
-                            md_label, md_tok))
+            source_node = hosts[index] or '块 #%d' % (index + 1)
+            target_line = md_text.count('\n', 0, md_ranges[index][0]) + 1
+            diffs.append('正文流第 %d 项不一致: %s %s %r vs %s L%d %r'
+                         % (index + 1, html_label, source_node, src_tok,
+                            md_label, target_line, md_tok))
     if len(src_tokens) != len(md_tokens):
         diffs.append('正文流长度不一致: %s %d 项 vs %s %d 项（删正文/'
                      '额外输出）' % (html_label, len(src_tokens),

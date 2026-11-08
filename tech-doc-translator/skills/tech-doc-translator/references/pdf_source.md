@@ -63,6 +63,69 @@
 `splice_fences.py` 程序化回填（不重造）；图片来源身份绑定见
 "图形裁剪与来源身份绑定"一节。
 
+## 确认数学装配
+
+按来源顺序以 ⟦m1⟧、⟦m2⟧ 等逐次代替草稿中的公式，句式围绕原序安排。
+装配已确认数学时必须传入当前来源准入所用的项目上下文。
+
+~~~bash
+python3 "$SCRIPTS/splice_math.py" --source "$SOURCE" --draft "$DRAFT" \
+  --project-context "$CONTEXT" --output "$CANDIDATE"
+python3 "$SCRIPTS/verify_pdf_source.py" "$ORIGINAL_PDF" --checklist "$CHECKLIST" \
+  --source-md "$SOURCE" --translation "$CANDIDATE"
+~~~
+
+单个工作包走同一装配入口，之后按既有包范围执行
+~~~bash
+python3 "$SCRIPTS/verify_translation.py" "$CANDIDATE" "$SOURCE_PACKAGE" \
+  --fragment --project-context "$CONTEXT"
+~~~
+
+公式的定界、原换行与同文的各次出现完整保留。候选路径必须是新文件。
+装配通过后仍须核对公式宿主、式号、题注和实际语义。题注禁止增加来源外数学。
+
+## 复用已核验的同源层
+
+先确认供体对应同一版本 PDF，记录其路径、SHA-256、实际页数、选页/选区、
+提取解释器和 PyMuPDF 版本，以及已完成的独立核验。逐项查看 pending 和
+选区，明确哪些材料实际存在及适用。范围、版本、提取口径或材料不足时，
+回原页处理受影响项，保留其他已确认裁决。
+
+以已有独立对账通过的供体为例，清单、双快照和资源都在供体 source/ 下。
+先建立工作区外的新目标目录。以下路径分别指向供体项目和本次试点目录。
+
+~~~bash
+REUSE="$TRANSLATOR_PILOT/reuse"
+mkdir "$REUSE" && mkdir "$REUSE/source" || exit 1
+cp -p "$DONOR/source/paper.pdf" "$REUSE/paper.pdf"
+cp -p "$DONOR/source/adjudication_checklist.json" "$REUSE/source/adjudication.json"
+cp -p "$DONOR/source/source_draft.md" "$REUSE/source/source.md"
+cp -p "$DONOR/source/source_draft.md.blocks.json" "$REUSE/source/blocks.json"
+cp -p "$DONOR/source/snapshots_layout.txt" "$DONOR/source/snapshots_reading.txt" "$REUSE/source/"
+~~~
+
+裁决引用的每份 golden、图片及其相邻依赖按原相对布局复制，图像显示映射
+在适用时一并保留。核对 `golden`、`image` 从清单目录解析后的目标，及源
+Markdown 图片从其文件目录解析后的目标。若源头 `pdf_checklist` 已引用
+`adjudication_checklist.json`，目标保留这个清单文件名，验证命令也传该路径。
+这样源 Markdown 和字符块映射仍可逐字保留。引用已有来源记录时，将目标记录
+中的 PDF、清单、双快照、源与块映射路径逐一对照修改。
+
+仅编辑目标清单的 `source.path`、`source.realpath`，分别填目标 PDF 的绝对
+路径和实际路径。记录每项旧值、新值及理由。核对目标 PDF、双快照、源、映射
+和适用素材的摘要与供体一致。检查供体清单记录的 Python/PyMuPDF 版本及 API
+与当前解释器一致。不要用批量字符串替换修改裁决、摘要或相对素材名。
+
+~~~bash
+"$TRANSLATOR_PY" "$SCRIPTS/verify_pdf_source.py" "$REUSE/paper.pdf" \
+  --checklist "$REUSE/source/adjudication.json" --source-md "$REUSE/source/source.md" \
+  --block-map "$REUSE/source/blocks.json"
+~~~
+
+以真实退出状态及原页/当前源对账结果确认复用，复查供体所有文件摘要。若变更
+目标 PDF 或删掉资源，保留旧裁决，并用定位结果回源。目标范围变化时重新裁决
+受影响部分。目标复用结果只覆盖已核验的原有范围。
+
 ## 人工确认数学（confirmed-tex-v1）
 
 在同一 version=1 清单中显式登记 `formula_contract: "confirmed-tex-v1"`。
@@ -100,6 +163,18 @@
 行内 code 的原字节保持，跨行代码继续走 golden；link 另有 `target`，须由原页
 原生URI覆盖标签字形，中文可翻译标签。普通阅读、代码叶子、链接目标与数学分别
 检查，不能用普通文字空白归一吞掉代码空白或字面实体。
+
+ACM 的同行小标题和正文各建一块，矩形分别覆盖两者原字形。两行题名用
+一个 heading 和按原序登记的 text 片段，物化时只连接题名的物理换行。
+普通引用如 [7, 15, 19] 登记为 text，阅读结果保留方括号。同样的 [8]
+在不同位置各登记一次，使用原页 block/line/span 和字符区间消歧。
+
+物化和独立对账都检查已裁决结构区域内每个非空白字形的覆盖。明确排除的
+页眉、装饰等沿用清单 rejected 条目，记录 page、rect 和 reason。子块覆盖
+直属算法或脚注区域时，按显式所属分工。诊断中的页号从 1 起，原生
+block/line/span/char 从 0 起。遇到遗漏、重复、错绑或提取版本漂移，先按
+诊断回原页重核受影响的定位及所属，再生成候选。物化拒绝时保留上一次源和
+映射。译文章首管理字段的链接和代码不计为正文叶子，正文中的同名字段照常检查。
 
 表格每个原格保存 `id`、一基 `row` / `column`、`rowspan` / `colspan`、布尔
 `header`、未旋转 `rect` 和有序 `content`；空格仍有格记录及空内容。

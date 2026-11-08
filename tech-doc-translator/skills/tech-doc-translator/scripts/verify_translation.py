@@ -206,14 +206,15 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
                      '不判定完整通过 FAIL')
 
     # 7) 代码围栏配对与逐块内容核对
-    code_doc,code_src=doc,src
+    block_doc, block_src = doc, src
     if pdf_view:
         import _pdf_math
         scan_context = _pdf_math.context(pdf_view['checklist'])
-        code_doc=_pdf_math.footnote_view(doc,_pdf_math.context(pdf_view['checklist']))[0]
-        code_src=_pdf_math.footnote_view(src,_pdf_math.context(pdf_view['checklist']))[0]
-    doc_fences = scan_code_fences(code_doc)
-    src_fences = scan_code_fences(code_src)
+        # Block scanners need the same projection for PDF footnote code and tables.
+        block_doc = _pdf_math.footnote_view(doc, scan_context)[0]
+        block_src = _pdf_math.footnote_view(src, scan_context)[0]
+    doc_fences = scan_code_fences(block_doc)
+    src_fences = scan_code_fences(block_src)
     code_fails = 0
     if not doc_fences.balanced:
         code_fails += 1
@@ -318,10 +319,11 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
                          (len(link_targets(src)), len(link_targets(doc))))
 
     from _source_reconcile import compare_translation_tables, table_code_problems
-    for problem in table_code_problems(doc, table_code_stage, scan_context):
+    for problem in table_code_problems(block_doc, table_code_stage, scan_context):
         fail += 1
         lines.append('表格代码: ' + problem + ' FAIL')
-    for diff in compare_translation_tables(src, doc, source_context=scan_context, header_cells=header_cells):
+    for diff in compare_translation_tables(block_src, block_doc, source_context=scan_context,
+                                           header_cells=header_cells):
         fail += 1
         lines.append('表格核对: ' + diff + ' FAIL')
 

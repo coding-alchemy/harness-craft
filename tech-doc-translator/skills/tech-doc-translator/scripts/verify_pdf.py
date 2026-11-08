@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tech-doc-translator PDF 独立核验入口。
 
-    python3 verify_pdf.py --pdf <候选.pdf> --work-dir <同一临时目录> <章节1.md> [...]
+    python3 verify_pdf.py --pdf <候选.pdf> --work-dir <当前导出报告目录> <章节1.md> [...]
 
 以原始输入重建预期，与导出证据及最终 PDF 相互核对：输入摘要保护、逐章
 标题顺序、文本/代码覆盖、公式机器检查、内外链接目标与大纲。核验器独立
@@ -98,6 +98,48 @@ def _load_aid_renderer():
 def _aid_renderer_version(renderer):
     version = getattr(renderer, "VersionBind", None)
     return "PyMuPDF %s" % version if version else "PyMuPDF"
+
+
+def compare_pdf_pages(old_pdf: str, current_pdf: str, render: dict) -> dict:
+    """Re-render both documents with the conditions of the original visual review."""
+    if (not isinstance(render, dict)
+            or set(render) != {"engine", "version", "dpi", "colorspace", "alpha", "annots"}
+            or render["engine"] != "pymupdf" or render["colorspace"] != "RGB"
+            or not isinstance(render["version"], str) or not render["version"]
+            or type(render["dpi"]) is not int or render["dpi"] <= 0
+            or type(render["alpha"]) is not bool or type(render["annots"]) is not bool):
+        raise ValueError("视觉复用缺少受支持的原始渲染条件")
+    renderer = _load_aid_renderer()
+    if renderer is None:
+        raise PdfDependencyError(dependency_message(
+            "PyMuPDF", requirements="requirements-pdf-source.txt"))
+    if render["version"] != getattr(renderer, "VersionBind", None):
+        raise ValueError("当前 PyMuPDF 版本与原目检版本不同")
+    pixmap_options = {"dpi": render["dpi"], "colorspace": renderer.csRGB,
+                      "alpha": render["alpha"], "annots": render["annots"]}
+    differences = []
+    try:
+        with renderer.open(old_pdf) as old, renderer.open(current_pdf) as current:
+            old_count, page_count = len(old), len(current)
+            if not old_count or not page_count:
+                raise ValueError("PDF 没有可复核页面")
+            for index in range(min(old_count, page_count)):
+                left, right = old[index], current[index]
+                if (left.rotation, left.mediabox, left.cropbox) != (
+                        right.rotation, right.mediabox, right.cropbox):
+                    differences.append(index + 1)
+                    continue
+                previous = left.get_pixmap(**pixmap_options)
+                latest = right.get_pixmap(**pixmap_options)
+                if (previous.width, previous.height, previous.samples_mv) != (
+                        latest.width, latest.height, latest.samples_mv):
+                    differences.append(index + 1)
+    except (OSError, RuntimeError, OverflowError) as exc:
+        raise ValueError("逐页渲染失败：%s" % exc) from exc
+    differences.extend(range(min(old_count, page_count) + 1,
+                             max(old_count, page_count) + 1))
+    return {"equal": not differences, "page_count": page_count,
+            "different_pages": differences}
 
 
 def _render_page_ink_coverage(page, renderer, dpi):
@@ -540,7 +582,7 @@ def _matmul(m1, m2):
     )
 
 
-def collect_drawn_images(pdf):
+def collect_drawn_images(pdf, *, with_names=False):
     """逐页解析内容流，返回每页按绘制顺序的 (绘制宽度 pt, 底边 y pt,
     顶边 y pt) 列表。
 
@@ -588,8 +630,8 @@ def collect_drawn_images(pdf):
                             ctm[1] * x + ctm[3] * y + ctm[5]
                             for x, y in ((0, 0), (1, 0), (0, 1), (1, 1))
                         ]
-                        images_drawn.append(
-                            (width, min(corners_y), max(corners_y)))
+                        geometry = (width, min(corners_y), max(corners_y))
+                        images_drawn.append(geometry + (name,) if with_names else geometry)
             result.append(images_drawn)
         except Exception:  # noqa: BLE001  内容流异常由计数对账暴露
             result.append([])
@@ -616,8 +658,12 @@ def check_image_coverage(chapters, bindings, undetermined_map,
     )
 
     occurrences = []
+    enumerations = {}
     for chapter in chapters:
-        enumeration = exporter.enumerate_images(chapter, [])
+        diagnostics = []
+        enumeration = exporter.enumerate_images(chapter, diagnostics)
+        enumerations[chapter.path] = enumeration
+        failures.extend(diagnostic for diagnostic in diagnostics if diagnostic["code"] == "svg-resource")
         for index, record in enumerate(enumeration):
             occurrences.append(
                 Occurrence(
@@ -666,6 +712,7 @@ def check_image_coverage(chapters, bindings, undetermined_map,
                     "input": diagnostic.get("input"),
                 }
             )
+    return enumerations
 
 
 def check_provenance(chapters, report, pdf, args_provenance, failures):
@@ -807,6 +854,8 @@ def check_image_widths(chapters, pdf, bounds, bindings, report, failures):
     drawn_per_page = collect_drawn_images(pdf)
     page_range = {chapter.path: (start, end) for chapter, start, end in bounds}
     recorded = report.get("image_display", {})
+    first_width_failure = len(failures)
+    widths = []
     for chapter in chapters:
         occurrence_map = bindings.get(chapter.path, {})
         if not occurrence_map:
@@ -824,10 +873,13 @@ def check_image_widths(chapters, pdf, bounds, bindings, report, failures):
             for index in range(start_page, end_page)
             for width, _bottom, _top in drawn_per_page[index]
         ]
+        svg_occurrences = getattr(pdf, "_svg_occurrences", set())
+        image_context = getattr(pdf, "_image_verification", None)
+        enumeration = (image_context[1][chapter.path] if image_context
+                       else exporter.enumerate_images(chapter, []))
         bitmap_occurrences = [
-            index + 1 for index, item in enumerate(
-                exporter.enumerate_images(chapter, []))
-            if item["pixel_known"]
+            index + 1 for index, item in enumerate(enumeration)
+            if item["pixel_known"] or (str(chapter.path), index + 1) in svg_occurrences
         ]
         for occurrence, binding in sorted(occurrence_map.items()):
             px = binding["px"]
@@ -865,7 +917,9 @@ def check_image_widths(chapters, pdf, bounds, bindings, report, failures):
                 )
                 continue
             measured = in_chapter[draw_index]
-            if abs(measured - expected_pt) > IMAGE_WIDTH_TOLERANCE_PT:
+            widths.append((measured, expected_pt))
+            if ((str(chapter.path), occurrence) not in svg_occurrences
+                    and abs(measured - expected_pt) > IMAGE_WIDTH_TOLERANCE_PT):
                 failures.append(
                     {
                         "code": "image-width-mismatch",
@@ -881,6 +935,94 @@ def check_image_widths(chapters, pdf, bounds, bindings, report, failures):
                         **context,
                     }
                 )
+    if len(widths) >= 2 and all(
+            measured < expected - IMAGE_WIDTH_TOLERANCE_PT for measured, expected in widths):
+        lower = max((measured - IMAGE_WIDTH_TOLERANCE_PT) / expected
+                    for measured, expected in widths)
+        upper = min((measured + IMAGE_WIDTH_TOLERANCE_PT) / expected
+                    for measured, expected in widths)
+        if lower <= upper:
+            failures.insert(first_width_failure, {
+                "code": "image-common-print-scale",
+                "message": "多次绘制宽度符合共同打印缩放 %.3f–%.3f 倍（%d 次）"
+                           % (lower, upper, len(widths)),
+            })
+
+
+def check_svg_renders(chapters, pdf, report, failures) -> None:
+    """从当前资源重建预期像素，与最终 PDF 逐次解码对账。"""
+    diagnostics = []
+    context = getattr(pdf, "_image_verification", None)
+    if context is None:
+        bindings, _, _, _ = exporter.load_display_maps(
+            chapters, report.get("images_display_maps", []), diagnostics)
+        enumerations = {chapter.path: exporter.enumerate_images(chapter, diagnostics)
+                        for chapter in chapters}
+        bounds = chapter_bounds(chapters, pdf, {}, failures)
+    else:
+        bindings, enumerations, bounds = context
+    plans = exporter.plan_svg_renders(chapters, enumerations, bindings, diagnostics)
+    failures.extend(d for d in diagnostics if d["severity"] == "fail")
+    expected_keys = [(plan["input"], plan["image_index"]) for plan in plans]
+    pdf._svg_occurrences = set(expected_keys)
+    rows = report.get("svg_renders", [])
+    if (not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
+            or [(row.get("input"), row.get("image_index")) for row in rows] != expected_keys):
+        failures.append({"code": "svg-render-evidence",
+                         "message": f"SVG 派生记录与当前图片出现不符，预期 {expected_keys}"})
+        return
+    if not plans:
+        return
+
+    drawn = collect_drawn_images(pdf, with_names=True)
+    page_ranges = {str(chapter.path): (start, end) for chapter, start, end in bounds}
+    draw_by_occurrence = {}
+    for chapter in chapters:
+        if not any(name == str(chapter.path) for name, _ in expected_keys):
+            continue
+        start, end = page_ranges.get(str(chapter.path), (0, 0))
+        actual = [(page, image) for page in range(start, end) for image in drawn[page]]
+        occurrences = [index for index, item in enumerate(enumerations[chapter.path], 1)
+                       if item["pixel_known"] or (str(chapter.path), index) in pdf._svg_occurrences]
+        if len(actual) != len(occurrences):
+            failures.append({"code": "svg-pdf-draw-count", "input": str(chapter.path),
+                             "message": f"实际位图绘制 {len(actual)} 次与可定位图片 {len(occurrences)} 次不符"})
+            continue
+        draw_by_occurrence.update({(str(chapter.path), index): placement
+                                   for index, placement in zip(occurrences, actual)})
+    try:
+        from io import BytesIO
+        from PIL import Image
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as runtime:
+            browser = runtime.chromium.launch()
+            registry = {}
+            for plan, row, key in zip(plans, rows, expected_keys):
+                if key not in draw_by_occurrence:
+                    continue
+                page, (width, _, _, name) = draw_by_occurrence[key]
+                detail = {"input": key[0], "line": plan["record"]["line"]}
+                payload, evidence = exporter.render_svg_payload(
+                    plan["record"]["path"], width_px=plan["width"], height_px=plan["height"],
+                    resource_registry=registry, browser=browser)
+                if row.get("display") != plan["display"] or any(row.get(k) != v for k, v in evidence.items()):
+                    failures.append({"code": "svg-render-drift", **detail,
+                                     "message": f"SVG #{key[1]} 当前依赖、尺寸或渲染证据漂移：{evidence['source'][0]}"})
+                expected_width = min(plan["display_px"], exporter.CONTENT_WIDTH_PX) * exporter.PT_PER_CSS_PX
+                if abs(width - expected_width) > IMAGE_WIDTH_TOLERANCE_PT:
+                    failures.append({"code": "svg-pdf-width", **detail,
+                                     "message": f"SVG #{key[1]} 第 {page + 1} 页宽 {width:.2f}pt，期望 {expected_width:.2f}pt"})
+                with Image.open(BytesIO(payload)) as image:
+                    reference = image.convert("RGB")
+                raster = pdf.reader.pages[page].images[name].image.convert("RGB")
+                if reference.size != raster.size or reference.tobytes() != raster.tobytes():
+                    failures.append({"code": "svg-pdf-pixels", **detail,
+                                     "message": f"SVG #{key[1]} 第 {page + 1} 页解码像素与独立重建不符"})
+            browser.close()
+    except Exception as exc:
+        failures.append({"code": "svg-render-unavailable",
+                         "message": f"SVG 派生独立核验失败：{exc}"})
 
 
 # ---------------------------------------------------------------------------
@@ -1224,14 +1366,17 @@ def check_print_toc(chapters, pdf, report, bounds, heading_pages, failures):
         target_index = target_page - 1
         if positional:
             annot = toc_annots[ordinal]
-            if annot["dest_page"] != target_index:
+            expected_id = entry.get("heading_id")
+            if expected_id is None:
+                expected_id = included.headings[0]["id"] if included.headings else included.prefix + "body"
+            if (annot["dest_page"] != target_index
+                    or annot.get("name", expected_id) != expected_id):
                 failures.append(
                     {
                         "code": "toc-link-target",
-                        "message": "目录条目链接未实际指向目标页 %d"
-                        "（实际指向第 %d 页）：%s"
-                        % (target_page, annot["dest_page"] + 1,
-                           entry["title"]),
+                        "message": "目录链接预期第 %d 页目标 %s，实际第 %d 页目标 %s：%s"
+                        % (target_page, expected_id, annot["dest_page"] + 1,
+                           annot.get("name"), entry["title"]),
                     }
                 )
         elif not any(
@@ -1483,8 +1628,27 @@ def _note_remainders(chapter):
             for backlink in block.select('a.footnote-backref'):
                 backlink.decompose()  # 自动生成导航由链接门禁负责，不属于原正文。
         value = normalize(block.get_text(' ', strip=True)) if block else ''
-        remainders[line] = value if len(value) >= 4 else ''
+        if len(value) >= 4:
+            remainders[line] = (value, '/' + block.name.capitalize())
     return remainders
+
+
+def _note_text_objects(pdf, start_page, end_page, roles):
+    """Reuse tagged PDF ownership, keeping wrapped runs within each logical block."""
+    runs = {}
+    for page in range(start_page, end_page):
+        for event in pdf.drawn_events[page]:
+            runs.setdefault((page, event["mcid"]), []).append(event["text"])
+    for order, role, marks in pdf.structure_containers or ():
+        if role not in roles or any(page is None or not start_page <= page < end_page
+                                    for page, _ in marks):
+            continue
+        text = normalize("".join(run for mark in dict.fromkeys(marks)
+                                 for run in runs.get(mark, ())))
+        if text:
+            yield text, {"page": marks[0][0] + 1,
+                         "pdf_object": {"role": role, "order": order,
+                                        "mcids": [[page + 1, mcid] for page, mcid in marks]}}
 
 
 def check_translator_notes(chapters, report, pdf, failures):
@@ -1510,12 +1674,28 @@ def check_translator_notes(chapters, report, pdf, failures):
                    len(exported) if isinstance(exported, list) else exported),
             }
         )
-    if pdf is None:
+    if pdf is None or not expected:
         return
     view_text = export_view_visible_text(chapters)
     remainders = {str(chapter.path): _note_remainders(chapter) for chapter in chapters}
+    ranges = getattr(pdf, "chapter_ranges", None)
+    if ranges is None:
+        ranges = {str(chapter.path): (start, end) for chapter, start, end
+                  in chapter_bounds(chapters, pdf, {}, failures)}
+    objects = {}
+    for path in dict.fromkeys(item["input"] for item in expected):
+        if path not in ranges:
+            continue
+        start, end = ranges[path]
+        roles = {role for _, role in remainders[path].values()}
+        # A leaked note can occur in prose even when its original owner was removed.
+        objects[path] = list(_note_text_objects(pdf, start, end, roles | {"/P"}))
     for item in expected:
         context = {"input": item["input"], "line": item["line"]}
+        candidates = objects.get(item["input"], ())
+        start, _ = ranges.get(item["input"], (None, None))
+        missing_location = {"page": start + 1 if start is not None else None,
+                            "pdf_object": None}
         token = normalize(item["fragment"])
         if len(token) >= 4:
             allowed = view_text.count(token)
@@ -1528,20 +1708,33 @@ def check_translator_notes(chapters, report, pdf, failures):
                         "（%d 次 > 允许 %d 次）：%r"
                         % (found, allowed, item["fragment"][:40]),
                         **context,
+                        **next((where for text, where in candidates if token in text),
+                               missing_location),
                     }
                 )
-        source_lines = next(
-            c.text.split("\n") for c in chapters
-            if str(c.path) == item["input"]
-        )
-        remainder = remainders[item["input"]].get(item["line"], "")
-        if remainder and remainder not in pdf.norm_text:
+        expected_object = remainders[item["input"]].get(item["line"])
+        if expected_object is None:
+            continue
+        remainder, role = expected_object
+        best_size, location = 0, missing_location
+        for text, where in candidates:
+            if where["pdf_object"]["role"] != role:
+                continue
+            if remainder in text:
+                break
+            # Only for locating a failure. A partial match never establishes integrity.
+            size = max(len(os.path.commonprefix([remainder, text])),
+                       len(os.path.commonprefix([remainder[::-1], text[::-1]])))
+            if size >= 4 and size > best_size:
+                best_size, location = size, where
+        else:
             failures.append(
                 {
                     "code": "translator-note-collateral",
-                    "message": "译注所在行其余文字未出现在 PDF（防连带删除）：%r"
-                    % source_lines[item["line"] - 1][:60],
+                    "message": "译注所在块的剩余文字未在同一 PDF 文本对象完整出现：%r"
+                    % remainder[:60],
                     **context,
+                    **location,
                 }
             )
 
@@ -1701,6 +1894,7 @@ class PdfFacts:
             for index, page in enumerate(self.reader.pages)
         }
         self.uri_links = set()
+        self.uri_annots = {}
         self.internal_annots = []  # {page, dest_page, top, rect, ref}
         self.broken_named_dests = []
         # PDF /Title 元数据（R3/A4）：与可见中文总标题一致性的核对输入。
@@ -1758,7 +1952,9 @@ class PdfFacts:
                 if action is not None:
                     action = action.get_object()
                     if action.get("/S") == "/URI":
-                        self.uri_links.add(str(action.get("/URI")))
+                        uri = str(action.get("/URI"))
+                        self.uri_links.add(uri)
+                        self.uri_annots[(page_index, ref)] = uri
                         continue
                 dest = obj.get("/Dest")
                 if dest is None and action is not None:
@@ -1783,7 +1979,7 @@ class PdfFacts:
                         self.internal_annots.append(
                             {"page": page_index,
                              "dest_page": named[name_key], "top": top,
-                             "rect": bounds_rect, "ref": ref}
+                             "rect": bounds_rect, "ref": ref, "name": unquote(name_key)}
                         )
                     else:
                         self.broken_named_dests.append(str(name_key))
@@ -2510,7 +2706,7 @@ def check_math_consumption(chapters, failures):
         if not formal_pdf:
             spans = table_math_spans(spans, chapter.projected_text,
                 decode_entities=getattr(chapter, "math_scan_context", None) is not None)
-        parsed = chapter.math
+        parsed = [math for math in chapter.math if not math.get("title_only")]
         context = {"input": str(chapter.path)}
         # 五轮 F3：确认序列按脚注渲染投影重排（与导出解析游标同一入口），
         # 跨度重排后游标按渲染序单调对齐；不再假定跨度序=来源序
@@ -2551,7 +2747,7 @@ def check_math_consumption(chapters, failures):
                 # 前进；错序/回退命中会回退历史分类并裁掉确认项的边界
                 # 空白，掩盖顺序差异
                 for cindex in range(confirmed_cursor, len(confirmed)):
-                    kind, tex = confirmed[cindex]
+                    kind, tex = confirmed[cindex][:2]
                     if kind != span.kind:
                         continue
                     expr = span.expr
@@ -4487,9 +4683,9 @@ def check_math(chapters, report, pdf_path, bounds, failures):
             chapter.projected_text, list(confirmed_attr),
             getattr(chapter, "math_scan_context", None),
             exporter.chapter_math_scan(chapter).spans if getattr(chapter,'pdf_math_confirmed',False) else None)
-        rendered = [(m["mode"], m["latex"]) for m in chapter.math]
-        expected = [("display" if kind == "block" else "inline", tex)
-                    for kind, tex in confirmed]
+        rendered = [(m["mode"], m["latex"]) for m in chapter.math if not m.get("title_only")]
+        expected = [("display" if entry[0] == "block" else "inline", entry[1])
+                    for entry in confirmed]
         if rendered != expected:
             failures.append(
                 {
@@ -4590,6 +4786,35 @@ def check_links(chapters, pdf, bounds, heading_pages, failures, reviews):
     annots_by_page = {}
     for annot in pdf.internal_annots:
         annots_by_page.setdefault(annot["page"], []).append(annot["dest_page"])
+
+    explicit_targets = {chapter.prefix + anchor for chapter in chapters
+                        for anchor in chapter.source_anchors}
+    for chapter, start_page, end_page in bounds:
+        labels = {normalize(link["text"]) for link in chapter.internal_links
+                  if link.get("resolved") in explicit_targets and link.get("text")}
+        if not labels:
+            continue
+        actual = _toc_link_instances(pdf, start_page, end_page, set())
+        actual = {label: [instance for instance in instances if instance["annots"]]
+                  for label, instances in actual.items()}
+        for link in chapter.internal_links:
+            label = normalize(link.get("text") or "")
+            if label not in labels:
+                continue
+            candidates = actual.get(label)
+            if candidates is None and len(link["text"]) == 80:
+                longer = [values for key, values in actual.items() if key.startswith(label)]
+                candidates = longer[0] if len(longer) == 1 else None
+            instance = candidates.pop(0) if candidates else None
+            target = link.get("resolved")
+            if target in explicit_targets and (
+                    not instance or not instance["usable"]
+                    or any(annot.get("name") != target for annot in instance["annots"])):
+                failures.append({
+                    "code": "internal-anchor-target",
+                    "message": f'链接 {link["text"]!r} 的实际注解未绑定预期锚点 {target}',
+                    "input": str(chapter.path), "line": link.get("source_line"),
+                })
 
     for chapter, link, start_page, end_page in expected_internal:
         # 目标判定优先采用消解结果（跨章文件链接的片段属于其他章），
@@ -4774,6 +4999,45 @@ def check_page_footers(pdf, failures):
             )
 
 
+def _structured_title_matches(chapters, pdf, start_page, single):
+    if start_page >= len(pdf.drawn_events):
+        return False
+    if single:
+        chapter = next(chapter for chapter in chapters if not chapter.is_toc)
+        heading = chapter.soup.find("h1")
+    else:
+        heading = chapters[0].soup.find("p", class_="document-title")
+    if heading is None:
+        return False
+    segments = exporter.block_text_segments(heading)
+    pattern = ".+?".join(re.escape(normalize(part)) for part in segments)
+    destinations = {(a["page"], a["ref"]): "#" + a["name"]
+                    for a in pdf.internal_annots if a.get("name")}
+    destinations.update(pdf.uri_annots)
+    expected = [unquote(a["href"]) if a["href"].startswith("#") else a["href"]
+                for a in heading.find_all("a", href=True)]
+    by_mark = {}
+    for event in pdf.drawn_events[start_page]:
+        by_mark.setdefault((start_page, event["mcid"]), []).append(event)
+    subtype = "/H1" if single else "/P"
+    for _, kind, marks in pdf.structure_containers or ():
+        if kind != subtype or any(page != start_page for page, _ in marks):
+            continue
+        runs = [event for mark in dict.fromkeys(marks) for event in by_mark.get(mark, ())]
+        if not re.fullmatch(pattern, normalize("".join(event["text"] for event in runs))):
+            continue
+        observed = []
+        marks = set(marks)
+        for link in pdf.structure_links:
+            if link["mcids"] and set(link["mcids"]).issubset(marks):
+                values = {destinations.get(ref) for ref in link["objects"]}
+                if len(values) == 1:
+                    observed.append(values.pop())
+        if observed == expected and (len(segments) == 1 or any("KaTeX" in r["font"] for r in runs)):
+            return True
+    return False
+
+
 def check_document_title(chapters, report, pdf, bounds, title_decision,
                          failures):
     """中文文档总标题的独立重建与成品核对（R3/A4/C5）。
@@ -4810,8 +5074,11 @@ def check_document_title(chapters, report, pdf, bounds, title_decision,
     elif bounds:
         # 合订：非章节性总标题段落渲染在首个章节容器（第 1 页）最前。
         start_page = bounds[0][1]
-    if start_page >= len(pdf.pages) \
-            or needle not in normalize(pdf.pages[start_page]):
+    if title_decision.get("title_inline_html"):
+        visible = _structured_title_matches(chapters, pdf, start_page, len(content_starts) == 1)
+    else:
+        visible = start_page < len(pdf.pages) and needle in normalize(pdf.pages[start_page])
+    if not visible:
         failures.append(
             {
                 "code": "document-title-missing",
@@ -4835,7 +5102,8 @@ def parse_args(argv=None):
         description="独立核验导出 PDF 与原始输入的一致性（机器层）。"
     )
     parser.add_argument("--pdf", required=True, help="待核验 PDF 路径")
-    parser.add_argument("--work-dir", required=True, help="导出时使用的同一临时目录")
+    parser.add_argument("--work-dir", required=True,
+                        help="当前 export_report.json 所在目录；正式交付使用首次绑定前固定的持久目录")
     parser.add_argument(
         "--unlink-target",
         action="append",
@@ -4906,7 +5174,61 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def run_verification(args):
+def resolve_source_adaptations(args, report: dict, *, root: str) -> list[str]:
+    """从导出证据取得实际有序依据，并核对当前文件和原始快照。"""
+    def absolute(path):
+        return os.path.realpath(os.path.join(root, os.path.expanduser(path)))
+
+    explicit = [absolute(path) for path in (getattr(args, "source_adaptation", None) or ())]
+    recorded = report.get("source_adaptation")
+    hashes = None
+    if recorded is None:
+        paths = explicit
+    else:
+        if not isinstance(recorded, dict) or ("path" in recorded) == ("paths" in recorded):
+            raise ValueError("导出报告 source_adaptation 的单项/多项声明无效")
+        if "paths" in recorded:
+            declared, hashes = recorded["paths"], recorded.get("sha256")
+        else:
+            declared, hashes = [recorded["path"]], [recorded.get("sha256")]
+        if (not isinstance(declared, list) or not declared
+                or not isinstance(hashes, list) or len(hashes) != len(declared)
+                or any(not isinstance(path, str) or not path for path in declared)
+                or any(not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                       for digest in hashes)):
+            raise ValueError("导出报告缺少完整有序的来源依据路径与摘要")
+        paths = [absolute(path) for path in declared]
+        if explicit and paths != explicit:
+            raise ValueError(f"--source-adaptation 的有序路径与导出报告冲突：{explicit!r} vs {paths!r}")
+    if len(set(paths)) != len(paths):
+        raise ValueError("来源依据路径重复")
+    if not paths:
+        return []
+    from _latexml_source import load_adaptation, sha256_text
+
+    for index, path in enumerate(paths):
+        if not os.path.isfile(path):
+            raise ValueError(f"来源依据缺失：{path}")
+        if hashes is not None:
+            digest = exporter.sha256_file(path)
+            if digest != hashes[index]:
+                raise ValueError(f"来源依据摘要漂移：{path}（导出 {hashes[index]}，当前 {digest}）")
+        payload = load_adaptation(path)
+        snapshot = payload["snapshot"]
+        snapshot_path = snapshot.get("path")
+        if not isinstance(snapshot_path, str) or not snapshot_path:
+            raise ValueError(f"来源依据缺少原始快照路径：{path}")
+        snap_path = absolute(snapshot_path)
+        try:
+            current = sha256_text(Path(snap_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"来源依据原始快照不可读：{snap_path}（{exc}）") from exc
+        if current != snapshot["sha256"]:
+            raise ValueError(f"来源依据原始快照摘要漂移：{snap_path}（依据 {snapshot['sha256']}，当前 {current}）")
+    return paths
+
+
+def run_verification(args, *, run_context=None):
     """核验计算（不落盘、不打印）：返回 (机器是否通过, 核验报告 dict)。
 
     CLI 与交付入口共用同一计算：交付检查直接取得本次结果作为机器证据，
@@ -4938,43 +5260,42 @@ def run_verification(args):
     if report.get('translation_readiness'):
         from verify_delivery import check_translation_readiness_cli
         declared=report['translation_readiness']
-        ready,current=check_translation_readiness_cli(declared.get('record'),args.inputs)
+        ready,current=check_translation_readiness_cli(
+            declared.get('record'), args.inputs, run_context=run_context)
         if not ready:
             failures.append({'code':'translation-readiness-invalid','message':'；'.join(current.get('reasons') or [])})
         else:
             readiness_projection=current.get('identity')
-            if readiness_projection!=declared.get('identity'):
+            declared_identity = declared.get('identity')
+            comparable = readiness_projection
+            if isinstance(declared_identity, dict) and 'dependencies_sha256' not in declared_identity:
+                comparable = {key: value for key, value in readiness_projection.items()
+                              if key != 'dependencies_sha256'}
+            if comparable != declared_identity:
                 failures.append({'code':'translation-readiness-drift','message':'当前翻译/来源就绪身份与导出时不符'})
-    chapters = reparse_inputs(
-        args.inputs, failures, args.unlink_target, args.toc_sections,
-        getattr(args, "view_declaration", None),
-        source_adaptation_path=getattr(args, "source_adaptation", None),
-        readiness_projection=readiness_projection)
+    chapters = []
+    try:
+        source_root = getattr(args, "_delivery_root", os.getcwd())
+        adaptations = resolve_source_adaptations(args, report, root=source_root)
+        if readiness_projection:
+            expected = [
+                os.path.realpath(path)
+                for entry in readiness_projection.get("sources", ())
+                for path in (entry.get("source_adaptations") or [entry.get("source_adaptation")])
+                if path]
+            if expected != adaptations:
+                raise ValueError(f"来源依据与当前翻译就绪范围不符：{adaptations!r} vs {expected!r}")
+    except (OSError, ValueError) as exc:
+        failures.append({"code": "source-adaptation-mismatch", "message": str(exc)})
+    else:
+        chapters = reparse_inputs(
+            args.inputs, failures, args.unlink_target, args.toc_sections,
+            getattr(args, "view_declaration", None),
+            source_adaptation_path=adaptations or None,
+            readiness_projection=readiness_projection)
     cross_check(chapters, failures)
     check_math_consumption(chapters, failures)
     check_inputs_protection(report, failures)
-    # 来源依据集合与导出证据一致性（F7/§7.5）：核验显式传入的
-    # --source-adaptation 必须与导出报告记录的实际来源依据同一集合，
-    # 不一致即拒绝（不降级为无来源约束核验）。
-    cli_adaptations = getattr(args, "source_adaptation", None) or []
-    if cli_adaptations and report_usable:
-        recorded = report.get("source_adaptation") or {}
-        if recorded.get("paths"):
-            declared = recorded["paths"]
-        elif recorded.get("path"):
-            declared = [recorded["path"]]
-        else:
-            declared = []
-        if declared:
-            cli_reals = {os.path.realpath(p) for p in cli_adaptations}
-            declared_reals = {os.path.realpath(p) for p in declared}
-            if cli_reals != declared_reals:
-                failures.append({
-                    "code": "source-adaptation-mismatch",
-                    "message": "--source-adaptation %s 与导出报告记录的 %s "
-                               "不一致" % (sorted(cli_adaptations),
-                                          sorted(declared))})
-
     # 视图声明独立重建（reparse 已按同一声明投影；此处再加载供逐项核对）。
     view_declaration = None
     if getattr(args, "view_declaration", None):
@@ -5038,17 +5359,18 @@ def run_verification(args):
             pdf = None
 
     # 覆盖独立重算不依赖 PDF 存在：从原输入与映射即可核对分类与严格策略。
-    check_image_coverage(chapters, bindings, display_undetermined,
+    enumerations = check_image_coverage(chapters, bindings, display_undetermined,
                          display_undetermined_raw, report,
                          bool(args.require_display_map), failures)
 
     check_projection(chapters, report, pdf, failures, view_declaration)
     check_unlinked_links(chapters, pdf, args.unlink_target, report, failures)
-    check_translator_notes(chapters, report, pdf, failures)
     check_view_declaration(chapters, report, pdf, args.view_declaration,
                            failures)
 
-    if pdf is not None:
+    if pdf is None:
+        check_translator_notes(chapters, report, pdf, failures)
+    else:
         if report.get("pdf_sha256") != exporter.sha256_file(pdf_path):
             failures.append({"code": "pdf-evidence-mismatch",
                              "message": "PDF 与导出证据不匹配，请重新导出并核验"})
@@ -5070,6 +5392,9 @@ def run_verification(args):
         # 出处预期独立重建与可见性核对（新政策：PDF 不显示前置出处）。
         check_provenance(chapters, report, pdf, args.provenance, failures)
         bounds = chapter_bounds(chapters, pdf, heading_pages, failures)
+        pdf.chapter_ranges = {str(chapter.path): (start, end)
+                              for chapter, start, end in bounds}
+        check_translator_notes(chapters, report, pdf, failures)
         check_blocks(chapters, pdf, bounds, failures, relaxed, "text")
         # R8：块内核验（结构归属逐行对账）、短块整块与长块页尾续排检查。
         code_block_infos = check_code_blocks_per_line(
@@ -5080,6 +5405,8 @@ def run_verification(args):
         check_math(chapters, report, pdf_path, bounds, failures)
         check_links(chapters, pdf, bounds, heading_pages, failures, reviews)
         check_outline(chapters, pdf, heading_pages, failures)
+        pdf._image_verification = bindings, enumerations, bounds
+        check_svg_renders(chapters, pdf, report, failures)
         check_image_widths(chapters, pdf, bounds, bindings, report, failures)
         check_print_toc(chapters, pdf, report, bounds, heading_pages, failures)
         # 目录章节导航独立核验（设计 §8.4）：从未投影目录原文枚举指向纳入
@@ -5152,11 +5479,18 @@ def run_verification(args):
 
 
 def main(argv=None):
+    from verify_delivery import new_run_context, progress_stage, stderr_progress
+
     args = parse_args(argv)
     work_dir = Path(args.work_dir).expanduser()
 
     try:
-        machine_pass, verify_report = run_verification(args)
+        run_context = new_run_context(stderr_progress)
+        with progress_stage(run_context, 'verify_pdf', args.pdf) as fail_stage:
+            machine_pass, verify_report = run_verification(
+                args, run_context=run_context)
+            if not machine_pass:
+                fail_stage()
     except PdfDependencyError as exc:
         print('FAIL: %s' % exc, file=sys.stderr)
         return 1

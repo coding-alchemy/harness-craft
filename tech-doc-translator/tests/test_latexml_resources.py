@@ -8,10 +8,14 @@ import copy
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from bs4 import BeautifulSoup
+from markdown_it import MarkdownIt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]
                        / 'skills/tech-doc-translator/scripts'))
@@ -103,6 +107,42 @@ class _ResourceDirs(unittest.TestCase):
 class SameNameResourcesTest(_ResourceDirs):
     """05-2：同名异资源无冲突目标对应。"""
 
+    def test_object_enumerate_pubnotes_roundtrip(self):
+        (self.base / 'chart.svg').write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="60"/>')
+        raw = (
+            '<article class="ltx_document"><h1>T <span class="ltx_pubnotes">'
+            '<span>出版注甲</span> <span>出版注乙</span></span></h1>'
+            '<figure><object type="image/svg+xml" data="chart.svg" id="figure-object"'
+            ' width="100" height="60"></object><figcaption>Chart</figcaption></figure>'
+            '<ol class="ltx_enumerate" start="3"><li>Alpha'
+            '<ol><li>Inner one</li><li>Inner two</li></ol></li>'
+            '<li>Beta</li></ol></article>')
+        snapshot = self.base / 'object.html'
+        snapshot.write_text(raw)
+        md, corrs, unresolved, fidelity, _ = latexml.adapt_latexml_snapshot(
+            raw, None, [], str(self.base))
+        self.assertEqual(unresolved, [])
+        self.assertEqual(md.splitlines()[0], '# T')
+        self.assertIn('出版注甲 出版注乙', md)
+        self.assertIn('[IMG: images/chart.svg]', md)
+        self.assertIn('3. Alpha', md)
+        self.assertLess(md.index('1. Inner one'), md.index('2. Inner two'))
+        self.assertLess(md.index('2. Inner two'), md.index('4. Beta'))
+        image = next(c for c in corrs if c['content_type'] == 'image')
+        self.assertEqual(image['conversion']['source_ref'], 'chart.svg')
+        self.assertEqual(image['conversion']['source_id'], 'figure-object')
+        self.assertEqual(fidelity.image_display[0]['value'], 100)
+        payload = {
+            'version': 1, 'format': 'latexml',
+            'snapshot': {'path': str(snapshot), 'sha256': latexml.sha256_text(raw)},
+            'paper_identity': {**IDENTITY, 'actual_title': 'T', 'expected_title': 'T'},
+            'decisions': [], 'correspondences': corrs, 'unresolved': unresolved,
+        }
+        self.assertEqual(reconcile_latexml_to_markdown(raw, md, None, payload), [])
+        for damaged in (md.replace('2. Inner two', ''), md.replace('3. Alpha', '8. Alpha')):
+            self.assertTrue(reconcile_latexml_to_markdown(raw, damaged, None, payload))
+
     def test_disambiguated_targets(self):
         _raw, md, payload, = self._payload()
         self.assertIn('[IMG: images/images--dup.png]', md)
@@ -113,6 +153,108 @@ class SameNameResourcesTest(_ResourceDirs):
                          'images/images--dup.png')
         self.assertEqual(images['img[2]']['conversion']['reference'],
                          'images/assets--dup.png')
+
+    def _parse_ordered_list(self, raw):
+        from translator_test_support import SCRIPTS
+
+        snapshot = self.base / 'enumerate.html'
+        snapshot.write_text(raw)
+        basis = self.base / 'input.json'
+        basis.write_text(json.dumps({
+            'version': 1, 'format': 'latexml',
+            'snapshot': {'path': str(snapshot), 'sha256': latexml.sha256_text(raw)},
+            'paper_identity': IDENTITY, 'decisions': [],
+        }))
+        output = self.base / 'source.md'
+        adaptation = self.base / 'adaptation.json'
+        run = subprocess.run([
+            sys.executable, str(SCRIPTS / 'parse_reference_html.py'),
+            str(snapshot), str(output), '--source-adaptation', str(basis),
+            '--adaptation-output', str(adaptation),
+        ], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return output.read_text(), json.loads(adaptation.read_text())
+
+    def test_ordered_list_preserves_image_order_and_ownership(self):
+        from latexml_test_support import replace_current
+
+        (self.base / 'chart.svg').write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="60"/>')
+        raw = (
+            '<article class="ltx_document"><h1>T05 Fixture</h1>'
+            '<ol class="ltx_enumerate" start="3"><li>Before'
+            '<img src="images/dup.png"/>After'
+            '<ol><li><object type="image/svg+xml" data="chart.svg" id="chart"'
+            ' width="100" height="60"></object></li></ol>Tail</li>'
+            '<li><img src="assets/dup.png"/>Next</li></ol></article>')
+        md, payload = self._parse_ordered_list(raw)
+        refs = ['images/images--dup.png', 'images/chart.svg', 'images/assets--dup.png']
+        markers = ['[IMG: %s]' % ref for ref in refs]
+        images = [c for c in payload['correspondences']
+                  if c['content_type'] == 'image']
+        self.assertEqual([c['conversion']['reference'] for c in images], refs)
+        self.assertEqual(images[1]['conversion']['source_id'], 'chart')
+        self.assertEqual(images[1]['conversion']['width'], '100')
+
+        readable = md
+        for marker, ref in zip(markers, refs):
+            readable = readable.replace(marker, '![](%s)' % ref)
+        dom = BeautifulSoup(MarkdownIt().render(readable), 'html.parser')
+        outer = dom.ol
+        self.assertEqual(outer['start'], '3')
+        first, second = outer.find_all('li', recursive=False)
+        self.assertEqual([part.get_text(strip=True) or part.name for part in first.children
+                          if part.name], ['Before', 'p', 'After', 'ol', 'Tail'])
+        self.assertEqual(first.ol.li.img['src'], refs[1])
+        self.assertEqual(second.img['src'], refs[2])
+        self.assertEqual(second.get_text(strip=True), 'Next')
+
+        for original, replacement, problem in (
+                ('   ' + markers[0] + '\n', '', '正文流'),
+                ('      ' + markers[1], '   ' + markers[1], '图片 object[1] 的列表嵌套不符'),
+                ('\n   ' + markers[2], '\n\n   ' + markers[2], '首块被空行移出列表')):
+            with self.subTest(problem=problem):
+                damaged, current = replace_current(md, payload, original, replacement)
+                diffs = reconcile_latexml_to_markdown(raw, damaged, None, current)
+                self.assertTrue(any(problem in diff for diff in diffs), diffs)
+
+    def test_ordered_list_preserves_figure_caption_roles(self):
+        from latexml_test_support import replace_current
+
+        formula = '\\[\n  x+y\n\\]'
+        raw = (
+            '<article class="ltx_document"><h1>T05 Fixture</h1>'
+            '<ol class="ltx_enumerate" start="3"><li>Before'
+            '<figure id="F1"><img src="images/dup.png" width="20"/>'
+            f'<div><figure id="F1a"><p>{formula}</p>'
+            '<img src="assets/dup.png" width="30"/>'
+            '<figcaption>Panel $x$.</figcaption></figure></div>'
+            '<figcaption>Figure 1: Caption.</figcaption></figure>After</li>'
+            '<li>Next</li></ol></article>')
+        md, payload = self._parse_ordered_list(raw)
+        self.assertIn('\n   ' + formula + '\n', md)
+        self.assertIn('   [FIGURE] Panel $x$.\n\n   [FIGURE] Figure 1: Caption.\n\n   After', md)
+        roles = [(c['content_type'], c['node'], c['figure'], c['subfigure'])
+                 for c in payload['correspondences']
+                 if c['content_type'] in ('image', 'figure-caption')]
+        self.assertEqual(roles, [
+            ('image', 'img[1]', 'figure[1]', None),
+            ('image', 'img[2]', 'figure[1]', 1),
+            ('figure-caption', 'figcaption[1]', 'figure[1]', 1),
+            ('figure-caption', 'figcaption[2]', 'figure[1]', None),
+        ])
+        prefix = '   [FIGURE] Figure 1'
+        damaged, current = replace_current(md, payload, prefix, prefix.lstrip())
+        diffs = reconcile_latexml_to_markdown(raw, damaged, None, current)
+        self.assertTrue(any('图题 figcaption[2] 的列表嵌套不符' in diff
+                            for diff in diffs), diffs)
+        wrong_owner = copy.deepcopy(payload)
+        caption = next(c for c in wrong_owner['correspondences']
+                       if c['node'] == 'figcaption[1]')
+        caption['subfigure'] = None
+        diffs = reconcile_latexml_to_markdown(raw, md, None, wrong_owner)
+        self.assertTrue(any('图题 figcaption[1] subfigure 归属不符' in diff
+                            for diff in diffs), diffs)
 
     def test_roundtrip_clean(self):
         raw, md, payload = self._payload()

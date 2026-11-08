@@ -129,14 +129,14 @@ def _candidate_check_failures(candidate_text, source_text, out_dir,
                                  '源文', label):
         fails.append('标题核对: %s' % diff)
     scan_context = None
-    code_src,code_doc=source_text,candidate_text
+    block_src, block_doc = source_text, candidate_text
     if pdf_view:
         import _pdf_math
         scan_context=_pdf_math.context(pdf_view['checklist'])
-        code_src=_pdf_math.footnote_view(source_text,scan_context)[0]
-        code_doc=_pdf_math.footnote_view(candidate_text,scan_context)[0]
-    src_fences = scan_code_fences(code_src)
-    doc_fences = scan_code_fences(code_doc)
+        block_src = _pdf_math.footnote_view(source_text, scan_context)[0]
+        block_doc = _pdf_math.footnote_view(candidate_text, scan_context)[0]
+    src_fences = scan_code_fences(block_src)
+    doc_fences = scan_code_fences(block_doc)
     if not doc_fences.balanced:
         fails.append('代码围栏不成对: 第 %d 行开启的代码块未闭合'
                      % doc_fences.unclosed_line)
@@ -185,8 +185,8 @@ def _candidate_check_failures(candidate_text, source_text, out_dir,
         fails.extend(math_issue_fails(src_scan.issues, '源文'))
         fails.extend(math_issue_fails(doc_scan.issues, label))
     from _source_reconcile import compare_translation_tables, table_code_problems
-    fails.extend(table_code_problems(candidate_text, source_context=scan_context))
-    fails.extend(compare_translation_tables(source_text, candidate_text,
+    fails.extend(table_code_problems(block_doc, source_context=scan_context))
+    fails.extend(compare_translation_tables(block_src, block_doc,
                                             source_context=scan_context, header_cells=header_cells))
     fn_diffs, _ = ([],[]) if pdf_view else footnote_diffs(source_text, candidate_text, '源文', label)
     fails.extend(fn_diffs)

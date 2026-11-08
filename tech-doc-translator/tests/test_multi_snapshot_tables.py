@@ -82,6 +82,20 @@ class MultiSnapshotTables(unittest.TestCase):
             self.assertEqual(len(fidelity.table_conversions),1)
             self.assertEqual(fidelity.table_conversions[0]['locate'],{'table':1})
 
+    def test_simple_tables_count_in_mapping(self):
+        from parse_reference_html import inspect_reference
+
+        for name in ('a', 'b'):
+            snapshot = self.root / (name + '.html')
+            raw = snapshot.read_text().replace(
+                '<table id="shared">', '<table><tr><th>S</th></tr></table><table id="shared">')
+            snapshot.write_text(raw)
+            candidate = inspect_reference(str(snapshot))
+            mapping, = candidate['table_conversions']['tables']
+            self.assertEqual(mapping['locate']['table'], 2)
+            self.assertEqual({target['table'] for cell in mapping['cells']
+                              for target in cell['targets']}, {2})
+
     def test_single_legacy_and_both_levels_same_map(self):
         record=copy.deepcopy(self.record)
         record['sources'][0].update(parsed_markdown='a.md',table_conversions='a.json')

@@ -46,8 +46,10 @@ import tempfile
 from _html_fidelity import (
     DISPLAY_MAP_VERSION,
     HtmlFidelity,
+    image_object_ref,
     resolve_snapshot_resource,
     shaped_display_entries,
+    snapshot_image_tags,
     warn_if_temp_output,
 )
 from _image_binding import (
@@ -186,7 +188,7 @@ def _snapshot_display_entries(raw, family, section_id, snapshot_dir):
                 or soup.find('body'))
     if root is None:
         raise RebuildError('快照缺少 article/main/body 根元素')
-    for img in root.find_all('img'):
+    for img in root.find_all(snapshot_image_tags(soup, family)):
         if family == 'api':
             cls = ' '.join(img.get('class') or [])
             if 'only-dark' in cls or (img.get('data-dark')
@@ -194,7 +196,7 @@ def _snapshot_display_entries(raw, family, section_id, snapshot_dir):
                 continue
             src = img.get('data-light') or img.get('src', '')
         else:
-            src = img.get('src', '')
+            src = img.get('src') or image_object_ref(img)
         if not src:
             continue
         source_ref = src
@@ -600,12 +602,12 @@ def _checked_map_items(payload, map_path, protected_paths=None):
             fidelity, soup, snapshot_digest = snapshots[snapshot]
             if snapshot_digest != source['snapshot_sha256']:
                 raise RebuildError('%s: 来源快照摘要不符' % snapshot)
-            node = re.fullmatch(r'img\[(\d+)\]', source['node'])
-            images = soup.find_all('img')
-            if node is None or int(node[1]) >= len(images):
+            node = re.fullmatch(r'(img|object)\[(\d+)\]', source['node'])
+            images = soup.find_all(node[1]) if node else []
+            if node is None or int(node[2]) >= len(images):
                 raise RebuildError('%s: 来源节点不存在 %s' % (snapshot, source['node']))
-            img = images[int(node[1])]
-            source_ref = img.get('data-light') or img.get('src') or ''
+            img = images[int(node[2])]
+            source_ref = img.get('data-light') or img.get('src') or image_object_ref(img)
             source_path = _snapshot_source_path(resource_base, source_ref)
             source_files, delivered_files = {}, {}
             digest = resource_identity_digest(source_path, _memo=source_files)
