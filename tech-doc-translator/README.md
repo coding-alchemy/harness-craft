@@ -29,7 +29,7 @@ python3 <SKILL目录>/scripts/export_pdf.py --output <候选.pdf> --work-dir <�
 python3 <SKILL目录>/scripts/verify_pdf.py --pdf <候选.pdf> --work-dir <同一临时目录> <章节1.md> ...
 ```
 
-PDF 导出的模式路由、离线约束与完成合同见 [references/pdf_export.md](./skills/tech-doc-translator/references/pdf_export.md)：机器检查通过只表示机器层通过，发布前必须完成全部页面视觉复核；指向未纳入范围的本地文档链接须由用户确认处置。
+PDF 导出的模式、离线约束及完成合同见 [PDF 导出与核验](./skills/tech-doc-translator/references/pdf_export.md)。正式交付按[单记录示例](./skills/tech-doc-translator/references/workflow_helpers.md#单记录翻译与-pdf-交付)固定持久报告，准备复核候选，并完成全页目检或符合条件的显式视觉复用。指向未纳入范围的本地文档链接按完成合同处置。
 
 离线回归入口：
 
@@ -39,6 +39,7 @@ bash tech-doc-translator/tests/run_single_page.sh   # 其余：run_*.sh 共七�
 
 当前权威文档：
 
+- [论文翻译流程去重与稳定性优化需求](./specs/2026-11-07-paper-workflow-optimization-requirements.md)及[设计](./specs/2026-11-07-paper-workflow-optimization-design.md)
 - [CUDA/Sphinx翻译实践优化需求](./specs/2026-10-23-cuda-practice-optimization-requirements.md)及[设计](./specs/2026-10-23-cuda-practice-optimization-design.md)，包含最终角色门禁、修订验收与已知限制
 - [论文翻译保真与交付需求](./specs/2026-10-02-paper-practice-requirements.md)及[设计](./specs/2026-10-02-paper-practice-design.md)，统一一至五期的现行合同
 - [NVIDIA 术语库](./skills/tech-doc-translator/references/glossaries/nvidia.md)，作为需要由项目显式选择的默认口径

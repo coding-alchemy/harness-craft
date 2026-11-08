@@ -110,8 +110,9 @@ def _load_block_map(path, md_path):
     if not isinstance(payload, dict) \
             or payload.get("version") != CHECKLIST_VERSION \
             or not isinstance(payload.get("blocks"), list):
-        fail("块区间映射版本/结构无效: %s（需 version=%d 与 blocks 数组）"
-             % (path, CHECKLIST_VERSION))
+        version = payload.get("version") if isinstance(payload, dict) else type(payload).__name__
+        fail("块区间映射版本/结构无效: %s（映射=%r，需 version=%d 与 blocks 数组；解释器=%s）"
+             % (path, version, CHECKLIST_VERSION, sys.executable))
     return payload["blocks"]
 
 
@@ -583,7 +584,18 @@ def parse_args(argv):
 
 
 def main(argv=None):
+    from verify_delivery import new_run_context, progress_stage, stderr_progress
+
     args = build_parser().parse_args(argv)
+    run_context = new_run_context(stderr_progress)
+    with progress_stage(run_context, "verify_pdf_source", args.pdf) as fail_stage:
+        result = _verify_cli(args)
+        if result:
+            fail_stage()
+    return result
+
+
+def _verify_cli(args):
     if not os.path.isfile(args.pdf):
         fail("PDF 源不存在: %s" % args.pdf)
     if not os.path.isfile(args.source_md):

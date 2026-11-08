@@ -20,6 +20,7 @@ import unittest
 import uuid
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 from translator_test_support import SCRIPTS, sha
 
@@ -732,6 +733,104 @@ class CheckFactsUnitTest(unittest.TestCase):
                           '--image-map', 'docs/imgmap.json']},
             ],
         }
+
+    def test_run_context_reuse_and_drift(self):
+        snapshot = self.root / 'docs/page.html'
+        snapshot.write_text('<html><body><article><h1>T</h1><p>Text.</p>'
+                            '</article></body></html>')
+        (self.root / 'docs/src.md').write_text('# T\n\nText.\n')
+        record = {
+            'version': 1, 'mode': 'translation',
+            'inputs': ['parsed.md'], 'outputs': [],
+            'sources': [{
+                'family': 'single', 'source_version': 'fixture',
+                'parsed_markdown': 'docs/src.md', 'covers': ['parsed.md'],
+                'snapshots': [{'snapshot': 'docs/page.html', 'section_id': None}],
+            }],
+            'checks': [{'tool': 'verify_translation',
+                        'args': ['parsed.md', 'docs/src.md']}],
+            'reviews': [],
+        }
+        entries, identity, input_checks, pdf_checks = delivery_contexts(
+            self.root, record)
+        target = record['inputs'][0]
+        for kind in ('source-reconcile', 'semantic'):
+            record['reviews'].append({
+                'kind': kind, 'target': target, 'status': 'closed',
+                'note': '当前输入实际复核', 'sha256': identity['inputs'][target],
+                'binding': expected_binding(
+                    kind, target, self.root, record,
+                    (entries, identity, input_checks, pdf_checks))})
+
+        record['mode'] = 'translation+pdf'
+        record['outputs'] = [{'path': 'book.pdf'}]
+        record['checks'].append({
+            'tool': 'verify_pdf',
+            'args': ['--pdf', 'book.pdf', '--work-dir', 'work', target],
+        })
+        copies = {'original_review': ('record', 'old-record.json'),
+                  'old_pdf': ('path', 'old.pdf'),
+                  'old_report': ('path', 'old-report.json')}
+        reuse = {}
+        for name, (key, filename) in copies.items():
+            path = self.root / filename
+            path.write_bytes(b'historical evidence')
+            reuse[name] = {key: filename, 'sha256': sha(path)}
+        record['reviews'].append({
+            'kind': 'visual', 'status': 'reused', 'target': 'book.pdf', 'reuse': reuse,
+        })
+        baseline = delivery_verifier.compute_delivery_identity(self.root, record, entries)
+        self.assertEqual(baseline['visual_reuse'], {
+            str((self.root / filename).resolve()): reuse[name]['sha256']
+            for name, (_key, filename) in copies.items()})
+
+        context = delivery_verifier.new_run_context()
+        import verify_pdf
+        with patch.object(delivery_verifier, 'run_source_reconcile',
+                          wraps=delivery_verifier.run_source_reconcile) as source, \
+                patch.object(subprocess, 'run', wraps=subprocess.run) as cli, \
+                patch.object(verify_pdf, 'run_verification', return_value=(
+                    True, {'management_exclusions': [{'input': str(self.root / target)}]})):
+            problems = []
+            delivery_verifier._rerun_checks(
+                self.root, record, problems, run_context=context, baseline=baseline)
+            self.assertEqual(problems, [])
+            for _ in range(2):
+                ready, report = delivery_verifier.check_translation_readiness(
+                    self.root, record, [str(self.root / target)], run_context=context)
+                self.assertTrue(ready, report)
+            self.assertEqual(source.call_count, 1)
+            checks = [call for call in cli.call_args_list
+                      if str(SCRIPTS / 'verify_translation.py') in call.args[0]]
+            self.assertEqual(len(checks), 1)
+            snapshot.write_text(snapshot.read_text().replace(
+                '<p>Text.</p>', '<p>Changed source.</p>'))
+            changed_ready, changed = delivery_verifier.check_translation_readiness(
+                self.root, record, [str(self.root / target)], run_context=context)
+            self.assertFalse(changed_ready, changed)
+            self.assertEqual(source.call_count, 2)
+
+    def test_pdf_check_facts_inherit_relative_adaptation_identity(self):
+        from latexml_test_support import IDENTITY, adapt_fixture
+
+        snapshot = self.root / 'docs/paper.html'
+        snapshot.write_text('<article class="ltx_document"><h1>T</h1><p>Text.</p></article>')
+        _, _, payload, _ = adapt_fixture(snapshot, IDENTITY)
+        basis = self.root / 'docs/paper.json'
+        basis.write_text(json.dumps(payload))
+        digest = sha(basis)
+        report = self.root / 'work/export_report.json'
+        report.write_text(json.dumps({'source_adaptation': {'path': 'docs/paper.json', 'sha256': digest}}))
+        args = self.record['checks'][0]['args']
+        facts, parsed = delivery_verifier._check_facts(str(self.root), 'verify_pdf', args, 1)
+        expected_path = str(basis.resolve())
+        self.assertEqual(facts['files']['source_adaptation'], [expected_path, digest])
+        self.assertEqual(parsed.source_adaptation, [expected_path])
+        basis.write_text(basis.read_text()+'\n')
+        problems = []
+        self.assertEqual((None, None), delivery_verifier._check_facts(
+            str(self.root), 'verify_pdf', args, 1, problems))
+        self.assertTrue(any('摘要漂移' in problem for problem in problems))
 
     def identity(self, record=None):
         return delivery_verifier.compute_delivery_identity(
@@ -2687,7 +2786,19 @@ class DeliveryEvidenceTest(unittest.TestCase):
             [sys.executable, str(SCRIPTS / 'verify_delivery.py'),
              '--record', self.write_record(record),
              '--evidence-dir', str(self.evidence)],
-            capture_output=True, text=True)
+            capture_output=True, text=True, timeout=60)
+
+    def test_stage_progress_streams(self):
+        result = self.run_delivery(base_record(self.root, self.pdf))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '交付检查通过：证据索引 %s\n' %
+                         (self.evidence / 'delivery_index.json'))
+        for stage in ('source-reconcile', 'verify_translation', 'verify_pdf',
+                      'reviews', 'publish'):
+            self.assertIn('start %s' % stage, result.stderr)
+            self.assertIn('end %s' % stage, result.stderr)
+        self.assertLess(result.stderr.index('end verify_translation'),
+                        result.stderr.index('start verify_pdf'))
 
     def test_compliant_delivery_publishes_batch_index(self):
         result = self.run_delivery(base_record(self.root, self.pdf))
@@ -2721,6 +2832,70 @@ class DeliveryEvidenceTest(unittest.TestCase):
                 self.assertTrue((self.evidence / rel).is_file(), rel)
         self.assertEqual(sha(self.root / 'book.pdf'),
                          index['outputs'][0]['sha256'])
+
+    def persistent_report_record(self):
+        current = self.evidence / 'current-export'
+        current.mkdir(parents=True)
+        original = self.root / 'work' / exporter.REPORT_NAME
+        report = current / exporter.REPORT_NAME
+        with report.open('xb') as output:
+            output.write(original.read_bytes())
+        self.assertEqual(sha(report), sha(original))
+
+        def select_persistent_report(checks):
+            args = checks[0]['args']
+            args[args.index('--work-dir') + 1] = str(current)
+
+        return report, base_record(self.root, self.pdf,
+                                   check_mutator=select_persistent_report)
+
+    def test_persistent_report_survives_temp_cleanup(self):
+        report, record = self.persistent_report_record()
+        original = report.read_bytes()
+        self.assertEqual(self.run_delivery(record).returncode, 0)
+        index = json.loads((self.evidence / 'delivery_index.json').read_bytes())
+        archived = self.evidence / index['checks'][0]['export_report']
+        self.assertEqual(archived.read_bytes(), original)
+        before = delivery_contexts(self.root, record)[1]
+        paths = (self.pdf, self.root / '01_章.md', self.base / 'record.json')
+        protected = {path: sha(path) for path in paths}
+
+        shutil.rmtree(self.root / 'work')
+        direct = subprocess.run(
+            [sys.executable, str(SCRIPTS / 'verify_pdf.py'), *record['checks'][0]['args']],
+            cwd=self.root, capture_output=True, text=True, timeout=60)
+        self.assertEqual(direct.returncode, 0, direct.stdout + direct.stderr)
+        result = self.run_delivery(record)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(delivery_contexts(self.root, record)[1], before)
+        self.assertEqual({path: sha(path) for path in paths}, protected)
+        self.assertEqual(report.read_bytes(), original)
+        self.assertEqual(archived.read_bytes(), original)
+
+    def test_report_change_invalidates_without_rebinding(self):
+        report, record = self.persistent_report_record()
+        result = self.run_delivery(record)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        index_path = self.evidence / 'delivery_index.json'
+        initial_index = json.loads(index_path.read_bytes())
+        original = report.read_bytes()
+        work = self.root / 'work'
+        page = work / 'unrelated-page.png'
+        page.write_bytes(b'unrelated rendering')
+        page.unlink()
+        result = self.run_delivery(record)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        index = index_path.read_bytes()
+        self.assertEqual(json.loads(index)['identity'], initial_index['identity'])
+
+        report.write_bytes(original + b' ')
+        result = self.run_delivery(record)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('binding', result.stderr)
+        self.assertEqual(index_path.read_bytes(), index)
+        for published in (initial_index, json.loads(index)):
+            archived = self.evidence / published['checks'][0]['export_report']
+            self.assertEqual(archived.read_bytes(), original)
 
     def test_source_chain_preflight_rejections(self):
         """源链预检负例：缺快照、选区不存在、版本错配、有图缺两级映射。"""

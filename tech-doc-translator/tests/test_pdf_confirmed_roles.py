@@ -9,10 +9,37 @@ import unittest
 from pdf_test_support import (
     original, fact_digest, pdf_project_context, SCRIPTS, HAVE_PYMUPDF, pymupdf,
 )
+from test_pdf_confirmed_structure import joined_origin
 
 
 @unittest.skipUnless(HAVE_PYMUPDF, 'PyMuPDF 不可用')
 class ConfirmedPdfRoleTests(unittest.TestCase):
+    def test_literal_brackets_and_multiline_title(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from _pdf_math import markdown_blocks, render_content
+        from _verification import scan_math
+
+        with pymupdf.open() as doc:
+            page = doc.new_page()
+            page.insert_text((50, 70), 'Two physical lines\nof the same title')
+            page.insert_text((50, 130), 'Plain citations [7, 15, 19] in prose.')
+            heading = {'type': 'heading', 'content': [
+                {'type': 'text', 'origin': joined_origin([
+                    original(page, 'Two physical lines'), original(page, 'of the same title')])},
+            ]}
+            paragraph = {'type': 'paragraph', 'content': [
+                {'type': 'text', 'origin': original(page, 'Plain citations [7, 15, 19] in prose.')},
+            ]}
+        title, title_maths = render_content(heading)
+        prose, prose_maths = render_content(paragraph)
+        self.assertEqual(([], []), (title_maths, prose_maths))
+        scan = scan_math(prose)
+        self.assertFalse(scan.issues)
+        self.assertFalse(scan.spans)
+        blocks, _ = markdown_blocks('# ' + title + '\n', None)
+        self.assertEqual(['heading'], [b['role'] for b in blocks])
+        self.assertEqual('Two physical lines of the same title', title)
+
     def test_math_heading_preserves_original_title_level_and_exact_expression(self):
         for prefix in ('Math title ', ''):
             with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as tmp:
@@ -153,6 +180,14 @@ class ConfirmedPdfRoleTests(unittest.TestCase):
                     ('verify_translation.py',target,source,'--project-context',context)]
             for args in checks:
                 q=run(*args);self.assertEqual(0,q.returncode,q.stdout+q.stderr)
+            title, rest = body.split('\n\n', 1)
+            fields = '> **来源**：[PDF](https://example.org/source) `原稿`\n> **抓取日期**：2026-11-08'
+            target.write_text(title+'\n\n'+fields+'\n\n'+rest)
+            for args in checks:
+                q=run(*args);self.assertEqual(0,q.returncode,q.stdout+q.stderr)
+            target.write_text(body+'\n'+fields+'\n')
+            for args in checks:
+                q=run(*args);self.assertNotEqual(0,q.returncode,q.stdout+q.stderr)
             for damage in [body.replace('a  `b`','a `b`'),body.replace('example.org/second','other.org/second'),body.replace('example.org','other.org'),
                            body.replace('Second link: [docs2](<https://example.org/second>).','Second link: .\n\n[docs2](<https://example.org/second>)'),
                            body.replace('[docs]','[]'),body.replace('`` a  `b` ``','a  \\`b\\`')]:

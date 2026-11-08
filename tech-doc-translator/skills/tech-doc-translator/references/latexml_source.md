@@ -16,7 +16,42 @@
 - 未解决项（无 TeX 等）非空即阻断分派与完整交付：主 Agent 回源补齐或裁决
   后重跑解析；不猜写、不丢弃、不留内部占位符。
 
+首次勘察后，以下对象可作为正式解析的 `--source-adaptation` 输入。把
+`--inspect-output` 的 `snapshot` 对象原样填入，身份字段填写本次独立确认
+的实际值。存在裁决时填写 `decisions`，解析器重建本次对应与未解决项。
+
+```json
+{
+  "version": 1,
+  "format": "latexml",
+  "paper_identity": {
+    "expected_title": "<任务指定的论文题名>",
+    "actual_title": "<快照核对的题名>",
+    "paper_id": "<论文标识>",
+    "version": "<实际版本>",
+    "final_url": "<实际最终来源 URL>",
+    "retrieved_at": "<已知取得时间或其可核对来源>",
+    "confirmation": "<用于确认身份与版本的实际证据>"
+  },
+  "snapshot": {"path": "<本次勘察快照路径>", "sha256": "<本次勘察快照摘要>"},
+  "decisions": [],
+  "correspondences": [],
+  "unresolved": []
+}
+```
+
 ## 2. 适配与独立对账
+
+- 有明确图像类型和资源引用的 `object` 与普通图片走同一资源及显示尺寸合同，独立核对原 ID、宽高和实际引用。保留有序列表的原起始编号与嵌套。题名内出版注单独成段，原题中确有的公式和链接留在题名内。普通软换行沿用现有段落口径，同段跨行 TeX 和相邻公式逐次保护。
+
+准备译写前可在库外生成只读候选：
+
+```bash
+python3 "$SCRIPTS/parse_reference_html.py" "$SNAPSHOT" "$SECTION" \
+  --inspect-output "$INSPECTION" --source-adaptation "$BASIS"
+```
+
+全篇可省略 `"$SECTION"`，首次勘察可省略已有依据。检查候选的资源基点、未解决项、原 ID 与表格草稿。按真实宿主将段落锚点行内附着，单元格锚点放在格内，图表与文献锚点放在对应对象。保留参考文献各次回链和同年字母后缀。复杂表草稿的表序包含简单数据表；跨度和分组须回源确认。确认后将所选映射写入已有依据的 `table_conversions`，再用正文位置参数和 `--adaptation-output` 走正式解析与独立对账。
 
 - 适配器在原节点上直接转换：MathML `alttext` 逐字取 TeX（实体解码一次；
   含边界空白与换行，不裁剪），行内/展示类型保持；无 `alttext`/类型冲突

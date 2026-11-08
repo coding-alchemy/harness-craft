@@ -1,18 +1,59 @@
 """字符建议保持证据层级，不能自动改写原提取视图。"""
 import json
+from copy import deepcopy
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from pdf_test_support import HAVE_PYMUPDF, pymupdf
+from pdf_test_support import HAVE_PYMUPDF, original, pymupdf
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills/tech-doc-translator/scripts'
 
 
 @unittest.skipUnless(HAVE_PYMUPDF, 'PyMuPDF 不可用')
 class CharacterCandidateTests(unittest.TestCase):
+    def test_runin_coverage_and_duplicate_occurrences(self):
+        sys.path.insert(0, str(SCRIPTS))
+        from _pdf_math import validate
+
+        with pymupdf.open() as doc:
+            page = doc.new_page()
+            page.insert_text((50, 70), 'Related Work. Body begins here.')
+            page.insert_text((50, 100), 'First [8].')
+            page.insert_text((50, 130), 'Second [8].')
+            title = original(page, 'Related Work.')
+            body = original(page, 'Body begins here.')
+            first = original(page, 'First [8].')
+            second = original(page, 'Second [8].')
+            blocks = [
+                {'id': 'title', 'type': 'heading', 'level': 2, 'page': 1,
+                 'rect': title['rect'], 'order': 1, 'content': [{'type': 'text', 'origin': title}]},
+                {'id': 'body', 'type': 'paragraph', 'page': 1,
+                 'rect': body['rect'], 'order': 2, 'content': [{'type': 'text', 'origin': body}]},
+                {'id': 'repeats', 'type': 'paragraph', 'page': 1,
+                 'rect': [45, 85, 170, 135], 'order': 3,
+                 'content': [{'type': 'text', 'origin': value} for value in (first, second)]},
+            ]
+            checklist = {'source': {'sha256': 'fixture'}, 'scope': [1], 'blocks': blocks,
+                         'formula_review': {'basis': 'confirmed run-in and citations',
+                                            'source_sha256': 'fixture', 'scope': [1]}}
+            self.assertIsNone(validate(checklist, doc))
+            for damage, diagnostic in [('remove', '遗漏.*repeats'), ('duplicate', '重复'),
+                                       ('wrong_owner', '宿主')]:
+                damaged = deepcopy(checklist)
+                changed = damaged['blocks'][2]['content']
+                if damage == 'remove':
+                    changed.pop()
+                elif damage == 'duplicate':
+                    changed[1]['origin'] = first
+                else:
+                    changed[1]['origin'] = title
+                    damaged['blocks'][0]['content'].clear()
+                with self.subTest(damage=damage), self.assertRaisesRegex(ValueError, diagnostic):
+                    validate(damaged, doc)
+
     def test_saved_rotations_keep_link_text_and_target_at_same_occurrence(self):
         source = 'https://one.test/fx fuser.html'
         target = 'https://one.test/fx_fuser.html'

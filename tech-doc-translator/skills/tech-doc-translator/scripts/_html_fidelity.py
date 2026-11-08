@@ -295,10 +295,23 @@ def _img_node(soup, img):
     消费端 _source_reconcile 以 id() 对象身份编号，两端命名空间语义
     必须一致。img 不属于该 soup 时显式报错，不静默降级。
     """
-    for index, candidate in enumerate(soup.find_all('img')):
+    for index, candidate in enumerate(soup.find_all(img.name)):
         if candidate is img:
-            return 'img[%d]' % index
+            return '%s[%d]' % (img.name, index)
     raise ValueError('img 节点不属于给定 soup，无法定位源节点')
+
+
+def image_object_ref(node):
+    """只有带明确图像 MIME 和 data 引用的 object 才是图片。"""
+    if node.name == 'object' and (node.get('type') or '').lower().startswith('image/'):
+        return (node.get('data') or '').strip()
+    return ''
+
+
+def snapshot_image_tags(soup, family):
+    if family == 'reference' and soup.find(class_='ltx_document'):
+        return ('img', 'object')
+    return ('img',)
 
 
 def image_display_width(img, soup, snapshot_dir=None):
@@ -341,7 +354,7 @@ def image_display_width(img, soup, snapshot_dir=None):
              'source_node': node},
             img, snapshot_dir, node)
 
-    src = img.get('data-light') or img.get('src') or ''
+    src = img.get('data-light') or img.get('src') or image_object_ref(img)
     derived_entry = _derived_width_from_height(img, src, snapshot_dir, node)
     if derived_entry is not None:
         return derived_entry
@@ -350,7 +363,7 @@ def image_display_width(img, soup, snapshot_dir=None):
 
 def _attach_resource_identity(entry, img, snapshot_dir, node):
     """确定尺寸条目补充独立来源资源身份（A28：解析后换图必被绑定拒绝）。"""
-    src = img.get('data-light') or img.get('src') or ''
+    src = img.get('data-light') or img.get('src') or image_object_ref(img)
     if snapshot_dir is None:
         return entry
     path, reason = resolve_snapshot_resource(src, snapshot_dir)
@@ -621,6 +634,51 @@ def warn_if_temp_output(paths):
         for path, real in hit:
             print('  %s -> %s' % (path, real), file=sys.stderr)
     return bool(hit)
+
+
+def table_grid_cells(tag, ordinal):
+    """按原 DOM 顺序定位格与覆盖坐标，不渲染或决定格内容。"""
+    if tag.find('table') is not None:
+        raise TableStructureError('表 #%d 含嵌套表，不能网格展开' % ordinal)
+    rows = [row for row in tag.find_all('tr') if row.find_parent('table') is tag]
+    if not rows:
+        raise TableStructureError('表 #%d 没有实际行' % ordinal)
+    occupied = set()
+    layout = []
+    for row_no, row in enumerate(rows, 1):
+        column = 1
+        cells = [cell for cell in row.find_all(['th', 'td'])
+                 if cell.find_parent('tr') is row]
+        for dom_col, cell in enumerate(cells, 1):
+            while (row_no, column) in occupied:
+                column += 1
+            spans = []
+            for attr in ('rowspan', 'colspan'):
+                raw = cell.get(attr, '1')
+                if not re.fullmatch(r'[1-9]\d*', str(raw).strip()):
+                    raise TableStructureError('表 #%d r=%d c=%d %s=%r 无法解释'
+                                              % (ordinal, row_no, dom_col, attr, raw))
+                spans.append(int(str(raw).strip()))
+            rowspan, colspan = spans
+            if row_no + rowspan - 1 > len(rows):
+                raise TableStructureError('表 #%d r=%d c=%d rowspan 越界'
+                                          % (ordinal, row_no, dom_col))
+            targets = []
+            for r in range(row_no, row_no + rowspan):
+                for c in range(column, column + colspan):
+                    if (r, c) in occupied:
+                        raise TableStructureError('表 #%d r=%d c=%d 覆盖冲突'
+                                                  % (ordinal, r, c))
+                    occupied.add((r, c))
+                    targets.append({'table': ordinal, 'row': r, 'col': c})
+            layout.append((cell, {'row': row_no, 'col': dom_col,
+                                  'rowspan': rowspan, 'colspan': colspan,
+                                  'targets': targets}))
+            column += colspan
+    width = max((column for _row, column in occupied), default=0)
+    if width == 0:
+        raise TableStructureError('表 #%d 没有实际单元格' % ordinal)
+    return len(rows), width, layout
 
 
 class HtmlFidelity:
@@ -1248,60 +1306,30 @@ class HtmlFidelity:
     def grid_table_block(self, tag):
         """显式 v2 网格：源 DOM 格坐标与覆盖坐标分开，代码只登记原点。"""
         ordinal = len(self.table_conversions) + 1
-        if tag.find('table') is not None:
-            raise TableStructureError('表 #%d 含嵌套表，不能网格展开' % ordinal)
-        rows = [r for r in tag.find_all('tr') if r.find_parent('table') is tag]
-        if not rows:
-            raise TableStructureError('表 #%d 没有实际行' % ordinal)
+        row_count, width, layout = table_grid_cells(tag, ordinal)
         grid, image_cells, mappings, codes = {}, {}, [], []
-        for row_no, row in enumerate(rows, 1):
-            column = 1
-            cells = [c for c in row.find_all(['th', 'td']) if c.find_parent('tr') is row]
-            for dom_col, cell in enumerate(cells, 1):
-                while (row_no, column) in grid:
-                    column += 1
-                spans = []
-                for attr in ('rowspan', 'colspan'):
-                    raw = cell.get(attr, '1')
-                    if not re.fullmatch(r'[1-9]\d*', str(raw).strip()):
-                        raise TableStructureError('表 #%d r=%d c=%d %s=%r 无法解释'
-                                                  % (ordinal, row_no, dom_col, attr, raw))
-                    spans.append(int(str(raw).strip()))
-                rowspan, colspan = spans
-                if row_no + rowspan - 1 > len(rows):
-                    raise TableStructureError('表 #%d r=%d c=%d rowspan 越界'
-                                              % (ordinal, row_no, dom_col))
-                image_start = len(self.image_display)
-                raw_text = self.render_inline(cell, escape_backslashes=True)
-                displays = self.image_display[image_start:]
-                del self.image_display[image_start:]
-                text = raw_text.replace('|', r'\|')
-                targets = []
-                origin = {'table': ordinal, 'row': row_no, 'col': column}
-                for r in range(row_no, row_no + rowspan):
-                    for c in range(column, column + colspan):
-                        if (r, c) in grid:
-                            raise TableStructureError('表 #%d r=%d c=%d 覆盖冲突'
-                                                      % (ordinal, r, c))
-                        grid[r, c] = '**%s**' % text if cell.name == 'th' and r > 1 and text else text
-                        image_cells[r, c] = displays
-                        targets.append({'table': ordinal, 'row': r, 'col': c})
-                mapping = {'row': row_no, 'col': dom_col, 'rowspan': rowspan,
-                           'colspan': colspan, 'targets': targets}
-                fences = self.cell_fences(cell)
-                if fences:
-                    mapping['code_target'] = origin
-                    codes.extend((row_no, column, n, fence) for n, fence in enumerate(fences, 1))
-                mappings.append(mapping)
-                column += colspan
-        width = max((c for r, c in grid), default=0)
-        if width == 0:
-            raise TableStructureError('表 #%d 没有实际单元格' % ordinal)
+        for cell, mapping in layout:
+            image_start = len(self.image_display)
+            raw_text = self.render_inline(cell, escape_backslashes=True)
+            displays = self.image_display[image_start:]
+            del self.image_display[image_start:]
+            text = raw_text.replace('|', r'\|')
+            for target in mapping['targets']:
+                r, c = target['row'], target['col']
+                grid[r, c] = '**%s**' % text if cell.name == 'th' and r > 1 and text else text
+                image_cells[r, c] = displays
+            fences = self.cell_fences(cell)
+            if fences:
+                origin = mapping['targets'][0]
+                mapping['code_target'] = origin.copy()
+                codes.extend((origin['row'], origin['col'], n, fence)
+                             for n, fence in enumerate(fences, 1))
+            mappings.append(mapping)
         lines = []
         caption = tag.find('caption', recursive=False)
         if caption is not None:
             lines.append('\n[TABLE-CAPTION] %s #' % self.render_inline(caption))
-        for r in range(1, len(rows) + 1):
+        for r in range(1, row_count + 1):
             lines.append(('\n' if r == 1 else '') + '| ' + ' | '.join(
                 grid.get((r, c), '') for c in range(1, width + 1)) + ' |')
             if r == 1:

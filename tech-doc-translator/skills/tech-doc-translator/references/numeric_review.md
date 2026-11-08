@@ -27,6 +27,11 @@
 
 ## 最终交付
 
+- 使用 `verify_delivery.py --record "$RECORD" --prepare-reviews "$CANDIDATE"`
+  取得当前逐项待办，按管理字段、标题或交叉引用、数量级或单位、其余项
+  分组查看。候选 `items` 保留每个原值、位置和 ID。同一真实依据可逐项
+  批量登记，未核定项维持 `pending`。修正译文后按新输入重新准备候选，
+  以当前差异 ID 为准。
 - 交付记录中覆盖译文的核验必须同样启用 `--numeric-review`；semantic 复核
   的 `items` 按目标、类别及次数逐项列明本次差异 ID，未闭合项阻断发布。
   统计提示不能覆盖公式/代码/标题/图片/脚注/强 token 的硬失败。

@@ -56,6 +56,46 @@ def _corr(payload, node):
 class IndependentFactsTest(unittest.TestCase):
     """S1：独立事实不消费生成侧自报文字；字面强调字符真实阅读保真。"""
 
+    def test_mixed_multiline_math_paragraph(self):
+        from _verification import scan_math
+
+        raw = ('<article class="ltx_document"><h1>T</h1><p>'
+               'Start <math alttext="u +&#10; v"></math> and '
+               '<math alttext="a_b"></math> between '
+               '<math alttext="w +&#10; z"></math> end.'
+               '</p></article>')
+        md, payload = _adapt(raw)
+        scan = scan_math(md, source_context=latexml.scan_context_from_payload(payload))
+        self.assertEqual([(span.kind, span.expr) for span in scan.spans],
+                         [('inline', 'u +\n v'), ('inline', 'a_b'), ('inline', 'w +\n z')])
+        self.assertEqual(reconcile_latexml_to_markdown(raw, md, None, payload), [])
+        self.assertTrue(reconcile_latexml_to_markdown(
+            raw, md.replace('u +\n v', 'u +\n  v'), None, payload))
+
+    def test_structural_position_damage_located(self):
+        raw = (
+            '<article class="ltx_document"><h1>T</h1>'
+            '<table><tr><th>Title</th></tr><tr><td>Cell</td></tr></table>'
+            '<h2>After the table</h2>'
+            '<ol class="ltx_enumerate" start="3"><li>First item</li></ol>'
+            '<figure><figcaption>Between items</figcaption></figure>'
+            '<ol class="ltx_enumerate" start="4"><li>Second item</li></ol>'
+            '<p>Left <img src="figure.png"> right.</p></article>')
+        md, payload = _adapt(raw)
+        self.assertEqual(payload['unresolved'], [])
+        self.assertEqual(reconcile_latexml_to_markdown(raw, md, None, payload), [])
+        self.assertLess(md.index('[TABLE]'), md.index('## After the table'))
+        self.assertLess(md.index('3. First item'), md.index('[FIGURE] Between items'))
+        self.assertLess(md.index('[FIGURE] Between items'), md.index('4. Second item'))
+        self.assertLess(md.index('Left'), md.index('[IMG: images/figure.png]'))
+        self.assertLess(md.index('[IMG: images/figure.png]'), md.index('right.'))
+        damaged = md.replace('[FIGURE] Between items', '').replace(
+            '4. Second item', '4. Second item\n\n[FIGURE] Between items')
+        diffs = reconcile_latexml_to_markdown(
+            raw, damaged, None, payload, html_label='original.html', md_label='candidate.md')
+        self.assertTrue(diffs)
+        self.assertTrue(any('original.html' in diff and 'candidate.md' in diff for diff in diffs), diffs)
+
     def test_shared_renderer_fault_detected(self):
         raw = ('<article class="ltx_document"><h1>T</h1>'
                '<p>Keep important word $x$.</p></article>')

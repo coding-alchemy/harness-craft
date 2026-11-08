@@ -45,6 +45,22 @@ def test_magnitude_words_chinese_and_english():
     assert magnitudes['250 万'] == '万'
 
 
+def test_numeric_grouping_preserves_every_diff():
+    report = numeric.compute_numeric_review(
+        "# 2. Setup\n\nThe model uses 104 billion parameters. It takes 5ms.\n",
+        "# 3. Setup\n\n> **抓取日期**：2026-11-08\n\n模型有 1040 亿参数。耗时 5s。\n")
+    grouped = numeric.group_numeric_diffs(report)
+    assert [group["category"] for group in grouped] == [
+        "cross_reference", "same_value_unit", "management"]
+    expanded = [item for group in grouped for item in group["items"]]
+    assert Counter(item["id"] for item in expanded) == Counter(
+        item["id"] for item in report["diffs"])
+    assert all(item in report["diffs"] for item in expanded)
+    quantities = next(group["items"] for group in grouped
+                      if group["category"] == "same_value_unit")
+    assert {item["raw"] for item in quantities} == {"104 billion", "1040 亿", "5ms", "5s"}
+
+
 def test_protected_contexts_math_code_url_identifier():
     text = (
         '公式 $x = 3$ 与 `int v = 7;` 及块级\n\n'

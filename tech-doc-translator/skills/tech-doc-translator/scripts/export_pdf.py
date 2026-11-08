@@ -22,7 +22,7 @@ import sys
 import unicodedata
 from html import escape
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from _pdf_dependencies import PdfDependencyError, preflight_browser, dependency_message, require_module
 
 try:
@@ -259,8 +259,11 @@ def load_display_maps(chapters, explicit_paths, diagnostics):
                 )
                 continue
             if held is None:
-                occurrence_map[occurrence] = {"px": px, "record": record,
-                                              "map_path": map_path}
+                source = entry.get("source")
+                occurrence_map[occurrence] = {
+                    "px": px, "record": record, "map_path": map_path,
+                    "source_resource": source.get("resource_sha256") if isinstance(source, dict) else None,
+                }
         for entry, map_path in chapter_undetermined:
             occurrence = entry.get("occurrence")
             if not isinstance(occurrence, int) or occurrence < 1:
@@ -938,7 +941,7 @@ def _check_toc_provenance_declaration(entry, chapter, chapters, ex_type,
 def load_view_declaration(path, chapters):
     """读取并校验 PDF 视图声明（--view-declaration）；非法即 ExportError。
 
-    声明格式（version 1）：
+    声明格式（version 1；version 2 可用 chinese_markdown 代替 chinese）：
         {"version": 1,
          "inputs": [{"path": "...", "sha256": "..."}],
          "exclusions": [{"input": "...", "lines": [起, 止],
@@ -949,8 +952,8 @@ def load_view_declaration(path, chapters):
     inputs 与实际有序输入一一对应且摘要必须匹配（漂移即拒绝）；行区间在
     文件内、fragment 与实际文本匹配、范围互不重叠；block 型必须对齐
     Markdown 块边界（整块引用块/段落/列表），区间覆盖标题、代码围栏、
-    表格等技术正文即失败；inline 型删除文本片段。document_title 本阶段
-    只在加载校验时接受并记录（ticket 04 才消费）。
+    表格等技术正文即失败；inline 型删除文本片段。题名 Markdown 只消费
+    已支持的行内节点，原题技术节点在实际投影时核对。
     kind=toc-provenance 只适用于目录文件（00_目录.md）：声明内容须以
     “译自”开头且含可定位来源，且不得含指向纳入目录/章节文件的导航
     链接；接管的候选不再进入目录出处自动判断（decide_toc_provenance）。
@@ -964,10 +967,10 @@ def load_view_declaration(path, chapters):
         raise ExportError("视图声明无法解析：%s（%s）" % (path, exc))
     if not isinstance(payload, dict):
         raise ExportError("视图声明必须是 JSON 对象：%s" % path)
-    if payload.get("version") != VIEW_DECLARATION_VERSION:
+    version = payload.get("version")
+    if version not in (VIEW_DECLARATION_VERSION, 2):
         raise ExportError(
-            "视图声明版本不受支持：%r（本工具只接受 version %d）"
-            % (payload.get("version"), VIEW_DECLARATION_VERSION))
+            "视图声明版本不受支持：%r（本工具接受 version 1 或 2）" % version)
     items = payload.get("inputs")
     if not isinstance(items, list) or len(items) != len(chapters):
         raise ExportError(
@@ -990,12 +993,17 @@ def load_view_declaration(path, chapters):
     document_title = payload.get("document_title")
     if document_title is not None and not isinstance(document_title, dict):
         raise ExportError("视图声明 document_title 必须是对象或缺省")
-    if isinstance(document_title, dict) \
-            and str(document_title.get("chinese") or "").strip():
+    title_markdown = None
+    if document_title and "chinese_markdown" in document_title:
+        if version != 2 or "chinese" in document_title:
+            raise ExportError("视图声明 chinese_markdown 仅限 version 2，且与 chinese 互斥")
+        title_markdown = _parse_title_markdown(document_title["chinese_markdown"])
+    if document_title and (title_markdown or str(document_title.get("chinese") or "").strip()):
         # 采用声明题名时校验可回查性与中文口径（R3/C5）：题名须含 CJK
         # 字符，依据与原题必填；单篇能从输入确定原题（首章 H1）时核对
         # 一致，多章合订的书名非首章标题，不作此核对。
-        chinese_title = str(document_title["chinese"]).strip()
+        chinese_title = (title_markdown["title"] if title_markdown
+                         else str(document_title["chinese"]).strip())
         if not _CJK_CHAR_RE.search(chinese_title):
             raise ExportError(
                 "视图声明 document_title.chinese 须为含中文（CJK）的题名："
@@ -1113,6 +1121,7 @@ def load_view_declaration(path, chapters):
         "path": str(Path(path).expanduser()),
         "sha256": sha256_file(Path(path).expanduser()),
         "document_title": document_title,
+        "_title_markdown": title_markdown,
         "exclusions": exclusions,
     }
 
@@ -2129,7 +2138,7 @@ def render_ordered_confirmed(text, confirmed, scan_context=None, math_spans=None
     for span in spans:
         hit = None
         for index in range(cursor, len(confirmed)):
-            kind, tex = confirmed[index]
+            kind, tex = confirmed[index][:2]
             expr = span.expr
             if expr != tex and kind == "block" and expr.startswith("\n") \
                     and expr.endswith("\n"):
@@ -2172,15 +2181,17 @@ class ConfirmedMathCursor(object):
     def __init__(self, entries):
         self._entries = list(entries or [])
         self._cursor = 0
+        self.labels = ()
 
     def resolve(self, content, display_mode):
+        self.labels = ()
         # strict：逐字命中（只剥已确认包装）；locate：解析插件可能裁掉
         # 块级内容边界空白（markdown-it dollarmath），定位回退仅用于
         # 找到确认项，输出永远是确认原表达式（逐字），改写检测由扫描
         # 侧逐字事实负责（verify_pdf source-math-mismatch）
         for mode_strict in (True, False):
             for index in range(self._cursor, len(self._entries)):
-                kind, tex = self._entries[index]
+                kind, tex, *labels = self._entries[index]
                 want_mode = "display" if kind == "block" else "inline"
                 if bool(display_mode) != (kind == "block"):
                     continue
@@ -2193,6 +2204,7 @@ class ConfirmedMathCursor(object):
                     if mode_strict or expr.strip() != tex.strip():
                         continue
                 self._cursor = index + 1
+                self.labels = labels[0] if labels else ()
                 return (tex, want_mode, "source_constrained")
         return None
 
@@ -2216,8 +2228,7 @@ def apply_source_math_context(chapters, payload):
     datas = []
     for adaptation_path in paths:
         adaptation_path = os.path.realpath(adaptation_path)
-        digest = latexml.sha256_text(
-            open(adaptation_path, encoding="utf-8").read())
+        digest = sha256_file(adaptation_path)
         data = latexml.load_adaptation(adaptation_path)
         if data.get("unresolved"):
             raise ExportError(
@@ -2229,11 +2240,19 @@ def apply_source_math_context(chapters, payload):
     for _path, _digest, data in datas:
         scan_entries.extend(
             latexml.scan_context_from_payload(data).entries)
-        confirmed.extend([
-            (corr["kind"], corr["tex"])
-            for corr in data.get("correspondences") or []
-            if isinstance(corr, dict) and corr.get("content_type") == "math"
-        ])
+        labels = {}
+        for group in data.get("groups", ()):
+            for label in group.get("eqnos", ()):
+                if 0 <= label["member"] < len(group["members"]):
+                    node = group["members"][label["member"]]
+                    labels.setdefault(node, []).append(label["text"])
+        for corr in data.get("correspondences") or []:
+            if not isinstance(corr, dict) or corr.get("content_type") != "math":
+                continue
+            entry = (corr["kind"], corr["tex"])
+            if corr["kind"] == "block" and corr["node"] in labels:
+                entry += (tuple(labels[corr["node"]]),)
+            confirmed.append(entry)
     scan_context = SourceMathContext(scan_entries)
     if len(datas) == 1:
         for chapter in chapters:
@@ -2263,7 +2282,7 @@ def apply_source_math_context(chapters, payload):
                     "第 %d 章存在已确认序列之外的公式（L%d %r），"
                     "拒绝导出（旧成品不变）"
                     % (chapter.index, span.start_line, span.expr))
-            kind, tex = remaining[0]
+            kind, tex = remaining[0][:2]
             expr = span.expr
             if span.kind == "block" and expr.startswith("\n") \
                     and expr.endswith("\n"):
@@ -2448,6 +2467,8 @@ def build_markdown(math_sink, chapter_prefix, math_spans, text,
                 "markup": env.get("markup", ""),
             }
         )
+        if confirmed_cursor.labels:
+            math_sink[-1]["equation_labels"] = confirmed_cursor.labels
         tag = "div" if mode == "display" else "span"
         css = "math-block" if mode == "display" else "math-inline"
         return '<%s class="%s" id="%s" data-tex="%s" data-mode="%s"></%s>' % (
@@ -2807,6 +2828,30 @@ class Chapter:
         self.html = ""
 
 
+_TABLE_NUMBER = re.compile(
+    r"[+\-−±]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][+\-−]?\d+)?"
+    r"(?:[ \u00a0]*(?:[%％‰×]|[a-zA-Zµμ°℃]+(?:[./][a-zA-Zµμ°℃]+)*))?"
+)
+
+
+def _group_equation_labels(soup, chapter):
+    for math in chapter.math:
+        labels = math.get("equation_labels")
+        if not labels:
+            continue
+        formula = soup.find(id=math["id"])
+        if {"math", "block"}.issubset(formula.parent.get("class", ())):
+            formula = formula.parent
+        label = formula.find_next_sibling()
+        expected = "".join("".join(text.split()) for text in labels)
+        if label is None or label.name != "p" or "".join(label.get_text().split()) != expected:
+            raise ExportError(f"{chapter.path}: 公式 {math['id']} 缺已确认的相邻式号 {labels!r}")
+        unit = soup.new_tag("div", attrs={"class": "equation-unit"})
+        formula.wrap(unit)
+        label["class"] = label.get("class", []) + ["equation-label"]
+        unit.append(label.extract())
+
+
 def parse_chapter(chapter):
     """解析单章（经授权投影后的导出视图）并渲染为带前缀的 HTML 片段。
 
@@ -2861,6 +2906,16 @@ def parse_chapter(chapter):
             "来源约束公式未全部落实：成品渲染 %d 条，少于已确认来源 %d 条"
             % (len(chapter.math), len(_confirmed)))
     soup = BeautifulSoup(raw_html, "html.parser")
+    _group_equation_labels(soup, chapter)
+    for cell in soup.find_all(["th", "td"]):
+        if _TABLE_NUMBER.fullmatch(cell.get_text(strip=True)) and not cell.find(["code", "img"]):
+            cell["class"] = cell.get("class", []) + ["table-number"]
+    for paragraph in soup.find_all("p"):
+        children = paragraph.find_all(recursive=False)
+        if children and not paragraph.get_text(strip=True) and all(
+                node.name == "a" and node.has_attr("id") and not node.has_attr("href")
+                for node in children):
+            paragraph["class"] = paragraph.get("class", []) + ["anchor-only"]
     for anchor in soup.find_all("a", id=True, href=False):
         chapter.targets.setdefault(anchor["id"], {"kind": "anchor"})
         chapter.source_anchors.append(anchor["id"])
@@ -3124,6 +3179,42 @@ _BILINGUAL_TITLE_RE = re.compile(
 _CJK_CHAR_RE = re.compile(r"[一-鿿]")
 
 
+def _parse_title_markdown(text):
+    if not isinstance(text, str) or not text.strip():
+        raise ExportError("视图声明 document_title.chinese_markdown 须为非空行内题名")
+    text = text.strip()
+    scan = scan_math(text)
+    if scan.issues or any(span.kind != "inline" for span in scan.spans):
+        raise ExportError("视图声明题名须使用合法行内公式")
+    math = []
+    markdown, _ = build_markdown(math, "document-title-", scan.spans, text,
+                                 confirmed_math=[(s.kind, s.expr) for s in scan.spans],
+                                 highlight=False)
+    # 识别原 HTML token 以便明确拒绝。仅白名单中的节点进入渲染器。
+    markdown.options["html"] = True
+    tokens = markdown.parse(text)
+    if [token.type for token in tokens] != ["paragraph_open", "inline", "paragraph_close"]:
+        raise ExportError("视图声明题名只接受一个行内段落")
+    children = tokens[1].children or []
+    allowed = {"text", "strong_open", "strong_close", "em_open", "em_close",
+               "code_inline", "math_inline", "link_open", "link_close"}
+    if any(token.type not in allowed for token in children):
+        raise ExportError("视图声明题名含不支持的行内节点")
+    inline = markdown.renderer.renderInline(children, markdown.options, {})
+    if len(math) != len(scan.spans):
+        raise ExportError("视图声明题名公式未完整消费")
+    plain = "".join(token.content for token in children).strip()
+    return {"title": plain, "title_inline_html": inline, "_title_math": math}
+
+
+def _title_technical_nodes(tag):
+    math = [(node["data-tex"], node["data-mode"],
+             anchor["href"] if (anchor := node.find_parent("a", href=True)) else None)
+            for node in tag.find_all(attrs={"data-tex": True})]
+    links = [node["href"] for node in tag.find_all("a", href=True)]
+    return math, links
+
+
 def decide_document_title(chapters, view_declaration):
     """决定 PDF 中文文档总标题（R3/A4/C5），返回决定字典。
 
@@ -3135,6 +3226,10 @@ def decide_document_title(chapters, view_declaration):
     第一章标题冒充全书标题。
     """
     declared = (view_declaration or {}).get("document_title") or None
+    structured = (view_declaration or {}).get("_title_markdown")
+    if structured:
+        return {**structured, "original": declared["original"].strip(),
+                "basis": str(declared["basis"]).strip(), "source": "declaration"}
     if declared is not None and str(declared.get("chinese") or "").strip():
         return {
             "title": str(declared["chinese"]).strip(),
@@ -3195,6 +3290,7 @@ def project_document_title(chapters, decision):
     不新建封面页、不改各章标题。
     """
     content = [c for c in chapters if not c.is_toc]
+    title_html = decision.get("title_inline_html")
     if len(content) == 1:
         chapter = content[0]
         heading = next(
@@ -3206,20 +3302,38 @@ def project_document_title(chapters, decision):
         if tag is None:
             raise ExportError(
                 "总标题投影失败：首章标题节点缺失（%s）" % heading["text"][:40])
-        if tag.find("a", href=True) is not None \
-                or tag.find(attrs={"data-tex": True}) is not None:
+        if title_html:
+            candidate = BeautifulSoup(title_html, "html.parser")
+            if (tag.find("img") or _title_technical_nodes(tag) != _title_technical_nodes(candidate)):
+                raise ExportError(f"中文题名未按原题保留公式或链接：{chapter.path}")
+            for original, replacement in zip(tag.find_all(attrs={"data-tex": True}),
+                                              candidate.find_all(attrs={"data-tex": True})):
+                replacement["id"] = original["id"]
+            anchors = [anchor.extract() for anchor in tag.find_all("a", id=True, href=False)]
+            tag.clear()
+            tag.extend(anchors + list(candidate.contents))
+        elif tag.find("a", href=True) is not None or tag.find(attrs={"data-tex": True}) is not None:
             raise ExportError(
                 "首章 H1 含行内链接或公式，无法保真替换为中文总标题：%r"
                 % heading["text"][:40])
-        tag.clear()
-        tag.append(NavigableString(decision["title"]))
+        else:
+            tag.clear()
+            tag.append(NavigableString(decision["title"]))
         heading["original_text"] = heading["text"]  # 供独立重建同一决定
         heading["text"] = decision["title"]
-        heading["segments"] = [decision["title"]]
+        heading["segments"] = block_text_segments(tag)
         return
     target = chapters[0]
     paragraph = target.soup.new_tag("p", attrs={"class": "document-title"})
-    paragraph.append(NavigableString(decision["title"]))
+    if title_html:
+        candidate = BeautifulSoup(title_html, "html.parser")
+        original = BeautifulSoup(_parse_title_markdown(decision["original"])["title_inline_html"], "html.parser")
+        if _title_technical_nodes(original) != _title_technical_nodes(candidate):
+            raise ExportError("中文合订题名未按声明原题保留公式或链接")
+        paragraph.extend(list(candidate.contents))
+        target.math[0:0] = [dict(math, title_only=True) for math in decision["_title_math"]]
+    else:
+        paragraph.append(NavigableString(decision["title"]))
     target.soup.insert(0, paragraph)
 
 
@@ -3393,7 +3507,21 @@ def enumerate_images(chapter, diagnostics):
                 }
             )
             continue
-        kind, pixel_size, frames, pixel_known = bitmap_facts(str(path))
+        if path.suffix.lower() == ".svg":
+            kind, pixel_size, frames, pixel_known = "SVG", None, None, False
+        else:
+            kind, pixel_size, frames, pixel_known = bitmap_facts(str(path))
+        svg_facts = {}
+        if kind == "SVG":
+            try:
+                svg_facts = _svg_resource_facts(str(path))
+            except ExportError as exc:
+                diagnostics.append({
+                    "severity": "fail", "code": "svg-resource",
+                    "input": str(chapter.path), "line": line,
+                    "message": f"{src}（解析基点 {chapter.dir}，实际 {path}）：{exc}",
+                })
+                continue
         enumeration.append(
             {
                 "img": image,
@@ -3405,6 +3533,7 @@ def enumerate_images(chapter, diagnostics):
                 "pixel_size": pixel_size,
                 "frames": frames,
                 "pixel_known": pixel_known,
+                **svg_facts,
             }
         )
     return enumeration
@@ -3414,6 +3543,139 @@ def enumerate_images(chapter, diagnostics):
 # 11 张 >2600px 原图全部解码失败）。重采样只影响 data URI，交付文件的
 # 字节、身份核对（枚举阶段按原文件完成）与显示宽度注入均不受影响。
 EMBED_MAX_EDGE = 2600
+
+
+def _svg_resource_facts(svg_path):
+    from _verification import check_image_file, resource_identity_digest
+
+    ok, kind, error = check_image_file(svg_path)
+    if not ok or kind != "SVG":
+        raise ExportError(error or "资源不是可核验的 SVG")
+    dependencies = {}
+    digest = resource_identity_digest(svg_path, kind="svg", _memo=dependencies)
+    if not digest:
+        raise ExportError("SVG 递归身份不可得")
+    dependencies.pop(os.path.realpath(svg_path), None)
+    return {"svg_identity": digest,
+            "svg_dependencies": {path: sha256_file(path) for path in dependencies}}
+
+
+def svg_print_dimensions(record, binding):
+    """已绑定显示宽度或含外部本地依赖的 SVG 需要可独立对账的负载。"""
+    if record["kind"] != "SVG" or not (binding or record["svg_dependencies"]):
+        return None
+    import xml.etree.ElementTree as ET
+    from math import ceil, isfinite
+    from _html_fidelity import _svg_intrinsic_ratio
+
+    path = record["path"]
+    if binding and binding.get("source_resource") not in (None, record["svg_identity"]):
+        raise ExportError(f"SVG 递归身份与映射来源不一致：{path}（映射 {binding['map_path']}）")
+    ratio, basis = _svg_intrinsic_ratio(path)
+    if not ratio or not isfinite(ratio) or ratio <= 0:
+        raise ExportError(f"SVG 无可核验固有比例：{path}（{basis}）")
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError) as exc:
+        raise ExportError(f"SVG 尺寸无法重读：{path}（{exc}）") from exc
+    width = re.fullmatch(r"([0-9]*\.?[0-9]+)(?:px)?", (root.get("width") or "").strip())
+    natural = float(width[1]) if width else 0
+    viewbox = (root.get("viewBox") or "").replace(",", " ").split()
+    native = float(viewbox[2]) if basis == "svg-viewbox" else natural
+    display = binding["px"] if binding else natural
+    if not display or not isfinite(display):
+        raise ExportError(f"含本地依赖的 SVG 缺可确定显示宽度：{path}")
+    physical = min(display, CONTENT_WIDTH_PX)
+    pixels = min(max(physical, native), EMBED_MAX_EDGE, EMBED_MAX_EDGE * ratio)
+    if not isfinite(pixels) or pixels + 0.5 < physical:
+        raise ExportError(f"SVG 在位图长边预算内无法保留显示分辨率：{path}")
+    return ceil(pixels), max(1, round(pixels / ratio)), display
+
+
+def render_svg_payload(svg_path: str, *, width_px: int, height_px: int,
+                       resource_registry, browser) -> tuple[bytes, dict]:
+    """只向离线浏览器提供已核对的源 SVG 与依赖，生成白底 PNG。"""
+    svg_path = os.path.realpath(svg_path)
+    facts = _svg_resource_facts(svg_path)
+    key = (facts["svg_identity"], width_px, height_px)
+    cached = resource_registry.setdefault(svg_path, {}).setdefault("svg_payloads", {})
+    if key in cached:
+        return cached[key]
+    if min(width_px, height_px) < 1 or max(width_px, height_px) > EMBED_MAX_EDGE:
+        raise ExportError(f"SVG 派生尺寸超出位图预算：{svg_path} ({width_px}×{height_px})")
+    host = "svg-payload.invalid"
+    allowed = {svg_path, *facts["svg_dependencies"]}
+    denied = []
+    context = browser.new_context(viewport={"width": width_px, "height": height_px},
+                                  device_scale_factor=1, color_scheme="light")
+    try:
+        def serve(route):
+            url = urlsplit(route.request.url)
+            path = os.path.realpath(unquote(url.path))
+            if url.hostname != host or path not in allowed:
+                denied.append(route.request.url)
+                route.abort()
+                return
+            mime = "image/svg+xml" if path == svg_path else (mimetypes.guess_type(path)[0]
+                                                           or "application/octet-stream")
+            route.fulfill(path=path, content_type=mime,
+                          headers={"Content-Security-Policy": "script-src 'none'; object-src 'none'"})
+
+        context.route("**/*", serve)
+        page = context.new_page()
+        page.on("requestfailed", lambda request: denied.append(request.url))
+        page.goto("https://" + host + quote(svg_path), wait_until="load")
+        page.evaluate("""async ([width, height]) => {
+          const svg = document.documentElement;
+          if (svg.localName !== 'svg') throw Error('SVG root missing');
+          const box = svg.getBoundingClientRect();
+          if (!svg.hasAttribute('viewBox')) svg.setAttribute('viewBox', [0, 0, box.width, box.height].join(' '));
+          svg.style.setProperty('width', width + 'px', 'important');
+          svg.style.setProperty('height', height + 'px', 'important');
+          svg.style.setProperty('background-color', 'white', 'important');
+          await document.fonts.ready;
+        }""", [width_px, height_px])
+        payload = page.screenshot(animations="disabled")
+    except Exception as exc:
+        raise ExportError(f"SVG 离线派生失败：{svg_path}（{exc}）") from exc
+    finally:
+        context.close()
+    if denied:
+        raise ExportError(f"SVG 依赖加载失败或超出已核对范围：{svg_path}（{denied[0]}）")
+    evidence = {
+        "source": [svg_path, facts["svg_identity"]],
+        "dependencies": facts["svg_dependencies"],
+        "render": {"browser": "chromium", "version": browser.version,
+                   "viewport": {"width": width_px, "height": height_px},
+                   "device_scale_factor": 1, "background": "white"},
+        "embedded": {"sha256": hashlib.sha256(payload).hexdigest(),
+                     "width": width_px, "height": height_px},
+    }
+    cached[key] = payload, evidence
+    return cached[key]
+
+
+def plan_svg_renders(chapters, enumerations, bindings, diagnostics):
+    plans = []
+    for chapter in chapters:
+        for index, record in enumerate(enumerations[chapter.path], 1):
+            binding = bindings.get(chapter.path, {}).get(index)
+            try:
+                dimensions = svg_print_dimensions(record, binding)
+            except (ExportError, OSError, ValueError) as exc:
+                diagnostics.append({
+                    "severity": "fail", "code": "svg-print-size",
+                    "input": str(chapter.path), "line": record["line"],
+                    "message": f"图片 #{index}（基点 {chapter.dir}）：{exc}",
+                })
+                continue
+            if dimensions:
+                width, height, display_px = dimensions
+                plans.append({"input": str(chapter.path), "image_index": index,
+                              "record": record, "width": width, "height": height,
+                              "display_px": display_px,
+                              "display": binding["record"]["width"] if binding else None})
+    return plans
 
 
 def _resampled_embed(path, record):
@@ -3469,8 +3731,7 @@ def inline_images(chapter, diagnostics, resource_registry, enumeration):
         path = record["path"]
         key = path
         if key not in resource_registry:
-            mime = mimetypes.guess_type(path)
-            mime = mime[0] if mime and mime[0] else None
+            mime = "image/svg+xml" if record["kind"] == "SVG" else mimetypes.guess_type(path)[0]
             if not mime:
                 diagnostics.append(
                     {
@@ -3513,9 +3774,8 @@ def inline_images(chapter, diagnostics, resource_registry, enumeration):
 # ---------------------------------------------------------------------------
 
 CHECK_SCRIPT = """
-(async () => {
-  const checks = {katex: [], images: [], fonts: {}, overflow: [],
-                  scrollWidth: 0, clientWidth: 0, mathTotal: 0};
+(() => {
+  const checks = {katex: [], mathTotal: 0};
   const nodes = document.querySelectorAll('[data-tex]');
   checks.mathTotal = nodes.length;
   nodes.forEach(n => {
@@ -3529,6 +3789,15 @@ CHECK_SCRIPT = """
       checks.katex.push({id: n.id, message: String(e && e.message || e)});
     }
   });
+  window.__pdfExportChecks = checks;
+  window.__pdfExportDone = true;
+})();
+"""
+
+PRINT_CHECK_SCRIPT = """
+async () => {
+  const checks = {katex: [], mathTotal: 0, ...window.__pdfExportChecks,
+                  images: [], fonts: {}, overflow: []};
   try { await document.fonts.ready; } catch (e) {}
   const probe = (family) => {
     try {
@@ -3547,20 +3816,59 @@ CHECK_SCRIPT = """
     }
   });
   const pageWidth = document.documentElement.clientWidth;
-  document.querySelectorAll('table, pre, .math-block, img').forEach(el => {
+  const tags = document.querySelectorAll('.math-block .katex-html > .katex-tag');
+  tags.forEach(tag => {
+    const width = tag.getBoundingClientRect().width;
+    tag.parentElement.style.setProperty('--equation-tag-slot', Math.ceil(width + 12) + 'px');
+  });
+  const selectors = [
+    'table', 'pre', '.math-block', '.math-inline', '.katex-html .base',
+    '.katex-tag', '.equation-unit', 'img', '.print-toc a', '.print-toc .toc-page',
+  ];
+  const report = (el, rect, reason) => {
+    const host = el.closest('[id]') || el.closest('.chapter');
+    checks.overflow.push({
+      tag: el.tagName, id: host?.id || '', reason,
+      text: (el.textContent || '').trim().slice(0, 60),
+      left: Math.round(rect.left), right: Math.round(rect.right), pageWidth,
+    });
+  };
+  document.querySelectorAll(selectors.join(',')).forEach(el => {
     const rect = el.getBoundingClientRect();
     if (rect.width > 0 && (rect.right > pageWidth + 1 || rect.left < -1)) {
-      checks.overflow.push({
-        tag: el.tagName, id: el.id || '',
-        text: (el.textContent || '').trim().slice(0, 60),
-        right: Math.round(rect.right), pageWidth: pageWidth});
+      report(el, rect, 'print-width');
     }
   });
+  tags.forEach(tag => {
+    const rect = tag.getBoundingClientRect();
+    if (Array.from(tag.parentElement.querySelectorAll(':scope > .base'))
+        .some(base => base.getBoundingClientRect().right + 2 > rect.left)) {
+      report(tag, rect, 'equation-label-overlap');
+    }
+  });
+  document.querySelectorAll('.equation-unit').forEach(unit => {
+    const label = unit.querySelector('.equation-label');
+    const rect = label.getBoundingClientRect();
+    if (Array.from(unit.querySelectorAll('.katex-html .base'))
+        .some(base => base.getBoundingClientRect().right + 2 > rect.left)) {
+      report(label, rect, 'equation-label-overlap');
+    }
+  });
+  const pageHeight = (297 - 18 * 2) / 25.4 * 96;
+  document.querySelectorAll('.equation-unit, .math-block:not(.equation-unit .math-block)')
+    .forEach(el => {
+      const rect = el.getBoundingClientRect();
+      if (rect.height > pageHeight) {
+        report(el, rect, 'equation-height');
+      }
+    });
   checks.scrollWidth = document.documentElement.scrollWidth;
   checks.clientWidth = pageWidth;
-  window.__pdfExportChecks = checks;
-  window.__pdfExportDone = true;
-})();
+  if (checks.scrollWidth > pageWidth + 1 && !checks.overflow.length) {
+    report(document.body, {left: 0, right: checks.scrollWidth}, 'print-width');
+  }
+  return checks;
+}
 """
 
 
@@ -3570,7 +3878,7 @@ CHECK_SCRIPT = """
 # （评审实测同一短块默认宽度下高 673px，打印宽度下达 1268px），
 # 会漏诊超页短块。版心宽为 @page A4 210mm 减 16mm×2 横边距的 96dpi
 # 换算，与 PdfStyleGeometryContractTest 的样式契约锁定一致。
-PRINT_CONTENT_WIDTH_PX = round((210 - 16 * 2) / 25.4 * 96)
+PRINT_CONTENT_WIDTH_PX = round(CONTENT_WIDTH_PX)
 
 CODE_SHORT_TALL_SCRIPT = """
 (() => {
@@ -3586,6 +3894,19 @@ CODE_SHORT_TALL_SCRIPT = """
   return tooTall;
 })()
 """
+
+
+def collect_print_checks(page, *, width_px: int) -> dict:
+    """使用本次打印的版心重测；目录页码回填后重新计算。"""
+    page.emulate_media(media="print")
+    page.set_viewport_size({"width": width_px, "height": round(297 / 25.4 * 96)})
+    page.wait_for_function(
+        "window.__pdfExportDone === true || !document.querySelector('[data-tex]')",
+        timeout=120000)
+    checks = page.evaluate(PRINT_CHECK_SCRIPT)
+    checks["viewport_width"] = width_px
+    checks["codeShortTooTall"] = page.evaluate(CODE_SHORT_TALL_SCRIPT)
+    return checks
 
 
 def file_uri(path):
@@ -3737,7 +4058,13 @@ def candidate_code_check(input_paths, unlink_targets, toc_sections,
 def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
            toc_sections=False, require_display_map=False,
            provenance_map_path=None, translation_record_path=None,
-           view_declaration_path=None, source_adaptation_path=None):
+           view_declaration_path=None, source_adaptation_path=None, *,
+           run_context=None):
+    from verify_delivery import (
+        check_translation_readiness_cli, new_run_context, progress_stage,
+    )
+
+    run_context = run_context if run_context is not None else new_run_context()
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
         import verify_pdf  # 候选必经的真实核验器（含 uniseg / pypdf），打印前加载。
@@ -3749,11 +4076,13 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     # 翻译验收身份门禁（§4.7，只读）：翻译加导出必须传入验收记录；
     # 生成任何候选之前核对验收绑定与当前翻译身份并重跑当前检查。
     readiness_projection = None
+    readiness_record_sha256 = None
     if translation_record_path:
-        from verify_delivery import check_translation_readiness_cli
+        translation_record_path = Path(translation_record_path).expanduser().resolve()
         ready, readiness = check_translation_readiness_cli(
             translation_record_path,
-            [str(Path(p).expanduser().resolve()) for p in paths])
+            [str(Path(p).expanduser().resolve()) for p in paths],
+            run_context=run_context)
         if not ready:
             report["status"] = STATUS_MACHINE_FAIL
             report["error"] = "；".join(readiness.get("reasons") or [])
@@ -3765,6 +4094,7 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                   % report["error"], file=sys.stderr)
             return 1
         readiness_projection = readiness.get("identity") or {}
+        readiness_record_sha256 = readiness["record_sha256"]
 
     # 来源依据上下文（二期 02-6）：显式 --source-adaptation 优先（可重复，
     # 多快照 F7/§7.5）；翻译加导出从 --translation-record 的就绪投影取得
@@ -3988,6 +4318,9 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     enumerations = {}
     for chapter in chapters:
         enumerations[chapter.path] = enumerate_images(chapter, diagnostics)
+    svg_plans = plan_svg_renders(chapters, enumerations, bindings, diagnostics)
+    svg_pixels = {(plan["input"], plan["image_index"]): (plan["width"], plan["height"])
+                  for plan in svg_plans}
     occurrences = [
         Occurrence(
             chapter=str(chapter.path),
@@ -3997,9 +4330,9 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             sha256=record["sha256"],
             line=record["line"],
             kind=record["kind"],
-            pixel_size=record["pixel_size"],
+            pixel_size=svg_pixels.get((str(chapter.path), index + 1), record["pixel_size"]),
             frames=record["frames"],
-            pixel_known=record["pixel_known"],
+            pixel_known=record["pixel_known"] or (str(chapter.path), index + 1) in svg_pixels,
         )
         for chapter in chapters
         for index, record in enumerate(enumerations[chapter.path])
@@ -4049,7 +4382,8 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
         return 1
 
     try:
-        preflight_browser()
+        with progress_stage(run_context, "browser-preflight", output):
+            preflight_browser()
     except PdfDependencyError as exc:
         raise ExportError(str(exc)) from exc
 
@@ -4137,12 +4471,29 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
 
     # 惰性导入：普通翻译环境不安装 playwright 时，导入本模块的其他脚本不受影响。
     from playwright.sync_api import sync_playwright
+    svg_renders = []
 
     def render_print():
         """渲染组合 HTML 并打印到候选 PDF，返回浏览器层检查结果。"""
-        html_path.write_text(build_document(chapters, title), encoding="utf-8")
         with sync_playwright() as p:
             browser = p.chromium.launch()
+            if not svg_renders:
+                for plan in svg_plans:
+                    source = plan["record"]
+                    payload, evidence = render_svg_payload(
+                        source["path"], width_px=plan["width"], height_px=plan["height"],
+                        resource_registry=resource_registry, browser=browser)
+                    if evidence["source"][1] != source["svg_identity"]:
+                        raise ExportError(f"SVG 在打印准备期间发生变化：{source['path']}")
+                    image = source["img"]
+                    image["src"] = "data:image/png;base64," + base64.b64encode(payload).decode("ascii")
+                    if plan["display"] is None:
+                        image["width"] = str(plan["display_px"])
+                    svg_renders.append({
+                        "input": plan["input"], "image_index": plan["image_index"],
+                        "display": plan["display"], **evidence,
+                    })
+            html_path.write_text(build_document(chapters, title), encoding="utf-8")
             context = browser.new_context()
 
             def block_network(route, request):
@@ -4154,13 +4505,9 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             context.route("**/*", block_network)
             page = context.new_page()
             page.goto(file_uri(html_path), wait_until="load")
-            page.wait_for_function("window.__pdfExportDone === true", timeout=120000)
-            checks = page.evaluate("window.__pdfExportChecks")
-            # 短块超页预检切到打印版心宽度量测（见 PRINT_CONTENT_WIDTH_PX）。
-            page.emulate_media(media="print")
-            page.set_viewport_size(
-                {"width": PRINT_CONTENT_WIDTH_PX, "height": 1123})
-            checks["codeShortTooTall"] = page.evaluate(CODE_SHORT_TALL_SCRIPT)
+            checks = collect_print_checks(page, width_px=PRINT_CONTENT_WIDTH_PX)
+            if checks["overflow"] or checks["codeShortTooTall"]:
+                return checks, False
             # Chromium 的 PDF 结构树不保留 KaTeX 的 MathML；仅在打印阶段让
             # 实际绘制的公式字形参与标记，否则纯公式章节会从结构树消失。
             page.evaluate("document.querySelectorAll('.katex-html').forEach("
@@ -4180,13 +4527,18 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                 footer_template=FOOTER_TEMPLATE,
             )
             browser.close()
-        return checks
+        return checks, True
 
     # 印刷目录两遍打印：占位页码探测 → 实际目的地回填 → 必要时一次修正。
     toc_pages = None
     toc_prints = 0
     while True:
-        browser_checks = render_print()
+        with progress_stage(run_context, "print", output, toc_prints + 1) as fail_print:
+            browser_checks, printed = render_print()
+            if not printed:
+                fail_print()
+        if not printed:
+            break
         toc_prints += 1
         if toc_chapter is None:
             break
@@ -4231,7 +4583,7 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     code_gate_failures = candidate_code_check(
         [str(c.path) for c in chapters], unlink_targets, toc_sections,
         candidate, view_declaration_path,
-        source_adaptation_path=adaptation_path,readiness_projection=readiness_projection)
+        source_adaptation_path=adaptation_path,readiness_projection=readiness_projection) if printed else []
     hard_failures.extend(code_gate_failures)
     fonts = browser_checks.get("fonts", {}) if browser_checks else {}
     # 正文与代码的 CJK 回退族必须至少一项可用，否则中文会退到不可控字体。
@@ -4250,8 +4602,8 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     report.update(
         {
             "status": STATUS_MACHINE_PASS if machine_ok else STATUS_MACHINE_FAIL,
-            "candidate": str(candidate),
-            "pdf_sha256": sha256_file(candidate),
+            "candidate": str(candidate) if printed else None,
+            "pdf_sha256": sha256_file(candidate) if printed else None,
             "output_target": str(output),
             "code_gate_failures": code_gate_failures,
             "unlink_targets": sorted(
@@ -4274,6 +4626,7 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                 "out_links": toc_out_links,
             },
             "browser_checks": browser_checks,
+            "svg_renders": svg_renders,
             "inputs": inputs,
             "resources": resources,
             "range_out_links": range_out,
@@ -4328,7 +4681,8 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     )
 
     if not machine_ok:
-        print("FAIL: 机器检查未通过，候选保留在 %s" % candidate, file=sys.stderr)
+        print("FAIL: 机器检查未通过，" + ("候选保留在 %s" % candidate if printed
+                                       else "当前打印布局被拒绝，未打印本轮候选"), file=sys.stderr)
         for diag in hard_failures:
             print(
                 "  [%s] %s:%s %s"
@@ -4361,9 +4715,12 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             )
         for overflow in (browser_checks or {}).get("overflow", []):
             print(
-                "  [overflow] %s 超出版心（right=%s > %s）：%r"
+                "  [overflow] %s %s %s（left=%s right=%s width=%s）：%r"
                 % (
                     overflow.get("tag"),
+                    overflow.get("id"),
+                    overflow.get("reason"),
+                    overflow.get("left"),
                     overflow.get("right"),
                     overflow.get("pageWidth"),
                     overflow.get("text"),
@@ -4384,16 +4741,17 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
         )
         return 1
     if translation_record_path:
-        from verify_delivery import check_translation_readiness_cli
         ready, readiness = check_translation_readiness_cli(
             translation_record_path,
-            [str(Path(p).expanduser().resolve()) for p in paths])
-        if not ready:
+            [str(Path(p).expanduser().resolve()) for p in paths],
+            run_context=run_context)
+        if (not ready or readiness["identity"] != readiness_projection
+                or readiness["record_sha256"] != readiness_record_sha256):
             print("FAIL: 导出期间输入或验收身份变化，按同一口径复确认失败，"
-                  "不替换旧成品: %s" % "；".join(readiness.get("reasons") or []),
+                  "不替换旧成品: %s" % "；".join(
+                      readiness.get("reasons") or ["验收记录或翻译依赖已变化"]),
                   file=sys.stderr)
             return 1
-        readiness_projection = readiness.get("identity") or {}
     output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(candidate, output)
     if translation_record_path:
@@ -4436,6 +4794,8 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
 
 
 def main(argv=None):
+    from verify_delivery import new_run_context, progress_stage, stderr_progress
+
     parser = argparse.ArgumentParser(
         description="把有序 Markdown 文档导出为单个 PDF（机器检查通过才写目标文件）。"
     )
@@ -4479,7 +4839,7 @@ def main(argv=None):
         "--view-declaration",
         default=None,
         metavar="PATH",
-        help="PDF 视图声明 JSON（version 1）：绑定有序输入摘要与授权排除"
+        help="PDF 视图声明 JSON（version 1 或 2）：绑定有序输入摘要与授权排除"
              "区间（block/inline），用于无法从语法定位的非原文说明；"
              "摘要漂移、越界、重叠或跨技术正文即在生成候选前失败",
     )
@@ -4506,19 +4866,25 @@ def main(argv=None):
     parser.add_argument("inputs", nargs="+", help="有序 Markdown 输入")
     args = parser.parse_args(argv)
     try:
-        return export(
-            args.inputs,
-            Path(args.output).expanduser(),
-            Path(args.work_dir).expanduser(),
-            unlink_targets=args.unlink_target,
-            images_display_paths=args.images_display,
-            toc_sections=args.toc_sections,
-            require_display_map=args.require_display_map,
-            provenance_map_path=args.provenance,
-            translation_record_path=args.translation_record,
-            view_declaration_path=args.view_declaration,
-            source_adaptation_path=args.source_adaptation,
-        )
+        run_context = new_run_context(stderr_progress)
+        with progress_stage(run_context, "export_pdf", args.output) as fail_stage:
+            result = export(
+                args.inputs,
+                Path(args.output).expanduser(),
+                Path(args.work_dir).expanduser(),
+                unlink_targets=args.unlink_target,
+                images_display_paths=args.images_display,
+                toc_sections=args.toc_sections,
+                require_display_map=args.require_display_map,
+                provenance_map_path=args.provenance,
+                translation_record_path=args.translation_record,
+                view_declaration_path=args.view_declaration,
+                source_adaptation_path=args.source_adaptation,
+                run_context=run_context,
+            )
+            if result:
+                fail_stage()
+        return result
     except (ExportError, PdfDependencyError) as exc:
         print("FAIL: %s" % exc, file=sys.stderr)
         return 1

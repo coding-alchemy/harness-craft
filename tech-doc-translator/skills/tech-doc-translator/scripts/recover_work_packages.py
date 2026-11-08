@@ -138,13 +138,13 @@ def _fragment_hard_checks(src_body, trans_body, trans_path, strong_tokens,
             fails.append('PDF确认数学片段核验: '+str(exc))
 
     scan_context = None
-    code_src,code_doc=src_body,trans_body
+    block_src, block_doc = src_body, trans_body
     if pdf_view:
         scan_context=_pdf_math.context(pdf_view['checklist'])
-        code_src=_pdf_math.footnote_view(src_body,scan_context)[0]
-        code_doc=_pdf_math.footnote_view(trans_body,scan_context)[0]
-    src_fences = scan_code_fences(code_src)
-    doc_fences = scan_code_fences(code_doc)
+        block_src = _pdf_math.footnote_view(src_body, scan_context)[0]
+        block_doc = _pdf_math.footnote_view(trans_body, scan_context)[0]
+    src_fences = scan_code_fences(block_src)
+    doc_fences = scan_code_fences(block_doc)
     if not doc_fences.balanced:
         fails.append('代码围栏不成对: 第 %d 行开启的代码块未闭合'
                      % doc_fences.unclosed_line)
@@ -236,8 +236,8 @@ def _fragment_hard_checks(src_body, trans_body, trans_path, strong_tokens,
         fails.append('可证明截断: 表格全部丢失（源 %d 张）'
                      % src_counts['tables'])
     from _source_reconcile import compare_translation_tables, table_code_problems
-    fails.extend(table_code_problems(trans_body, table_code_stage, scan_context))
-    fails.extend(compare_translation_tables(src_body, trans_body,
+    fails.extend(table_code_problems(block_doc, table_code_stage, scan_context))
+    fails.extend(compare_translation_tables(block_src, block_doc,
                                             source_context=scan_context, header_cells=header_cells))
     return fails, warns
 

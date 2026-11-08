@@ -2,11 +2,12 @@
 import hashlib
 import json
 import re
+import sys
 from dataclasses import replace
 
 from markdown_it import MarkdownIt
 from markdown_it.rules_block.table import escapedSplit
-from _pdf_source import load_fitz, norm_words
+from _pdf_source import glyph_center, load_fitz, norm_words, regional_glyphs
 from _verification import (SourceMathContext, scan_math, heading_entries,
                            markdown_table_tokens, encode_table_math, decode_table_math)
 from _source_reconcile import _md_inline_reading
@@ -42,9 +43,9 @@ def enabled(checklist, text=''):
     if declared is None and not has_facts and source_contract is None:
         return False
     if declared != CONTRACT:
-        raise ValueError('公式合同缺失或未知；新事实不得降级为旧路径')
+        raise ValueError(f'公式合同缺失或未知: 清单={declared!r}，需 {CONTRACT}；新事实不得降级')
     if source_contract is not None and source_contract!=CONTRACT:
-        raise ValueError('源/包与清单公式合同冲突')
+        raise ValueError(f'源/包与清单公式合同冲突: 源={source_contract!r}，清单={declared!r}')
     return True
 
 
@@ -112,34 +113,46 @@ def context(checklist):
                                   if block['type']=='footnote_def' or block.get('footnote') else (item['tex'],))])
 
 
-def original_text(doc, origin):
+def original_text(doc, origin, *, native=None):
     """重新定位原生字形序；不以框内同词或生成缓存替代。"""
     if not isinstance(origin, dict) or not origin.get('fragments'):
         raise ValueError('缺少原字形片段定位')
     fitz = load_fitz()
-    page = doc[origin['page'] - 1]
-    if origin.get('extraction') != {'pymupdf':fitz.VersionBind, 'view':'rawdict'}:
-        raise ValueError('字形提取口径漂移，须实际回源重核')
-    native = page.get_text('rawdict')['blocks']
+    page_number = origin['page']
+    current = {'pymupdf': fitz.VersionBind, 'view': 'rawdict'}
+    if origin.get('extraction') != current:
+        raise ValueError(f'原页 {page_number} 字形提取口径漂移，须实际回源重核 '
+                         f'（清单={origin.get("extraction")!r}，当前={current!r}，解释器={sys.executable}）')
+    if not 1 <= page_number <= len(doc):
+        raise ValueError(f'原页 {page_number} 超出实际 PDF 页数 {len(doc)}')
+    if native is None:
+        native = doc[page_number - 1].get_text('rawdict')['blocks']
+    rect = fitz.Rect(origin['rect'])
     parts = []
     used = set()
     previous_line=None
     for fragment in origin['fragments']:
-        chars = native[fragment['block']]['lines'][fragment['line']]['spans'][fragment['span']]['chars']
+        location = tuple(fragment[key] for key in ('block', 'line', 'span'))
+        try:
+            if any(type(index) is not int or index < 0 for index in location):
+                raise IndexError(location)
+            bi, li, si = location
+            chars = native[bi]['lines'][li]['spans'][si]['chars']
+        except (IndexError, KeyError) as exc:
+            raise ValueError(f'原页 {page_number} block/line/span={location} 字形位置无效') from exc
         a, z = fragment['start'], fragment['end']
         if not (isinstance(a,int) and isinstance(z,int) and 0 <= a < z <= len(chars)):
-            raise ValueError('原字形区间越界')
-        keys = [(fragment['block'],fragment['line'],fragment['span'],i) for i in range(a,z)]
+            raise ValueError(f'原页 {page_number} block/line/span={location} 字形区间 [{a}, {z}) 越界')
+        keys = [(*location, i) for i in range(a,z)]
         if used.intersection(keys):
             raise ValueError('重复来源字形片段')
         used.update(keys)
         text = ''.join(c['c'] for c in chars[a:z])
         if text != fragment.get('text'):
-            raise ValueError('原字形与确认原值不符')
-        if not all(fitz.Rect(origin['rect']).contains(fitz.Point(
-                (c['bbox'][0]+c['bbox'][2])/2,(c['bbox'][1]+c['bbox'][3])/2))
-                   for c in chars[a:z]):
-            raise ValueError('字形片段不属于声明区域')
+            raise ValueError(f'原页 {page_number} block/line/span={location} 字形与确认原值不符 '
+                             f'（清单={fragment.get("text")!r}，当前={text!r}）')
+        if not all(rect.contains(glyph_center(c)) for c in chars[a:z]):
+            raise ValueError(f'原页 {page_number} block/line/span={location} 字形片段不属于声明区域')
         current_line=(fragment['block'],fragment['line'])
         if previous_line is not None and current_line!=previous_line:
             parts.append('\n')
@@ -190,6 +203,29 @@ def table_targets(block):
     return targets
 
 
+def _glyph_keys(origin):
+    return {(origin['page'], f['block'], f['line'], f['span'], i)
+            for f in origin['fragments'] for i in range(f['start'], f['end'])}
+
+
+def _validate_coverage(block, native, registered, delegated, narrower, exclusions):
+    page = block['page']
+    rect = load_fitz().Rect(block['rect'])
+    for key, value, center in regional_glyphs(native, rect):
+        if value.isspace() or any(region.contains(center) for region in delegated):
+            continue
+        excluded = next((reason for region, reason in exclusions if region.contains(center)), None)
+        covered = (page, *key) in registered
+        if covered and excluded:
+            issue = f'字形同时登记和明确排除（{excluded}）'
+        elif not covered and not excluded and (page, *key) not in narrower:
+            issue = '遗漏原字形'
+        else:
+            continue
+        raise ValueError(f'{issue}: 块 {block["id"]}，原页 {page} '
+                         f'block/line/span/char={key}，当前值={value!r}')
+
+
 def validate(checklist, doc):
     groups(checklist)
     source = checklist['source']['sha256']
@@ -199,6 +235,13 @@ def validate(checklist, doc):
         raise ValueError('缺当前全范围数学原页复核依据')
     ids = set()
     original_glyphs = set()
+    coverage = []
+    native_pages = {}
+    fitz = load_fitz()
+    exclusions = {}
+    for rejected in checklist.get('rejected', ()):
+        if rejected.get('page') in scope and rejected.get('rect') and rejected.get('reason'):
+            exclusions.setdefault(rejected['page'], []).append((fitz.Rect(rejected['rect']), rejected['reason']))
     blocks=sorted(checklist['blocks'],key=lambda b:b['order'])
     notes={b.get('footnote_label'):b for b in blocks if b['type']=='footnote_def'}
     if len(notes)!=sum(b['type']=='footnote_def' for b in blocks):raise ValueError('脚注定义标签重复')
@@ -231,7 +274,7 @@ def validate(checklist, doc):
         if block['type'] not in ('paragraph','formula','heading','figure_caption','table_caption','algorithm','list_item','table_region','footnote_def'):
             raise ValueError('当前尚未支持该数学所属角色: '+block['type'])
         if block['type']=='heading' and (type(block.get('level')) is not int or not 1<=block['level']<=8):
-            raise ValueError('确认数学标题缺合法层级')
+            raise ValueError(f'原页 {block["page"]} 块 {block["id"]} 确认数学标题缺合法层级: {block.get("level")!r}')
         if block['type']=='list_item':
             if not block['content'] or block['content'][0].get('type')!='text':
                 raise ValueError('说明条目缺已确认的原说明文字')
@@ -244,23 +287,40 @@ def validate(checklist, doc):
             elif not re.match(r'^ {0,3}(?:[0-9]+[.)]|[-+*])[ \t]+',block['content'][0]['origin']['text']):
                 raise ValueError('说明条目缺原可见列表标记或具体转换；未知转换保持待处理')
         if 'cells' in block:table_targets(block)
+        page_number = block['page']
+        if page_number not in scope or not 1 <= page_number <= len(doc):
+            raise ValueError(f'块 {block["id"]} 原页 {page_number} 不在范围 {scope} 或实际 PDF 中')
+        if page_number not in native_pages:
+            native_pages[page_number] = doc[page_number - 1].get_text('rawdict')['blocks']
+        native = native_pages[page_number]
+        registered = _glyph_keys(block['footnote_origin']) if block['type'] == 'footnote_def' else set()
+        if registered & original_glyphs:
+            raise ValueError(f'重复登记原脚注标签: 块 {block["id"]}，原页 {page_number}')
+        original_glyphs.update(registered)
         for cell_id,content in contents(block):
+          last_on_line = {}
           for slot,item in enumerate(content):
               if item.get('type') not in ('text','math','code','link','footnote_ref'):
                   raise ValueError('未知有序内容角色')
               origin=item.get('origin',{})
               if origin.get('page') != block['page'] or origin['page'] not in scope:
                   raise ValueError('内容原页/范围与所属块不符')
-              original_text(doc,origin)
-              keys={(origin['page'],f['block'],f['line'],f['span'],i)
-                    for f in origin['fragments'] for i in range(f['start'],f['end'])}
+              original_text(doc,origin,native=native)
+              keys=_glyph_keys(origin)
               if original_glyphs.intersection(keys):
-                  raise ValueError('同一原字形被重复登记为不同内容出现')
+                  duplicate=min(original_glyphs & keys)
+                  raise ValueError(f'同一原字形被重复登记: 块 {block["id"]}，原页/block/line/span/char={duplicate}')
               original_glyphs.update(keys)
-              fitz=load_fitz()
+              registered.update(keys)
               host_rect=next(cell['rect'] for cell in block['cells'] if cell['id']==cell_id) if cell_id is not None else block['rect']
               if not fitz.Rect(host_rect).contains(fitz.Rect(origin['rect'])):
-                  raise ValueError('原字形区域不属于当前宿主块')
+                  raise ValueError(f'原字形区域不属于当前宿主块 {block["id"]}，原页 {page_number}，位置={origin["fragments"][0]}')
+              for fragment in origin['fragments']:
+                  line = (fragment['block'], fragment['line'])
+                  position = (fragment['span'], fragment['start'])
+                  if position < last_on_line.get(line, position):
+                      raise ValueError(f'同行字形出现顺序不符: 块 {block["id"]}，原页 {page_number} block/line={line}')
+                  last_on_line[line] = (fragment['span'], fragment['end'])
               if item['type']=='code' and ('\n' in origin['text'] or '\r' in origin['text']):
                   raise ValueError('多行代码须按现行golden代码块处理，不展平为行内代码')
               if item['type']=='footnote_ref' and (item.get('label') not in notes or origin['text']!=item['label']):
@@ -269,11 +329,10 @@ def validate(checklist, doc):
                   target=item.get('target');page=doc[origin['page']-1]
                   links=[(fitz.Rect(link['from'])*page.derotation_matrix,link['uri'])
                          for link in page.get_links() if link.get('uri')]
-                  raw=page.get_text('rawdict')['blocks']
                   for fragment in origin['fragments']:
-                      chars=raw[fragment['block']]['lines'][fragment['line']]['spans'][fragment['span']]['chars']
+                      chars=native[fragment['block']]['lines'][fragment['line']]['spans'][fragment['span']]['chars']
                       for char in chars[fragment['start']:fragment['end']]:
-                          box=char['bbox'];point=fitz.Point((box[0]+box[2])/2,(box[1]+box[3])/2)
+                          point=glyph_center(char)
                           if not target or {uri for rect,uri in links if rect.contains(point)}!={target}:
                               raise ValueError('链接目标或原页标签定位不符/歧义')
               if item['type']!='math':
@@ -292,16 +351,16 @@ def validate(checklist, doc):
                   raise ValueError('式号须显式给出或为空')
               label=item['label']
               if label is not None:
-                  if not label.get('text') or original_text(doc,label.get('origin')) != label['text']:
+                  if not label.get('text') or original_text(doc,label.get('origin'),native=native) != label['text']:
                       raise ValueError('式号原页定位/内容不符')
                   loc=label['origin']
                   if loc['page']!=block['page'] or not fitz.Rect(block['rect']).contains(fitz.Rect(loc['rect'])):
                       raise ValueError('式号原页区域不属于该次数学宿主')
-                  label_keys={(loc['page'],f['block'],f['line'],f['span'],i)
-                              for f in loc['fragments'] for i in range(f['start'],f['end'])}
+                  label_keys=_glyph_keys(loc)
                   if original_glyphs.intersection(label_keys):
                       raise ValueError('同一式号字形被重复登记为不同出现')
                   original_glyphs.update(label_keys)
+                  registered.update(label_keys)
               conversion=item.get('conversion',{})
               if (not conversion.get('basis') or conversion.get('source') != origin['text']
                       or conversion.get('target') != item['tex']):
@@ -311,6 +370,17 @@ def validate(checklist, doc):
               if (not confirmation.get('basis') or confirmation.get('source_sha256')!=source
                       or confirmation.get('scope')!=scope or confirmation.get('fact_sha256')!=digest(fact)):
                   raise ValueError('数学确认未绑定当前来源/范围/内容；须实际回源重核: '+identity)
+        coverage.append((block, native, registered))
+    for block, native, registered in coverage:
+        delegated = [fitz.Rect(b['rect']) for b in blocks
+                     if block['id'] in (b.get('algorithm'), b.get('footnote'))]
+        rect = fitz.Rect(block['rect'])
+        # 同行小标题可落入后续多行正文的外接矩形，已由较窄的标题区域登记。
+        narrower = set().union(*(keys for other, _, keys in coverage
+                                if other['page'] == block['page']
+                                and other['type'] == 'heading' and block['type'] == 'paragraph'
+                                and rect != fitz.Rect(other['rect']) and rect.contains(fitz.Rect(other['rect']))))
+        _validate_coverage(block, native, registered, delegated, narrower, exclusions.get(block['page'], ()))
 
 
 def render_content(block):
@@ -331,10 +401,13 @@ def render_content(block):
         if item['type']=='text':
             # CommonMark字面文字，数学及代码不经过这条转义路径。
             value=item['origin']['text'];prefix=''
+            if block['type']=='heading':
+                value=value.replace('\n', ' ')
             if block['type']=='list_item' and slot==0 and 'list_marker' not in block:
                 marker=re.match(r'^ {0,3}(?:[0-9]+[.)]|[-+*])[ \t]+',value)
                 prefix=value[:marker.end()];value=value[marker.end():]
-            text+=prefix+re.sub(r'([\\`*_$\[\]<>#&])',r'\\\1',value)
+            escaped=re.sub(r'([\\`*_$<>#&])',r'\\\1',value)
+            text+=prefix+escaped.replace('[', '&#91;').replace(']', '&#93;')
             continue
         if item['type']=='code':
             text+=markdown_inline_code(item['origin']['text'])
@@ -722,6 +795,19 @@ def leaf_hosts(blocks,spans):
             or block.get('footnote_label') is not None or any(block.get('leaf_groups',()))]
 
 
+def mask_management_fields(text: str) -> str:
+    from export_pdf import project_management_fields
+
+    _, exclusions = project_management_fields(text)
+    if not exclusions:
+        return text
+    lines = text.split('\n')
+    for span in exclusions:
+        for index in range(span['start_line'] - 1, span['end_line']):
+            lines[index] = re.sub(r'[^\r\n]', ' ', lines[index])
+    return '\n'.join(lines)
+
+
 def approved_extra_view(text, source_context, approved_extra_math=()):
     """只投影明确译注内逐次获准的数学；来源公式仍须完整独立对账。"""
     if not approved_extra_math:return text,[]
@@ -919,7 +1005,12 @@ def verify(checklist,doc,text,mapping,translation=None,source_range=None,approve
             if span.kind!=item['kind'] or tex!=item['tex'] or label!=(item['label'] or {}).get('text'):
                 raise ValueError('译文数学内容/类型/式号损伤: '+item['id'])
         target_member_blocks,target_hosts=math_hosts(translation,target_blocks,all_maths,target_scan.spans)
-        if leaf_hosts(chosen_blocks,chosen_spans)!=leaf_hosts(target_blocks,target_scan.spans):
+        leaf_text = mask_management_fields(translation)
+        leaf_blocks = target_blocks
+        if leaf_text != translation:
+            leaf_blocks, _ = markdown_blocks(leaf_text, context(checklist))
+            math_hosts(leaf_text, leaf_blocks, all_maths, target_scan.spans)
+        if leaf_hosts(chosen_blocks,chosen_spans)!=leaf_hosts(leaf_blocks,target_scan.spans):
             raise ValueError('译文代码/链接实际叶子宿主、正文边界、内容、目标或数学连接位置损伤')
         for item in all_maths:
             if source_hosts[item['id']]!=target_hosts[item['id']]:

@@ -53,6 +53,8 @@ th p, td p, .footnotes p, figcaption p { text-align: left; }
 p:has(+ table) { break-after: avoid-page; }
 p:has(> img) { break-after: avoid-page; }
 p:has(> img) + p { break-inside: avoid; }
+p:has(> img) + .anchor-only + p { break-inside: avoid; }
+.anchor-only { margin: 0; line-height: 0; break-after: avoid-page; }
 img { break-after: avoid-page; }
 caption { break-after: avoid-page; }
 
@@ -121,6 +123,8 @@ th, td {
 
 thead { display: table-header-group; }
 th { background: #efefef; font-family: "STHeiti", "Arial Unicode MS", sans-serif; }
+.table-number { white-space: nowrap; overflow-wrap: normal; }
+.table-number a { word-break: normal; }
 
 blockquote {
   margin: 0.7em 0;
@@ -173,6 +177,15 @@ img, svg { max-width: 100%; height: auto; }
   overflow: visible;
 }
 .katex-display { margin: 0; }
+.math-block .katex-html { padding-inline-end: var(--equation-tag-slot, 0px); }
+.equation-unit {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+  align-items: center;
+  break-inside: avoid;
+}
+.equation-label { margin: 0; white-space: nowrap; }
 .katex { font-size: 1.05em; }
 .katex-error-node { color: #b00; border-bottom: 1pt dashed #b00; }
 /* KaTeX 的行内公式与编号槽（.katex-tag，absolute + right:0）内，vlist 的 .vlist-s 支柱列

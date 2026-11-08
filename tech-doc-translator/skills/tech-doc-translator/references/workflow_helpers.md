@@ -2,6 +2,60 @@
 
 这些入口消费当前来源和现有核验事实，不翻译、不裁决语义，也不授予自动完成资格。先按对应源家族完成原快照准入、独立对账及主 Agent 的来源/范围确认。运行产物放在项目既有证据位置或 Git 工作区外；旧源包、历史任务、复核记录与有效索引保留。
 
+## 单记录翻译与 PDF 交付
+
+在同一路径维护 version=1 记录。先用 `translation` 模式登记正文、来源、翻译检查及当前已实际闭合的 source-reconcile / semantic 复核。启用数字辅助时，逐项登记本次差异 ID，未处置项会阻断就绪。正式交付使用库外项目 `PROJECT`，导出用新临时目录，当前报告使用项目持久目录。
+
+```bash
+EXPORT_WORK=$(mktemp -d) || exit 1
+CURRENT_REPORT="$PROJECT/evidence/current-export"
+python3 "$SCRIPTS/export_pdf.py" --translation-record "$RECORD" \
+  --output "$PDF" --work-dir "$EXPORT_WORK" "$CHAPTER" || exit 1
+python3 - "$EXPORT_WORK" "$CURRENT_REPORT" <<'PY' || exit 1
+from hashlib import sha256
+from pathlib import Path
+import sys
+
+source, target = (Path(path) / 'export_report.json' for path in sys.argv[1:])
+payload = source.read_bytes()
+target.parent.mkdir(parents=True, exist_ok=True)
+with target.open('xb') as output:
+    output.write(payload)
+if sha256(target.read_bytes()).digest() != sha256(payload).digest():
+    raise SystemExit('持久导出报告摘要不符')
+PY
+python3 "$SCRIPTS/verify_pdf.py" --pdf "$PDF" --work-dir "$CURRENT_REPORT" "$CHAPTER"
+```
+
+按实际情况在两条命令传入同一交付级图像映射及适用的来源依据。复制和摘要核对成功后，把同一记录改为 `translation+pdf`，登记 PDF 角色和输出摘要，在原有翻译检查后追加 `verify_pdf` 的实际参数。首次准备 PDF 复核候选及登记视觉绑定时，记录中的 `--work-dir` 已指向 `CURRENT_REPORT`。目标报告已存在时停止复制，保持原记录和报告。按当前绑定登记实际视觉及适用链接复核，再用 `verify_delivery.py --record "$RECORD" --evidence-dir "$EVIDENCE"` 发布。仅增加 PDF 事实时，已核对的翻译范围和复核无需重录。来源、正文或核验口径变化后，按实际影响重核。
+
+就绪、打印、机器核验、复核门禁和发布的阶段进度写入 stderr，现有 stdout 结果可照常消费。同一次调用中仍使用同一身份的已完成翻译结果可复用；独立来源对账、人工复核和发布前的当前身份复查各自保留。
+
+统一入口出现 `translation-readiness-invalid` 时，可把当前 `export_report.json` 原字节复制到新临时目录，使用记录实际调用的解释器、PDF、输入顺序和其余参数运行独立 `verify_pdf.py`，仅把 `--work-dir` 指向副本目录，从新 `verify_report.json` 读取具体失败原因。若指向检查器身份变化，对照实际加载的脚本及复核绑定摘要；历史版本的复验用于回查，当前交付仍按当前入口和真实复核闭合。
+
+显式目录放在 `inputs` 的实际位置，按 `files["00_目录.md"]="toc"` 和 `toc_manifests: {"00_目录.md": "source/toc.json"}` 登记。用 `build_toc.py` 的现有 manifest 格式记录独立官方依据、已确认范围和每条实际标题出现。已有手写目录可保留内容并补同格式 manifest。目录标签与本次目标按有序条目核对，目录说明超出已识别的出处、管理或范围文字时，用已有视图声明逐处确认。记录声明了视图文件时，导出和核验传同一 `--view-declaration`。目录仍进入实际 PDF 输入；源链、翻译检查及语义复核覆盖正文。
+
+用 `verify_delivery.py --record "$RECORD" --prepare-reviews "$CANDIDATE"` 在显式新路径生成复核候选。它按同一硬检查准备当前适用条目的绑定和逐项待办，原记录和索引保留。先实际回源、判读或目检，逐项登记依据并填写原有 `note/items/status`，再将闭合条目登记到当前记录，走正式 `--evidence-dir` 入口。候选中的 `pending` 和预填 `items` 表示待办。旧闭合条目仅在当前绑定、摘要和待处置覆盖一致时沿用。
+
+同路径重导出时，在覆盖前保留原实际视觉复核记录及旧成品、旧报告。当前视觉候选可按[显式视觉复用](pdf_export.md#显式视觉复用)人工登记 `reused`，由正式入口重验全页等价和原件。适用的链接复核另行核对并登记。
+
+## 数学逐字装配
+
+按已准入来源的实际数学出现顺序，在草稿放入 ⟦m1⟧、⟦m2⟧ 等占位。源中
+两次相同公式也各占一个位置。保持源公式顺序与宿主角色，译文句式围绕该顺序安排。
+LaTeXML 使用与来源核验一致的依据。多快照按同一顺序重复该参数。
+
+~~~bash
+python3 "$SCRIPTS/splice_math.py" --source "$SOURCE" --draft "$DRAFT" \
+  --source-adaptation "$ADAPTATION" --output "$CANDIDATE"
+python3 "$SCRIPTS/verify_translation.py" "$CANDIDATE" "$SOURCE" \
+  --source-adaptation "$ADAPTATION"
+~~~
+
+PDF 确认数学使用[PDF 原页裁决及装配](pdf_source.md#确认数学装配)的项目上下文。
+普通来源按共享扫描器处理合法数学。装配逐字插入完整定界切片，复查其实际位置、
+类型和顺序，并只写入新候选。家族硬检查和实际语义复核随后执行。
+
 ## 项目上下文
 
 `--project-context <JSON>` 的 `project_root` 是相对引用基点；`source_record` 引用现有 `verify_delivery.py` 来源记录。准备阶段不要求尚未生成的译文、PDF 或交付级映射。`source_scope` 为 `"all"` 或明确的包顺序整数数组，不能从已收到包反推范围。`source_review` 必须有同一 `scope`、主 Agent 实际来源/范围裁决的 `basis` 及当前来源 `binding`，后者使用现有来源核对结果中的 `parsed_sha256`、`source_version`、`snapshots`；旧 PASS 或手填新摘要不代替实际确认。

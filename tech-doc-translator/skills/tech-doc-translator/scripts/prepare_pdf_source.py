@@ -505,6 +505,10 @@ def cmd_materialize(args):
         formal_math = _pdf_math.enabled(checklist)
         if formal_math:
             _pdf_math.validate(checklist, doc)
+            for rejected in checklist.get("rejected", ()):
+                if rejected.get("page") in checklist["scope"] and rejected.get("rect") and rejected.get("reason"):
+                    print("原页 %s 明确排除区域 %s：%s"
+                          % (rejected["page"], rejected["rect"], rejected["reason"]), file=sys.stderr)
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         fail("确认数学拒绝物化: %s" % exc)
     lines = []
@@ -580,9 +584,9 @@ def cmd_materialize(args):
             else:
                 golden_path = os.path.join(checklist_dir, golden_rel)
                 if not os.path.isfile(golden_path):
-                    fail("code_region 块 %s 的 golden 缺失: %s（须先运行 "
+                    fail("code_region 块 %s（原页 %s，输出 L%d）的 golden 缺失: %s（须先运行 "
                          "extract-code 提取并回源确认）"
-                         % (block.get("id"), golden_path))
+                         % (block.get("id"), block.get("page"), start_line, golden_path))
                 with open(golden_path, encoding='utf-8', newline='') as handle:
                     body = handle.read()
                 if body.endswith("\n"):
@@ -599,9 +603,9 @@ def cmd_materialize(args):
             else:
                 image_path = os.path.join(checklist_dir, image_rel)
                 if not os.path.isfile(image_path):
-                    fail("figure_region 块 %s 的图片缺失: %s（须先运行 "
+                    fail("figure_region 块 %s（原页 %s，输出 L%d）的图片缺失: %s（须先运行 "
                          "extract-figures 提取并回源确认）"
-                         % (block.get("id"), image_path))
+                         % (block.get("id"), block.get("page"), start_line, image_path))
                 declared = block.get("image_sha256")
                 if declared and declared != file_sha256(image_path):
                     fail("figure_region 块 %s 的图片摘要与清单固化记录不符"

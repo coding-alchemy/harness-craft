@@ -146,6 +146,7 @@ def _host_facts(text, table_lines):
     """逐行已知宿主：所属章节、表格格位、题注、脚注。"""
     headings = [(line, title)
                 for line, _level, title in heading_entries(text)]
+    heading_lines = {line for line, _title in headings}
     hosts = {}
     for line_no, line in enumerate(text.split('\n'), start=1):
         section = None
@@ -156,6 +157,11 @@ def _host_facts(text, table_lines):
                 break
         host = {'section': section, 'table': False, 'column': None,
                 'caption': False, 'footnote': None}
+        if line_no in heading_lines:
+            host['heading'] = True
+        if re.match(r'^\s*>\s*(?:\*\*)?(?:原文|译例说明|来源|抓取日期)'
+                    r'(?:\*\*)?\s*[:：]', line):
+            host['management'] = True
         if line_no in table_lines:
             host['table'] = True
         match = _CAPTION_HINT.search(line)
@@ -264,6 +270,10 @@ def extract_numeric_tokens(text, label='正文'):
                 'offset': offset,
                 'host': dict(hosts[line_no]),
             }
+            if re.search(r'(?:\b(?:fig(?:ure)?\.?|table|eq(?:uation)?\.?|'
+                         r'section|sec\.)\s*|[图表节式]\s*)[（(]?$',
+                         line[:start], flags=re.IGNORECASE):
+                token['host']['cross_reference'] = True
             if context == 'unclassified':
                 unclassified.append(token)
             else:
@@ -502,6 +512,24 @@ def compute_numeric_review(src_text, doc_text, src_label='源文',
                                    if d['role'] == 'doc_added'),
         },
     }
+
+
+def group_numeric_diffs(review: dict) -> list[dict]:
+    """按上下文整理显示；保留每个原差异、出现次数及位置。"""
+    groups = {}
+    for diff in review["diffs"]:
+        host = diff["host"]
+        if host.get("management"):
+            category = "management"
+        elif host.get("heading") or host.get("cross_reference"):
+            category = "cross_reference"
+        elif diff["unit"] or diff["magnitude"] or diff["note"]:
+            category = "same_value_unit"
+        else:
+            category = "other"
+        groups.setdefault(category, []).append(diff)
+    return [{"category": category, "items": items}
+            for category, items in groups.items()]
 
 
 def numeric_binding(src_text, doc_text, scope, policy_path=None):
