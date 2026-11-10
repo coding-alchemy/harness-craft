@@ -541,6 +541,26 @@ printf 'index.html\nt04_page.html\n' > "$T04OUT/expected.txt"
 diff -u "$T04OUT/expected.txt" "$T04OUT/manifest.txt"
 python3 "$PARSE" "$T04SITE/t04_page.html" "$T04OUT/src/t04_page.md" 2>/dev/null
 python3 "$PARSE" "$T04SITE/index.html" "$T04OUT/src/index.md" 2>/dev/null
+T04_RECORD="$T04OUT/source_record.json"
+python3 - "$TMP" "$T04_RECORD" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+chapter = 't04out/merged.md'
+record = {
+    'version': 1, 'mode': 'translation', 'delivery_root': str(root),
+    'inputs': [chapter],
+    'sources': [
+        {'family': 'api', 'source_version': 'test',
+         'parsed_markdown': f't04out/src/{stem}.md',
+         'snapshots': [{'snapshot': f't04site/{stem}.html'}], 'covers': [chapter]}
+        for stem in ('index', 't04_page')
+    ],
+}
+Path(sys.argv[2]).write_text(json.dumps(record), encoding='utf-8')
+PY
 python3 - "$T04SITE/t04_page.html" "$T04OUT/src/t04_page.md" <<'PY'
 import sys
 sys.path.insert(0, 'skills/tech-doc-translator/scripts')
@@ -556,10 +576,11 @@ assert [t for _, _, t in heading_entries(md)] == [
 assert reconcile_html_to_markdown(html, md, 'api') == [], '独立对账误判'
 print('Ticket 04 API 解析保真与独立对账 PASS')
 PY
-python3 "$MERGE" "$T04OUT/manifest.txt" "$T04SITE" "$T04OUT/merged.md"
+python3 "$MERGE" "$T04OUT/manifest.txt" "$T04SITE" "$T04OUT/merged.md" \
+  --navigation-record "$T04_RECORD"
 python3 "$VERIFY" "$T04OUT/merged.md" "$T04OUT/manifest.txt" \
   "$T04OUT/expected.txt" "$T04SITE" \
-  "$T04OUT/src/index.md" "$T04OUT/src/t04_page.md"
+  "$T04OUT/src/index.md" "$T04OUT/src/t04_page.md" --navigation-record "$T04_RECORD"
 
 echo "==> Ticket 04 失败回归：API 译文去掉普通段转义必须判 FAIL"
 python3 - "$T04SITE/trans_t04_page.md" <<'PY'
@@ -569,10 +590,11 @@ text = open(path, encoding='utf-8').read()
 open(path, 'w', encoding='utf-8').write(
     text.replace('\\# define data', '# define data'))
 PY
-python3 "$MERGE" "$T04OUT/manifest.txt" "$T04SITE" "$T04OUT/merged.md" >/dev/null
+python3 "$MERGE" "$T04OUT/manifest.txt" "$T04SITE" "$T04OUT/merged.md" \
+  --navigation-record "$T04_RECORD" >/dev/null
 if python3 "$VERIFY" "$T04OUT/merged.md" "$T04OUT/manifest.txt" \
   "$T04OUT/expected.txt" "$T04SITE" \
-  "$T04OUT/src/index.md" "$T04OUT/src/t04_page.md"; then
+  "$T04OUT/src/index.md" "$T04OUT/src/t04_page.md" --navigation-record "$T04_RECORD"; then
   echo "错误：API 译文伪标题未被检测到"
   exit 1
 else

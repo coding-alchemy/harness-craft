@@ -697,6 +697,7 @@ class HtmlFidelity:
     def parse(self, raw):
         """保护代码后解析 HTML；每次重置本页代码池、图片及表转换事实。"""
         self._pre_blocks = []
+        self._pre_ids = {}
         self.image_display = []
         self.table_conversions = []
 
@@ -704,6 +705,10 @@ class HtmlFidelity:
             body = clean_code_html(match.group(2))
             index = len(self._pre_blocks)
             self._pre_blocks.append(body)
+            if re.search(r'\bid\s*=', match.group(1), re.I):
+                pre = BeautifulSoup(match.group(1), 'html.parser').find('pre')
+                if pre and pre.get('id'):
+                    self._pre_ids[index] = pre['id']
             return '<!-- __TECHDOC_PRE_%d__ -->' % index
 
         protected = re.sub(
@@ -1221,6 +1226,14 @@ class HtmlFidelity:
             return None
         text = self._pre_blocks[int(match.group(1))]
         return '\n```\n' + text.rstrip('\n') + '\n```'
+
+    def pre_anchor_ids(self, node):
+        from _api_navigation import code_anchor_ids
+        match = re.fullmatch(r'\s*__TECHDOC_PRE_(\d+)__\s*', node)
+        return code_anchor_ids(
+            node, self._pre_ids.get(int(match[1])),
+            is_placeholder=lambda item: isinstance(item, Comment)
+            and re.fullmatch(r'\s*__TECHDOC_PRE_\d+__\s*', item))
 
     @staticmethod
     def _span_guard(cell, attr, row_no, col_no):

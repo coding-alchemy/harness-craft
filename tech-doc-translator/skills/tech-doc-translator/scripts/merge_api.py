@@ -187,18 +187,66 @@ def _bind_display_entries(page_rel, page_map, translated_body, site_root,
     return bind_page(markdown_label, page_map, occurrences)
 
 
+def _publish_candidate(out_path, candidate, check):
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', newline='',
+                                         dir=os.path.dirname(os.path.abspath(out_path)),
+                                         prefix='.api-merge-', delete=False) as handle:
+            staged = handle.name
+            handle.write(candidate)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with open(staged, encoding='utf-8', newline='') as handle:
+            actual = handle.read()
+        if actual != candidate:
+            raise ValueError('API 合并候选重读不符')
+        check(staged, actual)
+        os.replace(staged, out_path)
+    finally:
+        if staged and os.path.exists(staged):
+            os.unlink(staged)
+
+
 def main():
     parser = argparse.ArgumentParser(description='按页面清单顺序合并已翻译 API 页面')
     parser.add_argument('manifest')
     parser.add_argument('site_root')
     parser.add_argument('out')
     parser.add_argument('--navigation-record', help='既有 source_record：快照及 covers 证明源页到章归属')
+    parser.add_argument('--recover-navigation-from', help='冻结的当前合章 Markdown 基准')
+    parser.add_argument('--official-toc', help='恢复模式使用的独立官方 TOC')
     parser.add_argument(
         '--display-src',
         help='解析期 <页名>.images_display.json 所在目录；提供后才关联显示尺寸')
     args = parser.parse_args()
 
     manifest_path, site_root, out_path = args.manifest, args.site_root, args.out
+    if args.recover_navigation_from:
+        if not args.navigation_record or not args.official_toc or args.display_src:
+            parser.error('导航恢复需要 --official-toc 和 --navigation-record，沿用当前显示尺寸映射')
+        from _api_navigation import recover_navigation, verify_recovery
+        baseline, manifest_path, toc, site_root, record = map(os.path.abspath, (
+            args.recover_navigation_from, manifest_path, args.official_toc, site_root,
+            args.navigation_record))
+        out_path = os.path.abspath(out_path)
+        try:
+            candidate = recover_navigation(
+                baseline, manifest_path, toc, site_root, record, chapter_path=out_path)
+
+            def check(staged, _actual):
+                errors = verify_recovery(
+                    baseline, staged, manifest_path, toc, site_root, record, chapter_path=out_path)
+                if errors:
+                    raise ValueError('导航恢复候选核验失败: ' + '；'.join(errors))
+
+            _publish_candidate(out_path, candidate, check)
+        except (OSError, ValueError, KeyError) as exc:
+            sys.exit(str(exc))
+        print('已恢复当前合章导航 -> %s' % out_path)
+        return
+    if args.official_toc:
+        parser.error('--official-toc 仅用于当前合章导航恢复')
 
     with open(manifest_path, encoding='utf-8') as f:
         pages = [line.strip() for line in f if line.strip()]
@@ -207,7 +255,10 @@ def main():
     navigation = None
     if args.navigation_record:
         from _api_navigation import load_navigation
-        navigation = load_navigation(args.navigation_record, site_root)
+        try:
+            navigation = load_navigation(args.navigation_record, site_root)
+        except (OSError, ValueError, KeyError) as exc:
+            sys.exit(str(exc))
     bodies = []
     assets = {}
     page_display_batches = []  # [(确定条目, 未确定条目, 该页图片数)]，按清单顺序
@@ -221,6 +272,9 @@ def main():
             if navigation is not None:
                 from _api_navigation import transform_page
                 body = transform_page(body, p, navigation, out_path)
+            else:
+                from _api_navigation import require_navigation_record
+                require_navigation_record(os.path.join(site_root, p), body)
             body = _localize_images(body, site_root, p, assets)
             if args.display_src:
                 page_map = _load_page_display_map(args.display_src, p)
@@ -239,7 +293,7 @@ def main():
                         os.path.abspath(map_dir)))
                 page_display_batches.append(
                     (batch, len(_real_image_matches(raw_body))))
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             sys.exit(str(exc))
         bodies.append(body)
 
@@ -264,13 +318,7 @@ def main():
             shutil.copy2(source, destination)
 
     candidate='\n\n---\n\n'.join(bodies) + '\n'
-    staged=None
-    try:
-        with tempfile.NamedTemporaryFile('w',encoding='utf-8',dir=output_dir,
-                                         prefix='.api-merge-',delete=False) as handle:
-            staged=handle.name;handle.write(candidate);handle.flush();os.fsync(handle.fileno())
-        actual=open(staged,encoding='utf-8').read()
-        if actual!=candidate:raise ValueError('API 合并候选重读不符')
+    def check(_staged, actual):
         if navigation is not None:
             from _api_navigation import verify_page
             from verify_api_translation import _split_pages
@@ -279,9 +327,7 @@ def main():
             for page,piece in zip(pages,pieces):
                 errors=verify_page(navigation[page]['source'],piece,page,navigation,out_path)
                 if errors:raise ValueError('API 合并候选导航核验失败: '+'；'.join(errors))
-        os.replace(staged,out_path)
-    finally:
-        if staged and os.path.exists(staged):os.unlink(staged)
+    _publish_candidate(out_path, candidate, check)
     if args.display_src:
         # 新交付布局：交付级映射固定写入 export/ 子目录，条目引用相对
         # 映射目录解析（../images/...），不再写根目录副本。

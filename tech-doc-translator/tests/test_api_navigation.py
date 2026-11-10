@@ -5,7 +5,7 @@ SCRIPTS=Path(__file__).resolve().parents[1]/'skills/tech-doc-translator/scripts'
 sys.path.insert(0,str(SCRIPTS))
 from _api_navigation import load_navigation,namespaced,verify_page,anchor_diffs
 
-class ApiNavigationTests(unittest.TestCase):
+class ApiNavigationFixture:
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(prefix='api-navigation-');self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name).resolve()
@@ -32,6 +32,9 @@ class ApiNavigationTests(unittest.TestCase):
     def merge(self):
         self.run_tool('merge_api.py',self.root/'ab.txt',self.root,self.root/'01_AB.md','--navigation-record',self.root/'record.json')
         self.run_tool('merge_api.py',self.root/'c.txt',self.root,self.root/'02_C.md','--navigation-record',self.root/'record.json')
+
+
+class ApiNavigationTests(ApiNavigationFixture, unittest.TestCase):
     def test_actual_merge_and_final_checker(self):
         self.assertFalse((self.root/'01_AB.md').exists());self.merge()
         self.run_tool('verify_api_translation.py',self.root/'01_AB.md',self.root/'ab.txt',self.root/'ab.txt',self.root,self.root/'a.md',self.root/'b.md','--navigation-record',self.root/'record.json')
@@ -43,6 +46,153 @@ class ApiNavigationTests(unittest.TestCase):
         damaged=final.replace('#'+namespaced('b.html','same'),'#'+namespaced('a.html','same'),1)
         (self.root/'01_AB.md').write_text(damaged)
         self.run_tool('verify_api_translation.py',self.root/'01_AB.md',self.root/'ab.txt',self.root/'ab.txt',self.root,self.root/'a.md',self.root/'b.md','--navigation-record',self.root/'record.json',ok=False)
+    def object_source(self):
+        return ('<article><h1 id="same">A</h1><p id="p">Paragraph.</p>'
+                '<pre id="direct">one &lt; two</pre>'
+                '<div class="literal-block-wrapper" id="listing">'
+                '<div class="code-block-caption">Listing 1. Example.</div>'
+                '<div class="highlight-c" id="alias"><pre>two &gt; one</pre></div></div>'
+                '<p><a href="#p">paragraph</a> <a href="#direct">first</a> '
+                '<a href="#listing">second</a> <a href="#alias">alias</a></p></article>')
+    def test_code_listing_and_paragraph_ids_survive_parse_merge_verify(self):
+        from _api_navigation import source_anchors
+        raw = self.object_source()
+        self.assertEqual(source_anchors(raw)['direct'], ('code', 1))
+        self.assertEqual(source_anchors(raw)['p'], ('paragraph', 1))
+        self.assertEqual(source_anchors(raw)['listing'], ('code', 2))
+        self.assertEqual(source_anchors(raw)['alias'], ('code', 2))
+        (self.root/'a.html').write_text(raw)
+        self.run_tool('parse_api_html.py', self.root/'a.html', self.root/'a.md')
+        text = (self.root/'a.md').read_text()
+        self.assertEqual(anchor_diffs(raw, text), [])
+        (self.root/'trans_a.md').write_text(text)
+        output = self.root/'01_AB.md'
+        self.run_tool('merge_api.py', self.root/'ab.txt', self.root, output,
+                      '--navigation-record', self.root/'record.json')
+        self.run_tool('verify_api_translation.py', output, self.root/'ab.txt',
+                      self.root/'ab.txt', self.root, self.root/'a.md', self.root/'b.md',
+                      '--navigation-record', self.root/'record.json')
+        for name in ('p', 'direct', 'listing', 'alias'):
+            self.assertIn('](#'+namespaced('a.html', name)+')', output.read_text())
+        self.assertIn('\none < two\n', output.read_text())
+        self.assertIn('\ntwo > one\n', output.read_text())
+        from recover_work_packages import _frontmatter
+        from _api_navigation import compare_anchors
+        for strategy in ('h2', 'chars:25'):
+            packages = self.root/strategy.replace(':', '_')
+            self.run_tool('split_work_packages.py', self.root/'a.md', packages,
+                          self.root/(packages.name+'_trans'), strategy)
+            remaining = {'p': 'Paragraph.', 'direct': 'one < two', 'listing': 'two > one'}
+            for package in packages.glob('wp_*.md'):
+                _, body = _frontmatter(package)
+                for name in tuple(remaining):
+                    anchor = f'<a id="{name}"></a>'
+                    if anchor in body:
+                        self.assertIn(remaining.pop(name), body)
+                        self.assertTrue(compare_anchors(body, body.replace(anchor, '')))
+            self.assertEqual(remaining, {})
+    def test_code_or_paragraph_anchor_wrong_object_is_rejected(self):
+        raw = self.object_source()
+        text = ('<a id="same"></a>\n\n# A\n\n<a id="p"></a>\n\nParagraph.\n\n<a id="direct"></a>\n\n'
+                '```\none < two\n```\n\nListing 1. Example.\n\n<a id="listing"></a>\n'
+                '<a id="alias"></a>\n\n```\ntwo > one\n```\n')
+        self.assertEqual(anchor_diffs(raw, text), [])
+        swapped = text.replace('"direct"', '"temp"').replace('"listing"', '"direct"')
+        swapped = swapped.replace('"temp"', '"listing"')
+        self.assertTrue(anchor_diffs(raw, swapped))
+        misplaced = '<a id="p"></a>\n\n'+text.replace('<a id="p"></a>\n\n','')
+        self.assertTrue(anchor_diffs(raw, misplaced))
+
+    def test_admonition_anchor_follows_the_quote(self):
+        from _api_navigation import _recovery_object_lines, source_anchors
+        raw = ('<article><h1>A</h1><blockquote><p>Quote.</p></blockquote>'
+               '<div class="admonition note" id="note"><p class="admonition-title">Note</p>'
+               '<p>Text.</p></div><p><a href="#note">Read the note</a>.</p></article>')
+        snapshot = self.root/'a.html'
+        parsed = self.root/'a.md'
+        snapshot.write_text(raw)
+        self.run_tool('parse_api_html.py', snapshot, parsed)
+        source = parsed.read_text()
+        anchor = '<a id="note"></a>'
+        self.assertIn(anchor, source)
+        self.assertEqual(anchor_diffs(raw, source), [])
+        self.assertTrue(anchor_diffs(raw, anchor+'\n\n'+source.replace(anchor, '')))
+        current = source.replace(anchor, '').replace('ADMONITION [Note]', '注（Note）')
+        facts = dict(source=source, raw=raw, section_id=None, anchors=source_anchors(raw))
+        targets = _recovery_object_lines(current, 'a.html', facts, self.root/'01_AB.md')
+        self.assertEqual(current.splitlines()[targets['note']-1], '> **注（Note）**')
+        ambiguous = current+'\n> **另一个注（Note）**\n> Other text.\n'
+        with self.assertRaisesRegex(ValueError, '无法唯一对应 admonition'):
+            _recovery_object_lines(ambiguous, 'a.html', facts, self.root/'01_AB.md')
+
+    def test_paragraph_recovery_uses_unique_adjacent_list_when_quote_layout_differs(self):
+        from _api_navigation import _recovery_object_lines, source_anchors
+        raw = ('<article><h1>A</h1><p id="flags">Options:</p><blockquote>'
+               '<div><p>Compiler options.</p><ul><li>Pass <code>-O3</code>.</li></ul></div>'
+               '</blockquote><p>End.</p></article>')
+        snapshot = self.root/'a.html'
+        parsed = self.root/'a.md'
+        snapshot.write_text(raw)
+        self.run_tool('parse_api_html.py', snapshot, parsed)
+        facts = dict(source=parsed.read_text(), raw=raw, section_id=None, anchors=source_anchors(raw))
+        current = '# A\n\n编译选项：\n\n选项说明。\n\n- 使用 `-O3`。\n\n结束。\n'
+        targets = _recovery_object_lines(current, 'a.html', facts, self.root/'01_AB.md')
+        self.assertEqual(current.splitlines()[targets['flags']-1], '编译选项：')
+        with self.assertRaisesRegex(ValueError, '无法唯一对应 paragraph'):
+            _recovery_object_lines(current.replace('-O3', '-O2'), 'a.html', facts, self.root/'01_AB.md')
+
+    def test_recovery_retains_block_boundary_when_a_neighbouring_anchor_moves(self):
+        from _api_navigation import _apply_edits, _recovery_anchor_edits
+        text = ('# A\n\n<a id="table"></a>\n<a id="paragraph"></a>\n'
+                '[TABLE-CAPTION] Table 1. Caption\n\n| A |\n| --- |\n\nText.\n')
+        roles = {'table': ('table', 1), 'paragraph': ('paragraph', 1)}
+        fixed = _apply_edits(text, _recovery_anchor_edits(
+            text, 'a.html', {'table': 7, 'paragraph': 10}, roles))
+        self.assertIn(f'<a id="{namespaced("a.html", "table")}"></a>\n\n[TABLE-CAPTION]', fixed)
+        targets = {'table': fixed.splitlines().index('| A |')+1,
+                   'paragraph': fixed.splitlines().index('Text.')+1}
+        self.assertEqual(_recovery_anchor_edits(fixed, 'a.html', targets, roles), [])
+
+    def test_navigation_record_required_from_source_even_when_translation_deletes_link(self):
+        import _api_navigation
+        raw = '<article><h1>A</h1><p><a href="b.html#same">B</a></p></article>'
+        (self.root/'a.html').write_text(raw)
+        (self.root/'trans_a.md').write_text('# A\n\nB\n')
+        manifest = self.root/'a.txt'
+        manifest.write_text('a.html\n')
+        output = self.root/'01_AB.md'
+        output.write_text('# A\n\nB\n')
+        before = output.read_bytes()
+        p = self.run_tool('merge_api.py', manifest, self.root, output, ok=False)
+        self.assertIn('--navigation-record', p.stderr)
+        self.assertIn('b.html#same', p.stderr)
+        self.assertEqual(output.read_bytes(), before)
+        (self.root/'a.md').write_bytes(before)
+        p = self.run_tool('verify_api_translation.py', output, manifest, manifest,
+                          self.root, self.root/'a.md', ok=False)
+        self.assertIn('--navigation-record', p.stdout+p.stderr)
+        self.assertTrue(_api_navigation.requires_navigation(raw, '# A\n\nB\n'))
+    def test_non_navigation_api_and_outside_article_nav_need_no_record(self):
+        import _api_navigation
+        raw = ('<nav><a href="b.html#same">outside</a></nav><article><h1>A</h1>'
+               '<p><a href="https://example.org">external</a> <a href="file.zip">asset</a></p>'
+               '<pre><a href="b.html">literal</a></pre></article>')
+        text = ('# A\n\n[external](https://example.org) [asset](file.zip)\n\n'
+                '```\n[literal](b.html)\n```\n')
+        (self.root/'a.html').write_text(raw)
+        for name in ('a.md', 'trans_a.md'):
+            (self.root/name).write_text(text)
+        manifest = self.root/'a.txt'
+        manifest.write_text('a.html\n')
+        output = self.root/'01_AB.md'
+        self.run_tool('merge_api.py', manifest, self.root, output)
+        self.run_tool('verify_api_translation.py', output, manifest, manifest, self.root,
+                      self.root/'a.md')
+        self.assertTrue(hasattr(_api_navigation, 'requires_navigation'))
+        self.assertFalse(_api_navigation.requires_navigation(raw, text))
+        self.assertTrue(_api_navigation.requires_navigation(raw, text+'\n[added](b.html)\n'))
+        with self.assertRaises(ValueError):
+            _api_navigation.requires_navigation(raw, text, section_id='missing')
     def test_ownership_missing_target_conflict_and_range_refused(self):
         self.record['sources'][0]['covers']=['01_AB.md','02_C.md'];self.save_record()
         with self.assertRaisesRegex(ValueError,'不唯一'):load_navigation(self.root/'record.json',self.root)
@@ -157,6 +307,165 @@ class ApiNavigationTests(unittest.TestCase):
         self.assertEqual(links(text),['b.html#same','a.html#same','c.html#same'])
         changed=replace_links(text,lambda href:'#new')
         self.assertEqual(links(changed),['#new','#new','#new']);self.assertIn('`[literal](c.html)`',changed)
+
+class RecoveryNavigationTests(ApiNavigationFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.manifest = self.root/'ab.txt'
+        self.toc = self.root/'official.txt'
+        self.toc.write_text('a.html\nb.html\n')
+        self.output = self.root/'01_AB.md'
+        self.baseline = self.root/'current.md'
+        self.candidate = self.root/'candidate.md'
+        self.record_path = self.root/'record.json'
+        source_image = self.root/'source.png'
+        source_image.write_bytes((Path(__file__).parent/'fixtures/valid_1x1.png').read_bytes())
+        raw = self.raws['a.html'].replace('</section>',
+            '<figure id="figure"><img src="source.png"></figure></section>')
+        self.raws['a.html'] = raw
+        (self.root/'a.html').write_text(raw)
+        self.run_tool('parse_api_html.py', self.root/'a.html', self.root/'a.md')
+        self.record['sources'][0]['snapshots'][0]['per_stem_map'] = 'a.images_display.json'
+        self.save_record()
+        a = (self.root/'a.md').read_text()
+        a = a.replace('<a id="t"></a>', '').replace('](source.png)', '](images/local.png)').replace(
+            'Table 1. Values', 'Table 1. Values [one](https://example.com/blog) '
+            '[two](https://example.com/blog)')
+        a += ('\n合章后修订 [custom](#mine) [slug](#a) $x$\n\n'
+              '<a id="mine"></a>\n\nCurrent text.\n')
+        b = (self.root/'b.md').read_text()
+        self.current = (a.rstrip()+'\n\n  ---  \n\n'+b).replace('\n', '\r\n').encode()
+        self.baseline.write_bytes(self.current)
+        (self.root/'trans_a.md').write_text('outdated translated page')
+        self.image = self.root/'images/local.png'
+        self.image.parent.mkdir()
+        self.image.write_bytes(source_image.read_bytes())
+        self.display = self.root/'images_display.json'
+        self.display.write_text('{"independent":"existing display map"}\n')
+        self.evidence = self.root/'previous-evidence.json'
+        self.evidence.write_text('{"status":"PASS"}\n')
+
+    def merge_args(self, baseline=None, output=None):
+        return (self.manifest, self.root, output or self.output,
+                '--recover-navigation-from', baseline or self.baseline,
+                '--official-toc', self.toc, '--navigation-record', self.record_path)
+
+    def verify_args(self):
+        return (self.output, self.manifest, self.toc, self.root,
+                '--navigation-only-from', self.baseline, '--navigation-record', self.record_path)
+
+    def verify_candidate(self):
+        from _api_navigation import verify_recovery
+        args = (self.baseline, self.candidate, self.manifest, self.toc, self.root, self.record_path)
+        return verify_recovery(*map(str,args), chapter_path=str(self.output))
+
+    def test_recovery_uses_current_merged_and_preserves_duplicate_external_link(self):
+        self.run_tool('merge_api.py', *self.merge_args())
+        result = self.output.read_text()
+        self.assertIn('合章后修订', result)
+        self.assertEqual(result.count('https://example.com/blog'), 2)
+        self.assertNotIn('outdated', result)
+        self.assertIn('](#'+namespaced('a.html','t')+')', result)
+        self.assertIn('](#'+namespaced('b.html',None)+')', result)
+        self.assertIn('](02_C.md#'+namespaced('c.html','same')+')', result)
+        self.candidate.write_bytes(self.output.read_bytes())
+        self.assertEqual(self.verify_candidate(), [])
+        p = self.run_tool('verify_api_translation.py', *self.verify_args())
+        self.assertIn('仅导航', p.stdout)
+
+    def test_recovery_preserves_bytes_links_resources_and_is_idempotent(self):
+        old_image, old_map = self.image.read_bytes(), self.display.read_bytes()
+        self.run_tool('merge_api.py', *self.merge_args())
+        result = self.output.read_bytes()
+        self.assertIn(b'\r\n\r\n  ---  \r\n\r\n', result)
+        self.assertIn(b'[custom](#mine) [slug](#a) $x$', result)
+        self.assertNotIn(b'\n', result.replace(b'\r\n', b''))
+        self.candidate.write_bytes(result)
+        self.run_tool('merge_api.py', *self.merge_args(baseline=self.candidate))
+        self.assertEqual(self.output.read_bytes(), result)
+        self.assertEqual(self.baseline.read_bytes(), self.current)
+        self.assertEqual(self.image.read_bytes(), old_image)
+        self.assertEqual(self.display.read_bytes(), old_map)
+
+    def test_recovery_rejects_wrong_pages_and_ambiguous_objects(self):
+        self.run_tool('merge_api.py', *self.merge_args())
+        for text in (self.current.replace(b'  ---  ', b'---\r\n---'),
+                     self.current.replace(b'# B', b'# Unexpected title')):
+            with self.subTest(text=text[:80]):
+                self.baseline.write_bytes(text)
+                self.run_tool('merge_api.py', *self.merge_args(), ok=False)
+        self.baseline.write_bytes(self.current)
+        self.toc.write_text('b.html\na.html\n')
+        self.run_tool('merge_api.py', *self.merge_args(), ok=False)
+        self.toc.write_text('a.html\nb.html\n')
+        raw = self.raws['a.html'].replace('</section>',
+            '<pre id="first">same code</pre><pre id="second">same code</pre>'
+            '</section>')
+        (self.root/'a.html').write_text(raw)
+        self.run_tool('parse_api_html.py', self.root/'a.html', self.root/'a.md')
+        current = self.current.replace(b'  ---  ', b'```\r\nsame code\r\n```\r\n\r\n'
+                                       b'```\r\nsame code\r\n```\r\n\r\n  ---  ')
+        self.baseline.write_bytes(current)
+        p = self.run_tool('merge_api.py', *self.merge_args(), ok=False)
+        self.assertIn('唯一', p.stdout+p.stderr)
+
+    def test_recovery_verifier_detects_candidate_and_dependency_mutation(self):
+        self.run_tool('merge_api.py', *self.merge_args())
+        healthy = self.output.read_bytes()
+        self.candidate.write_bytes(healthy)
+        self.assertEqual(self.verify_candidate(), [])
+        target = namespaced('a.html', 't').encode()
+        for change in (healthy.replace('合章后修订'.encode(), b'damaged'),
+                       healthy.replace(b'](#'+target+b')', b'](#mine)', 1),
+                       healthy.replace(b'id="'+target, b'id="wrong', 1),
+                       healthy.replace(b'images/local.png', b'images/other.png')):
+            with self.subTest(candidate=change[:70]):
+                self.assertNotEqual(change, healthy)
+                self.candidate.write_bytes(change)
+                self.assertTrue(self.verify_candidate())
+        self.candidate.write_bytes(healthy)
+        self.baseline.write_bytes(self.current.replace('合章后修订'.encode(), b'drift'))
+        self.assertTrue(self.verify_candidate())
+        self.baseline.write_bytes(self.current)
+        (self.root/'a.html').write_text(self.raws['a.html'].replace('id="t"', 'id="different"'))
+        self.assertTrue(self.verify_candidate())
+
+    def test_recovery_failure_keeps_baseline_output_and_evidence(self):
+        from unittest.mock import patch
+        import merge_api
+        self.run_tool('merge_api.py', *self.merge_args())
+        protected = (self.baseline, self.output, self.evidence)
+        before = {p: p.read_bytes() for p in protected}
+        self.run_tool('merge_api.py', *self.merge_args(output=self.baseline), ok=False)
+        with patch.object(sys, 'argv', ['merge_api.py', *map(str,self.merge_args())]):
+            with patch('_api_navigation.verify_recovery', return_value=['controlled failure']):
+                with self.assertRaises((ValueError, SystemExit)):
+                    merge_api.main()
+            with patch.object(merge_api.os, 'replace', side_effect=OSError('controlled publish failure')):
+                with self.assertRaises((OSError, SystemExit)):
+                    merge_api.main()
+        self.assertEqual({p: p.read_bytes() for p in protected}, before)
+        self.assertEqual(list(self.root.glob('.api-merge-*')), [])
+
+    def test_navigation_only_check_cannot_register_as_translation(self):
+        from verify_delivery import _check_facts, rerun_checks
+        self.run_tool('merge_api.py', *self.merge_args())
+        self.run_tool('verify_api_translation.py', *self.verify_args())
+        args = list(map(str,self.verify_args()))
+        problems = []
+        self.assertEqual(_check_facts(str(self.root), 'verify_api_translation', args, 1,
+                                      problems), (None, None))
+        self.assertIn('仅导航', '\n'.join(problems))
+        problems.clear()
+        delivery = {**self.record, 'checks': [{'tool': 'verify_api_translation', 'args': args}]}
+        _, _, translation_checks, _ = rerun_checks(str(self.root), delivery, problems)
+        self.assertEqual(translation_checks, {})
+        self.assertIn('仅导航', '\n'.join(problems))
+        normal = self.run_tool('verify_api_translation.py', self.output, self.manifest, self.toc,
+                               self.root, self.root/'a.md', self.root/'b.md',
+                               '--navigation-record', self.record_path, ok=False)
+        self.assertIn('链接目标对象或出现顺序改变', normal.stdout)
+
 
 class RawContainerLinkTests(unittest.TestCase):
     def test_outdented_code_literal_is_not_a_navigation_link(self):

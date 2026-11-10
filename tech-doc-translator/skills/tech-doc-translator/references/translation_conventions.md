@@ -79,6 +79,6 @@ API 的显式确定性展开使用 `parse_api_html.py <snapshot.html> <新source
 - 宣称交付完成前运行 `verify_delivery.py --record <记录> --evidence-dir <持久目录>`：目录允许清单、身份、核验复跑与证据索引统一核验（记录参数按各工具真实 CLI 解释，机器证据取自本次核验计算，不依赖预存核验 JSON；报告写入独立批次后原子替换索引）；人工视觉复核闭合才允许通过。
 - 交付验收成立后按 `<SKILL目录>/references/cleanup.md` 执行收尾清理：证据归入翻译项目 `evidence/`，已确认无用项直接删除，清理后复验阅读、重新导出、恢复与证据回查。
 
-API 对象锚点与合章链接：解析保留标题 / 以标题起始的 section、表格及图像对象原 ID，在对象前用独立 `<a id="original-id"></a>` 并留空行。翻译保留这些块边界及原链接目标；例如题注 `**表 41. 中文题注 [#](#id24)**` 中的链接须保留，不能删为纯 `#`。行内未知 ID 不提升为最近标题，不能可靠对应时报告未解决。
+API 对象锚点与合章链接：解析保留标题 / 以标题起始的 section、表格、图像、段落及代码清单的可定位原 ID 和同对象别名，在对象前用独立 `<a id="original-id"></a>` 并留空行。翻译保留这些块边界及原链接目标；例如题注 `**表 41. 中文题注 [#](#id24)**` 中的链接须保留，不能删为纯 `#`。行内未知 ID 不提升为最近标题，不能可靠对应时报告未解决。
 
 有来源对象导航的 API 合章用 `merge_api.py <manifest> <site_root> <chapter.md> --navigation-record <source_record.json>`；最终 API 核验传入同一 `--navigation-record`。记录复用既有 snapshots / range / covers，每个源页唯一对应一个最终章；输出章尚不存在时仍可构造。所有本地目标须在该来源范围且对象可定位。命名空间编码规范化源页相对 site_root 的路径及原 ID，不按 basename / 同名 ID 猜测。原 `#id` 按当前源页解释，同章转换为带命名空间的片段，跨章为明确 `other.md#fragment`；源页自身链接定位页首确认内容。实际候选重读核对来源及目标，缺失、冲突、错章、删除仍拒绝。普通独立 Markdown 无需 API 记录；PDF 裸 `#id` 仅查当前章，旧跨章回退链接必须据源明确修订。

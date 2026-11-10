@@ -18,6 +18,7 @@ import mimetypes
 import os
 import re
 import shutil
+import tempfile
 import sys
 import unicodedata
 from html import escape
@@ -1248,6 +1249,7 @@ def apply_view_declaration(chapter, declaration):
         tuple(ex["lines"]) for ex in own if ex["type"] == "block"
     )
     inline = [ex for ex in own if ex["type"] == "inline"]
+    chapter.view_block_spans = [tuple(ex["lines"]) for ex in own if ex["type"] == "block"]
     chapter.projected_text = project_view_declared(
         chapter.text, spans, inline)
 
@@ -1940,6 +1942,8 @@ def _management_field_segments(text):
     CommonMark lazy 续行均由解析器判定）：投影删除的每一段就是出处
     收集要保留的同一段，二者不各自按行猜测。
     """
+    from _api_navigation import SOURCE_ANCHOR
+
     tokens = _HEAD_STRUCTURE_MD.parse(text)
     lines = text.split("\n")
     segments = []
@@ -1952,6 +1956,10 @@ def _management_field_segments(text):
             continue
         if token.type == "hr":
             index += 1
+            continue
+        if token.type == "paragraph_open" and all(
+                SOURCE_ANCHOR.fullmatch(line) for line in lines[token.map[0]:token.map[1]]):
+            index += 3
             continue
         if token.type != "blockquote_open":
             break  # 首个非章首块级 token：技术正文边界
@@ -2806,6 +2814,7 @@ class Chapter:
         # 优先于自动判断，设计 §8.4），此处不先行判定，保证显式声明退路可达。
         self.projected_text, self.exclusions = project_management_fields(self.text)
         self.toc_provenance_exclusion = None
+        self.view_block_spans = []
         # toc-provenance 声明接管的出处原文片段（block 块文本 / inline
         # fragment），与自动段一起作为来源门禁证据与核验预期。
         self.toc_provenance_fragments = []
@@ -2813,6 +2822,7 @@ class Chapter:
         self.headings = []  # {level, text, slug, id}
         self.targets = {}  # 未加前缀片段 -> 描述（用于链接消解）
         self.internal_links = []  # {fragment, kind, source_line}
+        self.link_occurrences = []
         self.external_links = []  # href
         self.range_out_links = []  # {href, source_line, exists}
         self.unlinked_links = []  # 转为纯文字的术语表等目标链接投影
@@ -2915,10 +2925,25 @@ def parse_chapter(chapter):
         if children and not paragraph.get_text(strip=True) and all(
                 node.name == "a" and node.has_attr("id") and not node.has_attr("href")
                 for node in children):
-            paragraph["class"] = paragraph.get("class", []) + ["anchor-only"]
+            sibling = paragraph.find_next_sibling()
+            first = sibling.find(recursive=False) if sibling and sibling.name == "blockquote" else None
+            if first and first.name == "p":
+                # The quote can start on the next page or at a different indent.
+                for anchor in reversed(children):
+                    first.insert(0, anchor.extract())
+                paragraph.decompose()
+            else:
+                paragraph["class"] = paragraph.get("class", []) + ["anchor-only"]
     for anchor in soup.find_all("a", id=True, href=False):
         chapter.targets.setdefault(anchor["id"], {"kind": "anchor"})
         chapter.source_anchors.append(anchor["id"])
+
+    for item in soup.find_all("li", class_="footnote-item", id=True):
+        first = item.find(recursive=False)
+        lead = first.contents[0] if first and first.name == "p" and first.contents else None
+        if getattr(lead, "name", None) == "code":
+            # The list item's box starts before the inline code's own padding.
+            lead.insert(0, soup.new_tag("a", id=item.attrs.pop("id")))
 
     # 1) 解析器生成的既有 id（脚注等）统一加章前缀，避免跨章冲突。
     for element in soup.find_all(id=True):
@@ -3355,26 +3380,51 @@ def resolve_links(chapter, chapters, diagnostics, unlink_targets=()):
             return own_prefix + fragment, "ok"
         return None, "missing"
 
+    from collections import defaultdict, deque
+    from _api_navigation import _link_blocks
+
+    excluded = [*chapter.exclusions]
+    if chapter.toc_provenance_exclusion:
+        excluded.append(chapter.toc_provenance_exclusion)
+    removed = {line for item in excluded
+               for line in range(item["start_line"], item["end_line"]+1)}
+    removed.update(line for lo, hi in chapter.view_block_spans for line in range(lo, hi+1))
+    original_lines = [line for line in range(1, len(chapter.text.split("\n"))+1)
+                      if line not in removed]
+    source_positions = defaultdict(deque)
+    for block in _link_blocks(chapter.projected_text or chapter.text):
+        for token in block.children:
+            if token.type == 'link_open':
+                index = block.map[0]
+                if index < len(original_lines):
+                    source_positions[unquote(token.attrGet('href'))].append(original_lines[index])
+    chapter.link_occurrences = []
     for anchor in soup.find_all("a"):
         if anchor.find_parent("nav", class_="print-toc") is not None:
             continue  # 印刷目录条目使用已消解的最终目标，不走片段消解
         href = anchor.get("href")
         if href is None:
             continue
-        line = find_source_line(chapter, "](%s)" % href) or find_source_line(
-            chapter, "](%s)" % unquote(href)
-        )
+        positions = source_positions[unquote(href)]
+        line = positions.popleft() if positions else (
+            find_source_line(chapter, "](%s)" % href)
+            or find_source_line(chapter, "](%s)" % unquote(href)))
+        occurrence = {"href": href, "source_line": line, "text": anchor.get_text(),
+                      "segments": block_text_segments(anchor),
+                      "images": len(anchor.find_all("img")), "target": None}
         if href.startswith("#"):
             fragment = unquote(href[1:])
             new_fragment, status = resolve_fragment(fragment)
             if status == "ok":
                 anchor["href"] = "#" + new_fragment
+                occurrence["target"] = new_fragment
+                chapter.link_occurrences.append(occurrence)
                 chapter.internal_links.append(
                     {
                         "fragment": fragment,
                         "resolved": new_fragment,
                         "source_line": line,
-                        "text": anchor.get_text(strip=True)[:80],
+                        "text": occurrence["text"],
                     }
                 )
             else:
@@ -3394,6 +3444,7 @@ def resolve_links(chapter, chapters, diagnostics, unlink_targets=()):
         scheme = urlsplit(href).scheme.lower()
         if scheme in ("http", "https", "mailto"):
             chapter.external_links.append(href)
+            chapter.link_occurrences.append(occurrence)
             continue
         if scheme in EXTERNAL_IMAGE_SCHEMES:
             diagnostics.append(
@@ -3438,12 +3489,14 @@ def resolve_links(chapter, chapters, diagnostics, unlink_targets=()):
                 )
                 continue
             anchor["href"] = "#" + resolved_id
+            occurrence["target"] = resolved_id
+            chapter.link_occurrences.append(occurrence)
             chapter.internal_links.append(
                 {
                     "fragment": fragment_label,
                     "resolved": resolved_id,
                     "source_line": line,
-                    "text": anchor.get_text(strip=True)[:80],
+                    "text": occurrence["text"],
                 }
             )
             continue
@@ -3469,6 +3522,8 @@ def resolve_links(chapter, chapters, diagnostics, unlink_targets=()):
                 "text": anchor.get_text(strip=True)[:80],
             }
         )
+        occurrence["range_out"] = True
+        chapter.link_occurrences.append(occurrence)
 
 
 def enumerate_images(chapter, diagnostics):
@@ -4023,10 +4078,10 @@ def summarize_inputs(chapters):
     return inputs, sorted(resources.values(), key=lambda r: r["path"])
 
 
-def candidate_code_check(input_paths, unlink_targets, toc_sections,
+def candidate_pdf_check(input_paths, unlink_targets, toc_sections,
                          candidate_path, view_declaration_path=None,
                          source_adaptation_path=None, readiness_projection=None):
-    """对候选 PDF 运行与核验器同一实现的代码检查（设计 §4.9）。
+    """独立重读候选 PDF，复用独立核验器的代码与链接门禁。
 
     候选完成目录页码收敛后、复制到最终目标前调用：独立重读候选内容
     流与原 Markdown（不信任导出器统计），覆盖块对账、短块整块与长块
@@ -4052,6 +4107,7 @@ def candidate_code_check(input_paths, unlink_targets, toc_sections,
     gate_relaxed = []
     verifier.check_code_pagination(chapters, pdf, bounds, failures, [],
                                    infos, gate_relaxed)
+    verifier.check_links(chapters, pdf, bounds, heading_pages, failures, [])
     return failures
 
 
@@ -4059,13 +4115,19 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
            toc_sections=False, require_display_map=False,
            provenance_map_path=None, translation_record_path=None,
            view_declaration_path=None, source_adaptation_path=None, *,
-           run_context=None):
+           run_context=None, navigation_records=(), navigation_site_roots=()):
     from verify_delivery import (
         check_translation_readiness_cli, new_run_context, progress_stage,
     )
+    from _api_navigation import (load_pdf_navigation, navigation_dependencies,
+                                 navigation_identity, navigation_pairs, verify_pdf_navigation)
 
     run_context = run_context if run_context is not None else new_run_context()
     work_dir.mkdir(parents=True, exist_ok=True)
+    report_home = work_dir
+    if (report_home / REPORT_NAME).is_file():
+        work_dir = Path(tempfile.mkdtemp(prefix="export-run-", dir=report_home))
+        print("本轮导出证据目录：%s" % work_dir, file=sys.stderr)
     try:
         import verify_pdf  # 候选必经的真实核验器（含 uniseg / pypdf），打印前加载。
     except PdfDependencyError as exc:
@@ -4138,6 +4200,24 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
         )
         print("FAIL: %s" % exc, file=sys.stderr)
         return 1
+
+    try:
+        pairs = navigation_pairs(navigation_records, navigation_site_roots)
+        navigation = load_pdf_navigation(paths, pairs, readiness_projection)
+        navigation_issues = verify_pdf_navigation(paths, navigation)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        navigation_issues = [{"code": "api-navigation-source", "message": str(exc)}]
+    if navigation_issues:
+        diagnostics.extend({**issue, "severity": "fail"} for issue in navigation_issues)
+        report["status"] = STATUS_MACHINE_FAIL
+        (work_dir / REPORT_NAME).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        for issue in navigation_issues:
+            print("FAIL [%s] %s:%s %s" % (issue["code"], issue.get("input", ""),
+                                         issue.get("line", ""), issue["message"]), file=sys.stderr)
+        return 1
+    if navigation:
+        report["api_navigation"] = navigation_identity(navigation)
+    navigation_inputs = {path: sha256_file(path) for item in navigation for path in item["inputs"]}
 
     # 视图声明（受输入摘要绑定的授权排除范围）：必须在解析前加载校验，
     # 任何漂移/越界/重叠/跨技术正文在生成任何候选前失败。
@@ -4580,11 +4660,11 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     # 候选代码门禁（设计 §4.9 分页验收与失败保护）：候选完成目录页码
     # 收敛后调用与核验器同一实现的代码检查，不通过则不复制到最终目标，
     # 已有成品保持原样。
-    code_gate_failures = candidate_code_check(
+    candidate_gate_failures = candidate_pdf_check(
         [str(c.path) for c in chapters], unlink_targets, toc_sections,
         candidate, view_declaration_path,
         source_adaptation_path=adaptation_path,readiness_projection=readiness_projection) if printed else []
-    hard_failures.extend(code_gate_failures)
+    hard_failures.extend(candidate_gate_failures)
     fonts = browser_checks.get("fonts", {}) if browser_checks else {}
     # 正文与代码的 CJK 回退族必须至少一项可用，否则中文会退到不可控字体。
     cjk_font_ok = any(fonts.get(f, False) for f in ("STFangsong", "STHeiti"))
@@ -4605,7 +4685,7 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             "candidate": str(candidate) if printed else None,
             "pdf_sha256": sha256_file(candidate) if printed else None,
             "output_target": str(output),
-            "code_gate_failures": code_gate_failures,
+            "candidate_gate_failures": candidate_gate_failures,
             "unlink_targets": sorted(
                 str(Path(p).expanduser().resolve()) for p in unlink_targets
             ),
@@ -4752,6 +4832,17 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                       readiness.get("reasons") or ["验收记录或翻译依赖已变化"]),
                   file=sys.stderr)
             return 1
+    try:
+        if (any(navigation_dependencies(item["record"]) != item["dependencies"] for item in navigation)
+                or any(sha256_file(path) != digest for path, digest in navigation_inputs.items())):
+            raise ValueError("导出期间 API 导航来源或当前章改变")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        report["status"] = STATUS_MACHINE_FAIL
+        report["diagnostics"].append({"code": "api-navigation-drift", "severity": "fail",
+                                      "message": str(exc)})
+        (work_dir / REPORT_NAME).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("FAIL [api-navigation-drift] %s" % exc, file=sys.stderr)
+        return 1
     output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(candidate, output)
     if translation_record_path:
@@ -4759,6 +4850,15 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
         (work_dir / REPORT_NAME).write_text(
             json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+    if report_home != work_dir:
+        # 成功才更新请求目录的现行报告。本轮候选与失败证据各自独立保留。
+        with tempfile.NamedTemporaryFile(dir=report_home, prefix=".export-report-", delete=False) as handle:
+            pending = Path(handle.name)
+            handle.write((work_dir / REPORT_NAME).read_bytes())
+        try:
+            pending.replace(report_home / REPORT_NAME)
+        finally:
+            pending.unlink(missing_ok=True)
     print(
         "机器检查通过：%s（候选与证据见 %s）\n成品待视觉复核后才能发布。"
         % (output, work_dir)
@@ -4864,6 +4964,10 @@ def main(argv=None):
              "仅导出既有 Markdown 时不传，行为不变",
     )
     parser.add_argument("inputs", nargs="+", help="有序 Markdown 输入")
+    parser.add_argument("--navigation-record", action="append", default=[],
+                        help="API 来源导航记录，与 --site-root 成对，可重复")
+    parser.add_argument("--site-root", action="append", default=[],
+                        help="对应 API 导航记录的快照站点根，可重复")
     args = parser.parse_args(argv)
     try:
         run_context = new_run_context(stderr_progress)
@@ -4881,6 +4985,8 @@ def main(argv=None):
                 view_declaration_path=args.view_declaration,
                 source_adaptation_path=args.source_adaptation,
                 run_context=run_context,
+                navigation_records=args.navigation_record,
+                navigation_site_roots=args.site_root,
             )
             if result:
                 fail_stage()

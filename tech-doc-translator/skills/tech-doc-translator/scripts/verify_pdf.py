@@ -11,8 +11,10 @@
 """
 import argparse
 import json
+import math
 import os
 import re
+import tempfile
 import sys
 import unicodedata
 from pathlib import Path
@@ -582,7 +584,7 @@ def _matmul(m1, m2):
     )
 
 
-def collect_drawn_images(pdf, *, with_names=False):
+def collect_drawn_images(pdf, *, with_names=False, _with_marks=False):
     """逐页解析内容流，返回每页按绘制顺序的 (绘制宽度 pt, 底边 y pt,
     顶边 y pt) 列表。
 
@@ -612,6 +614,7 @@ def collect_drawn_images(pdf, *, with_names=False):
 
             stream = ContentStream(page.get_contents(), pdf.reader)
             stack = []
+            marks = []
             ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
             for operands, operator in stream.operations:
                 op = operator.decode("latin-1") if isinstance(operator, bytes) else str(operator)
@@ -621,6 +624,11 @@ def collect_drawn_images(pdf, *, with_names=False):
                     ctm = stack.pop() if stack else ctm
                 elif op == "cm" and len(operands) == 6:
                     ctm = _matmul(tuple(float(x) for x in operands), ctm)
+                elif op in ("BDC", "BMC"):
+                    props = operands[1] if len(operands) > 1 else {}
+                    marks.append(props.get("/MCID") if isinstance(props, dict) else None)
+                elif op == "EMC" and marks:
+                    marks.pop()
                 elif op == "Do":
                     name = str(operands[0])
                     if name in images:
@@ -631,6 +639,11 @@ def collect_drawn_images(pdf, *, with_names=False):
                             for x, y in ((0, 0), (1, 0), (0, 1), (1, 1))
                         ]
                         geometry = (width, min(corners_y), max(corners_y))
+                        if _with_marks:
+                            corners_x = [ctm[0]*x + ctm[2]*y + ctm[4]
+                                         for x, y in ((0, 0), (1, 0), (0, 1), (1, 1))]
+                            mcid = next((mark for mark in reversed(marks) if mark is not None), None)
+                            geometry += (min(corners_x), max(corners_x), mcid)
                         images_drawn.append(geometry + (name,) if with_names else geometry)
             result.append(images_drawn)
         except Exception:  # noqa: BLE001  内容流异常由计数对账暴露
@@ -1274,17 +1287,13 @@ def check_print_toc(chapters, pdf, report, bounds, heading_pages, failures):
                     % text[:60],
                 }
             )
-    # 位置绑定：目录页内的内部链接注解按“页序 + 自上而下”排列后与
-    # 条目一一对应；数量一致时逐条比对注解实际目的地，交换目的地而
-    # 标题/页码/目标页集合不变也会被逐位关联检出（N02/T20）。
-    toc_annots = sorted(
-        (
-            annot for annot in pdf.internal_annots
-            if start_page <= annot["page"] < end_page
-        ),
-        key=lambda annot: (annot["page"], -annot.get("top", 0.0)),
-    )
-    positional = len(toc_annots) == len(expectations)
+    instances = _toc_link_instances(pdf, start_page, end_page, set())
+    target_ids = {}
+    for entry in expectations:
+        included = next(c for c in chapters if c.index == entry["chapter_index"])
+        target_ids[id(entry)] = entry.get("heading_id") or (
+            included.headings[0]["id"] if included.headings else included.prefix+"body")
+    destinations, origins = _link_target_facts(pdf, bounds, set(target_ids.values()))
     expected_labels = Counter()
     for entry in expectations:
         if entry["level"] == 1:
@@ -1295,9 +1304,7 @@ def check_print_toc(chapters, pdf, report, bounds, heading_pages, failures):
         if page is not None:
             expected_labels[normalize(entry["title"]) + str(page + 1)] += 1
     position = 0
-    for ordinal, (entry, record) in enumerate(
-        zip(expectations, recorded.get("entries", []))
-    ):
+    for entry, record in zip(expectations, recorded.get("entries", [])):
         title_norm = normalize(entry["title"])
         printed, found_at = _toc_find_entry(toc_lines, title_norm, position)
         if printed is None:
@@ -1360,37 +1367,19 @@ def check_print_toc(chapters, pdf, report, bounds, heading_pages, failures):
                     % (target_page, expected_target, entry["title"]),
                 }
             )
-        # 点击到达：目录页上的链接注解必须实际指向目标页。数量一致时
-        # 按位置逐条绑定（自上而下第 N 条注解属于第 N 条目录条目），
-        # 交换目的地不能靠“某条注解恰好指向目标页”混过。
-        target_index = target_page - 1
-        if positional:
-            annot = toc_annots[ordinal]
-            expected_id = entry.get("heading_id")
-            if expected_id is None:
-                expected_id = included.headings[0]["id"] if included.headings else included.prefix + "body"
-            if (annot["dest_page"] != target_index
-                    or annot.get("name", expected_id) != expected_id):
-                failures.append(
-                    {
-                        "code": "toc-link-target",
-                        "message": "目录链接预期第 %d 页目标 %s，实际第 %d 页目标 %s：%s"
-                        % (target_page, expected_id, annot["dest_page"] + 1,
-                           annot.get("name"), entry["title"]),
-                    }
-                )
-        elif not any(
-            start_page <= annot["page"] < end_page
-            and annot["dest_page"] == target_index
-            for annot in pdf.internal_annots
-        ):
-            failures.append(
-                {
-                    "code": "toc-link-target",
-                    "message": "目录条目链接未实际指向目标页 %d：%s"
-                    % (target_page, entry["title"]),
-                }
-            )
+        # 自身绘制与注解绑定到具体对象；同页的另一条好链接不参与。
+        label = title_norm + str(printed)
+        candidates = instances.get(label, [])
+        instance = candidates.pop(0) if candidates else None
+        expected_id = target_ids[id(entry)]
+        if (not instance or not instance["usable"] or not _link_drawing_covered(instance)
+                or any(not _destination_matches(pdf, annot, expected_id, destinations, origins)
+                       for annot in instance["annots"])):
+            failures.append({
+                "code": "toc-link-target",
+                "message": "印刷目录链接未绑定其实际目标 %s：%s" % (expected_id, entry["title"]),
+                "input": str(toc_chapter.path),
+            })
 
 
 # ---------------------------------------------------------------------------
@@ -1415,6 +1404,8 @@ def authorized_head_exclusions(text):
     属技术内容终止延续。返回 [(起始行0基, 最后行1基, 标签)]；核验器用
     本结果与导出证据对账，伪造排除正文时两侧不一致必须 FAIL。
     """
+    from _api_navigation import SOURCE_ANCHOR
+
     tokens = _AUTHORIZED_STRUCTURE.parse(text)
     source = text.split("\n")
     spans = []
@@ -1426,6 +1417,10 @@ def authorized_head_exclusions(text):
             continue
         if token.type == "hr":
             cursor += 1
+            continue
+        if token.type == "paragraph_open" and all(
+                SOURCE_ANCHOR.fullmatch(line) for line in source[token.map[0]:token.map[1]]):
+            cursor += 3
             continue
         if token.type != "blockquote_open":
             break
@@ -1933,70 +1928,64 @@ class PdfFacts:
         return self.norm_text.find(needle, start)
 
     def collect_annotations(self):
-        named = {}
-        for name, dest in self.reader.named_destinations.items():
+        from pypdf.generic import NullObject
+
+        def read_destination(array):
+            if not isinstance(array, (list, tuple)) or len(array) < 2:
+                return {}
+            target_page = self.page_id_to_index.get(getattr(array[0], "idnum", None))
+            if target_page is None:
+                return {}
             try:
-                named[str(name).lstrip("/")] = self.reader.get_destination_page_number(
-                    dest
-                )
-            except Exception:  # noqa: BLE001  个别目标无法解析时跳过
-                continue
-        self.named_dest_pages = named
+                position = tuple(None if isinstance(value, NullObject) else float(value)
+                                 for value in array[2:])
+            except (TypeError, ValueError):
+                return {}
+            if any(value is not None and not math.isfinite(value) for value in position):
+                return {}
+            return {"dest_page": target_page, "dest_type": str(array[1]),
+                    "position": position}
+
+        named = {str(name).lstrip("/"): read_destination(dest.dest_array)
+                 for name, dest in self.reader.named_destinations.items()}
+        self.named_dest_pages = {name: dest["dest_page"] for name, dest in named.items() if dest}
+        self.link_annots = {}
         for page_index, page in enumerate(self.reader.pages):
-            annotations = page.get("/Annots") or []
-            for ref in annotations:
+            for ref in page.get("/Annots") or []:
                 obj = ref.get_object()
                 if obj.get("/Subtype") != "/Link":
                     continue
+                rect = obj.get("/Rect")
+                bounds_rect = [float(value) for value in rect] if rect is not None and len(rect) == 4 else None
+                fact = {"page": page_index, "ref": ref, "rect": bounds_rect,
+                        "top": bounds_rect[3] if bounds_rect else 0.0}
+                self.link_annots[(page_index, ref)] = fact
                 action = obj.get("/A")
-                if action is not None:
-                    action = action.get_object()
-                    if action.get("/S") == "/URI":
-                        uri = str(action.get("/URI"))
-                        self.uri_links.add(uri)
-                        self.uri_annots[(page_index, ref)] = uri
-                        continue
-                dest = obj.get("/Dest")
-                if dest is None and action is not None:
-                    action_obj = action.get_object()
-                    if action_obj.get("/S") == "/GoTo":
-                        dest = action_obj.get("/D")
+                action = action.get_object() if action is not None else {}
+                fact["action"] = str(action.get("/S") or "")
+                if action.get("/S") == "/URI":
+                    uri = str(action.get("/URI"))
+                    fact["uri"] = uri
+                    self.uri_links.add(uri)
+                    self.uri_annots[(page_index, ref)] = uri
+                    continue
+                dest = (obj.get("/Dest") if not action else
+                        action.get("/D") if action.get("/S") == "/GoTo" else None)
                 if dest is None:
                     continue
                 dest = dest.get_object() if hasattr(dest, "get_object") else dest
-                name_key = None
-                if isinstance(dest, str):
-                    name_key = dest.lstrip("/")
-                elif isinstance(dest, bytes):
-                    name_key = dest.decode("utf-8", "replace").lstrip("/")
-                rect = obj.get("/Rect")
-                top = float(rect[3]) if rect is not None else 0.0
-                bounds_rect = (
-                    [float(rect[i]) for i in range(4)]
-                    if rect is not None else None)
-                if name_key is not None:
-                    if name_key in named:
-                        self.internal_annots.append(
-                            {"page": page_index,
-                             "dest_page": named[name_key], "top": top,
-                             "rect": bounds_rect, "ref": ref, "name": unquote(name_key)}
-                        )
-                    else:
-                        self.broken_named_dests.append(str(name_key))
-                    continue
-                if isinstance(dest, (list, tuple)) or hasattr(dest, "__getitem__"):
-                    try:
-                        target_ref = dest[0]
-                        index = self.page_id_to_index.get(
-                            getattr(target_ref, "idnum", None)
-                        )
-                        if index is not None:
-                            self.internal_annots.append(
-                                {"page": page_index, "dest_page": index,
-                                 "top": top, "rect": bounds_rect, "ref": ref}
-                            )
-                    except (KeyError, TypeError, IndexError):
+                if isinstance(dest, (str, bytes)):
+                    key = (dest.decode("utf-8", "replace") if isinstance(dest, bytes)
+                           else dest).lstrip("/")
+                    fact["name"] = unquote(key)
+                    if not named.get(key):
+                        self.broken_named_dests.append(key)
                         continue
+                    fact.update(named[key])
+                else:
+                    fact.update(read_destination(dest))
+                if "dest_page" in fact:
+                    self.internal_annots.append(fact)
 
     def collect_outline(self):
         def walk(items):
@@ -2282,54 +2271,60 @@ def _toc_raw_chapter_links(toc_chapter, chapters):
     return links
 
 
-def _toc_link_instances(pdf, page_start, page_end, printed_labels):
-    """以完整 /Link 自有的绘制事件定位导航实例，不借用全页文字。
+def _drawings_by_mark(pdf):
+    """读出真实绘制与 MCID 的关联，供链接实例和目标共用。"""
+    if not hasattr(pdf, "_drawings_by_mark"):
+        text, images = {}, {}
+        for page, events in enumerate(pdf.drawn_events):
+            for event in events:
+                if event["mcid"] is not None and event["text"].strip():
+                    text.setdefault((page, event["mcid"]), []).append(event)
+        for page, records in enumerate(collect_drawn_images(pdf, _with_marks=True)):
+            for _width, bottom, top, left, right, mcid in records:
+                if mcid is not None:
+                    images.setdefault((page, mcid), []).append((left, bottom, right, top))
+        pdf._drawings_by_mark = text, images
+    return pdf._drawings_by_mark
 
-    折行只是同一实例的多个绘制段；同行其他文字属于其他 MCID。
-    /OBJR 只提供归属，注解是否仍在页面上由实际 /Annots 事实确认。
-    结构树可能引用从不含文本绘制操作的空 MCID（如行内代码的包装
-    节点）：这类标记不产生文字与跨度，容忍其缺席；含文本绘制操作
-    但提取不到事件的标记仍按归属证据缺失处理。
-    """
-    events_by_mark = {}
-    for page_index in range(page_start, min(page_end, len(pdf.drawn_events))):
-        for event in pdf.drawn_events[page_index]:
-            if event["mcid"] is not None:
-                events_by_mark.setdefault(
-                    (page_index, event["mcid"]), []).append(event)
-    text_marks = {
-        (page, mcid)
-        for page, ops in (pdf.mcid_marks or {}).items()
-        for mcid in ops
-    }
-    owners = Counter(mark for link in pdf.structure_links
-                     for mark in set(link["mcids"]))
-    pool = {}
+
+def _link_instances(pdf):
+    """完整保留结构树中的 Link 槽位，即使动作或实际页注解已损伤。"""
+    text_by_mark, images_by_mark = _drawings_by_mark(pdf)
+    mark_owners = Counter(mark for link in pdf.structure_links
+                          for mark in set(link["mcids"]))
+    annot_owners = Counter(obj for link in pdf.structure_links for obj in set(link["objects"]))
+    text_marks = {(page, mcid) for page, ops in (pdf.mcid_marks or {}).items() for mcid in ops}
+    instances = []
     for link in pdf.structure_links:
         marks = list(dict.fromkeys(link["mcids"]))
-        if not marks or any(not (page_start <= page < page_end)
-                            for page, _mcid in marks):
-            continue
+        objects = list(dict.fromkeys(link["objects"]))
+        page = next((page for page, _ in marks + objects if page is not None), None)
         runs = [(page, event) for page, mcid in marks
-                for event in events_by_mark.get((page, mcid), [])]
-        label = normalize("".join(event["text"] for _page, event in runs))
-        if not label or label in printed_labels:
+                for event in text_by_mark.get((page, mcid), ())]
+        images = [(page, box) for page, mcid in marks
+                  for box in images_by_mark.get((page, mcid), ())]
+        spans = [(page, event["start_pt"], event["right_pt"], event["baseline_y_pt"],
+                  event["font_size_pt"]) for page, event in runs]
+        annots = [pdf.link_annots[obj] for obj in objects if obj in pdf.link_annots]
+        usable = (bool(marks and objects) and len(annots) == len(objects)
+                  and all(mark_owners[mark] == 1 for mark in marks)
+                  and all(mark not in text_marks or text_by_mark.get(mark) for mark in marks)
+                  and all(annot_owners[obj] == 1 for obj in objects))
+        instances.append({"page": page, "label": normalize("".join(e["text"] for _, e in runs)),
+                          "spans": spans, "images": images, "annots": annots, "usable": usable})
+    return instances
+
+
+def _toc_link_instances(pdf, page_start, page_end, printed_labels):
+    pool = {}
+    for instance in _link_instances(pdf):
+        page, label = instance["page"], instance["label"]
+        if page is None or not (page_start <= page < page_end) or not label or label in printed_labels:
             continue
-        spans = []
-        # 每个事件保持自己的物理几何，逐段检查；不聚合成整行吸收旁邻文字。
-        for page, event in runs:
-            if event["text"].strip():
-                spans.append((page, event["start_pt"], event["right_pt"],
-                              event["baseline_y_pt"], event["font_size_pt"]))
-        objects = set(link["objects"])
-        annots = [annot for annot in pdf.internal_annots
-                  if (annot["page"], annot["ref"]) in objects]
-        usable = (all(owners[mark] == 1 for mark in marks)
-                  and all(mark not in text_marks or events_by_mark.get(mark)
-                          for mark in marks)
-                  and objects and len(annots) == len(objects))
-        pool.setdefault(label, []).append(
-            {"spans": spans, "annots": annots, "usable": bool(usable)})
+        actual = dict(instance)
+        actual["annots"] = [annot for annot in instance["annots"] if "dest_page" in annot]
+        actual["usable"] = instance["usable"] and len(actual["annots"]) == len(instance["annots"])
+        pool.setdefault(label, []).append(actual)
     return pool
 
 
@@ -4766,127 +4761,303 @@ def check_math(chapters, report, pdf_path, bounds, failures):
                     )
 
 
-def check_links(chapters, pdf, bounds, heading_pages, failures, reviews):
-    expected_internal = []
-    for chapter, start_page, end_page in bounds:
-        for link in chapter.internal_links:
-            expected_internal.append((chapter, link, start_page, end_page))
+def _destination_origin(page):
+    """Chromium 的目的地以版心原点为基准；从页面裁剪路径实测平移。"""
+    ops = page.get_contents().operations
+    if [op for _, op in ops[:5]] not in (
+            [b"cm", b"q", b"re", b"W*", b"n"], [b"cm", b"q", b"re", b"W", b"n"]):
+        return None
+    a, b, c, d, e, f = map(float, ops[0][0])
+    x, y, width, height = map(float, ops[2][0])
+    if a <= 0 or d >= 0 or b or c or width <= 0 or height <= 0:
+        return None
+    left, top = a*x+e, d*y+f
+    return left, float(page.mediabox.top)-top
 
-    internal_count = len(pdf.internal_annots)
-    if internal_count < len(expected_internal):
-        failures.append(
-            {
-                "code": "internal-link-count",
-                "message": "PDF 内部链接注解 %d 少于预期 %d"
-                % (internal_count, len(expected_internal)),
-            }
-        )
 
-    dest_pages = {a["dest_page"] for a in pdf.internal_annots}
-    annots_by_page = {}
-    for annot in pdf.internal_annots:
-        annots_by_page.setdefault(annot["page"], []).append(annot["dest_page"])
+_TARGET_ROLES = {
+    **{f"h{level}": f"/H{level}" for level in range(1, 7)},
+    "p": "/P", "pre": "/Div", "table": "/Table", "img": "/Figure",
+    "td": "/TD", "th": "/TH", "li": "/LI", "figcaption": "/Caption",
+}
 
-    explicit_targets = {chapter.prefix + anchor for chapter in chapters
-                        for anchor in chapter.source_anchors}
-    for chapter, start_page, end_page in bounds:
-        labels = {normalize(link["text"]) for link in chapter.internal_links
-                  if link.get("resolved") in explicit_targets and link.get("text")}
-        if not labels:
-            continue
-        actual = _toc_link_instances(pdf, start_page, end_page, set())
-        actual = {label: [instance for instance in instances if instance["annots"]]
-                  for label, instances in actual.items()}
-        for link in chapter.internal_links:
-            label = normalize(link.get("text") or "")
-            if label not in labels:
+
+def _target_host(element):
+    """从重解析的当前文档定位目标宿主及宿主内锚点的文字偏移。"""
+    def printable(tag):
+        return tag.name in _TARGET_ROLES and "anchor-only" not in tag.get("class", ())
+
+    if element is None:
+        return None
+    if element.name == "a":
+        parent = element.parent
+        if parent.name == "p" and "anchor-only" in parent.get("class", ()):
+            host = parent.find_next(printable)
+            if host and host.name == "p" and not host.get_text(strip=True):
+                host = host.find("img") or host
+            return host, 0, True
+        host = element.find_parent(printable)
+        if host is not None:
+            prefix, suffix = [], []
+            parts = prefix
+            for node in host.descendants:
+                if node is element:
+                    parts = suffix
+                if isinstance(node, exporter.NavigableString):
+                    parts.append(str(node))
+                elif node.get("data-tex") is not None:
+                    parts.append(exporter.MATH_SENTINEL)
+            before = "".join(prefix)
+            offset = len(normalize(before))
+            if exporter.MATH_SENTINEL in before:
+                offset = (before, "".join(suffix))
+            return host, offset, False
+    if element.name == "li":
+        return element.find("p", recursive=False) or element, 0, False
+    if printable(element):
+        return element, 0, False
+    host = element.find(printable)
+    return (host, 0, False) if host else None
+
+
+def _target_objects(chapter, pdf, start_page, end_page, targets):
+    """按结构顺序及各对象自身内容，将预期宿主对应到 PDF 的带标记绘制。"""
+    elements = {element["id"]: element for element in chapter.soup.find_all(id=True)}
+    wanted = {name: _target_host(elements.get(name)) for name in targets}
+    if chapter.prefix+"body" in wanted:
+        first = chapter.soup.find(lambda tag: tag.name in _TARGET_ROLES
+                                  and "anchor-only" not in tag.get("class", ()))
+        wanted[chapter.prefix+"body"] = (first, 0, False) if first else None
+    expected_roles = {_TARGET_ROLES[item[0].name] for item in wanted.values()
+                      if item and item[0] is not None}
+    if not expected_roles:
+        return {}
+    text_by_mark, images_by_mark = _drawings_by_mark(pdf)
+    # Chromium 跨页表头复用同一个 TH 结构节点，在后续页重绘同一格。
+    # 以各页独立 MCID 内容核对重复片段，身份与落点取该节点首片段。
+    repeated_headers = set()
+    if expected_roles.intersection(("/Table", "/TH")):
+        for _, role, marks in pdf.structure_containers or ():
+            if role != "/TH" or len({page for page, _ in marks}) < 2:
                 continue
-            candidates = actual.get(label)
-            if candidates is None and len(link["text"]) == 80:
-                longer = [values for key, values in actual.items() if key.startswith(label)]
-                candidates = longer[0] if len(longer) == 1 else None
-            instance = candidates.pop(0) if candidates else None
-            target = link.get("resolved")
-            if target in explicit_targets and (
-                    not instance or not instance["usable"]
-                    or any(annot.get("name") != target for annot in instance["annots"])):
-                failures.append({
-                    "code": "internal-anchor-target",
-                    "message": f'链接 {link["text"]!r} 的实际注解未绑定预期锚点 {target}',
-                    "input": str(chapter.path), "line": link.get("source_line"),
-                })
+            fragments = {}
+            for mark in dict.fromkeys(marks):
+                fragments.setdefault(mark[0], []).append(mark)
+            first, *later = sorted(fragments)
+            label = lambda page: normalize("".join(
+                event["text"] for mark in fragments[page] for event in text_by_mark.get(mark, ())))
+            first_label = label(first)
+            for page in later:
+                if first_label and label(page) == first_label:
+                    repeated_headers.update(fragments[page])
+    slots = {}
+    list_labels = {mark for _, role, marks in pdf.structure_containers or ()
+                   if role == "/Lbl" for mark in marks}
+    for _, role, marks in pdf.structure_containers or ():
+        if (role not in expected_roles or not marks or marks[0][0] is None
+                or not (start_page <= marks[0][0] < end_page)):
+            continue
+        if role in ("/Table", "/TH"):
+            marks = [mark for mark in marks if mark not in repeated_headers]
+        elif role == "/LI":
+            marks = [mark for mark in marks if mark not in list_labels]
+        runs = [(page, event) for page, mark in dict.fromkeys(marks)
+                for event in text_by_mark.get((page, mark), ())]
+        images = [(page, box) for page, mark in dict.fromkeys(marks)
+                  for box in images_by_mark.get((page, mark), ())]
+        label = normalize("".join(e["text"] for _, e in runs))
+        if label or images:
+            slots.setdefault(role, []).append((label, runs, images))
+    matched = {}
+    cursor = Counter()
+    wanted_ids = {id(item[0]) for item in wanted.values() if item and item[0] is not None}
+    for element in chapter.soup.find_all(list(_TARGET_ROLES)):
+        role = _TARGET_ROLES[element.name]
+        if role not in expected_roles or "anchor-only" in element.get("class", ()):
+            continue
+        label = normalize(element.get_text())
+        segments = [normalize(segment) for segment in exporter.block_text_segments(element)]
+        pattern = re.compile(".*".join(re.escape(segment) for segment in segments))
+        candidates = slots.get(role, [])
+        if role != "/Figure" and not label and element.find("img") is None:
+            continue
+        for index in range(cursor[role], len(candidates)):
+            actual, runs, images = candidates[index]
+            if pattern.fullmatch(actual) and (role != "/Figure" or images):
+                cursor[role] = index+1
+                if id(element) in wanted_ids:
+                    matched[id(element)] = (runs, images)
+                break
+    result = {}
+    for name, item in wanted.items():
+        if item and id(item[0]) in matched:
+            element, offset, standalone = item
+            result[name] = (element, offset, standalone, *matched[id(element)])
+    return result
 
-    for chapter, link, start_page, end_page in expected_internal:
-        # 目标判定优先采用消解结果（跨章文件链接的片段属于其他章），
-        # 退化为"本章 slug 优先、其他章唯一命中"的规则。
-        target_id = link.get("resolved")
-        if target_id not in heading_pages:
-            target_id = None
-            for heading in chapter.headings:
-                if heading["slug"] == link["fragment"]:
-                    target_id = heading["id"]
-                    break
-            if target_id is None:
-                others = [
-                    heading["id"]
-                    for other in chapters
-                    if other is not chapter
-                    for heading in other.headings
-                    if heading["slug"] == link["fragment"]
-                ]
-                if len(others) == 1:
-                    target_id = others[0]
-        if target_id and target_id in heading_pages:
-            target_page = heading_pages[target_id]
-            text_norm = normalize(link.get("text") or "")
-            source_page = None
-            if text_norm:
-                for page_index in range(start_page, end_page):
-                    if text_norm and text_norm in normalize(pdf.pages[page_index]):
-                        source_page = page_index
-                        break
-            if (
-                source_page is not None
-                and target_page not in annots_by_page.get(source_page, [])
-            ):
-                failures.append(
-                    {
-                        "code": "internal-link-target",
-                        "message": "内部链接未指向正确目标页（链接 %r，期望第 %d 页）"
-                        % (link.get("text"), target_page + 1),
-                        "input": str(chapter.path),
-                    }
-                )
-            elif target_page not in dest_pages:
-                failures.append(
-                    {
-                        "code": "internal-link-target",
-                        "message": "没有任何内部链接指向目标页 %d（片段 %s）"
-                        % (target_page + 1, link["fragment"]),
-                        "input": str(chapter.path),
-                    }
-                )
 
-    expected_external = sorted(
-        {href for chapter in chapters for href in chapter.external_links}
-    )
-    missing = [href for href in expected_external if href not in pdf.uri_links]
-    for href in missing:
-        failures.append(
-            {"code": "external-link-missing", "message": "外链未保留：%s" % href}
-        )
+def _destination_matches(pdf, annot, target, destinations, origins):
+    expected = destinations.get(target)
+    if expected is None or "dest_page" not in annot:
+        return False
+    element, offset, standalone, runs, images = expected
+    if "name" in annot:
+        named = destinations.get(annot["name"])
+        if named is None or named[0] is not element or named[1] != offset:
+            return False
+        standalone = named[2]
+    if isinstance(offset, tuple):
+        before, after = [re.compile(".*".join(
+            re.escape(normalize(segment)) for segment in text.split(exporter.MATH_SENTINEL)))
+            for text in offset]
+        painted = normalize("".join(run["text"] for _, run in runs))
+        candidates = [index for index in range(len(painted)+1)
+                      if before.fullmatch(painted[:index]) and after.fullmatch(painted[index:])]
+        if len(candidates) != 1:
+            return False
+        offset = candidates[0]
+    page = annot["dest_page"]
+    origin = origins[page]
+    if origin is None:
+        return False
+    kind, params = annot["dest_type"], annot["position"]
+    if kind == "/XYZ" and len(params) == 3:
+        left, top, _zoom = params
+    elif kind in ("/FitH", "/FitBH") and len(params) == 1:
+        left, top = None, params[0]
+    elif kind == "/FitR" and len(params) == 4:
+        left, _bottom, _right, top = params
+    else:
+        return False
+    if top is None:
+        return False
+    x = origin[0]+left if left is not None else None
+    y = top-origin[1]
+    rounding = 0.8  # Chromium 按 CSS 像素量化 PDF 目的地。
+    name = element.name
+    if name == "img" or not runs:
+        if not images or offset:
+            return False
+        first_page, (x0, _bottom, _right, y0) = images[0]
+        # 图像的块级引导锚点可位于图片所在行盒的起点。
+        upper = y0 + (10.5 * (1.65+0.45) if standalone else 0)
+    else:
+        boundary = 0
+        first_page = event = None
+        for run_page, candidate in runs:
+            length = len(normalize(candidate["text"]))
+            if boundary+length > offset:
+                first_page, event = run_page, candidate
+                break
+            boundary += length
+        if event is None:
+            return False
+        font = event["font_size_pt"]
+        x0, y0 = event["start_pt"], event["baseline_y_pt"]
+        if offset > boundary:
+            x0 += (offset-boundary)*event["advance_pt"]
+        if name == "pre":
+            upper = y0+1.45*font+7.5+(0.7*font if standalone else 0)
+            x0 -= PDF_PRE_PADDING_HORIZONTAL_PT
+        elif name == "table":
+            upper = y0+1.4*font+2.75+(0.7*font if standalone else 0)
+            # 整表锚点在版心边界，第一行表头可居中绘制。
+            x0 = origin[0]
+        elif name in ("td", "th"):
+            upper = y0+1.4*font
+        elif name.startswith("h") and name[1:].isdigit():
+            upper = y0+1.35*font+(1.1*font if standalone else 0)
+        else:
+            upper = y0+1.65*font+(0.45*font if standalone else 0)
+    if page != first_page:
+        return False
+    # 独立锚点与随后块之间允许原样式的块间距，但不得进入前一对象行盒。
+    if standalone:
+        preceding = [event["baseline_y_pt"] for event in pdf.drawn_events[page]
+                     if event["text"].strip() and event["baseline_y_pt"] > y0+rounding]
+        if preceding:
+            upper = min(upper, min(preceding)-rounding)
+    if x is None and (offset or name in ("td", "th")):
+        return False
+    return y0-rounding <= y <= upper+rounding and (
+        x is None or abs(x-x0) <= rounding)
 
+
+def _link_drawing_covered(instance):
+    def contains(page, x, y, top=None):
+        for annot in instance["annots"]:
+            if annot["page"] != page or not annot["rect"]:
+                continue
+            left, bottom, right, upper = annot["rect"]
+            if left-1 <= x <= right+1 and bottom-1 <= y <= upper+1 and (
+                    top is None or top <= upper+1):
+                return True
+        return False
+
+    return (all(contains(page, left, baseline) for page, left, _, baseline, _ in instance["spans"])
+            and all(contains(page, left, bottom, top)
+                    for page, (left, bottom, _, top) in instance["images"]))
+
+
+def _link_target_facts(pdf, bounds, target_names):
+    if not target_names:
+        return {}, []
+    names = target_names | {annot["name"] for annot in pdf.internal_annots if annot.get("name")}
+    origins = [_destination_origin(page) for page in pdf.reader.pages]
+    destinations = {}
+    for chapter, start, end in bounds:
+        destinations.update(_target_objects(
+            chapter, pdf, start, end, {name for name in names if name.startswith(chapter.prefix)}))
+    return destinations, origins
+
+
+def check_links(chapters, pdf, bounds, heading_pages, failures, reviews):
+    occurrences = [link for chapter in chapters for link in chapter.link_occurrences]
+    target_names = {link["target"] for link in occurrences if link["target"] is not None}
+    instances = _link_instances(pdf) if occurrences else []
+    destinations, origins = _link_target_facts(pdf, bounds, target_names)
+    for chapter, start, end in bounds:
+        expected = chapter.link_occurrences
+        if not expected:
+            continue
+        actual = [item for item in instances if item["page"] is not None and start <= item["page"] < end]
+        if chapter.is_toc:
+            # 印刷目录由 check_toc_nav_links 独立核验，保留未投影的正文链接。
+            labels = {normalize(link["text"]) for link in expected}
+            actual = [item for item in actual if item["label"] in labels]
+        for index, link in enumerate(expected):
+            instance = actual[index] if index < len(actual) else None
+            target = link["target"]
+            detail = {"input": str(chapter.path), "line": link["source_line"]}
+            where = f'链接 {link["text"]!r} ({link["href"]})'
+            if (instance is None or not heading_matches(link, instance["label"])
+                    or len(instance["images"]) != link["images"]
+                    or not instance["usable"] or not _link_drawing_covered(instance)):
+                failures.append({"code": "internal-link-instance" if target else "external-link-missing",
+                                 "message": where + " 未对应自身完整绘制与注解", **detail})
+                continue
+            if target and any(not _destination_matches(pdf, annot, target, destinations, origins)
+                              for annot in instance["annots"]):
+                actions = [{key: annot[key] for key in ("name", "dest_page", "dest_type", "position", "uri")
+                            if key in annot} for annot in instance["annots"]]
+                failures.append({"code": "internal-link-target",
+                                 "message": f"{where} 期望对象 {target}，实际动作 {actions}", **detail})
+            if not target and not link.get("range_out") and any(
+                    annot.get("uri") != link["href"] for annot in instance["annots"]):
+                failures.append({"code": "external-link-missing",
+                                 "message": where + " 的外链动作未保留", **detail})
+        if len(actual) > len(expected):
+            failures.append({"code": "internal-link-instance", "input": str(chapter.path),
+                             "message": "成品链接实例多于当前输入"})
     for chapter in chapters:
         for link in chapter.range_out_links:
-            reviews.append(
-                {
-                    "code": "range-out-link",
-                    "message": "范围外本地文档链接待处置：%s（%s）"
-                    % (link["href"], "文件存在" if link["exists"] else "文件不存在"),
-                    "input": str(chapter.path),
-                    "line": link.get("source_line"),
-                }
-            )
+            reviews.append({
+                "code": "range-out-link",
+                "message": "范围外本地文档链接待处置：%s（%s）"
+                % (link["href"], "文件存在" if link["exists"] else "文件不存在"),
+                "input": str(chapter.path),
+                "line": link.get("source_line"),
+            })
 
 
 def check_outline(chapters, pdf, heading_pages, failures):
@@ -5104,6 +5275,10 @@ def parse_args(argv=None):
     parser.add_argument("--pdf", required=True, help="待核验 PDF 路径")
     parser.add_argument("--work-dir", required=True,
                         help="当前 export_report.json 所在目录；正式交付使用首次绑定前固定的持久目录")
+    parser.add_argument("--navigation-record", action="append", default=[],
+                        help="与导出一致的 API 来源记录，与 --site-root 成对")
+    parser.add_argument("--site-root", action="append", default=[],
+                        help="与导出一致的 API 快照站点根")
     parser.add_argument(
         "--unlink-target",
         action="append",
@@ -5228,6 +5403,18 @@ def resolve_source_adaptations(args, report: dict, *, root: str) -> list[str]:
     return paths
 
 
+def resolve_navigation_declarations(args, report, *, root=None):
+    from _api_navigation import navigation_pairs
+
+    explicit = navigation_pairs(getattr(args, "navigation_record", ()),
+                                getattr(args, "site_root", ()), base_dir=root)
+    binding = report.get("api_navigation", [])
+    recorded = [(item["record"], item["site_root"]) for item in binding]
+    if explicit and (set(explicit) != set(recorded) or len(explicit) != len(recorded)):
+        raise ValueError("显式 API 导航记录/站点根与导出报告不一致")
+    return recorded, binding
+
+
 def run_verification(args, *, run_context=None):
     """核验计算（不落盘、不打印）：返回 (机器是否通过, 核验报告 dict)。
 
@@ -5273,6 +5460,16 @@ def run_verification(args, *, run_context=None):
                               if key != 'dependencies_sha256'}
             if comparable != declared_identity:
                 failures.append({'code':'translation-readiness-drift','message':'当前翻译/来源就绪身份与导出时不符'})
+    from _api_navigation import load_pdf_navigation, navigation_identity, verify_pdf_navigation
+    try:
+        pairs, binding = resolve_navigation_declarations(
+            args, report, root=getattr(args, "_delivery_root", None))
+        contexts = load_pdf_navigation(args.inputs, pairs, readiness_projection)
+        if navigation_identity(contexts) != binding:
+            raise ValueError("API 导航来源依赖、站点根或 covers 与导出时不一致")
+        failures.extend(verify_pdf_navigation(args.inputs, contexts))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        failures.append({"code": "api-navigation-drift", "message": str(exc)})
     chapters = []
     try:
         source_root = getattr(args, "_delivery_root", os.getcwd())
@@ -5494,15 +5691,21 @@ def main(argv=None):
     except PdfDependencyError as exc:
         print('FAIL: %s' % exc, file=sys.stderr)
         return 1
-    (work_dir / VERIFY_NAME).write_text(
-        json.dumps(verify_report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    evidence_path = work_dir / VERIFY_NAME
+    if not machine_pass and evidence_path.is_file():
+        try:
+            previous = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        if isinstance(previous, dict) and previous.get("status") == STATUS_MACHINE_PASS:
+            evidence_path = Path(tempfile.mkdtemp(prefix="verify-run-", dir=work_dir)) / VERIFY_NAME
+    evidence_path.write_text(json.dumps(verify_report, ensure_ascii=False, indent=2), encoding="utf-8")
     failures = verify_report["failures"]
     relaxed = verify_report["relaxed_matches"]
     reviews = verify_report["reviews"]
 
     if not machine_pass:
-        print("FAIL: 核验未通过（%d 项），详见 %s" % (len(failures), work_dir / VERIFY_NAME), file=sys.stderr)
+        print("FAIL: 核验未通过（%d 项），详见 %s" % (len(failures), evidence_path), file=sys.stderr)
         for failure in failures[:20]:
             print(
                 "  [%s] %s %s"

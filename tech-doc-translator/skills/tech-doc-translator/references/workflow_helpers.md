@@ -102,6 +102,8 @@ python <Skill>/scripts/verify_api_translation.py <译文.md> <manifest.txt> <off
 
 `manifest.txt` 和独立官方 `official_toc.txt` 各按实际范围列出 `page.html`；不能把发现结果复制成官方依据。将标题工作清单作为任务的标题顺序提示，逐项保留源层级，不能把它作为 `--official-headings-file` 的独立官方基准。导出器排除代码中的伪标题；列表覆盖率按真实有序 / 无序项读取，两侧同口径，差值仅供回源复核。
 
+单页选区含源页内或源页间链接时，按下文[来源对象导航](#来源对象导航)完成合章和核验。
+
 ## 自足任务与当前漂移
 
 ```bash
@@ -221,6 +223,25 @@ python3 "$SCRIPTS/verify_api_translation.py" 01_章节.md source/chapter-pages.t
 ```
 
 `source_record.json` 使用上文相同的 delivery_root 与 sources 声明；a / b 快照的 covers 都须唯一为 `01_章节.md`，其他章的目标页也在记录中以自身 covers 声明。多快照按 range 全量无缝覆盖；不同源页同名 ID 保持不同身份，不改变原始翻译页。记录、快照、解析源、映射及检查器进入最终检查依赖，变化后实际重核。
+
+原 HTML 或译文交付选区含源页片段、相对源页链接时，两条命令必须传入同一记录。默认选区依次取 `article`、`main`、`body`，显式 `section_id` 以来源记录所选范围为准。选区外站点导航、外链、资源链接和代码里的伪链接不触发该门禁。原 HTML 仍含正文导航时，译文删除链接不能省略记录。
+
+#### 恢复当前合章导航
+
+用原 HTML 快照重新解析带源锚点的解析稿，建立覆盖当前页及引用目标的来源记录。冻结当前合章为同目录的独立基准文件。`covers` 指向最终章文件名，保留当前图片目录和显示尺寸映射。
+
+```bash
+python3 "$SCRIPTS/merge_api.py" source/chapter-pages.txt source/site 01_章节.md \
+  --recover-navigation-from 01_章节.baseline.md --official-toc source/official-pages.txt \
+  --navigation-record source_record.json
+python3 "$SCRIPTS/verify_api_translation.py" 01_章节.md source/chapter-pages.txt \
+  source/official-pages.txt source/site --navigation-only-from 01_章节.baseline.md \
+  --navigation-record source_record.json
+```
+
+恢复以冻结基准保留当前正文、每次链接出现和资源引用。来源对象或页面身份无法确认时，保留已有输出并报告缺失依据。仅导航核验的通过结果只证明链接和当前合章的保真，完整翻译交付仍使用正常 API 译文核验。
+
+正常 API 翻译加导出由 `--translation-record` 的就绪检查传递同一来源导航记录与站点根。仅导出恢复后的章时显式传递这两项，命令见 [API 来源导航导出](pdf_export.md#api-来源导航导出)。
 
 ### 规则—任务—检查的接续
 

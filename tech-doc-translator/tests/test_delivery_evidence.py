@@ -696,6 +696,15 @@ class GlossaryBindingUnitTest(unittest.TestCase):
 
 
 class CheckFactsUnitTest(unittest.TestCase):
+    def test_navigation_only_api_check_has_no_translation_facts(self):
+        args = ['chapter.md', 'manifest', 'official', 'site',
+                '--navigation-only-from', 'baseline.md',
+                '--navigation-record', 'record.json']
+        problems = []
+        self.assertEqual(delivery_verifier._check_facts(
+            os.getcwd(), 'verify_api_translation', args, 1, problems), (None, None))
+        self.assertIn('仅导航', '\n'.join(problems))
+
     """检查身份事实（设计 §9.3 固定回归，无浏览器）。
 
     真实 CLI 参数指向的文件依赖（导出报告、provenance、image_map、
@@ -2177,6 +2186,15 @@ class MapParamConsistencyTest(unittest.TestCase):
 
 
 class ToolArgInterpretationTest(unittest.TestCase):
+    def test_navigation_only_api_check_rejected_as_translation(self):
+        args = ['chapter.md', 'manifest', 'official', 'site',
+                '--navigation-only-from', 'baseline.md',
+                '--navigation-record', 'record.json']
+        problems = []
+        self.assertIsNone(delivery_verifier._parse_tool_args(
+            'verify_api_translation', args, problems, 1))
+        self.assertIn('仅导航', '\n'.join(problems))
+
     """参数单源：真实 CLI 与交付入口对已支持写法作同一解释（纯规则）。"""
 
     def test_pdf_equals_form_and_bool_adjacent_positional(self):
@@ -3856,6 +3874,64 @@ class PdfSourceDeliveryTests(unittest.TestCase):
         delivery_verifier.check_source_chains(str(self.root), record,
                                               problems)
         self.assertTrue(any('两级映射' in p for p in problems), problems)
+
+
+from test_api_navigation import ApiNavigationFixture
+
+
+class ApiNavigationBindingTests(ApiNavigationFixture, unittest.TestCase):
+    def test_navigation_dependencies_follow_snapshot_resource_location(self):
+        from _api_navigation import navigation_dependencies
+
+        image = self.root/'_images'/'sample.png'
+        image.parent.mkdir()
+        image.write_bytes((Path(__file__).parent/'fixtures/valid_1x1.png').read_bytes())
+        snapshot = self.root/'a.html'
+        snapshot.write_text(self.raws['a.html'].replace(
+            '</article>', '<figure id="image"><img src="_images/sample.png"></figure></article>'))
+        parsed = self.root/'parsed'/'a.md'
+        parsed.parent.mkdir()
+        self.run_tool('parse_api_html.py', snapshot, parsed)
+        self.record['sources'][0]['parsed_markdown'] = 'parsed/a.md'
+        self.record['sources'][0]['snapshots'][0]['per_stem_map'] = 'parsed/a.images_display.json'
+        self.save_record()
+        deps = navigation_dependencies(self.root/'record.json')
+        self.assertIn([str(image), delivery_verifier.sha256_file(image)], deps)
+        self.assertNotIn(str(parsed.parent/'_images'/'sample.png'), [path for path, _ in deps])
+        image.unlink()
+        with self.assertRaises(ValueError):
+            navigation_dependencies(self.root/'record.json')
+
+    def test_independent_pdf_check_facts_bind_export_navigation_dependencies(self):
+        from _api_navigation import load_pdf_navigation, navigation_identity
+
+        self.merge()
+        inputs = [self.root/name for name in self.record['inputs']]
+        record = self.root/'record.json'
+        pairs = [(str(record), str(self.root))]
+        context = load_pdf_navigation(list(map(str,inputs)), pairs)
+        work = self.root/'work'
+        work.mkdir()
+        (work/'export_report.json').write_text(json.dumps({
+            'api_navigation': navigation_identity(context),
+        }))
+        args = ['--pdf', 'book.pdf', '--work-dir', 'work', *self.record['inputs']]
+        facts, _ = delivery_verifier._check_facts(str(self.root), 'verify_pdf', args, 1)
+        self.assertEqual(facts['params']['api_navigation'][0]['site_root'], str(self.root))
+        self.assertEqual(facts['files']['pdf_navigation_sources'], context[0]['dependencies'])
+        explicit = args+['--navigation-record', 'record.json', '--site-root', '.']
+        self.assertEqual(delivery_verifier._check_facts(
+            str(self.root), 'verify_pdf', explicit, 1)[0], facts)
+        changed = explicit[:-1]+['different-site']
+        problems = []
+        self.assertEqual(delivery_verifier._check_facts(
+            str(self.root), 'verify_pdf', changed, 1, problems), (None, None))
+        self.assertIn('不一致', '\n'.join(problems))
+        snapshot = self.root/'b.html'
+        snapshot.write_bytes(snapshot.read_bytes()+b'\n')
+        current, _ = delivery_verifier._check_facts(str(self.root), 'verify_pdf', args, 1)
+        self.assertNotEqual(current['files']['pdf_navigation_sources'],
+                            facts['files']['pdf_navigation_sources'])
 
 
 if __name__ == '__main__':

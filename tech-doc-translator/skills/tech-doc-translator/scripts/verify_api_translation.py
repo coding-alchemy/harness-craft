@@ -6,6 +6,8 @@
         [--official-headings-file <文件>]
         [--approved-extra-math <表达式>]...
         [--navigation-record <source_record.json>]
+    python3 verify_api_translation.py <candidate.md> <manifest.txt> <official_toc.txt> <site_root>
+        --navigation-only-from <baseline.md> --navigation-record <source_record.json>
 
 --official-headings-file 提供 UTF-8 官方原题清单文件（每行一项，按官方
 页面顺序）；与 manifest/TOC/site root/源路径可并存，角色不变。原 TOC
@@ -51,7 +53,6 @@ from _verification import (
     extract_image_options,
     extract_numeric_review_options,
     extract_strong_tokens,
-    fenced_line_numbers,
     heading_entries,
     image_occurrence_fails,
     image_references,
@@ -87,18 +88,9 @@ def _visible_html_images(site_root, page_rel):
 
 def _split_pages(text):
     """按独立一行的 --- 切分合并文件为多页；代码围栏内的 --- 不参与切分。"""
-    lines = text.split('\n')
-    code_lines = fenced_line_numbers(text)
-    pages = []
-    cur = []
-    for line_no, line in enumerate(lines, start=1):
-        if line_no not in code_lines and line.strip() == '---':
-            pages.append('\n'.join(cur))
-            cur = []
-        else:
-            cur.append(line)
-    pages.append('\n'.join(cur))
-    return [p for p in pages if p.strip()]
+    from _api_navigation import split_page_ranges
+    return [text[lo:hi].removesuffix('\n') if hi < len(text) else text[lo:hi]
+            for lo, hi in split_page_ranges(text) if text[lo:hi].strip()]
 
 
 def run_checks(merged_text, merged_dir, manifest, official, site_root,
@@ -165,7 +157,12 @@ def run_checks(merged_text, merged_dir, manifest, official, site_root,
                 fails.extend(verify_page(src_text,trans_text,page_rel,navigation,chapter))
             except (ValueError,KeyError) as exc:fails.append('页 %s 导航: %s' % (page_rel,exc))
         else:
-            from _api_navigation import compare_anchors
+            from _api_navigation import compare_anchors, require_navigation_record
+            try:
+                require_navigation_record(os.path.join(site_root, page_rel),
+                                          src_text + '\n\n' + trans_text)
+            except (OSError, ValueError) as exc:
+                fails.append('页 %s 导航: %s' % (page_rel, exc))
             fails.extend('页 %s %s' % (page_rel,diff) for diff in compare_anchors(src_text,trans_text))
             if links(src_text)!=links(trans_text):fails.append('页 %s 原链接目标或出现顺序改变' % page_rel)
             fails.extend('页 %s 表格核对: %s' % (page_rel, diff)
@@ -300,6 +297,21 @@ def parse_args(argv, *, base_dir=None):
     --official-headings-file 与 manifest/official TOC/site root/源路径可
     并存，角色不变；官方 TOC 继续独立核对页面集合与顺序。
     """
+    if any(arg == '--navigation-only-from' or arg.startswith('--navigation-only-from=')
+           for arg in argv):
+        from argparse import ArgumentParser
+        parser = ArgumentParser(description='独立核验当前合章的导航恢复与字节保真')
+        for name in ('merged_path', 'manifest_path', 'toc_path', 'site_root'):
+            parser.add_argument(name)
+        parser.add_argument('--navigation-only-from', required=True, action='append')
+        parser.add_argument('--navigation-record', required=True, action='append')
+        parsed = vars(parser.parse_args(argv))
+        for name in ('navigation_only_from', 'navigation_record'):
+            if len(parsed[name]) != 1:
+                parser.error(name + ' 只能声明一次')
+            parsed[name] = parsed[name][0]
+        return {**parsed, 'scope': 'navigation-only'}
+
     argv, official_headings_file = extract_official_headings_option(argv)
     argv, approved_extra_math = extract_approved_extra_math(argv)
     token_files = []
@@ -315,6 +327,7 @@ def parse_args(argv, *, base_dir=None):
     if len(argv) < 5:
         sys.exit(__doc__)
     return {
+        'scope': 'translation',
         'merged_path': argv[0],
         'manifest_path': argv[1],
         'toc_path': argv[2],
@@ -334,6 +347,16 @@ def parse_args(argv, *, base_dir=None):
 
 def main():
     parsed = parse_args(sys.argv[1:])
+    if parsed['scope'] == 'navigation-only':
+        from _api_navigation import verify_recovery
+        baseline, merged, manifest, toc, site, record = (os.path.abspath(parsed[name])
+            for name in ('navigation_only_from', 'merged_path', 'manifest_path',
+                         'toc_path', 'site_root', 'navigation_record'))
+        failures = verify_recovery(baseline, merged, manifest, toc, site, record, chapter_path=merged)
+        if failures:
+            sys.exit('FAIL（仅导航）: ' + '；'.join(failures))
+        print('PASS（仅导航）: 已验证来源目标和当前合章字节保真')
+        return
     merged_path = parsed['merged_path']
     manifest_path = parsed['manifest_path']
     toc_path = parsed['toc_path']

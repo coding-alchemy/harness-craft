@@ -1976,6 +1976,33 @@ def snapshot_image_facts(raw_html, family, section_id=None):
     return list(facts.image_facts)
 
 
+def api_paragraph_positions(root, source):
+    """以原段落内容和标题归属校对解析稿，跳过渲染生成的图题等段落。"""
+    from bisect import bisect_left
+    from collections import defaultdict
+    from _api_navigation import _markdown_paragraphs, _paragraph
+    from _verification import heading_entries
+
+    headings = [line for line, _, _ in heading_entries(source)]
+    actual = defaultdict(list)
+    for index, (line, content) in enumerate(_markdown_paragraphs(source), 1):
+        actual[bisect_left(headings, line), ' '.join(content.split())].append(index)
+    expected = defaultdict(list)
+    fidelity = HtmlFidelity()
+    section = paragraph = 0
+    for node in root.find_all(re.compile(r'^(h[1-6]|p)$')):
+        if re.fullmatch(r'h[1-6]', node.name):
+            if not node.find_parent(['pre', 'code']):
+                section += 1
+        elif _paragraph(node):
+            paragraph += 1
+            key = (section, ' '.join(fidelity.paragraph_text(node).split()))
+            expected[key].append(paragraph)
+    return {ordinal: index for key, ordinals in expected.items()
+            if len(ordinals) == len(actual[key])
+            for ordinal, index in zip(ordinals, actual[key])}
+
+
 def reference_anchor_targets(raw_html, section_id=None):
     """读取实际内部链接目标与宿主，保留原 ID，定位歧义或范围外目标。"""
     soup = BeautifulSoup(protect_code_entities(raw_html, skip_pre=True), 'html.parser')
