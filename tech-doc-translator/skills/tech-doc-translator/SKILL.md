@@ -27,6 +27,8 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 
 ## 已有 Markdown 的 PDF 导出
 
+已识别的 API 文档先完成来源导航正规化，再按 [API 来源导航导出](references/pdf_export.md#api-来源导航导出)传递来源依据。普通独立 Markdown 直接使用下述导出流程。
+
 用户要求把已有 Markdown 导出为 PDF（单篇或合订）时，先完整读取 `<SKILL目录>/references/pdf_export.md`，按其模式路由、命令合同与完成合同执行。要点：单篇与合订共用一个导出入口，输入顺序即文档顺序；多章导出且意图不明时先询问是否合订并等待，目录与术语表不计入章节数；术语表默认不入 PDF，指向术语表的链接用 `--unlink-target` 保留文字转纯文本；章首“原文”“译例说明”“来源”“抓取日期”四类管理字段由导出器默认排除且不在 PDF 显示（Markdown 保留；缺可定位来源在生成前拒绝）；目录“译自…”出处默认按窄格式自动隐藏（格式外须经 `--view-declaration` 的 `toc-provenance` 声明逐处授权）、已标识译注 `【译注：…】` 与 `--view-declaration` 视图声明排除的其他非原文说明只从 PDF 导出视图移除片段（细节见 `<SKILL目录>/references/pdf_export.md`）；中文总标题为默认行为——单篇替换可见 H1 文字、合订在最前可见区域加独立总标题，PDF `Title` 元数据取同一题名决定，仅外文题名单篇与无书名多章合订须由视图声明提供题名否则拒绝生成；每页底部居中 `当前页 / 总页数` 页脚页码与普通正文段落两端对齐均为默认；合订含 `00_目录.md` 时由导出器增强为 PDF 最前的印刷目录（两遍打印、页码为 PDF 实际页序）。代码块按 10 个逻辑行分界分页（短块保持整体、长块跨页续排并利用页尾），长边超 2600px 的 PNG/JPEG 单帧位图仅在 PDF 嵌入负载内重采样且原件不变。执行模型无图像输入时，核验可加 `--visual-aid` 取得逐页辅助统计（渲染成功与否、墨迹覆盖率、图片对象数、链接注解目标，渲染参数与阈值写入报告）定位疑似空白页或异常链接；统计仅作定位线索，不构成无缺字/重叠/裁切的证明，也不构成视觉复核，完成合同不变。机器检查通过后，按完成合同闭合视觉复核（全页目检或经正式核验的显式复用）及适用链接复核，并完成交付说明；宣称交付完成前用 `verify_delivery.py --record <记录> --evidence-dir <持久目录>` 统一核验（目录允许清单、身份、核验复跑、证据索引；复核记录须绑定当前译文与源资源摘要、检查器身份及语义参数口径；目录见 `<SKILL目录>/references/pdf_export.md`）。翻译任务同时要求 PDF 时，在 Markdown 验收后进入同一导出流程，且必须传入 `--translation-record <交付记录.json>`：按[单记录流程](references/workflow_helpers.md#单记录翻译与-pdf-交付)完成当前翻译就绪检查，替换成品前复查身份；漂移或证据不足即停止、旧成品不变。该流程包含首次绑定前固定持久报告、复核候选与显式视觉复用。仅导出已有 Markdown 时可直接运行独立导出。图片显示尺寸按 `<SKILL目录>/references/images_display.md` 的契约在解析、绑定与导出链路中保持（新交付映射固定在交付根 `export/images_display.json`，条目相对映射目录解析）。
 
 ## 执行顺序
@@ -87,7 +89,7 @@ description: 将计算机、工程、数学、物理等理工科英文技术文�
 | 单页 HTML，含 `<article>` / `<main>` / `<body>` 与常规章节 | `<SKILL目录>/scripts/parse_single_page_html.py <html> [section_id] <out.md>` |
 | 分页、代码密集型 HTML（多页/多节，需围栏拼接） | `<SKILL目录>/scripts/parse_paginated_html.py page1.html page2.html ...` → `splice_fences.py` → `merge_sections.py` |
 | 数学密集或深层嵌套参考手册 | `<SKILL目录>/scripts/parse_reference_html.py <html> <out.md>` |
-| 多页面 API/DSL 文档 | `<SKILL目录>/scripts/discover_pages.py <site/index.html>` → `parse_api_html.py` → `merge_api.py`；页面清单必须与**独立的官方 TOC/导航快照**逐项对账，manifest 交付顺序按官方 TOC 重排（`discover_pages` 的字典序输出只用于集合发现，不作为交付顺序）；保留图片显示尺寸时用 `merge_api.py --display-src` 自动绑定（契约见 `<SKILL目录>/references/images_display.md`） |
+| 多页面 API/DSL 文档 | `<SKILL目录>/scripts/discover_pages.py <site/index.html>` → `parse_api_html.py` → `merge_api.py`；页面清单必须与**独立的官方 TOC/导航快照**逐项对账，manifest 交付顺序按官方 TOC 重排（`discover_pages` 的字典序输出只用于集合发现，不作为交付顺序）；交付选区含源页内或源页间链接时，合章和 API 核验传同一 `--navigation-record`，用法见 [来源对象导航](references/workflow_helpers.md#来源对象导航)；保留图片显示尺寸时用 `merge_api.py --display-src` 自动绑定（契约见 `<SKILL目录>/references/images_display.md`） |
 | LaTeXML 快照（arXiv HTML 等；含或不含 MathML） | 先完整读取 `<SKILL目录>/references/latexml_source.md`；`parse_reference_html.py <html> <out.md> --source-adaptation <依据.json> --adaptation-output <候选依据.json>` → 独立对账通过后接入项目 → 直接或按现有工作包翻译与复核 → `verify_delivery.py` 当前交付；多快照合并源每份快照各自依据，拆包/恢复/合并/核验/导出重复 `--source-adaptation` 按序传入（单依据用法不变） |
 | 文字版 PDF（正文有可靠文本层；含位图插图仍按文字版判定，素材单列） | 先完整读取 `<SKILL目录>/references/pdf_source.md`；`<SKILL目录>/scripts/prepare_pdf_source.py inspect <pdf> --pages <范围> --output <项目source/>` → 主 Agent 对照原页逐项裁决清单 → `extract-code` / `extract-figures` 提取并回源确认 → `materialize` → `<SKILL目录>/scripts/verify_pdf_source.py --translation <译文.md>` 机器硬检查通过后才交付；机器 PASS 不登记语义复核；不自动 OCR、不自动提取位图或推导 TeX；人工确认数学按 `pdf_source.md` 的 confirmed-tex-v1 合同消费，未闭合素材写显式 `[PENDING-*]` 标记 |
 | 扫描版 PDF | 仅当用户明确要求且使用宿主 OCR 工具 |

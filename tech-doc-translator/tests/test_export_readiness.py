@@ -403,5 +403,167 @@ class ExportReadinessTests(unittest.TestCase):
         return json.loads(reports[-1].read_text(encoding='utf-8'))
 
 
+from test_api_navigation import ApiNavigationFixture
+
+
+class ApiNavigationReadinessTests(ApiNavigationFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.merge()
+        self.nav = self.root/'record.json'
+        self.inputs = [self.root/name for name in self.record['inputs']]
+        for path in self.inputs:
+            text = path.read_text()
+            lines = text.splitlines(keepends=True)
+            start = next(i for i, line in enumerate(lines) if line.startswith('# '))
+            lines.insert(start+1, '\n> **来源**：https://example.org/api\n')
+            path.write_text(''.join(lines))
+        self.acceptance = self.root/'acceptance.json'
+
+    def build_acceptance(self):
+        checks = []
+        for out, manifest, sources in (('01_AB.md','ab.txt',['a.md','b.md']),
+                                       ('02_C.md','c.txt',['c.md'])):
+            checks.append({'tool': 'verify_api_translation',
+                           'args': [out, manifest, manifest, '.', *sources,
+                                    '--navigation-record', 'record.json']})
+        record = {**self.record, 'checks': checks, 'outputs': []}
+        problems = []
+        entries = delivery_verifier.check_source_chains(str(self.root), record, problems)
+        identity = delivery_verifier.compute_delivery_identity(str(self.root), record, entries)
+        _, _, input_checks, pdf_checks = delivery_verifier.rerun_checks(
+            str(self.root), record, problems)
+        self.assertEqual(problems, [])
+        record['reviews'] = [
+            {'kind': kind, 'target': path.name, 'status': 'closed',
+             'sha256': identity['inputs'][path.name], 'note': 'fixture reviewed',
+             'binding': delivery_verifier.expected_review_binding(
+                 kind, path.name, str(self.root), record, entries,
+                 input_checks, pdf_checks, identity)}
+            for path in self.inputs for kind in ('source-reconcile', 'semantic')]
+        self.acceptance.write_text(json.dumps(record))
+        return record
+
+    def export(self, *extra, paths=None, ok=True):
+        paths = paths or self.inputs
+        work = self.root/('work-'+uuid.uuid4().hex)
+        pdf = work.with_suffix('.pdf')
+        view = self.root/'view.json'
+        original = (next(line[2:] for line in paths[0].read_text().splitlines()
+                         if line.startswith('# ')) if len(paths) == 1 else 'API')
+        view.write_text(json.dumps({'version': 1, 'exclusions': [],
+            'inputs': [{'path': str(p), 'sha256': delivery_verifier.sha256_file(p)} for p in paths],
+            'document_title': {'original': original, 'chinese': '接口文档', 'basis': '测试'}}))
+        result = self.run_tool('export_pdf.py', '--output', pdf, '--work-dir', work,
+                               '--view-declaration', view, *extra, *paths, ok=ok)
+        return result, pdf, work, view
+
+    def test_api_navigation_projection_binds_record_site_root_and_covers(self):
+        record = self.build_acceptance()
+        ready, result = delivery_verifier.check_translation_readiness_cli(
+            self.acceptance, self.inputs)
+        self.assertTrue(ready, result)
+        projected = result['identity']['api_navigation']
+        expected_paths = sorted(str(self.root/p) for p in
+            ('record.json', 'a.html', 'b.html', 'c.html', 'a.md', 'b.md', 'c.md'))
+        expected_identity = [{'record': str(self.nav), 'site_root': str(self.root),
+                              'inputs': list(map(str,self.inputs)),
+                              'dependencies': [[p, delivery_verifier.sha256_file(p)]
+                                               for p in expected_paths]}]
+        self.assertEqual(projected, expected_identity)
+        for name in ('record.json', 'a.html', 'a.md'):
+            with self.subTest(changed=name):
+                target = self.root/name
+                before = target.read_bytes()
+                target.write_bytes(before+b'\n')
+                ready, _ = delivery_verifier.check_translation_readiness_cli(
+                    self.acceptance, self.inputs)
+                self.assertFalse(ready)
+                target.write_bytes(before)
+        record['checks'][0]['args'][3] = 'wrong-root'
+        self.acceptance.write_text(json.dumps(record))
+        ready, _ = delivery_verifier.check_translation_readiness_cli(self.acceptance, self.inputs)
+        self.assertFalse(ready)
+        self.record['sources'][0]['covers'] = ['02_C.md']
+        self.save_record()
+        ready, _ = delivery_verifier.check_translation_readiness_cli(self.acceptance, self.inputs)
+        self.assertFalse(ready)
+
+    def test_explicit_and_readiness_navigation_must_agree(self):
+        self.build_acceptance()
+        options = ('--translation-record', self.acceptance, '--navigation-record', self.nav)
+        result, _, _, _ = self.export(*options, '--site-root', self.root)
+        self.assertEqual(result.returncode, 0)
+        self.export(*options, '--site-root', self.root/'wrong-site', ok=False)
+        self.export(*options, ok=False)
+        alternate = self.root/'alternate.json'
+        alternate.write_bytes(self.nav.read_bytes())
+        self.export('--navigation-record', self.nav, '--site-root', self.root,
+                    '--navigation-record', alternate, '--site-root', self.root, ok=False)
+        first_record = json.loads(self.nav.read_text())
+        first_record['inputs'] = ['01_AB.md']
+        first_record['sources'] = first_record['sources'][:2]
+        second_record = json.loads(self.nav.read_text())
+        second_record['inputs'] = ['02_C.md']
+        second_record['sources'] = second_record['sources'][2:]
+        first, second = self.root/'first.json', self.root/'second.json'
+        first.write_text(json.dumps(first_record))
+        second.write_text(json.dumps(second_record))
+        self.export('--navigation-record', first, '--site-root', self.root,
+                    '--navigation-record', second, '--site-root', self.root)
+
+    def test_known_api_without_navigation_cannot_fall_back(self):
+        from export_pdf import STATUS_MACHINE_FAIL
+
+        record = self.build_acceptance()
+        record['checks'][0]['args'] = record['checks'][0]['args'][:-2]
+        self.acceptance.write_text(json.dumps(record))
+        result, _, _, _ = self.export('--translation-record', self.acceptance, ok=False)
+        self.assertIn('navigation-record', result.stderr)
+        result, _, _, _ = self.export(paths=self.inputs[:1], ok=False)
+        self.assertIn('navigation-record', result.stderr)
+        from _api_navigation import namespaced
+        path = self.inputs[0]
+        baseline = path.read_text()
+        tag = namespaced('a.html', 't')
+        for bad in (baseline.replace('](#'+tag+')', '](a.html#t)', 1),
+                    baseline.replace('](#'+tag+')', '](#'+namespaced('a.html','missing')+')', 1),
+                    baseline.replace(f'<a id="{tag}"></a>', '')):
+            self.assertNotEqual(bad, baseline)
+            path.write_text(bad)
+            _, _, work, _ = self.export('--navigation-record', self.nav, '--site-root',
+                                        self.root, ok=False)
+            report = json.loads((work/'export_report.json').read_text())
+            self.assertEqual(report.get('status'), STATUS_MACHINE_FAIL)
+            self.assertTrue(any(d['code'].startswith('api-navigation')
+                                for d in report['diagnostics']), report)
+
+    def test_api_partial_export_reports_only_proven_out_of_scope(self):
+        options = ('--navigation-record', self.nav, '--site-root', self.root)
+        _, partial, work, view = self.export(*options, paths=self.inputs[:1])
+        report = json.loads((work/'export_report.json').read_text())
+        self.assertTrue(any(item['href'].startswith('02_C.md#') for item in report['range_out_links']))
+        self.run_tool('verify_pdf.py', '--pdf', partial, '--work-dir', work,
+                      '--view-declaration', view, self.inputs[0])
+        _, whole, work, view = self.export(*options)
+        self.run_tool('verify_pdf.py', '--pdf', whole, '--work-dir', work,
+                      '--view-declaration', view, *self.inputs)
+        report = json.loads((work/'verify_report.json').read_text())
+        self.assertEqual(report['failures'], [])
+        self.record['sources'].pop()
+        self.record['inputs'].pop()
+        self.save_record()
+        self.export(*options, paths=self.inputs[:1], ok=False)
+
+    def test_plain_markdown_range_out_contract_is_unchanged(self):
+        plain, glossary = self.root/'plain.md', self.root/'terms.md'
+        glossary.write_text('Terms')
+        plain.write_text('# 接口文档\n\n> **来源**：https://example.org/api\n\n'
+                         '[范围外](missing.html#label) 与 [术语表](terms.md)。\n')
+        _, _, work, _ = self.export('--unlink-target', glossary, paths=[plain])
+        report = json.loads((work/'export_report.json').read_text())
+        self.assertEqual([link['href'] for link in report['range_out_links']], ['missing.html#label'])
+
+
 if __name__ == '__main__':
     unittest.main()

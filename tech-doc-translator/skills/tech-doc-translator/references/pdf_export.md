@@ -72,6 +72,21 @@
 
 首位目录本身不算正文章节，但占输入序号。每个实际正文须有对应来源；一个实际出处段落可覆盖多章，不能凭映射补造原文未给的来源或版本。`lines: [1, 999]` 越界、`chapters: [3]` 超出本例输入、摘要改成全零、目录未列首位、path 指向未纳入输入或正文文件，均失败且保持旧成品。出处映射不会让格式外“译自”段落自动获得视图排除资格，仍遵守既有 `--view-declaration` 的边界。
 
+## API 来源导航导出
+
+已识别的 API 文档先按[来源对象导航](workflow_helpers.md#来源对象导航)正规化合章。正常翻译加导出使用 `--translation-record`，从就绪检查取得实际消费的导航记录与站点根。仅导出已恢复的章时显式给出配对参数。
+
+```bash
+python3 "$SCRIPTS/export_pdf.py" --output "$RUN/book.pdf" --work-dir "$RUN/export" \
+  --navigation-record source_record.json --site-root site chapter.md
+python3 "$SCRIPTS/verify_pdf.py" --pdf "$RUN/book.pdf" --work-dir "$RUN/export" \
+  --navigation-record source_record.json --site-root site chapter.md
+```
+
+合订有多个来源时可按相同顺序重复两个参数。独立核验可从当前导出报告重读配对，显式配对须与报告一致。来源依赖与章节覆盖进入检查身份。只有来源目标可证明且其章明确未纳入，才登记范围外；缺依据、遗留源 HTML 跳转或目标错绑会阻断。PDF 阶段保持 Markdown 原样。
+
+普通独立 Markdown 沿用下文命令，继续支持本章片段、外链、术语表投影和范围外待处置。发布前及独立核验共用成品链接检查。已有成功证据时，本轮失败报告写入独立运行目录。
+
 ## 依赖与环境
 
 - 使用独立虚拟环境，安装和运行始终用同一解释器。以下 `TDT_SKILL` 替换为实际 Skill 目录，`TDT_VENV` 替换为工作区外的环境路径：

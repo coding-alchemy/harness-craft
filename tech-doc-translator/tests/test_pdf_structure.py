@@ -12,6 +12,24 @@ import export_pdf as exporter
 import verify_pdf as verifier
 
 
+class LinkOccurrenceFactsTest(unittest.TestCase):
+    def test_link_occurrences_keep_full_labels_projection_and_original_lines(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)/'chapter.md'
+            label = '完整链接文字' * 20
+            path.write_text('# 第一章\n\n> **来源**：https://example.org\n\n'
+                            f'[{label}](#甲)\n\n[重复](#甲)\n\n'
+                            '[重复](https://example.org/)\n\n## 甲\n\n正文。\n')
+            failures = []
+            chapter, = verifier.reparse_inputs([path], failures)
+            self.assertEqual(failures, [])
+            self.assertEqual([link['text'] for link in chapter.link_occurrences],
+                             [label, '重复', '重复'])
+            self.assertEqual([link['source_line'] for link in chapter.link_occurrences], [5, 7, 9])
+            self.assertEqual([link['target'] for link in chapter.link_occurrences],
+                             ['ch01-甲', 'ch01-甲', None])
+
+
 REAL_CHAPTER_HEAD = (
     '# CUDA Programming Guide 中文翻译 —— 第 1 章 Introduction to CUDA\n'
     '\n'

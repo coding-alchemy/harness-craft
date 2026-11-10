@@ -3703,7 +3703,9 @@ for page in (reader.pages[0], seen, seen, reader.pages[-1]):
 writer.write(str(base / "dup_footer.pdf"))
 print("页脚反例样本就绪")
 PY
-python3 - "$FT/w_toc" "$FT/no_footer.pdf" "$FT/with_toc.pdf" <<'PY'
+mkdir -p "$FT/no_footer_evidence"
+cp "$FT/w_toc/export_report.json" "$FT/no_footer_evidence/export_report.json"
+python3 - "$FT/no_footer_evidence" "$FT/no_footer.pdf" "$FT/with_toc.pdf" <<'PY'
 import json, sys
 from pathlib import Path
 path = Path(sys.argv[1]) / "export_report.json"
@@ -3712,18 +3714,20 @@ report["pdf_sha256"] = __import__("hashlib").sha256(
     Path(sys.argv[2]).read_bytes()).hexdigest()
 path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
-if python3 "$VERIFY" --pdf "$FT/no_footer.pdf" --work-dir "$FT/w_toc" \
+if python3 "$VERIFY" --pdf "$FT/no_footer.pdf" --work-dir "$FT/no_footer_evidence" \
     "$FT/00_目录.md" "$FT/with_toc.md" >"$FT/nf_v.txt" 2>&1; then
   echo "错误：缺页脚页未被拒绝"; exit 1
 fi
-python3 - "$FT/w_toc" footer-missing <<'PY'
+python3 - "$FT/no_footer_evidence" footer-missing <<'PY'
 import json, sys
 from pathlib import Path
 codes = {f["code"] for f in json.loads(
     (Path(sys.argv[1]) / "verify_report.json").read_text())["failures"]}
 assert sys.argv[2] in codes, codes
 PY
-python3 - "$FT/w_toc" "$FT/dup_footer.pdf" "$FT/with_toc.pdf" <<'PY'
+mkdir -p "$FT/dup_footer_evidence"
+cp "$FT/w_toc/export_report.json" "$FT/dup_footer_evidence/export_report.json"
+python3 - "$FT/dup_footer_evidence" "$FT/dup_footer.pdf" "$FT/with_toc.pdf" <<'PY'
 import json, sys
 from pathlib import Path
 path = Path(sys.argv[1]) / "export_report.json"
@@ -3732,11 +3736,11 @@ report["pdf_sha256"] = __import__("hashlib").sha256(
     Path(sys.argv[2]).read_bytes()).hexdigest()
 path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 PY
-if python3 "$VERIFY" --pdf "$FT/dup_footer.pdf" --work-dir "$FT/w_toc" \
+if python3 "$VERIFY" --pdf "$FT/dup_footer.pdf" --work-dir "$FT/dup_footer_evidence" \
     "$FT/00_目录.md" "$FT/with_toc.md" >"$FT/df_v.txt" 2>&1; then
   echo "错误：错总页数未被拒绝"; exit 1
 fi
-python3 - "$FT/w_toc" footer-number <<'PY'
+python3 - "$FT/dup_footer_evidence" footer-number <<'PY'
 import json, sys
 from pathlib import Path
 codes = {f["code"] for f in json.loads(

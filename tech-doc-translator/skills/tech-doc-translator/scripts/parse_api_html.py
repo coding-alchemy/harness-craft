@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import tempfile
+from html import escape
 
 from bs4 import Comment, Tag
 
@@ -135,6 +136,8 @@ def _render_children(node, out, fidelity, include_self=False):
     for child in ([node] if include_self else node.children):
         fenced = fidelity.fenced_pre(child)
         if fenced is not None:
+            for anchor in fidelity.pre_anchor_ids(child):
+                out.append('\n<a id="%s"></a>\n' % escape(anchor, quote=True))
             out.append(fenced)
             continue
         if isinstance(child, str):
@@ -143,7 +146,6 @@ def _render_children(node, out, fidelity, include_self=False):
             continue
         name, cls = child.name, ' '.join(child.get('class') or [])
         for anchor in source_anchor_ids(child):
-            from html import escape
             out.append('\n<a id="%s"></a>\n' % escape(anchor, quote=True))
         if name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
             out.append('\n' + fidelity.heading_line(

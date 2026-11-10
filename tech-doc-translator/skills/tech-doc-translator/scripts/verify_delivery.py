@@ -461,7 +461,7 @@ CHECK_SHARED_DEPS = {
                    "_html_fidelity.py", "_source_reconcile.py",
                    "_image_binding.py", "_image_preflight.py",
                    "_pdf_dependencies.py",
-                   "_latexml_source.py"),
+                   "_latexml_source.py", "_api_navigation.py"),
     "verify_translation": ("verify_translation.py", "_verification.py",
                            "_official_headings.py", "_html_fidelity.py",
                            "_source_reconcile.py", "_latexml_source.py",
@@ -1003,7 +1003,8 @@ def _check_pdf_source_chain(root, entry, order, problems):
     }
 
 
-def source_dependency_paths(root, record, problems, *, entries=None):
+def source_dependency_paths(root, record, problems, *, entries=None,
+                            include_parsed_resources=True):
     """辅助输出的来源保护：声明与当前来源事实共用，不授予来源资格。
 
     不可读来源仍保留已知路径及可读裁决资产；调用方决定拒绝或逐项诊断。
@@ -1072,6 +1073,8 @@ def source_dependency_paths(root, record, problems, *, entries=None):
             for item in (facts or {}).get('images', []):
                 if item.get('path'):
                     resource(item['path'])
+    if not include_parsed_resources:
+        return paths
     for document in documents:
         if not document.is_file():
             continue
@@ -2230,6 +2233,9 @@ def _parse_tool_args(tool, args, problems, order, root_abs=None):
     if tool == "verify_pdf_source":
         # 受约束 PDF 核验入口：Namespace 归一为与翻译家族一致的事实字典
         parsed = vars(parsed)
+    if tool == "verify_api_translation" and parsed.get("scope") == "navigation-only":
+        problems.append('核验记录 #%d 仅导航恢复不能登记为完整翻译检查' % order)
+        return None
     if isinstance(parsed, dict) and parsed.get('table_code_stage') == 'intermediate':
         problems.append('核验记录 #%d 交付禁止使用中间表格代码阶段' % order)
         return None
@@ -2302,6 +2308,18 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             "toc_sections": bool(parsed.toc_sections),
             "require_display_map": bool(parsed.require_display_map),
         }
+        try:
+            pairs, binding = pdf_verifier.resolve_navigation_declarations(
+                parsed, report if isinstance(report, dict) else {}, root=root_abs)
+            if pairs:
+                from _api_navigation import navigation_dependencies
+                facts["files"]["pdf_navigation_sources"] = [
+                    item for record_path, _site in pairs for item in navigation_dependencies(record_path)]
+                facts["params"]["api_navigation"] = [
+                    {key: item[key] for key in ("record", "site_root", "inputs")} for item in binding]
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            local_problems.append(f"核验记录 #{order} API 导航来源拒绝：{exc}")
+            return None, None
         # 进程内复验以交付根解释相对路径（与子进程 cwd=交付根口径一致）
         parsed.pdf = _rooted(root_abs, parsed.pdf)
         parsed.work_dir = _rooted(root_abs, parsed.work_dir)
@@ -2410,22 +2428,39 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             facts["files"]["toc"] = dep(parsed["toc_path"])
             facts["params"]["site_root"] = os.path.realpath(
                 _rooted(root_abs, parsed["site_root"]))
+            manifest_path = _rooted(root_abs, parsed["manifest_path"])
+            if facts["files"]["manifest"][1] is not None:
+                with open(manifest_path, encoding='utf-8') as handle:
+                    manifest = [line.strip() for line in handle if line.strip()]
+            else:
+                manifest = []
             if parsed.get('navigation_record'):
-                facts['files']['navigation_record']=dep(parsed['navigation_record'])
-                nav_path=_rooted(root_abs,parsed['navigation_record'])
-                nav_record=json.load(open(nav_path,encoding='utf-8'))
-                nav_problems=[]
-                nav_paths=source_dependency_paths(nav_record['delivery_root'],nav_record,nav_problems)
-                if nav_problems:raise ValueError('导航依赖不可核对: '+'；'.join(nav_problems))
-                facts['files']['navigation_sources']=[[str(path),sha256_file(path)] for path in sorted(nav_paths)]
-                from _api_navigation import load_navigation
-                pages=load_navigation(nav_path, facts['params']['site_root'])
-                with open(_rooted(root_abs,parsed['manifest_path']),encoding='utf-8') as handle:
-                    manifest=[line.strip() for line in handle if line.strip()]
-                translated=facts['files']['translated'][0]
-                facts['params']['table_role_sources']=[
-                    pages[page]['role_source'] if page in pages and str(pages[page]['chapter'])==translated else None
+                from _api_navigation import navigation_context
+                nav_path = _rooted(root_abs, parsed['navigation_record'])
+                try:
+                    context = navigation_context(nav_path, facts['params']['site_root'])
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    local_problems.append(f"核验记录 #{order} 导航来源拒绝：{exc}")
+                    return None, None
+                facts['files']['navigation_record'] = next(
+                    item for item in context['dependencies'] if item[0] == context['record'])
+                facts['files']['navigation_sources'] = [
+                    item for item in context['dependencies'] if item[0] != context['record']]
+                pages = context['pages']
+                translated = facts['files']['translated'][0]
+                facts['params']['table_role_sources'] = [
+                    pages[page]['role_source'] if page in pages and str(pages[page]['chapter']) == translated else None
                     for page in manifest]
+            else:
+                from _api_navigation import require_navigation_record
+                for page in manifest:
+                    snapshot = os.path.join(facts['params']['site_root'], page)
+                    if os.path.isfile(snapshot):
+                        try:
+                            require_navigation_record(snapshot, '')
+                        except (OSError, ValueError) as exc:
+                            local_problems.append(f"核验记录 #{order} 导航来源拒绝：{exc}")
+                            return None, None
         if parsed.get("official_headings_file"):
             # 官方标题文件作为实际依赖（D5）：规范化路径 + 内容摘要 +
             # 加载后的有效原题与确认范围口径；同路径改内容使相关旧
@@ -3724,6 +3759,25 @@ def _translation_projection(root, record, entries, baseline, *, input_roles=None
                     for entry in entries],
         "dependencies_sha256": _translation_fingerprint(root, record, baseline),
     }
+    navigation = {}
+    for check in baseline["checks"]:
+        facts = check.get("facts") or {}
+        files, params = facts.get("files", {}), facts.get("params", {})
+        if files.get("navigation_record"):
+            record_dep = files["navigation_record"]
+            key = record_dep[0], params["site_root"]
+            context = navigation.setdefault(key, {
+                "record": key[0], "site_root": key[1], "inputs": [],
+                "dependencies": sorted([record_dep, *files["navigation_sources"]]),
+            })
+            translated = files["translated"][0]
+            if translated not in context["inputs"]:
+                context["inputs"].append(translated)
+    if navigation:
+        ordered = [os.path.realpath(_rooted(root_abs, path)) for path in record["inputs"]]
+        for context in navigation.values():
+            context["inputs"] = [path for path in ordered if path in context["inputs"]]
+        projection["api_navigation"] = list(navigation.values())
     approvals = {}
     for check in baseline["checks"]:
         facts = check.get("facts") or {}

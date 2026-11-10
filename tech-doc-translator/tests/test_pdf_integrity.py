@@ -171,11 +171,14 @@ class PdfIntegrityTests(unittest.TestCase):
         return path
 
     def verify(self, path, inputs=None):
+        evidence = Path(tempfile.mkdtemp(prefix='verify-', dir=self.root))
+        (evidence / exporter.REPORT_NAME).write_bytes(
+            (self.work / exporter.REPORT_NAME).read_bytes())
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = verifier.main(['--pdf', str(path), '--work-dir', str(self.work),
+            result = verifier.main(['--pdf', str(path), '--work-dir', str(evidence),
                                     '--view-declaration', str(self.declaration),
                                     *(inputs if inputs is not None else self.inputs)])
-        report = json.loads((self.work / verifier.VERIFY_NAME).read_text())
+        report = json.loads((evidence / verifier.VERIFY_NAME).read_text())
         return result, {item['code'] for item in report['failures']}
 
     def setUp(self):
@@ -1031,7 +1034,7 @@ class CodePaginationGapTest(unittest.TestCase):
         report = json.loads(
             (work / exporter.REPORT_NAME).read_text(encoding='utf-8'))
         self.assertEqual(report['status'], 'machine-fail')
-        gate_codes = {item['code'] for item in report['code_gate_failures']}
+        gate_codes = {item['code'] for item in report['candidate_gate_failures']}
         self.assertIn('code-page-gap', gate_codes)
 
     def test_forced_move_with_leading_h2_still_blocked(self):
@@ -1044,7 +1047,7 @@ class CodePaginationGapTest(unittest.TestCase):
         self.assertEqual(pdf.read_bytes(), b'OLD-PDF-BYTES')  # 旧成品不变
         report = json.loads(
             (work / exporter.REPORT_NAME).read_text(encoding='utf-8'))
-        gate_codes = {item['code'] for item in report['code_gate_failures']}
+        gate_codes = {item['code'] for item in report['candidate_gate_failures']}
         self.assertIn('code-page-gap', gate_codes)
 
     def test_same_content_without_patch_uses_page_tail(self):
