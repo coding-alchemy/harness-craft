@@ -317,6 +317,13 @@ def run_checks(doc_text, src_text, official=(), *, doc_dir, doc_label,
         else:
             lines.append('链接目标: 源 %d / 译 %d PASS' %
                          (len(link_targets(src)), len(link_targets(doc))))
+        # API 解析稿（有来源锚点行）的链接顺序在合章时逐个比对，片段核验提前查
+        from _api_navigation import ANCHOR, first_link_difference
+        if any(ANCHOR.fullmatch(line) for line in src.splitlines()):
+            difference = first_link_difference(src, doc)
+            if difference:
+                fail += 1
+                lines.append('链接顺序: %s FAIL' % difference)
 
     from _source_reconcile import compare_translation_tables, table_code_problems
     for problem in table_code_problems(block_doc, table_code_stage, scan_context):

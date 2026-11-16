@@ -12,10 +12,15 @@ from dataclasses import dataclass
 import tinycss2
 from markdown_it import MarkdownIt
 
+from _install_integrity import warn_if_modified
+
+warn_if_modified()
+
 
 _BLOCK_PLACEHOLDER = re.compile(r'^\[([A-Z][A-Z0-9_-]*)\]\s', re.M)
 _IMAGE = re.compile(r'!\[[^\]]*\]\(([^)]+)\)')
-_LINK = re.compile(r'(?<!!)\[(?:\\.|[^\\\]])+\]\(([^)]+)\)')
+# 链接文字里可以有一整个图片；链接文字不跨空行（行内链接不跨段落）
+_LINK = re.compile(r'(?<!!)\[(?:\\.|!\[[^\]\n]*\]\([^)\n]*\)|\n(?![ \t]*\n)|[^\\\]\n])+\]\(([^)]+)\)')
 _FENCE_OPEN = re.compile(r'^(`{3,}|~{3,})(.*)$')
 _FENCE_CLOSE = re.compile(r'^(`{3,}|~{3,})\s*$')
 

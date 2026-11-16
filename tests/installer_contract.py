@@ -10,7 +10,9 @@ online-media-reader 与 tech-doc-translator 的 install_skill.py 按批准设计
 - 目标 ${CODEX_HOME:-~/.codex}/skills/<skill-name>；
 - 全量预检通过前不写任何文件；冲突默认拒绝；--force 只替换受管文件；
   未知目标文件保留；受管路径上的非普通文件（目录等）一律预检失败；
-- Skill 源目录本身是符号链接时拒绝安装。
+- Skill 源目录本身是符号链接时拒绝安装；
+- 安装脚本另外生成的文件（如安装清单）由合同的 generated_files 声明，
+  默认为空。
 """
 
 import os
@@ -42,6 +44,7 @@ class InstallerContract:
     forbidden_top_dirs: tuple
     prepare_fixtures: object = None
     out_of_source: object = None
+    generated_files: tuple = ()
 
     @property
     def error_prefix(self):
@@ -183,7 +186,7 @@ def check_fresh_install_matches_source_publish_set(contract):
             "Installed %d %s Skill files\n" % (len(managed), contract.skill_name)
         )
         installed_files = session.installed_files()
-        assert installed_files == set(managed)
+        assert installed_files == set(managed) | set(contract.generated_files)
         assert "README.md" not in installed_files
         assert "install_skill.py" not in installed_files
         for development_dir in contract.forbidden_top_dirs:
@@ -383,7 +386,8 @@ def check_cache_files_are_excluded_from_manifest(contract):
 
         assert result.returncode == 0, result.stderr
         installed_files = session.installed_files()
-        assert installed_files == set(publish_files(contract.source_skill))
+        assert installed_files == (set(publish_files(contract.source_skill))
+                                   | set(contract.generated_files))
         assert not any("__pycache__" in name for name in installed_files)
         assert not any(".DS_Store" in name for name in installed_files)
         assert not any(name.startswith(".pytest_cache") for name in installed_files)

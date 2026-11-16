@@ -2257,5 +2257,141 @@ class SectionAttributionTest(unittest.TestCase):
         self.assertTrue(any('脚注定义' in d for d in diffs))
 
 
+class FootnoteReferenceNumberTest(unittest.TestCase):
+    """脚注引用在格位、提示框、列表和冒号前都按编号对账；定义首行跳过空白文本。"""
+
+    BRACKETED_REF = ('<a class="footnote-reference brackets" href="#fn1" id="r1" role="doc-noteref">'
+                     '<span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a>')
+    BARE_REF = '<a class="footnote-reference brackets" href="#fn1" id="r1">1</a>'
+    ASIDE_DEF = ('<aside class="footnote-list brackets"><aside class="footnote brackets" id="fn1" '
+                 'role="doc-footnote"><span class="label"><span class="fn-bracket">[</span>'
+                 '<a role="doc-backlink" href="#r1">1</a><span class="fn-bracket">]</span></span>'
+                 '<p>See PTX.</p></aside></aside>')
+    DL_DEF = ('<dl class="footnote brackets"><dt class="label" id="fn1"><span class="brackets">'
+              '<a class="fn-backref" href="#r1">1</a></span></dt><dd>\n<p>See PTX.</p>\n</dd></dl>')
+    HOSTS = {
+        'cell': '<table><tr><th>Name</th><th>Value</th></tr><tr><td>xREF</td><td>10</td></tr></table>',
+        'admonition': ('<div class="admonition note"><p class="admonition-title">Note</p>'
+                       '<p>ECC reduces DRAMREF.</p></div>'),
+        'list': '<ul><li><p>ItemREF</p></li></ul>',
+        'colon': '<p>warp shuffle REF: <code>shfl</code> moves data.</p>',
+    }
+
+    @staticmethod
+    def _render(raw, family):
+        from _html_fidelity import HtmlFidelity
+        import parse_api_html
+        import parse_single_page_html
+        fidelity = HtmlFidelity()
+        out = []
+        module = parse_api_html if family == 'api' else parse_single_page_html
+        module.render(fidelity.parse(raw).article, out, fidelity)
+        return '\n'.join(out).strip() + '\n'
+
+    def test_bare_and_bracketed_references_reconcile_in_every_host(self):
+        forms = (('bare', self.BARE_REF, self.DL_DEF),
+                 ('bracketed', self.BRACKETED_REF, self.ASIDE_DEF))
+        for family in ('single', 'api'):
+            for host, body in self.HOSTS.items():
+                for form, ref, definition in forms:
+                    raw = '<article><h1>T</h1>%s%s</article>' % (body.replace('REF', ref), definition)
+                    with self.subTest(family=family, host=host, form=form):
+                        md = self._render(raw, family)
+                        self.assertEqual(reconcile_html_to_markdown(raw, md, family), [])
+                        self.assertTrue(reconcile_html_to_markdown(
+                            raw, md.replace('[^1]', '', 1), family))
+
+    def test_definition_first_line_skips_whitespace_text(self):
+        raw = ('<article><h1>T</h1><dl><dt>Threading resources</dt><dd>\n'
+               '<p>Execution pipelines are limited.</p>\n</dd></dl></article>')
+        for family in ('single', 'api'):
+            with self.subTest(family=family):
+                md = self._render(raw, family)
+                self.assertEqual(reconcile_html_to_markdown(raw, md, family), [])
+                damaged = md.replace('Execution pipelines are limited.', 'Something else.')
+                self.assertTrue(reconcile_html_to_markdown(raw, damaged, family))
+
+
+class LinkTargetsTest(unittest.TestCase):
+    """链接目标：链接包住图片时取外层目标；链接文字不跨空行。"""
+
+    def test_targets(self):
+        from _verification import link_targets
+        cases = [
+            ('见 [![示意图](images/a.png)](https://example.com/big.png) 图。\n',
+             ['https://example.com/big.png']),
+            ('见 [第 3 节](#sec-3) 与 [nvcc](nvcc.html#nvcc)。\n', ['#sec-3', 'nvcc.html#nvcc']),
+            ('区间 [a, b) 的说明。\n\n![图](images/b.png)\n\n见 [c](#c)。\n', ['#c']),
+            ('区间 [a, b) 的说明。\n\n见 [c](#c)。\n', ['#c']),
+            ('见 [第 3\n节](#sec-3)。\n', ['#sec-3']),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(link_targets(text), expected)
+
+    def test_dropping_the_outer_link_of_a_linked_image_is_reported(self):
+        import tempfile
+        from verify_translation import run_checks
+        source = '# T\n\n见 [![示意图](images/a.png)](https://example.com/big.png) 图。\n'
+        damaged = source.replace('[![示意图](images/a.png)](https://example.com/big.png)',
+                                 '![示意图](images/a.png)')
+        with tempfile.TemporaryDirectory() as tmp:
+            def missing(doc):
+                _fail, lines = run_checks(doc, source, doc_dir=tmp, doc_label='doc.md',
+                                          src_label='src.md')
+                return [line for line in lines if line.startswith('链接目标缺失')]
+            self.assertEqual(missing(source), [])
+            reported = missing(damaged)
+        self.assertEqual(len(reported), 1)
+        self.assertIn('https://example.com/big.png', reported[0])
+
+
+class MultiBacklinkFootnoteTest(unittest.TestCase):
+    """多回链脚注：回链只留文字；删掉一处引用仍被拒绝（R10）。"""
+
+    BODY = ('<p>Counts <a class="footnote-reference brackets" href="#family2" id="id2" role="doc-noteref">'
+            '<span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a>, limits '
+            '<a class="footnote-reference brackets" href="#family2" id="id3" role="doc-noteref">'
+            '<span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a> and ranges '
+            '<a class="footnote-reference brackets" href="#family2" id="id4" role="doc-noteref">'
+            '<span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a> differ.</p>')
+    ASIDE = ('<aside class="footnote brackets" id="family2" role="doc-footnote">'
+             '<span class="label"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></span>'
+             '<span class="backrefs">(<a href="#id2" role="doc-backlink">1</a>,'
+             '<a href="#id3" role="doc-backlink">2</a>,<a href="#id4" role="doc-backlink">3</a>)</span>'
+             '<p>Some families only contain a single member.</p></aside>')
+
+    @staticmethod
+    def _render(raw, family):
+        from _html_fidelity import HtmlFidelity
+        import parse_api_html
+        import parse_single_page_html
+        fidelity = HtmlFidelity()
+        out = []
+        module = parse_api_html if family == 'api' else parse_single_page_html
+        module.render(fidelity.parse(raw).article, out, fidelity)
+        return '\n'.join(out).strip() + '\n'
+
+    def test_backlinks_render_as_plain_text(self):
+        raw = '<article><h1>T</h1>' + self.BODY + self.ASIDE + '</article>'
+        for family in ('single', 'api'):
+            with self.subTest(family=family):
+                md = self._render(raw, family)
+                self.assertIn('(1, 2, 3)', md)
+                self.assertNotIn('](#id2)', md)
+                self.assertEqual(reconcile_html_to_markdown(raw, md, family), [])
+
+    def test_deleting_one_reference_is_rejected(self):
+        raw = '<article><h1>T</h1>' + self.BODY + self.ASIDE + '</article>'
+        for family in ('single', 'api'):
+            with self.subTest(family=family):
+                md = self._render(raw, family)
+                head, _sep, _tail = md.partition('limits')
+                token = '[1]' if '[1]' in head else '[^1]'  # 正文第一处脚注引用
+                self.assertIn(token, head)
+                self.assertTrue(reconcile_html_to_markdown(
+                    raw, md.replace(token, '', 1), family))
+
+
 if __name__ == '__main__':
     unittest.main()

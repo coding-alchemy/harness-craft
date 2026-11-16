@@ -129,5 +129,40 @@ class TableCodeLifecycleTest(unittest.TestCase):
         self.assertTrue(any('交付禁止' in problem for problem in problems))
 
 
+SHELL_HTML = ('<article><h1>T</h1>'
+              '<table><tr><td><div class="highlight"><pre>one();</pre></div></td></tr></table>'
+              '<table><tr><td><div class="highlight"><pre>two();</pre></div></td></tr></table></article>')
+
+
+class HeaderOnlyTableCodeTest(unittest.TestCase):
+    """只有表头行的表（Sphinx 选项卡里的单格代码表）认领后面的格内代码。"""
+
+    @staticmethod
+    def render():
+        fidelity = HtmlFidelity()
+        out = []
+        parse_api_html.render(fidelity.parse(SHELL_HTML).article, out, fidelity)
+        return '\n'.join(out).strip() + '\n'
+
+    def test_header_only_tables_own_their_cell_code(self):
+        md = self.render()
+        self.assertIn('[TABLE]\n \n---\n\n[TABLE-CODE r=1 c=1#1]\n\n```\none();\n```', md)
+        self.assertEqual(reconcile_html_to_markdown(SHELL_HTML, md, 'api'), [])
+        self.assertEqual([record['codes'] for record in markdown_table_facts(md)],
+                         [{(1, 1, 1): 'one();'}, {(1, 1, 1): 'two();'}])
+        self.assertEqual(table_code_problems(md, 'source'), [])
+
+    def test_swapped_missing_or_out_of_range_cell_code_is_rejected(self):
+        md = self.render()
+        swapped = md.replace('one();', '@').replace('two();', 'one();').replace('@', 'two();')
+        self.assertTrue(reconcile_html_to_markdown(SHELL_HTML, swapped, 'api'))
+        missing = md.replace('```\ntwo();\n```', '', 1)
+        self.assertTrue(reconcile_html_to_markdown(SHELL_HTML, missing, 'api'))
+        self.assertTrue(table_code_problems(missing, 'source'))
+        out_of_range = md.replace('[TABLE-CODE r=1 c=1#1]', '[TABLE-CODE r=2 c=1#1]', 1)
+        self.assertIn('格内代码坐标越界', '；'.join(table_code_problems(out_of_range, 'source')))
+        self.assertTrue(reconcile_html_to_markdown(SHELL_HTML, out_of_range, 'api'))
+
+
 if __name__ == '__main__':
     unittest.main()
