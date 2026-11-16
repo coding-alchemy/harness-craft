@@ -4,9 +4,12 @@
 受管清单从 skills/tech-doc-translator/ 递归派生：只接受普通发布文件，
 排除缓存与编译字节码；符号链接与非普通文件直接失败。写入采用同目录
 临时文件与原子替换，冲突默认拒绝，--force 只替换受管文件，清单外目标
-文件保持不变。
+文件保持不变。安装完成后在目标目录写 .install-manifest.json（受管文件的
+sha256），脚本运行时据此发现安装副本被改；内容不变时不重写。
 """
 import argparse
+import hashlib
+import json
 import os
 import stat
 import sys
@@ -160,6 +163,18 @@ def verify(target_root, sources):
             raise InstallError("managed target verification failed: %s" % target)
 
 
+MANIFEST_NAME = ".install-manifest.json"
+
+
+def write_manifest(target_root, sources):
+    """安装清单：受管文件的 sha256。内容不变时不重写，重复安装保持幂等。"""
+    files = {rel: hashlib.sha256(data).hexdigest() for rel, (data, _mode) in sources.items()}
+    content = (json.dumps({"files": files}, indent=1, sort_keys=True) + "\n").encode("utf-8")
+    path = target_root / MANIFEST_NAME
+    if not path.is_file() or path.read_bytes() != content:
+        atomic_write(path, content, 0o644)
+
+
 def install(force=False, environ=None, home=None, module_root=None):
     environ = os.environ if environ is None else environ
     home = Path.home() if home is None else home
@@ -175,6 +190,7 @@ def install(force=False, environ=None, home=None, module_root=None):
             content, mode = sources[relative]
             atomic_write(target / relative, content, mode)
     verify(target, sources)
+    write_manifest(target, sources)
     return len(sources)
 
 

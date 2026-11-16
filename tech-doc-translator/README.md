@@ -1,6 +1,6 @@
 # 技术文档翻译器
 
-当前正式版本：**V1.4**（2026-10-24 更新）。主要改动、升级影响与限制见[变更日志](./CHANGELOG.md)。
+当前正式版本：**V1.7**（2026-11-16 更新）。主要改动、升级影响与限制见[变更日志](./CHANGELOG.md)。
 
 本模块提供一个面向理工科英文技术文档翻译的 Agent Skill，唯一 Skill 源目录为 [skills/tech-doc-translator/](./skills/tech-doc-translator/)：入口 [SKILL.md](./skills/tech-doc-translator/SKILL.md)、源家族解析/校验/合并/编排与 PDF 导出脚本（[scripts/](./skills/tech-doc-translator/scripts/)）、翻译约定与共享术语库及 PDF 导出规则（[references/](./skills/tech-doc-translator/references/)）、离线 PDF 打印样式与数学渲染资产（[assets/pdf/](./skills/tech-doc-translator/assets/pdf/)）以及依赖声明（[requirements.txt](./skills/tech-doc-translator/requirements.txt)、[requirements-pdf.txt](./skills/tech-doc-translator/requirements-pdf.txt)）都在该目录内，随 Skill 整体安装。README、规格、docs、测试和安装器留在模块根目录，不属于安装包。已支持单页 HTML、分页代码文档、数学/深层嵌套参考手册、多页面 API/DSL 文档、工作包拆分/恢复/术语合并、显式选择的共享术语库，以及已有译文 Markdown 的单篇/合订 PDF 导出。
 

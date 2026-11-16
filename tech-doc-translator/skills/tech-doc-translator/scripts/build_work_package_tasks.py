@@ -74,7 +74,7 @@ def task(context, exp, source_path, output_path):
          if rwp.table_code_stage(context) == 'intermediate' else
          '当前为最终阶段：实际 TABLE-CODE 标记须已转为可读格位说明，不能裸删标记或保留解析残留。'),
         '已获准额外公式、具体转换和所选术语只采用当前引用依据；遇不能适配的结构先报告，不自行豁免。',
-        '保留来源对象的独立 <a id="…"></a> 锚点及其块边界，不能移入表格数据区。翻译页保留原链接目标（含题注 [#](#id)）；仅交付合章按明确 navigation-record 转换命名空间及跨章路径。PDF 裸 #id 只查当前章，缺失时回源处理，不能借外章同名对象通过。',
+        '保留来源对象的独立 <a id="…"></a> 锚点及其块边界，不能移入表格数据区。翻译页保留原链接目标（含题注 [#](#id)），并保持链接的出现顺序；仅交付合章按明确 navigation-record 转换命名空间及跨章路径。PDF 裸 #id 只查当前章，缺失时回源处理，不能借外章同名对象通过。',
         '本包已批准的具体转换（空表示没有）：'+json.dumps(conversions,ensure_ascii=False,sort_keys=True),
         '本包原 DOM 表格及转换映射（只读，空表示不涉及）：'+json.dumps(table_policy,ensure_ascii=False,sort_keys=True),
         '完整表映射只读位置：'+str(table_map or '无'),

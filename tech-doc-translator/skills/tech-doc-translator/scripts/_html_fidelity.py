@@ -31,6 +31,11 @@ DISPLAY_MAP_VERSION = 1
 _CODE_TOKEN_FMT = '\x00%d\x00'
 
 
+def footnote_ref_number(ref):
+    """脚注引用的编号；渲染端与源侧对账共用同一取法。"""
+    return re.sub(r'\D', '', ref.get_text(strip=True))
+
+
 def strip_math_wrapper(body):
     r"""仅剥除一对最外层 \(…\)/\[…\]，保留内部定界。"""
     if ((body.startswith(r'\(') and body.endswith(r'\)'))
@@ -860,7 +865,7 @@ class HtmlFidelity:
             code_spans.append('$' + inline_math_text(math) + '$')
             math.replace_with(_CODE_TOKEN_FMT % (len(code_spans) - 1))
         for ref in copied.find_all(class_='footnote-reference'):
-            number = re.sub(r'\D', '', ref.get_text(strip=True))
+            number = footnote_ref_number(ref)
             ref.replace_with(
                 '[^%s]' % number if number else self._unknown_footnote)
         for superscript in copied.find_all('sup'):
@@ -885,6 +890,10 @@ class HtmlFidelity:
         for link in copied.find_all('a', href=True):
             label = link.get_text(' ', strip=True)
             href = link.get('href', '').strip()
+            if link.get('role') == 'doc-backlink':
+                # 脚注、引文的回链指回正文里的引用位置，不是来源对象：只留文字
+                link.replace_with(label)
+                continue
             if label and href:
                 label = label.replace('[', r'\[').replace(']', r'\]')
                 link.replace_with('[%s](%s)' % (label, href))

@@ -784,6 +784,8 @@ def build_parser():
 
 
 def main(argv=None):
+    from _install_integrity import warn_if_modified
+    warn_if_modified()
     args = build_parser().parse_args(argv)
     return args.func(args)
 

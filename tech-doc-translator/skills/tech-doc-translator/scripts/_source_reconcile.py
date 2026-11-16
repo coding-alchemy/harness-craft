@@ -20,6 +20,7 @@ from _html_fidelity import (
     _INLINE_TAGS,
     HtmlFidelity,
     clean_code_html,
+    footnote_ref_number,
     image_object_ref,
     markdown_inline_code,
     protect_code_entities,
@@ -895,6 +896,9 @@ class _SourceFacts:
 
     def _admonition_texts(self, div, title):
         """提示框内的段落/行内文字流（排除标题与代码等块级）。"""
+        div = self._bracket_footnote_refs(copy.deepcopy(div))
+        if title is not None:
+            title = div.find(['p', 'div'], class_='admonition-title')
         texts = []
         for child in div.children:
             if isinstance(child, Tag):
@@ -924,12 +928,28 @@ class _SourceFacts:
         return items
 
     @staticmethod
+    def _bracket_footnote_refs(el):
+        """把副本里的脚注引用换成 ``[N]``，与渲染端 ``[^N]`` 归一后的文字一致。
+
+        只取编号（footnote_ref_number），带方括号与裸数字两种写法结果相同。
+        原地修改，调用方必须传副本；专用脚注引用流仍在原树上计数。"""
+        for anchor in list(el.find_all(class_='footnote-reference')):
+            anchor.replace_with(NavigableString(
+                '[%s]' % (footnote_ref_number(anchor) or '?')))
+        return el
+
+    @staticmethod
     def _primary_text(el):
-        """块容器首个行内片段或首段的文字（渲染为条目行/定义首行的内容）。"""
+        """块容器首个行内片段或首段的文字（渲染为条目行/定义首行的内容）。
+
+        只有空白的文本子节点（Sphinx 序列化的 ``<dd>\\n<p>…</p>`` 换行）
+        不是内容，跳过；否则首段分支永远走不到，定义首行读成空。"""
+        el = _SourceFacts._bracket_footnote_refs(copy.deepcopy(el))
         parts = []
         for child in el.children:
             if isinstance(child, str):
-                parts.append(str(child))
+                if child.strip():
+                    parts.append(str(child))
                 continue
             if not isinstance(child, Tag):
                 continue
@@ -1045,6 +1065,7 @@ class _SourceFacts:
         """
         seq = []
         buffer = []
+        el = _SourceFacts._bracket_footnote_refs(copy.deepcopy(el))
         structural = {
             'figure', 'img', 'figcaption', 'dl', 'table', 'blockquote',
             'aside', 'summary', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
@@ -1135,6 +1156,7 @@ class _SourceFacts:
         copied = copy.deepcopy(cell)
         for pre in copied.find_all('pre'):
             pre.decompose()
+        self._bracket_footnote_refs(copied)
         # 格内公式按家族合同做包装去除（\(…\)/\[…\]），与渲染端
         # render_inline 同一口径投影为 $…$，使格文字与输出侧归一后的
         # 阅读文字一致（块级 \[…\] 不再残留字面方括号）；LaTeXML 来源
@@ -1355,7 +1377,11 @@ class _MarkdownFacts:
         for line_no, line in enumerate(self.lines, start=1):
             if line_no in self.fenced:
                 continue
-            for match in re.finditer(r'\[\^([^\]]+)\](?!:)', line):
+            for match in re.finditer(r'\[\^([^\]]+)\]', line):
+                # 只有行首的 `[^N]:` 是脚注定义；正文里跟冒号的引用
+                # （如 "warp shuffle [^7]: `shfl`"）仍是引用
+                if match.start() == 0 and line[match.end():].startswith(':'):
+                    continue
                 refs.append(_footnote_label(match.group(1)))
         defs = []
         if rich:
@@ -1705,6 +1731,7 @@ class _MarkdownFacts:
             cells = line.split(' | ')
             if all(cell.strip() and _MD_TABLE_SEP_CELL_RE.match(cell.strip())
                    for cell in cells):
+                current['row_lines'].add(line_no)  # 分隔行属于表格，与 GFM 记录一致
                 continue  # 表头分隔行（单列 --- 同样适用）
             if ' | ' in line:
                 # 逐格按实际阅读核对：格位序列化对 \+ASCII 标点按阅读语义

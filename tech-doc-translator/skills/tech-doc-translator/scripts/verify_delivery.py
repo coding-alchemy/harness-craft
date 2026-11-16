@@ -1366,12 +1366,23 @@ def check_source_chains(root, record, problems, *, source_only=False):
                 problems.append("%s 的快照 %s 的 per_stem_map 无效: %r"
                                 % (label, snap["snapshot"], map_decl))
                 continue
+            broken = snap.get("source_broken_links")
+            if broken is not None and not (isinstance(broken, list) and all(
+                    isinstance(item, dict) and isinstance(item.get("href"), str)
+                    and item["href"] and isinstance(item.get("basis"), str)
+                    and item["basis"].strip() for item in broken)):
+                problems.append("%s 的快照 %s 的 source_broken_links 无效: 须为 "
+                                "[{\"href\": 原链接, \"basis\": 回源依据}] 列表"
+                                % (label, snap["snapshot"]))
+                continue
             snapshots.append({
                 "snapshot": snap["snapshot"],
                 "snapshot_sha256": sha256_file(snapshot_path),
                 "section_id": section_id,
                 "range": snap.get("range"),
             })
+            if broken:
+                snapshots[-1]["source_broken_links"] = broken
             snap_map_decls.append(map_decl)
             snap_adapt_decls.append(adapt_decl)
             snap_table_decls.append(snap.get('table_conversions'))

@@ -51,22 +51,34 @@ def _paragraph(node):
         and bool(node.get_text(strip=True) or node.find('img')))
 
 
+def _blockquote(node):
+    """解析端在列 0 写出 [BLOCKQUOTE] 的引用块：不在 pre/code/table/li/dt/dd 里。"""
+    return (node.name == 'blockquote'
+            and not node.find_parent(['pre', 'code', 'table', 'li', 'dt', 'dd']))
+
+
 def _admonition(node):
     return (node.name == 'div' and 'admonition' in node.get('class', ())
             and not node.find_parent(['pre', 'code', 'table', 'li', 'blockquote']))
 
 
-def _section_head(node):
+def _leading_aliases(node):
+    """(第一个内容子元素, 开头的别名 id)：docutils 把同一元素的其余 id 写成内容前的空 <span id>。"""
     aliases=[]
     for child in node.children:
         if not isinstance(child,Tag):
-            if str(child).strip():return None,[]
+            if str(child).strip():return None,aliases
             continue
         if child.name=='span' and not child.get_text(strip=True) and not child.find(True):
             if child.get('id'):aliases.append(child['id'])
             continue
-        return (child,aliases) if re.fullmatch(r'h[1-6]',child.name) else (None,[])
-    return None,[]
+        return child,aliases
+    return None,aliases
+
+
+def _section_head(node):
+    first,aliases=_leading_aliases(node)
+    return (first,aliases) if first is not None and re.fullmatch(r'h[1-6]',first.name) else (None,[])
 
 
 def source_anchors(raw, section_id=None):
@@ -82,9 +94,11 @@ def _source_anchors(root):
     paragraphs = root.find_all(_paragraph)
     admonitions = root.find_all(_admonition)
     codes = [node for node in root.find_all('pre') if visible(node)]
+    blockquotes = [node for node in root.find_all(_blockquote) if visible(node)]
     objects = {id(node): (kind, index) for kind, nodes in [
         ('heading', headings), ('table', tables), ('image', images),
         ('paragraph', paragraphs), ('code', codes), ('admonition', admonitions),
+        ('blockquote', blockquotes),
     ] for index, node in enumerate(nodes, 1)}
     code_ids = {name: objects[id(pre)] for pre in codes
                 for name in code_anchor_ids(pre, pre.get('id'), root=root)}
@@ -106,8 +120,10 @@ def _source_anchors(root):
         elif node.name=='span' and node.parent.name=='section':
             heading,aliases=_section_head(node.parent)
             target=heading if name in aliases else None
-        elif node.name == 'figure':
-            target=next((img for img in images if any(p is node for p in img.parents)),None)
+        elif node.name == 'figure' or (node.name=='span' and node.parent.name=='figure'
+                                       and name in _leading_aliases(node.parent)[1]):
+            figure=node if node.name == 'figure' else node.parent  # 别名与 figure 自身 id 同指其图片
+            target=next((img for img in images if any(p is figure for p in img.parents)),None)
         role=objects.get(id(target)) if node.name != 'pre' else None
         if role:result[name]=role
     return result
@@ -115,7 +131,10 @@ def _source_anchors(root):
 
 def source_anchor_ids(node):
     """渲染端只在确定对象的块入口发出其自身原 ID。"""
-    if (node.name in ('table','figure','img') or _paragraph(node) or _admonition(node)
+    if node.name == 'figure':
+        return ([node['id']] if node.get('id') else [])+_leading_aliases(node)[1]
+    if (node.name in ('table','img') or _paragraph(node) or _admonition(node)
+            or _blockquote(node)
             or re.fullmatch(r'h[1-6]',node.name or '')):
         return [node['id']] if node.get('id') else []
     if node.name == 'section':
@@ -125,20 +144,66 @@ def source_anchor_ids(node):
     return []
 
 
+_BARE_HINT = re.compile(r'^\[(BLOCKQUOTE|DEF-LIST|FOOTNOTE-LIST)\]\s*$')
+_FOOTNOTE_DEF = re.compile(r'^\[\^[^\]]+\]:')
+
+
 def _markdown_paragraphs(text):
+    """规范段落枚举：解析稿与按约定改写结构提示的译文得到同一序列。
+
+    只有标记的提示行不算段落；[FOOTNOTE-LIST] 的缩进区、脚注定义
+    `[^N]:` 及其续行不算；不是提示框的顶层引用块里，直接的段落按顶层
+    段落计；其余同前：顶层段落计入，表题行不计。"""
     from _source_reconcile import _TABLE_CAPTION_LINE_RE
+    from _verification import footnote_definition_block
     lines = text.splitlines()
-    prose = '\n'.join('' if ANCHOR.fullmatch(line) else line for line in lines)
-    tokens = _INLINE.parse(prose)
-    return [(token.map[0]+1, tokens[index+1].content)
-            for index, token in enumerate(tokens)
-            if token.type == 'paragraph_open' and token.level == 0
-            and not _TABLE_CAPTION_LINE_RE.match(lines[token.map[0]])]
+    fenced = fenced_line_numbers(text)
+    masked, skipped = list(lines), set()
+    number = 1
+    while number <= len(lines):
+        line = lines[number-1]
+        if number in fenced:
+            number += 1
+            continue
+        if ANCHOR.fullmatch(line):
+            masked[number-1] = ''
+        elif _BARE_HINT.match(line):
+            masked[number-1] = ''
+            if line.strip() == '[FOOTNOTE-LIST]':
+                cursor = number + 1
+                while cursor <= len(lines) and (not lines[cursor-1].strip()
+                                                or lines[cursor-1][:1] in ' \t'):
+                    skipped.add(cursor)
+                    cursor += 1
+        elif _FOOTNOTE_DEF.match(line):
+            _body, _last, cursor = footnote_definition_block(lines, number)
+            skipped.update(range(number, cursor))
+            number = max(cursor, number + 1)
+            continue
+        number += 1
+    admonitions = _markdown_admonitions(text)
+    tokens = _INLINE.parse('\n'.join(masked))
+    result, stack = [], []
+    for index, token in enumerate(tokens):
+        if token.nesting == -1:
+            stack.pop()
+            continue
+        if token.type == 'paragraph_open':
+            parent = stack[-1] if stack else None
+            start = token.map[0] + 1
+            counted = token.level == 0 or (
+                token.level == 1 and parent is not None and parent.type == 'blockquote_open'
+                and parent.level == 0 and parent.map[0] + 1 not in admonitions)
+            if counted and start not in skipped and not _TABLE_CAPTION_LINE_RE.match(lines[token.map[0]]):
+                result.append((start, tokens[index+1].content))
+        if token.nesting == 1:
+            stack.append(token)
+    return result
 
 
 def _markdown_admonitions(text):
     label_pattern = re.compile(
-        r'\s*>\s*\*\*(?:ADMONITION \[([^\]]+)\]|[^（(]+[（(](Note|Warning|Important|Tip)[）)])\*\*\s*')
+        r'\s*>\s*\*\*(?:ADMONITION \[([^\]]+)\]|[^（(*]+[（(]([^）)*]+)[）)])\*\*\s*')
     labels = {index: (label[1] or label[2]).strip().casefold()
               for index, line in enumerate(text.splitlines())
               if (label := label_pattern.fullmatch(line))}
@@ -146,6 +211,23 @@ def _markdown_admonitions(text):
         return {}
     return {token.map[0]+1: labels[token.map[0]] for token in _INLINE.parse(text)
             if token.type == 'blockquote_open' and token.level == 0 and token.map[0] in labels}
+
+
+def _markdown_blockquotes(text):
+    """Markdown 侧引用块对象：顶层 [BLOCKQUOTE] 行，或不是提示框的顶层 > 引用块。"""
+    lines = text.splitlines()
+    prose = '\n'.join('' if ANCHOR.fullmatch(line) else line for line in lines)
+    admonitions = _markdown_admonitions(text)
+    found = []
+    for token in _INLINE.parse(prose):
+        if token.level or not token.map:
+            continue
+        start = token.map[0] + 1
+        if token.type == 'blockquote_open' and start not in admonitions:
+            found.append(start)
+        elif token.type == 'paragraph_open' and re.match(r'\[BLOCKQUOTE\](\s|$)', lines[start-1]):
+            found.append(start)
+    return found
 
 
 def _following_list_code(text, paragraph_lines):
@@ -191,7 +273,10 @@ def markdown_objects(text):
                    enumerate(_markdown_paragraphs(text), 1))
     objects.extend((line, 'admonition', index) for index, line in
                    enumerate(_markdown_admonitions(text), 1))
-    order = ('heading', 'table', 'image', 'code', 'paragraph', 'admonition')
+    objects.extend((line, 'blockquote', index) for index, line in
+                   enumerate(_markdown_blockquotes(text), 1))
+    # 译文的 > 引用块与它的第一段同一行开始：紧随锚点的对象先认引用块
+    order = ('heading', 'table', 'image', 'code', 'blockquote', 'paragraph', 'admonition')
     return sorted(objects, key=lambda item: (item[0], order.index(item[1])))
 
 
@@ -219,7 +304,9 @@ def anchor_diffs(raw, text, *, section_id=None, names=None, source=None):
             diffs.append('缺来源对象锚点 '+name);continue
         following=next((obj for obj in objects if obj[0]>line),None)
         if following is None or (following[0], *role) not in objects:
-            diffs.append('锚点目标错绑: '+name);continue
+            wanted='%s #%s' % role if role[1] is not None else '%s（源侧无法定位序号）' % role[0]
+            got='%s #%s（L%d）' % (following[1],following[2],following[0]) if following else '无'
+            diffs.append('锚点目标错绑: %s；期望 %s，实际紧随 %s' % (name,wanted,got));continue
         for value in lines[line:following[0]-1]:
             stripped=value.strip()
             if stripped and not ANCHOR.fullmatch(value) and not _TABLE_CAPTION_LINE_RE.match(value):
@@ -258,9 +345,28 @@ def _link_blocks(text):
     return sorted(blocks,key=lambda block:block.map[0] if block.map else 0)
 
 
+def link_occurrences(text):
+    """[(行号, href)]：实际 Markdown 链接按出现顺序；行号取所在块的首行。"""
+    return [((block.map[0]+1) if block.map else 0, token.attrGet('href'))
+            for block in _link_blocks(text) for token in (block.children or [])
+            if token.type=='link_open']
+
+
 def links(text):
     """实际 Markdown 链接出现；代码和图片不作为普通目标。"""
-    return [token.attrGet('href') for block in _link_blocks(text) for token in (block.children or []) if token.type=='link_open']
+    return [href for _line, href in link_occurrences(text)]
+
+
+def first_link_difference(source, translated):
+    """源译链接序列的第一处不同；相同时返回 None。"""
+    src, doc = link_occurrences(source), link_occurrences(translated)
+    for index, (a, b) in enumerate(zip(src, doc), 1):
+        if a[1] != b[1]:
+            return '第 %d 个链接：源 %s（L%d），译 %s（L%d）' % (index, a[1], a[0], b[1], b[0])
+    if len(src) != len(doc):
+        return '链接数不同：源 %d，译 %d，从第 %d 个起' % (
+            len(src), len(doc), min(len(src), len(doc)) + 1)
+    return None
 
 
 def _navigation_href(href):
@@ -334,6 +440,31 @@ def compare_anchors(source, translated):
     return [] if read(source)==read(translated) else ['来源锚点 ID、顺序或内容对象归属改变']
 
 
+def _link_span_start(chunk, close, end, target):
+    """`[文字](目标)` 的起点：从 `](` 里的 `]`（close）往回配对方括号，跳过转义的方括号；
+    再用 markdown-it 确认 chunk[起点:end+1] 恰好是一个指向 target 的链接。"""
+    depth = 0
+    for index in range(close-1, -1, -1):
+        char = chunk[index]
+        if char not in '[]':
+            continue
+        if (len(chunk[:index]) - len(chunk[:index].rstrip('\\'))) % 2:
+            continue
+        if char == ']':
+            depth += 1
+            continue
+        if depth:
+            depth -= 1
+            continue
+        children = _INLINE.parseInline(chunk[index:end+1])[0].children or []
+        if (children and children[0].type == 'link_open' and children[-1].type == 'link_close'
+                and [child.attrGet('href') for child in children
+                     if child.type == 'link_open'] == [target]):
+            return index
+        break
+    raise ValueError('导航链接语法无法可靠改写: '+target)
+
+
 def _link_edits(text, convert):
     """按实际 inline token 的目标重写语法；不触碰代码中的同形字符串。"""
     # markdown-it 没有 inline 绝对偏移；逐块只重写已确认的链接出现。
@@ -361,7 +492,14 @@ def _link_edits(text, convert):
                 if any(start<=lo-line_start<end for _,start,end,_ in image_reference_spans(line)):continue
                 found=(lo,hi);break
             if found is None:raise ValueError('导航链接语法无法可靠改写: '+target)
-            lo,hi=found;edits.append((start+lo,start+hi,converted));cursor=hi
+            lo,hi=found
+            if converted is None:
+                # 已登记的源文坏链接：整个 [文字](目标) 换成文字（lo-2 是 "](" 里的 "]"）
+                begin=_link_span_start(chunk,lo-2,hi,target)
+                edits.append((start+begin,start+hi+1,chunk[begin+1:lo-2]))
+            else:
+                edits.append((start+lo,start+hi,converted))
+            cursor=hi
     return edits
 
 
@@ -373,6 +511,28 @@ def _apply_edits(text, edits):
 
 def replace_links(text, convert):
     return _apply_edits(text, _link_edits(text, convert))
+
+
+def _snapshot_ids(facts):
+    """页原快照整份 DOM 的全部 id（含选区外）；只在出错和登记校验时调用。"""
+    return {node['id'] for node in BeautifulSoup(facts['raw'], 'html.parser').find_all(id=True)}
+
+
+def _broken_link_problem(pages, page, href, present):
+    """登记的源文坏链接须出现在解析稿里，且目标 id 在目标页原快照里确实不存在。"""
+    if href not in present:
+        return '解析稿里没有这个链接'
+    parts = urlsplit(href)
+    if parts.scheme or parts.netloc or parts.query or not parts.fragment:
+        return '只能登记站内带片段的链接'
+    path = unquote(parts.path)
+    key = (os.path.normpath(os.path.join(os.path.dirname(page), path)).replace(os.sep, '/')
+           if path else page)
+    if key not in pages:
+        return '目标页不在来源记录范围'
+    if unquote(parts.fragment) in _snapshot_ids(pages[key]):
+        return '目标页快照里有这个 id，不是源文坏链接'
+    return None
 
 
 def load_navigation(path, site_root):
@@ -412,7 +572,14 @@ def load_navigation(path, site_root):
             mapping=json.loads((root/info['path']).read_text(encoding='utf-8')) if info else None
             headers=_mapped_table_headers(_SourceFacts(raw,'api',snap.get('section_id')),mapping,snap.get('section_id'))
             pages[key]={'chapter':chapter,'anchors':facts,'raw':raw,'section_id':snap.get('section_id'),'source':source,'resources':resources,'header_cells':headers,
-                        'role_source':delivery.table_role_source(entry,str(root))}
+                        'role_source':delivery.table_role_source(entry,str(root)),
+                        'broken_links':{_INLINE.normalizeLink(item['href'])
+                                        for item in snap.get('source_broken_links') or ()}}
+    for key,facts in pages.items():
+        present=set(links(facts['source']))
+        for href in sorted(facts['broken_links']):
+            problem=_broken_link_problem(pages,key,href,present)
+            if problem:raise ValueError('源文坏链接登记无效: %s → %s（%s）' % (key,href,problem))
     return pages
 
 
@@ -433,7 +600,14 @@ def target_for(pages, page, href, chapter):
             return 'images/'+quote(resource.name,safe='')  # 资产冲突仍由合并器拒绝。
         raise ValueError('来源目标页不在交付范围: %s → %s' % (page,href))
     target=pages[key]
-    if fragment and fragment not in target['anchors']:raise ValueError('来源目标缺失或无法定位: %s → %s' % (page,href))
+    if fragment and fragment not in target['anchors']:
+        if href in pages[page]['broken_links']:
+            return None  # 已登记的源文坏链接：合章去掉链接，保留文字
+        if fragment not in _snapshot_ids(target):
+            raise ValueError('源文坏链接未登记: %s → %s（目标页快照里没有这个 id；回源确认后在来源记录'
+                             '该快照的 source_broken_links 登记 {"href": "%s", "basis": "<回源依据>"}）'
+                             % (page,href,href))
+        raise ValueError('来源目标缺失或无法定位: %s → %s' % (page,href))
     suffix='#'+namespaced(key,fragment)
     return suffix if target['chapter']==Path(chapter).resolve() else quote(os.path.relpath(target['chapter'],Path(chapter).resolve().parent).replace(os.sep,'/'),safe='/')+suffix
 
@@ -441,24 +615,45 @@ def target_for(pages, page, href, chapter):
 def transform_page(text, page, pages, chapter):
     if page not in pages or pages[page]['chapter']!=Path(chapter).resolve():raise ValueError('当前源页未唯一归属输出章: '+page)
     facts=pages[page]
+    # 锚点、链接、表格三类都检查完再一起报（R7）
+    problems=[]
     diffs=anchor_diffs(facts['raw'],text,section_id=facts['section_id'],source=facts['source'])
-    if diffs:raise ValueError('翻译页锚点无来源证明: '+'；'.join(diffs))
-    if links(text)!=links(facts['source']):raise ValueError('翻译页改变原链接目标: '+page)
+    if diffs:problems.append('翻译页锚点无来源证明: '+'；'.join(diffs))
+    difference=first_link_difference(facts['source'],text)
+    if difference:problems.append('翻译页改变原链接目标: %s（%s）' % (page,difference))
     from _source_reconcile import compare_translation_tables
     before=text
-    text=replace_links(text,lambda href:target_for(pages,page,href,chapter))
-    old_links=iter(links(before))
-    restored=replace_links(text,lambda _href:next(old_links))
-    table_problems=compare_translation_tables(before,restored,exact=True,header_cells=facts.get('header_cells',()))
-    if table_problems:raise ValueError('导航转换损伤表格: '+page+'；'+'；'.join(table_problems))
+    source_links=set(links(facts['source']))
+    targets,failed={},{}
+    for line,href in link_occurrences(before):
+        if href not in source_links:continue  # 译文多出的链接已由链接检查报出
+        if href not in targets and href not in failed:
+            try:targets[href]=target_for(pages,page,href,chapter)
+            except ValueError as exc:failed[href]=(str(exc),[])
+        if href in failed:failed[href][1].append('L%d' % line)
+    problems.extend('链接转换失败: %s（译文 %s）' % (reason,'、'.join(where)) for reason,where in failed.values())
+    convert=lambda href:targets.get(href,href)  # 算不出目标的链接保持原样，表格照常检查
+    try:
+        text=replace_links(before,convert)
+    except ValueError as exc:
+        problems.append('链接转换失败: '+str(exc))  # 链接写法改不了：跳过依赖转换结果的表格检查
+    else:
+        # 已登记的源文坏链接被去掉：只还原保留下来的链接，比较基线也先去掉它们
+        old_links=iter([href for href in links(before) if convert(href) is not None])
+        restored=replace_links(text,lambda _href:next(old_links))
+        baseline=replace_links(before,lambda href:None if convert(href) is None else href)
+        table_problems=compare_translation_tables(baseline,restored,exact=True,header_cells=facts.get('header_cells',()))
+        if table_problems:problems.append('导航转换损伤表格: '+page+'；'+'；'.join(table_problems))
     fenced=fenced_line_numbers(text)
     lines=text.splitlines()
     for n,line in enumerate(lines,1):
         match=ANCHOR.fullmatch(line)
         if not match or n in fenced:continue
         name=unescape(match[1])
-        if name not in facts['anchors']:raise ValueError('无来源锚点: '+name)
+        if name not in facts['anchors']:
+            problems.append('无来源锚点: '+name);continue
         lines[n-1]='<a id="'+namespaced(page,name)+'"></a>'
+    if problems:raise ValueError('\n'.join(problems))
     return '<a id="'+namespaced(page,'')+'"></a>\n\n'+'\n'.join(lines)
 
 
@@ -470,7 +665,8 @@ def verify_page(source, translated, page, pages, chapter):
     diffs=anchor_diffs(facts['raw'],source,section_id=facts['section_id'])
     diffs+=anchor_diffs(facts['raw'],translated,section_id=facts['section_id'],
                         names=lambda name:namespaced(page,name),source=source)
-    expected=[target_for(pages,page,href,chapter) for href in links(source)]
+    expected=[target for target in (target_for(pages,page,href,chapter) for href in links(source))
+              if target is not None]
     if links(translated)!=expected:diffs.append('链接目标对象或出现顺序改变: '+page)
     from _source_reconcile import compare_translation_tables
     mapped_source=replace_links(source,lambda href:target_for(pages,page,href,chapter))
@@ -599,7 +795,8 @@ def _recovery_object_lines(text, page, facts, chapter):
             cell_roles = [(1, row, col) for table, row, col in facts['header_cells'] if table == ordinal]
             possible = [line for line in possible if not compare_translation_tables(
                 source_table, table_text(normalized, dst_tables[line]), header_cells=cell_roles)]
-        elif kind == 'paragraph':
+        # 引用块沿用段落规则：同一节数量相等就按位置对应，不相等就报错
+        elif kind in ('paragraph', 'blockquote'):
             src_group = [line for (role, _), line in source_objects.items()
                          if role == kind and bisect_left(source_heads, line) == section]
             if len(src_group) == len(possible):
@@ -630,7 +827,11 @@ def _recovery_href(pages, page, href, chapter):
     if not parts.path and fragment in pages[page]['anchors']:
         return target_for(pages, page, href, chapter)
     if Path(unquote(parts.path)).suffix.lower() in ('.html', '.htm'):
-        return target_for(pages, page, href, chapter)
+        converted = target_for(pages, page, href, chapter)
+        if converted is None:
+            # 存量恢复不处理源文坏链接，保持原来的失败
+            raise ValueError('来源目标缺失或无法定位: %s → %s' % (page, href))
+        return converted
     if fragment.startswith('src-'):
         # 已正规化的目标须能从同一来源反解，且章路径仍匹配。
         match = re.fullmatch(r'src-([0-9a-f]+)-(?:p|i-([0-9a-f]+))', fragment)

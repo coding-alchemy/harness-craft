@@ -262,6 +262,7 @@ def main():
     bodies = []
     assets = {}
     page_display_batches = []  # [(确定条目, 未确定条目, 该页图片数)]，按清单顺序
+    failures = []  # 各页问题收齐后一起报（R7）
     for p in pages:
         tp = translated_path(site_root, p)
         if not os.path.exists(tp):
@@ -294,8 +295,13 @@ def main():
                 page_display_batches.append(
                     (batch, len(_real_image_matches(raw_body))))
         except (OSError, ValueError) as exc:
-            sys.exit(str(exc))
+            failures.append(p + ':\n' + '\n'.join('    ' + line for line in str(exc).splitlines()))
+            continue
         bodies.append(body)
+
+    if failures:
+        sys.exit('合章失败，%d 页有问题，未写出成品:\n%s'
+                 % (len(failures), '\n'.join('  - ' + item for item in failures)))
 
     # 页内出现序号重编号为合并文档中的全局出现序号；未确定项同序保留。
     display_entries = []

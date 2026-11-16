@@ -5,7 +5,9 @@
 按批准设计保持独立实现，安装合同只维护这一份。
 """
 
+import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -67,6 +69,7 @@ CONTRACT = installer_contract.InstallerContract(
     forbidden_top_dirs=("tests", "specs", "docs"),
     prepare_fixtures=prepare_fixtures,
     out_of_source=out_of_source,
+    generated_files=(".install-manifest.json",),
 )
 
 
@@ -75,3 +78,55 @@ CONTRACT = installer_contract.InstallerContract(
 )
 def test_installer_contract(check):
     check(CONTRACT)
+
+
+def test_installed_copy_reports_modified_files_without_blocking():
+    directory, session = installer_contract.make_session(CONTRACT)
+    try:
+        assert session.run().returncode == 0
+        manifest = json.loads((session.target / ".install-manifest.json").read_text(encoding="utf-8"))
+        assert set(manifest["files"]) == set(installer_contract.publish_files(CONTRACT.source_skill))
+        script = str(session.target / "scripts" / "parse_api_html.py")
+        clean = session.run_python(script, "--help")
+        assert clean.returncode == 0 and "安装清单" not in clean.stderr, clean.stderr
+        edited = session.target / "references" / "cleanup.md"
+        edited.write_text(edited.read_text(encoding="utf-8") + "\n本地改动\n", encoding="utf-8")
+        (session.target / "references" / "numeric_review.md").unlink()
+        warned = session.run_python(script, "--help")
+        assert warned.returncode == 0 and "usage:" in warned.stdout
+        assert "与安装清单不符" in warned.stderr
+        assert "references/cleanup.md" in warned.stderr
+        assert "references/numeric_review.md（缺失）" in warned.stderr
+        assert session.run("--force").returncode == 0
+        assert "安装清单" not in session.run_python(script, "--help").stderr
+        (session.target / ".install-manifest.json").write_text("{", encoding="utf-8")
+        broken = session.run_python(script, "--help")
+        assert broken.returncode == 0 and "安装清单读不出" in broken.stderr
+        (session.target / ".install-manifest.json").write_text('{"files": []}', encoding="utf-8")
+        shaped = session.run_python(script, "--help")
+        assert shaped.returncode == 0 and "安装清单读不出" in shaped.stderr, shaped.stderr
+    finally:
+        directory.cleanup()
+
+
+def test_repository_checkout_has_no_manifest_and_no_warning():
+    script = CONTRACT.source_skill / "scripts" / "parse_api_html.py"
+    result = subprocess.run([sys.executable, str(script), "--help"],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode == 0 and "安装清单" not in result.stderr, result.stderr
+
+
+def test_files_created_by_running_the_installed_copy_do_not_warn():
+    """评审关注：运行安装副本会生成 __pycache__，项目也可能留下自己的文件；清单外的文件不触发提示。"""
+    directory, session = installer_contract.make_session(CONTRACT)
+    try:
+        assert session.run().returncode == 0
+        assert (session.target / ".install-manifest.json").is_file()
+        cache = session.target / "scripts" / "__pycache__"
+        cache.mkdir(exist_ok=True)
+        (cache / "_verification.cpython-312.pyc").write_bytes(b"cache")
+        (session.target / "notes.txt").write_text("项目自己的记录\n", encoding="utf-8")
+        result = session.run_python(str(session.target / "scripts" / "parse_api_html.py"), "--help")
+        assert result.returncode == 0 and "安装清单" not in result.stderr, result.stderr
+    finally:
+        directory.cleanup()

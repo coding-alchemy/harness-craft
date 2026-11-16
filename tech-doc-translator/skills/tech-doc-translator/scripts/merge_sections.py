@@ -34,6 +34,8 @@ def load(path, demote):
 
 
 def main():
+    from _install_integrity import warn_if_modified
+    warn_if_modified()
     ap = argparse.ArgumentParser()
     ap.add_argument('-o', '--out', required=True)
     ap.add_argument('files', nargs='+', help='第一个为章节头，其余为各节文件（按文档顺序）')
