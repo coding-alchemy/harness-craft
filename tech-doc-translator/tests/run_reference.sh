@@ -11,6 +11,11 @@ mkdir -p "$TMPDIR/images"
 cp fixtures/valid_1x1.png "$TMPDIR/images/thread_hierarchy.png"
 cp fixtures/math_reference_translated.md fixtures/nested_reference_translated.md "$TMPDIR/"
 
+python3 test_latexml_anchor_writing.py
+
+echo "==> R9/R16：诊断归类、证据缺位根因与参数漏写路径"
+python3 test_diagnostics_output.py
+
 echo "==> 解析数学密集参考手册样本"
 python3 "$PARSE" fixtures/math_reference.html "$TMPDIR/math_source.md"
 

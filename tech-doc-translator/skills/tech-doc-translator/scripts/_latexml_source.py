@@ -22,6 +22,8 @@ import json
 import os
 import re
 
+from html import escape as _html_escape
+
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 from _html_fidelity import (HtmlFidelity, clean_code_html,
@@ -1244,6 +1246,16 @@ class _Piece(object):
         self.marks = marks
 
 
+class ReconcileError(ValueError):
+    """源对账失败：消息为归类汇总，diffs 保存全部差异供入口落盘。"""
+
+    def __init__(self, label, diffs):
+        from _verification import summarize_messages
+        self.diffs = list(diffs)
+        super().__init__('%s与原始快照完整对账失败（不降级）: %s'
+                         % (label, summarize_messages(self.diffs)))
+
+
 class LatexmlAdapter(object):
     """LaTeXML 原节点适配器（01 最小范围、02 数学、03 浮动体/脚注、
     04 表格逐格）；未支持的内容性容器保留为 [TAGNAME] 文字并登记
@@ -1316,7 +1328,12 @@ class LatexmlAdapter(object):
         self.groups = []
         self.emissions = []
         self._note_labels = prepare_notes_dom(root)
+        from _source_reconcile import reference_anchor_targets
+        targets, _unresolved_targets = reference_anchor_targets(raw_html, section_id)
+        self._anchor_targets = {item['id'] for item in targets}
+        self._anchors_written = set()
         self._walk(root)
+        self.anchor_leftovers = sorted(self._anchor_targets - self._anchors_written)
         md_text, ranges, occ_ranges = self._serialize()
         correspondences, unresolved = self._records(ranges, md_text,
                                                     occ_ranges)
@@ -1571,6 +1588,21 @@ class LatexmlAdapter(object):
     def _emit(self, text, meta=None):
         self.emissions.append(_Emission(text, meta))
 
+    def _take_anchors(self, *nodes, descendants=False):
+        """取尚未写出的链接目标 id，返回锚点串（按文档序，可为空）。"""
+        found = []
+        for node in nodes:
+            if not isinstance(node, Tag):
+                continue
+            pool = [node, *node.find_all(True)] if descendants else [node]
+            for tag in pool:
+                anchor = tag.get('id')
+                if anchor in self._anchor_targets and anchor not in self._anchors_written:
+                    self._anchors_written.add(anchor)
+                    found.append(anchor)
+        return ''.join('<a id="%s"></a>' % _html_escape(anchor, quote=True)
+                       for anchor in found)
+
     def _walk(self, node):
         for child in node.children:
             self._dispatch_child(child, node)
@@ -1603,6 +1635,14 @@ class LatexmlAdapter(object):
             notes = [note.extract() for note in publication_notes(title_node)]
             text = fidelity.clean_heading(fidelity.heading_text(
                 title_node, escape_backslashes=True))
+            # 节锚点（链接目标在所属 section 上）独占一行写在标题前，
+            # 不属于任何对象（R3 §6.1）
+            section = child.parent if isinstance(child.parent, Tag) else None
+            owner = (section if section is not None and section.name == 'section'
+                     and section.find(_HEADING_RE) is child else None)
+            standalone = self._take_anchors(owner, child)
+            if standalone:
+                self._emit('\n' + standalone)
             self._emit('\n' + fidelity.heading_line(
                 int(name[1]), text), {
                 'type': 'heading', 'node': self._h_ordinals[id(child)],
@@ -1683,13 +1723,17 @@ class LatexmlAdapter(object):
         imgs = [img for img in child.find_all(['img', 'object'])
                 if img.find_parent('pre') is None
                 and (img.get('src') or image_object_ref(img))]
+        # 段落锚点行内写在段首（含宿主与后代上的链接目标，R3 §6.1）
+        prefix = self._take_anchors(child, descendants=True)
         if not imgs:
             # 按阅读语义加写原文字面反斜线与强调定界（复评 S1：裸 `*`/`_`
             # 会在真实阅读中丢字符），使实际阅读与原文字面一致
             text = self.fidelity.paragraph_text(child,
                                                 escape_backslashes=True)
             if text:
-                self._emit('\n' + text, meta)
+                self._emit('\n' + prefix + text, meta)
+            elif prefix:
+                self._emit('\n' + prefix)
             return
         copied = copy.deepcopy(child)
         copied_imgs = [img for img in copied.find_all(['img', 'object'])
@@ -1700,11 +1744,16 @@ class LatexmlAdapter(object):
         text = self.fidelity.paragraph_text(copied, escape_backslashes=True)
         ctx = self._fig_ctx[-1] if self._fig_ctx else (None, None)
         pieces = re.split(r'\x01(\d+)\x01', text)
+        prefixed = False
         for position, piece in enumerate(pieces):
             if position % 2 == 1:
                 self._image(imgs[int(piece)], ctx[0], ctx[1])
             elif piece.strip():
-                self._emit('\n' + piece.strip(), meta)
+                self._emit('\n' + ('' if prefixed else prefix) + piece.strip(),
+                           meta)
+                prefixed = True
+        if not prefixed and prefix:
+            self._emit('\n' + prefix)
 
     def _math_group(self, node):
         """公式组/式号容器：行内容格按源序空格拼接为行（含来源标记），
@@ -1769,7 +1818,15 @@ class LatexmlAdapter(object):
                 if not text:
                     continue
                 anchor = td.find('a', href=True)
-                self._emit('\n' + escape_text_backslashes(text), {
+                # 公式锚点并入式号行（目标常在组/表/tbody 上，R3 §6.1）；
+                # eqnos 登记的 text 不含锚点，保持原样
+                chain = [td]
+                for parent in td.parents:
+                    chain.append(parent)
+                    if parent is node:
+                        break
+                prefix = self._take_anchors(*chain)
+                self._emit('\n' + prefix + escape_text_backslashes(text), {
                     'type': 'math-group', 'node': gid,
                     'section': section_of(self.root, node)})
                 eqnos.append({
@@ -1795,16 +1852,50 @@ class LatexmlAdapter(object):
             'ds-site-footer'))
             for c in cls)
 
+    def _table_anchor_holders(self, table):
+        """表格锚点占位（R3 §6.1：单元格锚点行内放格内最前）：渲染前逐格
+        取锚点并在格首插入 \\x03k\\x03 占位，返回 {k: 锚点串}（空 = 无锚点）。
+        """
+        holders = {}
+        for cell in table.find_all(['td', 'th']):
+            if cell.find_parent('table') is not table:
+                continue
+            anchors = self._take_anchors(cell, descendants=True)
+            if anchors:
+                key = len(holders)
+                holders[key] = anchors
+                cell.insert(0, NavigableString('\x03%d\x03' % key))
+        return holders
+
+    def _restore_table_anchors(self, text, holders):
+        """把 _table_anchor_holders 插入的占位还原为锚点串；还原后仍含
+        \\x03 或有占位未出现即内部错误（不静默丢锚点）。"""
+        if not holders:
+            return text
+        used = set()
+
+        def restore(match):
+            key = int(match.group(1))
+            used.add(key)
+            return holders.get(key, match.group(0))
+
+        text = re.sub(r'\x03(\d+)\x03', restore, text)
+        if '\x03' in text or used != set(holders):
+            raise ValueError('内部错误: 表格锚点占位丢失')
+        return text
+
     def _table_simple(self, table):
         "简单表：复用既有 [TABLE] 格位与代码表示（04-1）；格内公式出现"
         "以来源标记随格位序列化传递，写出时逐字展开（§7.11.4）。"
         node_id = self._table_ids.get(id(table))
+        holders = self._table_anchor_holders(table)
         try:
             lines = self.fidelity.table_block(table)
         except Exception:
             self._unsupported_container(table)
             return
         text = '\n'.join(lines).strip('\n')
+        text = self._restore_table_anchors(text, holders)
         self._emit('\n' + text, {
             'type': 'table', 'node': node_id,
             'section': section_of(self.root, table),
@@ -1837,9 +1928,11 @@ class LatexmlAdapter(object):
                 reason='复杂表缺少 table_conversions 逐源格裁决映射'
                        '（已保留原文，不展平不转代码）')
             return
+        holders = self._table_anchor_holders(table)
         cells, codes = table_cell_facts(table,
                                         pre_bodies=self.fidelity._pre_blocks)
         text, _declared = render_mapped_table(cells, codes, mapping)
+        text = self._restore_table_anchors(text, holders)
         self._emit('\n' + text, {
             'type': 'table', 'node': node_id,
             'section': section_of(self.root, table),
@@ -1876,8 +1969,10 @@ class LatexmlAdapter(object):
             count += 1
             text = self.fidelity.render_inline(item,
                                                escape_backslashes=True)
+            # 文献锚点行内写在条目首（R3 §6.1）
+            prefix = self._take_anchors(item, descendants=True)
             if text:
-                self._emit('\n' + text, {
+                self._emit('\n' + prefix + text, {
                     'type': 'paragraph', 'node': None,
                     'section': section_of(self.root, item)})
         if count == 0:
@@ -2122,13 +2217,26 @@ class LatexmlAdapter(object):
         parts = blocks(body)
         # Each block stays at its source position and within the definition.
         content = '\n\n'.join(parts)
+        # 脚注自身 id 不写锚点（指向它的链接已转为 [^label]，评审重点 4）；
+        # 只取定义体内其他链接目标
+        anchor_tags = [tag for tag in node.find_all(True)
+                       if tag.get('id') != label]
+        prefix = self._take_anchors(*anchor_tags)
         first, *rest = content.split('\n')
         # A first list starts on the indented definition line so the real
         # footnote parser measures its child indentation relative to that list.
         if re.match(r'(?:- |[0-9]+\. )', first):
+            # 首行是列表时锚点无处行内附着：回收入未写出集合（进
+            # anchor_leftovers，由解析提示转告手工放置）
+            for tag in anchor_tags:
+                anchor_id = tag.get('id')
+                if anchor_id in self._anchor_targets:
+                    self._anchors_written.discard(anchor_id)
             text = '[^%s]:\n    %s' % (label, first)
         else:
-            text = '[^%s]: %s' % (label, first) if first else '[^%s]:' % label
+            text = ('[^%s]: %s' % (label, prefix + first) if first else
+                    '[^%s]: %s' % (label, prefix) if prefix
+                    else '[^%s]:' % label)
         for line in rest:
             text += '\n    ' + line
         self._emit('\n' + text, {
@@ -2217,6 +2325,10 @@ class LatexmlAdapter(object):
                     if sib.find_parent('figure') is dom_parent)
             else:
                 parent_id = figure_id
+        # 图锚点独占一行写在浮动体首（不属于任何对象，R3 §6.1）
+        standalone = self._take_anchors(figure)
+        if standalone:
+            self._emit('\n' + standalone)
         self._fig_ctx.append((parent_id, sub_index))
         try:
             # walk 按子节点分发：对 figure 自身调用即遍历其全部内容
@@ -2590,8 +2702,7 @@ def multi_admission_view(source_text, payloads, paths, label='当前源'):
             raw, piece, selection, payload,
             table_conversions=payload.get('table_conversions'))
         if diffs:
-            raise ValueError('%s切片 #%d 与原始快照完整对账失败（不降级）: '
-                             '%s' % (label, index, '；'.join(diffs[:5])))
+            raise ReconcileError('%s切片 #%d ' % (label, index), diffs)
     return pieces, merge_slice_payloads(payloads, pieces)
 
 

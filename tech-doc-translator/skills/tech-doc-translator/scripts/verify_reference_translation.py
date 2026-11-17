@@ -6,7 +6,7 @@
         [--official-headings-file <文件>]
         [--approved-extra-math <表达式>]...
         [--source-adaptation <依据.json> [--source-adaptation <依据.json> ...]]
-        [--numeric-review] [--numeric-policy <UTF-8 项目约定文件>]
+        [--numeric-review] [--numeric-policy <UTF-8 项目约定文件>] [--verbose]
 
 --numeric-review 显式启用数字与单位复核辅助（R5/§4.7）：报告数字、
 百分比、数量级与单位差异及源/译位置，只报告不换算、不改文、不授予
@@ -67,6 +67,7 @@ from _verification import (
     scan_code_fences,
     MathScan,
     scan_math,
+    summarize_messages,
     source_occurrence_digests,
     strong_token_report,
 )
@@ -217,6 +218,9 @@ def verify(doc_text, src_text, strong_tokens, approved_extra_math=(),
         m in doc_text for m in ('[TABLE]', '[IMG:', '[FIGURE]', '[FIGCAP]'))
     fails = []
     warns = []
+    # 来源锚点核对（R3 §6.3）：译文删改锚点、改变写法或所属对象即失败
+    from _api_navigation import compare_anchors
+    fails.extend(compare_anchors(src_text, doc_text, inline=True))
     scan_context = None
     doc = doc_text
     src = src_text
@@ -434,7 +438,11 @@ def parse_args(argv, *, base_dir=None):
     --source-adaptation 引用 LaTeXML 来源依据（公式按已确认口径核对）。
     --numeric-review 显式启用数字与单位复核辅助；--numeric-policy 引用
     本次实际适用的 UTF-8 项目数字约定（只作复核上下文，不执行为规则）。
+    --verbose 逐条列出全部告警（默认超过 10 条时按模板归类，只给计数与
+    每类前几条样例）。
     """
+    verbose = '--verbose' in argv
+    argv = [item for item in argv if item != '--verbose']
     argv, official_headings_file = extract_official_headings_option(argv)
     argv, approved_extra_math = extract_approved_extra_math(argv)
     token_files = []
@@ -458,6 +466,7 @@ def parse_args(argv, *, base_dir=None):
         'source_adaptations': source_adaptations,
         'numeric_review': numeric_review,
         'numeric_policy': numeric_policy,
+        'verbose': verbose,
     }
 
 
@@ -490,8 +499,12 @@ def main():
     print('%s: %s' % (os.path.basename(translated_path), 'PASS' if not fails else 'FAIL'))
     for f in fails:
         print('   ✗', f)
-    for w in warns:
-        print('   ⚠', w)
+    if parsed['verbose'] or len(warns) <= 10:
+        for w in warns:
+            print('   ⚠', w)
+    elif warns:
+        print('   ⚠ ' + summarize_messages(warns).replace('\n', '\n     '))
+        print('   （逐条告警加 --verbose）')
     sys.exit(0 if not fails else 1)
 
 

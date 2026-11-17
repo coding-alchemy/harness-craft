@@ -383,6 +383,11 @@ def _adapted_main(html_path, section_id, out_path, args):
                  % '\n'.join('  - %s: %s' % (u.get('node'), u.get('reason'))
                              for u in unresolved))
 
+    leftovers = getattr(adapter, 'anchor_leftovers', None)
+    if leftovers:
+        print('提示: 以下链接目标未写入解析稿（宿主不支持），译文需按 references/'
+              'latexml_source.md 手工放置: %s' % ', '.join(leftovers), file=sys.stderr)
+
     items = [(adapt_out, candidate_text), (out_abs, md_text)]
     display_map = None
     if fidelity.image_display:

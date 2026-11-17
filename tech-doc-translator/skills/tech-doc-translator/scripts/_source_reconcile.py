@@ -3879,12 +3879,13 @@ def _expected_table_block(label, entry, expected_map):
     return expected_map.get(label)
 
 
-def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
-                                  adaptation, html_label='原快照',
-                                  md_label='解析 Markdown',
-                                  table_conversions=None):
-    """LaTeXML 来源独立对账：身份/摘要核对 + 候选 correspondences 与
-    unresolved 逐节点核对 + 两侧有序流比较。返回损伤诊断（空 = 通过）。
+def _reconcile_latexml_core(raw_html, md_text, section_id,
+                            adaptation, html_label='原快照',
+                            md_label='解析 Markdown',
+                            table_conversions=None):
+    """LaTeXML 来源独立对账核心（无锚点口径）：身份/摘要核对 + 候选
+    correspondences 与 unresolved 逐节点核对 + 两侧有序流比较。返回损伤
+    诊断（空 = 通过）。
 
     删正文、漏节点、范围交叠、额外输出、错归属、无解释重复、等数替换、
     改类型都按各自目标原因失败；两侧不共享渲染遍历或“已输出”清单。
@@ -4572,3 +4573,64 @@ def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
                      '额外输出）' % (html_label, len(src_tokens),
                                     md_label, len(md_tokens)))
     return diffs
+
+
+_EMPTY_ANCHOR = re.compile(r'<a id="[^"<>]+"></a>')
+_ANCHOR_LINE = re.compile(r'(?m)^(?:<a id="[^"<>]+"></a>)+\n\n')
+
+
+def _strip_empty_anchors(md_text):
+    """去掉空锚点：独占一行的连同其后空行，行内的只去锚点本身。
+    返回 (去锚文本, 旧偏移 -> 新偏移)。"""
+    cuts = [match.span() for match in _ANCHOR_LINE.finditer(md_text)]
+    covered = set()
+    for start, end in cuts:
+        covered.update(range(start, end))
+    cuts += [match.span() for match in _EMPTY_ANCHOR.finditer(md_text)
+             if match.start() not in covered]
+    cuts.sort()
+    pieces, position = [], 0
+    for start, end in cuts:
+        pieces.append(md_text[position:start])
+        position = end
+    pieces.append(md_text[position:])
+
+    def mapped(offset):
+        removed = 0
+        for start, end in cuts:
+            if offset >= end:
+                removed += end - start
+            elif offset > start:
+                removed += offset - start
+        return offset - removed
+    return ''.join(pieces), mapped
+
+
+def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
+                                  adaptation, html_label='原快照',
+                                  md_label='解析 Markdown',
+                                  table_conversions=None):
+    """LaTeXML 来源独立对账入口：空锚点按零宽处理后交给 _reconcile_latexml_core。"""
+    if not adaptation or not _EMPTY_ANCHOR.search(md_text):
+        return _reconcile_latexml_core(raw_html, md_text, section_id, adaptation,
+                                       html_label, md_label, table_conversions)
+    # declared 由 _latexml_source.markdown_range_facts 写入（切片形式：
+    # 去掉一个结尾换行），actual 按同一口径计算；只比较 sha256/lines 两键，
+    # 依据若还有其他键则原样保留
+    from _latexml_source import markdown_range_facts
+    declared = adaptation.get('markdown') or {}
+    actual = markdown_range_facts(md_text)
+    if declared and any(declared.get(key) != value
+                        for key, value in actual.items()):
+        return ['%s 与依据声明的 Markdown 身份不符' % md_label]
+    clean, mapped = _strip_empty_anchors(md_text)
+    payload = copy.deepcopy(adaptation)
+    for entry in (payload.get('correspondences') or []) + (payload.get('unresolved') or []):
+        if isinstance(entry, dict) and isinstance(entry.get('md_start'), int):
+            entry['md_start'] = mapped(entry['md_start'])
+            entry['md_end'] = mapped(entry['md_end'])
+    if declared:
+        payload['markdown'] = dict(declared,
+                                   **markdown_range_facts(clean))
+    return _reconcile_latexml_core(raw_html, clean, section_id, payload,
+                                   html_label, md_label, table_conversions)

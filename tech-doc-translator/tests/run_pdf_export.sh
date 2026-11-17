@@ -9,8 +9,10 @@ cd "$(dirname "$0")"
 python3 test_pdf_structure.py
 python3 test_pdf_integrity.py
 python3 test_pdf_footnote_notes.py
+python3 test_pdf_text_split.py
 python3 test_pdf_dependency_preflight.py
 python3 test_compose_image_maps.py
+python3 test_katex_macros.py
 python3 -m pytest -p no:cacheprovider test_print_geometry.py -q
 EXPORT="../skills/tech-doc-translator/scripts/export_pdf.py"
 VERIFY="../skills/tech-doc-translator/scripts/verify_pdf.py"

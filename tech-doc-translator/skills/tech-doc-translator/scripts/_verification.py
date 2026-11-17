@@ -881,6 +881,8 @@ def extract_source_adaptation(argv):
     rest = []
     i = 0
     while i < len(argv):
+        if argv[i] == '--source-adaptation' and (i + 1 >= len(argv) or argv[i + 1].startswith('--')):
+            raise SystemExit('--source-adaptation 缺少依据路径：参数后须紧跟来源依据 JSON 路径')
         if argv[i] == '--source-adaptation' and i + 1 < len(argv):
             paths.append(argv[i + 1])
             i += 2
@@ -1902,3 +1904,16 @@ def residual_markers(text, markers):
     residuals.extend('[%s]' % match.group(1)
                      for match in _BLOCK_PLACEHOLDER.finditer(text))
     return residuals
+
+
+def summarize_messages(messages, samples=3):
+    """按模板归类：数字与 name[n] 节点编号替换为占位后取前 60 字为类。"""
+    groups = {}
+    for message in messages:
+        key = re.sub(r'\d+', 'N', re.sub(r'[A-Za-z_]+\[\d+\]', 'node[N]', message))[:60]
+        groups.setdefault(key, []).append(message)
+    lines = ['共 %d 处，%d 类：' % (len(messages), len(groups))]
+    for key, items in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        lines.append('  [%d] %s' % (len(items), key))
+        lines.extend('      - ' + item[:200] for item in items[:samples])
+    return '\n'.join(lines)
