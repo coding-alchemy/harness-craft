@@ -3837,7 +3837,8 @@ CHECK_SCRIPT = """
     try {
       katex.render(n.dataset.tex, n,
                    {displayMode: n.dataset.mode === 'display',
-                    throwOnError: true, strict: false, output: 'htmlAndMathml'});
+                    throwOnError: true, strict: false, output: 'htmlAndMathml',
+                    macros: Object.assign({}, window.__katexMacros || {})});
       n.dataset.katexOk = '1';
     } catch (e) {
       n.classList.add('katex-error-node');
@@ -3984,7 +3985,29 @@ FOOTER_TEMPLATE = (
 )
 
 
-def build_document(chapters, title):
+def load_katex_macros(path):
+    """宏表：JSON 对象，键为以反斜杠开头的命令名，值为替换的 TeX 字符串。"""
+    if not path:
+        return {}
+    try:
+        payload = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ExportError("宏表读取失败：%s（%s）" % (path, exc)) from exc
+    if not isinstance(payload, dict) or not all(
+            isinstance(key, str) and key.startswith("\\") and isinstance(value, str)
+            for key, value in payload.items()):
+        raise ExportError('宏表格式无效：%s（需 {"\\\\textsc": "\\\\text"} 形式的对象）' % path)
+    return payload
+
+
+def katex_hint(message):
+    match = re.search(r"Undefined control sequence: (\\[A-Za-z]+)", message or "")
+    if match is None:
+        return None
+    return "可在 --katex-macros 中把 %s 映射为 KaTeX 支持的命令" % match.group(1)
+
+
+def build_document(chapters, title, *, katex_macros=None):
     katex_dir = ASSETS_DIR / "katex"
     for name in ("katex.min.css", "katex.min.js"):
         if not (katex_dir / name).is_file():
@@ -4008,6 +4031,7 @@ def build_document(chapters, title):
 <body>
 %s
 <script src="%s"></script>
+<script>window.__katexMacros = %s;</script>
 <script>%s</script>
 </body>
 </html>
@@ -4018,6 +4042,7 @@ def build_document(chapters, title):
         file_uri(ASSETS_DIR / "style.css"),
         body,
         file_uri(katex_dir / "katex.min.js"),
+        json.dumps(katex_macros or {}, ensure_ascii=False).replace("</", "<\\/"),
         CHECK_SCRIPT,
     )
 
@@ -4111,10 +4136,57 @@ def candidate_pdf_check(input_paths, unlink_targets, toc_sections,
     return failures
 
 
+def check_math_only(paths, katex_macros=None, source_adaptations=None):
+    """只渲染公式：不排版、不出 PDF、不写导出报告，一次列出全部失败。
+
+    带来源依据时与 export() 一样先装配确认数学，公式按来源依据的类型与
+    原表达式渲染，与正式导出一致。"""
+    from playwright.sync_api import sync_playwright
+
+    chapters = load_inputs(paths)
+    if source_adaptations:
+        apply_source_math_context(chapters, {"_paths": list(source_adaptations)})
+    for chapter in chapters:
+        parse_chapter(chapter)
+    with tempfile.TemporaryDirectory(prefix="check-math-") as temp:
+        html_path = Path(temp) / "math.html"
+        html_path.write_text(build_document(chapters, "math check", katex_macros=katex_macros),
+                             encoding="utf-8")
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto(file_uri(html_path), wait_until="load")
+            page.wait_for_function(
+                "window.__pdfExportDone === true || !document.querySelector('[data-tex]')",
+                timeout=120000)
+            checks = page.evaluate("window.__pdfExportChecks || {katex: [], mathTotal: 0}")
+            browser.close()
+    # 失败定位（设计 §7.2）：节点 id、输入文件与行、TeX 前 80 字、KaTeX
+    # 消息。行号取共享扫描跨度的开启行：本模式无来源约束重排，渲染条目
+    # 与 chapter_math_scan 的跨度一一按序对应；parse_chapter 已给节点 id
+    # 加章前缀（:2948 一致口径），索引按 DOM id 键入。
+    index = {}
+    for chapter in chapters:
+        span_lines = [span.start_line
+                      for span in chapter_math_scan(chapter).spans]
+        for math, line in zip(chapter.math, span_lines):
+            index[chapter.prefix + math["id"]] = (str(chapter.path), line, math["latex"])
+    for error in checks["katex"]:
+        path, line, latex = index.get(error.get("id"), ("?", "?", ""))
+        print("[katex-error] %s:%s %s：%s（%s）"
+              % (path, line, error.get("id"), error.get("message"), latex[:80]))
+        hint = katex_hint(error.get("message"))
+        if hint:
+            print("  " + hint)
+    print("公式 %d 个，渲染失败 %d 个" % (checks.get("mathTotal", 0), len(checks["katex"])))
+    return 1 if checks["katex"] else 0
+
+
 def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
            toc_sections=False, require_display_map=False,
            provenance_map_path=None, translation_record_path=None,
-           view_declaration_path=None, source_adaptation_path=None, *,
+           view_declaration_path=None, source_adaptation_path=None,
+           katex_macros_path=None, *,
            run_context=None, navigation_records=(), navigation_site_roots=()):
     from verify_delivery import (
         check_translation_readiness_cli, new_run_context, progress_stage,
@@ -4123,6 +4195,9 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                                  navigation_identity, navigation_pairs, verify_pdf_navigation)
 
     run_context = run_context if run_context is not None else new_run_context()
+    # R5：宏表只改交给渲染器的 TeX（data-tex 与核验基准不变），先加载，
+    # 使所有报告写入路径都带上 katex_macros 证据。
+    katex_macros = load_katex_macros(katex_macros_path)
     work_dir.mkdir(parents=True, exist_ok=True)
     report_home = work_dir
     if (report_home / REPORT_NAME).is_file():
@@ -4133,7 +4208,12 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     except PdfDependencyError as exc:
         raise ExportError(str(exc)) from exc
     diagnostics = []
-    report = {"diagnostics": diagnostics}
+    report = {
+        "diagnostics": diagnostics,
+        "katex_macros": ({"path": str(Path(katex_macros_path).expanduser().absolute()),
+                          "sha256": hashlib.sha256(Path(katex_macros_path).expanduser().read_bytes()).hexdigest(),
+                          "macros": katex_macros} if katex_macros_path else None),
+    }
 
     # 翻译验收身份门禁（§4.7，只读）：翻译加导出必须传入验收记录；
     # 生成任何候选之前核对验收绑定与当前翻译身份并重跑当前检查。
@@ -4573,7 +4653,8 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                         "input": plan["input"], "image_index": plan["image_index"],
                         "display": plan["display"], **evidence,
                     })
-            html_path.write_text(build_document(chapters, title), encoding="utf-8")
+            html_path.write_text(build_document(chapters, title, katex_macros=katex_macros),
+                                 encoding="utf-8")
             context = browser.new_context()
 
             def block_network(route, request):
@@ -4781,6 +4862,9 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                 % (error.get("id"), error.get("message"), latex[:80]),
                 file=sys.stderr,
             )
+            hint = katex_hint(error.get("message"))
+            if hint:
+                print("    " + hint, file=sys.stderr)
         for error in (browser_checks or {}).get("images", []):
             print(
                 "  [image-error] 图片解码失败：%s（%s）"
@@ -4899,9 +4983,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="把有序 Markdown 文档导出为单个 PDF（机器检查通过才写目标文件）。"
     )
-    parser.add_argument("--output", required=True, help="最终 PDF 路径")
+    parser.add_argument("--output", required=False, help="最终 PDF 路径")
     parser.add_argument(
-        "--work-dir", required=True, help="工作区外临时目录，存放 HTML/候选/证据"
+        "--work-dir", required=False, help="工作区外临时目录，存放 HTML/候选/证据"
     )
     parser.add_argument(
         "--unlink-target",
@@ -4968,14 +5052,28 @@ def main(argv=None):
                         help="API 来源导航记录，与 --site-root 成对，可重复")
     parser.add_argument("--site-root", action="append", default=[],
                         help="对应 API 导航记录的快照站点根，可重复")
+    parser.add_argument("--katex-macros", metavar="JSON",
+                        help='KaTeX 宏表：{"\\\\textsc": "\\\\text"}，只改交给渲染器的 TeX，'
+                             '不改 data-tex 与核验基准；写入导出报告')
+    parser.add_argument("--check-math", action="store_true",
+                        help="只渲染公式并列出全部失败，不排版、不出 PDF、不写导出报告")
     args = parser.parse_args(argv)
+    if args.check_math:
+        try:
+            return check_math_only(args.inputs, load_katex_macros(args.katex_macros),
+                                   args.source_adaptation)
+        except (ExportError, PdfDependencyError) as exc:
+            print("FAIL: %s" % exc, file=sys.stderr)
+            return 1
+    if not args.output or not args.work_dir:
+        parser.error("导出需要 --output 与 --work-dir")
     try:
         run_context = new_run_context(stderr_progress)
         with progress_stage(run_context, "export_pdf", args.output) as fail_stage:
             result = export(
                 args.inputs,
                 Path(args.output).expanduser(),
-                Path(args.work_dir).expanduser(),
+                Path(args.work_dir).expanduser().absolute(),
                 unlink_targets=args.unlink_target,
                 images_display_paths=args.images_display,
                 toc_sections=args.toc_sections,
@@ -4984,6 +5082,7 @@ def main(argv=None):
                 translation_record_path=args.translation_record,
                 view_declaration_path=args.view_declaration,
                 source_adaptation_path=args.source_adaptation,
+                katex_macros_path=args.katex_macros,
                 run_context=run_context,
                 navigation_records=args.navigation_record,
                 navigation_site_roots=args.site_root,
@@ -4993,6 +5092,10 @@ def main(argv=None):
         return result
     except (ExportError, PdfDependencyError) as exc:
         print("FAIL: %s" % exc, file=sys.stderr)
+        from verify_pdf import write_reconcile_diffs
+        path = write_reconcile_diffs(exc, args.work_dir) if args.work_dir else None
+        if path:
+            print("全部差异见 %s" % path, file=sys.stderr)
         return 1
 
 

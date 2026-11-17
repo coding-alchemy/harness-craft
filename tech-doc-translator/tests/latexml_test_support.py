@@ -49,11 +49,12 @@ def note(content):
 def current_candidate(base, raw):
     snapshot = base / 'input.html'
     snapshot.write_text(raw)
-    md, corrs, unresolved, _, _ = latexml.adapt_latexml_snapshot(
+    md, corrs, unresolved, _, adapter = latexml.adapt_latexml_snapshot(
         raw, None, [], str(base))
     payload = latexml.build_candidate_adaptation(
         {'paper_identity': IDENTITY, 'decisions': []}, raw, str(snapshot),
-        corrs, unresolved, selection=None, md_text=md)
+        corrs, unresolved, groups=getattr(adapter, 'groups', None),
+        selection=None, md_text=md)
     return md, payload
 
 

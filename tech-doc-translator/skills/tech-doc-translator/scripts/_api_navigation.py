@@ -417,8 +417,12 @@ def require_navigation_record(snapshot, translated):
                          % (snapshot, kind, line, label, href))
 
 
-def compare_anchors(source, translated):
-    """包内锚点 ID 和实际对象序号守恒；普通无锚点 Markdown 无新增要求。"""
+def compare_anchors(source, translated, *, inline=False):
+    """包内锚点 ID 和实际对象序号守恒；普通无锚点 Markdown 无新增要求。
+    inline=True 时逐锚点核对行内写法与所属对象（参考家族，R3 §6.3）；
+    默认（inline=False）行为与既有 API 家族逐字相同。"""
+    if inline:
+        return _compare_inline_anchors(source, translated)
     from _source_reconcile import _TABLE_CAPTION_LINE_RE
     def read(text):
         if not any(ANCHOR.fullmatch(line) for line in text.splitlines()):
@@ -438,6 +442,61 @@ def compare_anchors(source, translated):
                 facts.append((unescape(match[1]),obj,valid))
         return facts
     return [] if read(source)==read(translated) else ['来源锚点 ID、顺序或内容对象归属改变']
+
+
+INLINE_ANCHOR = re.compile(r'<a id="([^"<>]+)"></a>')
+_EQNO = re.compile(r'\([^()]+\)')
+
+
+def _anchor_facts(text):
+    """(id, 写法, 是否与前一锚点同块, 块序号) 有序列表；跳过代码围栏与行内
+    代码。比较口径为前三元组（共块关系，对译文重排非锚点块不敏感）；块序号
+    仅随事实保留，供差异诊断定位。"""
+    fenced = fenced_line_numbers(text)
+    facts, block, blank = [], 0, True
+    prev_block = None
+    for line_no, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            blank = True
+            continue
+        if blank:
+            block += 1
+        blank = False
+        if line_no in fenced:
+            continue
+        visible = re.sub(r'`[^`]*`', lambda m: ' ' * len(m.group(0)), line)
+        for match in INLINE_ANCHOR.finditer(visible):
+            rest = INLINE_ANCHOR.sub('', visible[match.end():]).strip()
+            if not INLINE_ANCHOR.sub('', visible).strip():
+                form = 'line'
+            elif _EQNO.fullmatch(rest) and not INLINE_ANCHOR.sub('', visible[:match.start()]).strip():
+                form = 'eqno'
+            elif visible.lstrip().startswith('[^'):
+                form = 'footnote'
+            elif '|' in INLINE_ANCHOR.sub('', visible):
+                form = 'cell'
+            elif not INLINE_ANCHOR.sub('', visible[:match.start()]).strip():
+                form = 'lead'
+            else:
+                form = 'inline'
+            facts.append((unescape(match.group(1)), form,
+                          block == prev_block, block))
+            prev_block = block
+    return facts
+
+
+def _compare_inline_anchors(source, translated):
+    expected, actual = _anchor_facts(source), _anchor_facts(translated)
+    if not expected or [fact[:3] for fact in expected] \
+            == [fact[:3] for fact in actual]:
+        return []
+    for index, (want, got) in enumerate(zip(expected, actual)):
+        if want[:3] != got[:3]:
+            return ['来源锚点 ID、顺序或所属对象改变：第 %d 个锚点期望 %r，'
+                    '实际 %r（源块 %d，译块 %d）'
+                    % (index + 1, want[:3], got[:3], want[3], got[3])]
+    return ['来源锚点 ID、顺序或所属对象改变：期望 %d 个，实际 %d 个'
+            % (len(expected), len(actual))]
 
 
 def _link_span_start(chunk, close, end, target):

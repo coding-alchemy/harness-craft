@@ -2,6 +2,16 @@
 
 按产品版本记录主要功能、兼容性变化与已知限制。
 
+## 未发布
+
+- 论文 PDF 核验：片段被数学字形或页缝分成两段、各段逐字齐全且有序时登记待复核，不再报缺字。译注剩余文字按公式切段核对；对象内找不到时，段落宿主只在剩余文字确实跨页时按两页页文本核对，表格单元格宿主按页文本有序核对。锚点目的地判定不计宿主自身字形。
+- LaTeXML 正式解析稿按宿主写入链接目标锚点（段落、文献、单元格在行内，公式在式号行，图与节独占一行），源对账把空锚点按零宽处理，未写入的目标在解析时列出。参考家族核验按序比较锚点的 id、写法，以及是否与前一个锚点同块。
+- `export_pdf.py` 新增 `--katex-macros`（宏表只改交给渲染器的 TeX，写入导出报告）与 `--check-math`（只渲染公式，一次列出全部失败；带 `--source-adaptation` 时公式类型与正式导出一致）。
+- 诊断：核验缺导出证据时只报根因；导出 work-dir 接受相对路径；对账差异第一屏归类计数，全部写入 `reconcile_diffs.txt`；参考译文核验超过 10 条告警时默认归类（`--verbose` 逐条）；`--source-adaptation` 漏写路径直接报错；`references/latexml_source.md` 增论文链路最小命令。
+- 兼容性：用新版重新解析的 LaTeXML 论文，`source.md` 多出锚点行，旧译文需补上同样锚点才能通过核验；未重新解析的项目不受影响。API 家族与通用核验的锚点比较不变。导出报告新增 `katex_macros` 键。
+- 已知限制：锚点挪到相邻、原本没有锚点的块时，参考家族核验查不出；表格单元格译注按页核对时，同页别处的相同文字可能掩盖单元格内的删改，整行删改仍报 `text-missing`；文字版 PDF 来源的确认数学不经 `--check-math`。
+- 验收（真实样本，2026-11-16/17）：V1 通过——AutoInt/HSTU 跨页接缝片段登记 relaxed 且原因含页码（AutoInt 重导出接缝在 8→9 页，交付说明记 7→8；HSTU 去除临时分页 div 后 34→35 页），删字副本报 `text-missing`。V2 通过——Hiformer 含数学译注段与 cuSPARSE 表格单元格译注均无 `translator-note-collateral`，删剩余文字报该码。V3 通过——重新解析 0 个未写入目标、源对账通过，84 个锚点搬到译文后 `verify_reference_translation` 无锚点失败，删锚点、改锚点写法均报“来源锚点”，导出内链 184 一次通过。V3b 通过——S1.p3.1、S5.p1.2 改为独立锚点段后导出与核验通过，无 `internal-link-target`。V4 通过——Hiformer 式号后独立锚点段无 `internal-link-target`。V5/V5b 通过——DIN 带 `--source-adaptation` 预检 155 个公式 0 失败，同一依据的正式导出 katex-error 与预检一致（均为 0）；ULTRA-HSTU 预检一次列出 `\textsc` 失败并带宏表提示，带宏表 0 失败，带宏表导出与核验通过、报告含 `katex_macros`。V6 通过——缺 `export_report.json` 只报一条根因，相对 work-dir 导出成功；STCA 收敛前依据未找到，以单元测试为准。V7 通过——按 `references/latexml_source.md` 最小命令在干净副本全链首次跑通，漏写 `--source-adaptation` 路径报“缺少依据路径”。全量回归失败集合与改动前相同。
+
 <a name="v17"></a>
 
 ## V1.7 — 2026-11-16

@@ -31,7 +31,7 @@ class PdfFootnoteNotesTest(unittest.TestCase):
 
     def test_original_context_controls_named_numeric_and_repeated_refs(self):
         chapter = exporter.Chapter(1, self.doc)
-        values = [text for text, _role in verifier._note_remainders(chapter).values()]
+        values = [''.join(segments) for segments, _role in verifier._note_remainders(chapter).values()]
         self.assertIn('第一段[1]正文保留123。再次引用[1:1]。', values)
         self.assertIn('第二段先引用[2]再引用[3],正文继续。', values)
         self.assertTrue(any('[^named]' in value and '[3:1]' in value for value in values))
@@ -115,6 +115,72 @@ class PdfFootnoteNotesTest(unittest.TestCase):
                 self.assertEqual(failures[0]['line'], 5)
                 self.assertEqual(failures[0]['page'], 1)
                 self.assertTrue(failures[0]['pdf_object'])
+
+    def test_note_in_paragraph_with_inline_math(self):
+        prefix = '# 数学译注\n\n> **来源**：https://example.org/math-notes\n\n'
+        body = ('其中 $\\phi^{h}$ 是第 $h$ 个头的投影，【译注：原文此处缺下标】'
+                '而 $\\hat{K}^{h}$ 为对应键矩阵，二者共同决定注意力权重。')
+        self.doc.write_text(prefix + body + '\n', encoding='utf-8')
+        chapter = exporter.Chapter(1, self.doc)
+        exporter.parse_chapter(chapter)
+        notes = []
+        exporter.strip_translator_notes(chapter, notes)
+        report = {'translator_note_exclusions': notes}
+        for name, text in (('ok', body), ('deleted', body.replace('二者共同', ''))):
+            with self.subTest(case=name):
+                path = self.root / (name + '.md')
+                path.write_text(prefix + text + '\n', encoding='utf-8')
+                pdf = path.with_suffix('.pdf')
+                result = subprocess.run([sys.executable, str(SCRIPTS / 'export_pdf.py'),
+                    '--output', str(pdf), '--work-dir', str(self.root / ('work-math-' + name)),
+                    str(path)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                failures = []
+                verifier.check_translator_notes([chapter], report, verifier.PdfFacts(pdf), failures)
+                if name == 'ok':
+                    self.assertEqual(failures, [])
+                else:
+                    self.assertEqual(failures[0]['code'], 'translator-note-collateral')
+
+    def test_note_in_narrow_table_cell_wrapped_identifier(self):
+        # V2 cuSPARSE：窄列按 overflow-wrap:anywhere 在词中折行，标识符拆成两个文本块。
+        prefix = '# 表格译注\n\n> **来源**：https://example.org/table-note\n\n'
+        head = '| `参数名` | `内存` | `输入/输出` | `含义` |\n| --- | --- | --- | --- |\n'
+        rows = ''.join(
+            '| `%s` | DEVICE | OUT | 指向长度为 `mb` 的整数数组的下标表；宽列的说明文字'
+            '用于把首列挤窄到在标识符词中折行，同 cuSPARSE 交付样本的窄列形态。 |\n' % name
+            for name in ('csrValA', 'csrRowPtrA', 'csrEndPtrA', 'csrColIndA'))
+        body = (head + rows
+                + '| `bsrEndPtrA`【译注：原文如此，疑为笔误】 | DEVICE | OUT | 宽列说明保持首列窄。 |\n')
+        self.doc.write_text(prefix + body + '\n', encoding='utf-8')
+        chapter = exporter.Chapter(1, self.doc)
+        exporter.parse_chapter(chapter)
+        notes = []
+        exporter.strip_translator_notes(chapter, notes)
+        report = {'translator_note_exclusions': notes}
+        remainders = verifier._note_remainders(chapter)
+        self.assertIn('bsrEndPtrA', [''.join(segments) for segments, _role in remainders.values()])
+        self.assertTrue(any(role in ('/Table', '/Td', '/Th') for _segments, role in remainders.values()))
+        for name, text in (('ok', body),
+                           ('deleted', body.replace('`bsrEndPtrA`', '`bsrPtrA`'))):
+            with self.subTest(case=name):
+                path = self.root / (name + '.md')
+                path.write_text(prefix + text + '\n', encoding='utf-8')
+                pdf = path.with_suffix('.pdf')
+                result = subprocess.run([sys.executable, str(SCRIPTS / 'export_pdf.py'),
+                    '--output', str(pdf), '--work-dir', str(self.root / ('work-table-' + name)),
+                    str(path)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                facts = verifier.PdfFacts(pdf)
+                failures = []
+                verifier.check_translator_notes([chapter], report, facts, failures)
+                if name == 'ok':
+                    # 窄列确在词中折行：原始页文本无完整标识符，规范化页文本按序齐全。
+                    self.assertNotIn('bsrEndPtrA', facts.pages[0])
+                    self.assertIn('bsrEndPtrA', verifier.normalize(facts.pages[0]))
+                    self.assertEqual(failures, [])
+                else:
+                    self.assertEqual(failures[0]['code'], 'translator-note-collateral')
 
 
 if __name__ == '__main__':

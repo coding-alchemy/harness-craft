@@ -51,7 +51,34 @@ python3 "$SCRIPTS/parse_reference_html.py" "$SNAPSHOT" "$SECTION" \
   --inspect-output "$INSPECTION" --source-adaptation "$BASIS"
 ```
 
-全篇可省略 `"$SECTION"`，首次勘察可省略已有依据。检查候选的资源基点、未解决项、原 ID 与表格草稿。按真实宿主将段落锚点行内附着，单元格锚点放在格内，图表与文献锚点放在对应对象。保留参考文献各次回链和同年字母后缀。复杂表草稿的表序包含简单数据表；跨度和分组须回源确认。确认后将所选映射写入已有依据的 `table_conversions`，再用正文位置参数和 `--adaptation-output` 走正式解析与独立对账。
+全篇可省略 `"$SECTION"`，首次勘察可省略已有依据。检查候选的资源基点、未解决项、原 ID 与表格草稿。正式解析稿已按宿主写入链接目标锚点（段落、文献、单元格行内，公式在式号行，图与节独占一行），译文原样保留；解析提示未写入的目标按同样写法手工放置。保留参考文献各次回链和同年字母后缀。复杂表草稿的表序包含简单数据表；跨度和分组须回源确认。确认后将所选映射写入已有依据的 `table_conversions`，再用正文位置参数和 `--adaptation-output` 走正式解析与独立对账。
+
+### 论文链路最小命令
+
+```bash
+PY=<工作区外环境>/bin/python; S=<SKILL目录>/scripts
+# 1 勘察（首次可省略 --source-adaptation）；重跑勘察用新的 --inspect-output 路径（产物保护拒绝覆盖既有文件）
+$PY $S/parse_reference_html.py source/<快照>.html --inspect-output source/inspection.json
+# 2 正式解析（写出 source.md、候选依据与显示尺寸映射；解析稿已含链接目标锚点）
+$PY $S/parse_reference_html.py source/<快照>.html source/source.md \
+  --source-adaptation source/source_adaptation.input.json --adaptation-output source/source_adaptation.json
+# 3 译文核验（告警默认归类，逐条加 --verbose）
+$PY $S/verify_reference_translation.py <译文.md> source/source.md \
+  --source-adaptation source/source_adaptation.json [--image-map <图片身份映射.json>]
+# 4 公式预检、导出与核验（work-dir 同一个，放 docs/export_work）
+$PY $S/export_pdf.py --check-math --source-adaptation source/source_adaptation.json [--katex-macros <宏表.json>] <译文.md>
+$PY $S/export_pdf.py --output <候选.pdf> --work-dir docs/export_work \
+  --source-adaptation source/source_adaptation.json [--katex-macros <宏表.json>] \
+  [--images-display <显示尺寸映射.json>] <译文.md>
+$PY $S/verify_pdf.py --pdf <候选.pdf> --work-dir docs/export_work \
+  --source-adaptation source/source_adaptation.json \
+  [--images-display <显示尺寸映射.json>] <译文.md>
+```
+
+- `--source-adaptation` 后必须紧跟依据 JSON 路径，可重复；漏写路径会直接报错。
+- 图片身份映射 `--image-map` 是 `{"digests": ["<sha256>", ...]}`，按源 Markdown 中图片出现顺序列出资源身份摘要（`_verification.resource_identity_digest`）。源 Markdown 所在目录能解析到源资源时不用提供；`source.images_display.json` 是显示尺寸映射，不是图片身份映射。
+- 显示尺寸映射 `--images-display`——项目把交付级显示尺寸映射放在 `export/images_display.json` 等非缺省位置时，导出与核验都必须带上；源 Markdown 同目录的缺省映射可解析或文档无图时可省略。
+- 导出与核验用同一个 `--work-dir`；核验报“导出证据缺失”时，先在该目录重新导出。
 
 - 适配器在原节点上直接转换：MathML `alttext` 逐字取 TeX（实体解码一次；
   含边界空白与换行，不裁剪），行内/展示类型保持；无 `alttext`/类型冲突

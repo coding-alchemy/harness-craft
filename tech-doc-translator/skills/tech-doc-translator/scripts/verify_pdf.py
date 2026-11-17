@@ -1622,10 +1622,23 @@ def _note_remainders(chapter):
         if block:
             for backlink in block.select('a.footnote-backref'):
                 backlink.decompose()  # 自动生成导航由链接门禁负责，不属于原正文。
-        value = normalize(block.get_text(' ', strip=True)) if block else ''
-        if len(value) >= 4:
-            remainders[line] = (value, '/' + block.name.capitalize())
+        segments = ([normalize(part) for part in exporter.block_text_segments(block)]
+                    if block else [])
+        segments = [part for part in segments if part]
+        if sum(len(part) for part in segments) >= 4:
+            remainders[line] = (segments, '/' + block.name.capitalize())
     return remainders
+
+
+def _segments_in_order(segments, text):
+    """各段按序逐字出现在 text 中（段间允许数学字形穿插）。"""
+    position = 0
+    for segment in segments:
+        found = text.find(segment, position)
+        if found < 0:
+            return False
+        position = found + len(segment)
+    return True
 
 
 def _note_text_objects(pdf, start_page, end_page, roles):
@@ -1688,7 +1701,7 @@ def check_translator_notes(chapters, report, pdf, failures):
     for item in expected:
         context = {"input": item["input"], "line": item["line"]}
         candidates = objects.get(item["input"], ())
-        start, _ = ranges.get(item["input"], (None, None))
+        start, end_page = ranges.get(item["input"], (None, None))
         missing_location = {"page": start + 1 if start is not None else None,
                             "pdf_object": None}
         token = normalize(item["fragment"])
@@ -1710,28 +1723,44 @@ def check_translator_notes(chapters, report, pdf, failures):
         expected_object = remainders[item["input"]].get(item["line"])
         if expected_object is None:
             continue
-        remainder, role = expected_object
+        segments, role = expected_object
+        joined = ''.join(segments)
         best_size, location = 0, missing_location
         for text, where in candidates:
             if where["pdf_object"]["role"] != role:
                 continue
-            if remainder in text:
+            if _segments_in_order(segments, text):
                 break
             # Only for locating a failure. A partial match never establishes integrity.
-            size = max(len(os.path.commonprefix([remainder, text])),
-                       len(os.path.commonprefix([remainder[::-1], text[::-1]])))
+            size = max(len(os.path.commonprefix([joined, text])),
+                       len(os.path.commonprefix([joined[::-1], text[::-1]])))
             if size >= 4 and size > best_size:
                 best_size, location = size, where
         else:
-            failures.append(
-                {
-                    "code": "translator-note-collateral",
-                    "message": "译注所在块的剩余文字未在同一 PDF 文本对象完整出现：%r"
-                    % remainder[:60],
-                    **context,
-                    **location,
-                }
-            )
+            # 跨页段落被拆成多个对象：只在首段所在页及下一页的页文本里核对；
+            # 单页已能完整解释时，对象级失败并非页缝所致（如段落被拆成两段），仍报失败。
+            # 表格宿主例外：窄列在词中折行是合法排版，单元格文字本就分散在多个
+            # 文本对象，页文本按序核对即为正确粒度，不要求单页不可解释。
+            table_host = role in ('/Table', '/Td', '/Th')
+            pages = [index for index in range(start, end_page)
+                     if segments[0] in normalize(pdf.pages[index])] if start is not None else []
+            spanned = any(
+                _segments_in_order(
+                    segments, normalize(pdf.pages[index] + (pdf.pages[index + 1]
+                                                            if index + 1 < len(pdf.pages) else '')))
+                and (table_host
+                     or not _segments_in_order(segments, normalize(pdf.pages[index])))
+                for index in pages)
+            if not spanned:
+                failures.append(
+                    {
+                        "code": "translator-note-collateral",
+                        "message": "译注所在块的剩余文字未在同一 PDF 文本对象完整出现：%r"
+                        % joined[:60],
+                        **context,
+                        **location,
+                    }
+                )
 
 
 def check_view_declaration(chapters, report, pdf, args_view_declaration,
@@ -3009,6 +3038,24 @@ def subsequence_in_window(needle, haystack, start, end):
     return None
 
 
+def split_match(needle, pdf, start, end):
+    """片段切成前后两段，两段各自逐字连续、按序出现，后段整体落在前段
+    所在页或下一页内（数学字形批量后置、页缝劈词）。返回
+    (消费结束位置, 前段页序号, 后段页序号)，无匹配返回 None。"""
+    for k in range(1, len(needle)):
+        head, tail = needle[:k], needle[k:]
+        head_at = pdf.norm_text.find(head, start, end)
+        if head_at < 0:
+            break                      # 更长的前段同样找不到
+        page = pdf.page_of_offset(head_at)
+        last = min(page + 1, len(pdf.page_offsets) - 1)
+        limit = min(end, pdf.page_offsets[last][1])
+        tail_at = pdf.norm_text.find(tail, head_at + k, limit)
+        if tail_at >= 0:
+            return tail_at + len(tail), page, pdf.page_of_offset(tail_at)
+    return None
+
+
 def check_blocks(chapters, pdf, bounds, failures, relaxed, kind):
     """kind: text；在章区间内做严格单调的顺序包含检查。
 
@@ -3042,6 +3089,20 @@ def check_blocks(chapters, pdf, bounds, failures, relaxed, kind):
                         {
                             "segment": segment.strip()[:80],
                             "reason": "数学渲染文本穿插导致的非连续提取",
+                            "input": str(chapter.path),
+                        }
+                    )
+                    position = consumed
+                    continue
+                split = (split_match(needle, pdf, position, end_offset)
+                         if position < end_offset else None)
+                if split is not None:
+                    consumed, head_page, tail_page = split
+                    relaxed.append(
+                        {
+                            "segment": segment.strip()[:80],
+                            "reason": "片段被数学字形或页缝分为两段，各段逐字齐全且"
+                                      "顺序一致（第 %d→%d 页）" % (head_page + 1, tail_page + 1),
                             "input": str(chapter.path),
                         }
                     )
@@ -4973,8 +5034,10 @@ def _destination_matches(pdf, annot, target, destinations, origins):
         return False
     # 独立锚点与随后块之间允许原样式的块间距，但不得进入前一对象行盒。
     if standalone:
+        own = {id(event) for _, event in runs}
         preceding = [event["baseline_y_pt"] for event in pdf.drawn_events[page]
-                     if event["text"].strip() and event["baseline_y_pt"] > y0+rounding]
+                     if event["text"].strip() and id(event) not in own
+                     and event["baseline_y_pt"] > y0+rounding]
         if preceding:
             upper = min(upper, min(preceding)-rounding)
     if x is None and (offset or name in ("td", "th")):
@@ -5415,6 +5478,21 @@ def resolve_navigation_declarations(args, report, *, root=None):
     return recorded, binding
 
 
+def write_reconcile_diffs(exc, work_dir):
+    """沿异常链找 ReconcileError，把全部差异写入 work-dir，返回文件路径。"""
+    from _latexml_source import ReconcileError
+    cause, seen = exc, set()
+    while cause is not None and id(cause) not in seen and not isinstance(cause, ReconcileError):
+        seen.add(id(cause))
+        cause = cause.__cause__ or cause.__context__
+    if not isinstance(cause, ReconcileError):
+        return None
+    path = Path(work_dir).expanduser().absolute() / 'reconcile_diffs.txt'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(''.join(item + '\n' for item in cause.diffs), encoding='utf-8')
+    return path
+
+
 def run_verification(args, *, run_context=None):
     """核验计算（不落盘、不打印）：返回 (机器是否通过, 核验报告 dict)。
 
@@ -5425,7 +5503,7 @@ def run_verification(args, *, run_context=None):
     """
     if getattr(args, 'visual_aid', False) and _load_aid_renderer() is None:
         raise PdfDependencyError(dependency_message('PyMuPDF', requirements='requirements-pdf-source.txt'))
-    work_dir = Path(args.work_dir).expanduser()
+    work_dir = Path(args.work_dir).expanduser().absolute()
     report_path = work_dir / REPORT_NAME
     report = None
     if report_path.is_file():
@@ -5441,7 +5519,8 @@ def run_verification(args, *, run_context=None):
     reviews = []
     if not report_usable:
         failures.append({"code": "export-evidence-missing",
-                         "message": "导出证据缺失或不可解析: %s" % report_path})
+                         "message": "导出证据缺失或不可解析: %s；请在同一 --work-dir 先运行 "
+                                    "export_pdf，再核验" % report_path})
 
     readiness_projection=None
     if report.get('translation_readiness'):
@@ -5627,6 +5706,9 @@ def run_verification(args, *, run_context=None):
         # 实测页脚带几何。
         check_page_footers(pdf, failures)
 
+    if not report_usable:
+        # 缺导出证据时其余检查都建立在空报告上，只报根因
+        failures[:] = [item for item in failures if item["code"] == "export-evidence-missing"]
     machine_pass = not failures
     verify_report = {
         "status": STATUS_MACHINE_PASS if machine_pass else STATUS_MACHINE_FAIL,
@@ -5679,7 +5761,7 @@ def main(argv=None):
     from verify_delivery import new_run_context, progress_stage, stderr_progress
 
     args = parse_args(argv)
-    work_dir = Path(args.work_dir).expanduser()
+    work_dir = Path(args.work_dir).expanduser().absolute()
 
     try:
         run_context = new_run_context(stderr_progress)
@@ -5691,6 +5773,12 @@ def main(argv=None):
     except PdfDependencyError as exc:
         print('FAIL: %s' % exc, file=sys.stderr)
         return 1
+    except ValueError as exc:
+        path = write_reconcile_diffs(exc, work_dir)
+        print('FAIL: %s' % exc, file=sys.stderr)
+        if path:
+            print('全部差异见 %s' % path, file=sys.stderr)
+        return 1
     evidence_path = work_dir / VERIFY_NAME
     if not machine_pass and evidence_path.is_file():
         try:
@@ -5699,6 +5787,9 @@ def main(argv=None):
             previous = {}
         if isinstance(previous, dict) and previous.get("status") == STATUS_MACHINE_PASS:
             evidence_path = Path(tempfile.mkdtemp(prefix="verify-run-", dir=work_dir)) / VERIFY_NAME
+    # 核验证据随核验写出：work-dir 尚不存在（如证据缺位根因场景）时创建，
+    # 保证失败项打印与证据落盘都完成，不以写证据崩溃掩盖根因。
+    work_dir.mkdir(parents=True, exist_ok=True)
     evidence_path.write_text(json.dumps(verify_report, ensure_ascii=False, indent=2), encoding="utf-8")
     failures = verify_report["failures"]
     relaxed = verify_report["relaxed_matches"]
@@ -5718,10 +5809,7 @@ def main(argv=None):
         % (Path(args.pdf).expanduser(), work_dir / VERIFY_NAME)
     )
     for item in relaxed:
-        print(
-            "  待复核 [%s] %s（已解释：数学渲染文本穿插，逐段字符齐全且顺序一致）"
-            % (item["input"], item["segment"])
-        )
+        print("  待复核 [%s] %s（已解释：%s）" % (item["input"], item["segment"], item["reason"]))
     for review in reviews:
         print(
             "  待处置 [%s] %s:%s %s"
