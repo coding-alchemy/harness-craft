@@ -1037,18 +1037,32 @@ class CodePaginationGapTest(unittest.TestCase):
         gate_codes = {item['code'] for item in report['candidate_gate_failures']}
         self.assertIn('code-page-gap', gate_codes)
 
-    def test_forced_move_with_leading_h2_still_blocked(self):
+    def test_forced_move_with_leading_h2_is_relaxed_for_review(self):
         # H2 变体：小节标题随块移到下页（标题在块前、前页大段留白）。
-        # 前导内容不构成豁免：前页放得下标题与至少一完整代码行即拒绝。
+        # R4：块前紧邻标题的整块移页不孤行，不再阻断导出；独立核验把
+        # 该处记为带页码的 review 放宽项，交视觉复核。
         rc, stderr, pdf, work = self._export(self._long_block_markdown(20),
                                              patched=True)
-        self.assertEqual(rc, 1)
-        self.assertIn('code-page-gap', stderr)
-        self.assertEqual(pdf.read_bytes(), b'OLD-PDF-BYTES')  # 旧成品不变
+        self.assertEqual(rc, 0)
+        self.assertNotIn('code-page-gap', stderr)
         report = json.loads(
             (work / exporter.REPORT_NAME).read_text(encoding='utf-8'))
         gate_codes = {item['code'] for item in report['candidate_gate_failures']}
-        self.assertIn('code-page-gap', gate_codes)
+        self.assertNotIn('code-page-gap', gate_codes)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            vrc = verifier.main(['--pdf', str(pdf), '--work-dir', str(work),
+                                 str(pdf.parent / 'gap.md')])
+        self.assertEqual(vrc, 0)
+        verify_report = json.loads(
+            (work / verifier.VERIFY_NAME).read_text(encoding='utf-8'))
+        self.assertNotIn('code-page-gap',
+                         [f['code'] for f in verify_report['failures']])
+        relaxed_hits = [item for item in verify_report['relaxed_matches']
+                        if '与紧邻的标题一起移到' in item['segment']]
+        self.assertEqual(len(relaxed_hits), 1)
+        self.assertTrue(relaxed_hits[0]['review'])
+        self.assertEqual(relaxed_hits[0]['page'], 2)
 
     def test_same_content_without_patch_uses_page_tail(self):
         # 配对正例：去掉强制整块约束后，长块从当前页尾续排并跨页，

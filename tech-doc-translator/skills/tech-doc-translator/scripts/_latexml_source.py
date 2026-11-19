@@ -743,8 +743,17 @@ def _list_item_blocks(node):
             yield from _list_item_blocks(child)
 
 
-def enumerate_items(node):
-    """原序号和条目 DOM 分段；文字渲染与独立读取各自消费这些节点。"""
+# LaTeX itemize 第 1–4 层默认标记（\textbullet、\textendash、
+# \textasteriskcentered、\textperiodcentered）；\item[自定义] 的标签不在此列。
+ITEMIZE_MARKERS = ('•', '–', '∗', '·')
+
+
+def enumerate_items(node, keep_itemize_markers=False):
+    """原序号和条目 DOM 分段；文字渲染与独立读取各自消费这些节点。
+
+    keep_itemize_markers 只供源对账按 R7 之前的写法（保留无序列表默认
+    标记）重读旧解析稿，写出侧不用。
+    """
     items = node.find_all('li', recursive=False)
     ordered = node.name == 'ol'
     descending = ordered and node.has_attr('reversed')
@@ -766,8 +775,13 @@ def enumerate_items(node):
         for index, child in enumerate(list(_list_item_blocks(body))):
             child.replace_with(NavigableString('\x02%d\x02' % index))
         for label in body.find_all(class_='ltx_tag_item', recursive=False):
-            if label.get_text(strip=True) in ('(%d)' % number, '%d.' % number,
-                                              '%d)' % number, str(number)):
+            text = label.get_text(strip=True)
+            if ordered:
+                default = text in ('(%d)' % number, '%d.' % number,
+                                   '%d)' % number, str(number))
+            else:
+                default = text in ITEMIZE_MARKERS and not keep_itemize_markers
+            if default:
                 label.extract()
         yield item, marker, body, blocks
 
@@ -1981,11 +1995,16 @@ class LatexmlAdapter(object):
     def _itemize(self, node):
         "简单无序列表：`- ` 条目行表示，逐条保留（08）；条内公式出现以"
         "来源标记传递、写出时逐字展开；块级出现拆段为独立块片段（同"
-        " _biblist）。"
+        " _biblist）。默认标记不进入条目文字（嵌套条目随整条行内渲染，"
+        "一并剥除）；\\item[自定义] 的标签保留（R7）。"
         count = 0
         for item in node.find_all('li', recursive=False):
             count += 1
-            text = self.fidelity.render_inline(item,
+            body = copy.deepcopy(item)
+            for label in body.find_all(class_='ltx_tag_item'):
+                if label.get_text(strip=True) in ITEMIZE_MARKERS:
+                    label.extract()
+            text = self.fidelity.render_inline(body,
                                                escape_backslashes=True)
             self._emit('\n- ' + text if text else '\n-', {
                 'type': 'paragraph', 'node': None,

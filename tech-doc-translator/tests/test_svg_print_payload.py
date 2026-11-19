@@ -63,6 +63,9 @@ def test_svg_payload_identity_and_dimensions(tmp_path):
     pdf, work = _export(tmp_path, chapter, mapping)
     report = json.loads((work / exporter.REPORT_NAME).read_text())
     record, = report['svg_renders']
+    assert report['svg_raster_scale'] == exporter.SVG_RASTER_SCALE == 2
+    # 360 宽的 SVG 显示为 240px：不足 2 倍，宽高同乘 2（R18）。
+    assert (record['embedded']['width'], record['embedded']['height']) == (720, 360)
     assert record['source'] == [str(svg), resource_identity_digest(str(svg))]
     assert set(record['dependencies']) == {str(css), str(svg.parent / 'tile.png')}
     ok, facts = _verify(pdf, work, chapter, mapping)
@@ -79,8 +82,8 @@ def test_svg_payload_identity_and_dimensions(tmp_path):
         reference = Image.open(BytesIO(payload)).convert('RGB')
         browser.close()
     assert raster.image.convert('RGB').tobytes() == reference.tobytes()
-    assert reference.getpixel((40, 35)) == (170, 85, 0)
-    assert reference.getpixel((200, 120)) == (34, 102, 170)
+    assert reference.getpixel((80, 70)) == (170, 85, 0)
+    assert reference.getpixel((400, 240)) == (34, 102, 170)
     assert svg.read_bytes() == original
 
 
@@ -130,3 +133,53 @@ def test_resource_bases_do_not_guess_by_name(tmp_path, monkeypatch):
     chapter.write_text(chapter.read_text().replace('../source/diagram.svg', 'diagram.svg'))
     assert exporter.export([str(chapter)], pdf, work, images_display_paths=[str(mapping)]) == 1
     assert pdf.read_bytes() == old
+
+
+def test_svg_dimensions_reach_raster_scale(tmp_path):
+    def dimensions(width, height, display, scale):
+        svg = tmp_path / ('s%dx%d.svg' % (width, height))
+        svg.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
+                       'viewBox="0 0 %d %d"><rect width="%d" height="%d"/></svg>'
+                       % (width, height, width, height, width, height))
+        record = {'kind': 'SVG', 'path': str(svg), **exporter._svg_resource_facts(str(svg))}
+        binding = {'px': float(display), 'source_resource': None,
+                   'map_path': tmp_path / 'm.json', 'record': {'width': None}}
+        return exporter.svg_print_dimensions(record, binding, scale)
+
+    assert dimensions(360, 180, 240, 1) == (360, 180, 240.0)     # 1 倍：与改动前相同
+    assert dimensions(360, 180, 240, 2) == (720, 360, 240.0)     # 不足 2 倍：宽高同乘 2
+    assert dimensions(360, 180, 150, 2) == (360, 180, 150.0)     # 自身已超过 2 倍：不变
+    assert dimensions(400, 1400, 400, 2) == (400, 1400, 400.0)   # 乘 2 会超过 2600 长边：不乘
+
+
+def test_legacy_1x_export_without_raster_scale_verifies(tmp_path, monkeypatch):
+    pytest.importorskip('playwright.sync_api')
+    chapter, mapping, _svg, _css = _inputs(tmp_path)
+    monkeypatch.setattr(exporter, 'SVG_RASTER_SCALE', 1)   # 模拟改动前的 1 倍导出
+    pdf, work = _export(tmp_path, chapter, mapping)
+    monkeypatch.undo()
+    report_path = work / exporter.REPORT_NAME
+    report = json.loads(report_path.read_text())
+    assert report['svg_renders'][0]['embedded']['width'] == 360
+    del report['svg_raster_scale']                          # 改动前的报告没有这个字段
+    report_path.write_text(json.dumps(report))
+    ok, facts = _verify(pdf, work, chapter, mapping)
+    assert ok, facts
+
+
+def test_raster_scale_claim_must_match_pdf(tmp_path):
+    pytest.importorskip('playwright.sync_api')
+    chapter, mapping, _svg, _css = _inputs(tmp_path)
+    pdf, work = _export(tmp_path, chapter, mapping)
+    report_path = work / exporter.REPORT_NAME
+    report = json.loads(report_path.read_text())
+    report['svg_raster_scale'] = 1
+    report_path.write_text(json.dumps(report))
+    ok, facts = _verify(pdf, work, chapter, mapping)
+    codes = {x['code'] for x in facts['failures']}
+    assert not ok and {'svg-render-drift', 'svg-pdf-pixels'} <= codes, codes
+    report['svg_raster_scale'] = 5
+    report_path.write_text(json.dumps(report))
+    ok, facts = _verify(pdf, work, chapter, mapping)
+    assert not ok
+    assert [x['code'] for x in facts['failures']] == ['svg-render-evidence'], facts['failures']

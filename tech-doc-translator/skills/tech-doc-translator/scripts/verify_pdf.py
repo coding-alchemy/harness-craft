@@ -249,6 +249,7 @@ def collect_visual_aid(pdf_path, dpi=VISUAL_AID_DEFAULT_DPI,
                 and entry["ink_coverage"] is not None
                 and entry["ink_coverage"] < blank_threshold
             )
+            _check_aid_footer(page, renderer, index + 1, document.page_count, entry)
             report["pages"].append(entry)
     finally:
         document.close()
@@ -258,8 +259,75 @@ def collect_visual_aid(pdf_path, dpi=VISUAL_AID_DEFAULT_DPI,
                           if not entry["render_ok"]],
         "blank_suspects": [entry["page"] for entry in report["pages"]
                            if entry["blank_suspect"]],
+        "footer_anomalies": [entry["page"] for entry in report["pages"]
+                             if not entry["footer_ok"]],
     }
     return report
+
+
+def _check_aid_footer(page, renderer, number, total, entry):
+    """R13：用辅助渲染器读页面底部边距带内的文字，应为“页码 / 总页数”。
+
+    PyMuPDF 坐标原点在左上，带取页面最下方 PDF_PAGE_FOOTER_BAND_PT。
+    """
+    try:
+        rect = page.rect
+        band = renderer.Rect(rect.x0, rect.y1 - PDF_PAGE_FOOTER_BAND_PT, rect.x1, rect.y1)
+        text = " ".join(page.get_text("text", clip=band).split())
+    except Exception as exc:  # noqa: BLE001  读取失败按缺口记录
+        entry["footer_ok"] = False
+        entry["footer_gap"] = "页脚文字读取失败：%s" % exc
+        return
+    match = _FOOTER_TEXT_RE.match(text)
+    entry["footer_text"] = text[:40]
+    entry["footer_ok"] = bool(match) and (int(match.group(1)), int(match.group(2))) == (number, total)
+
+
+def visual_key_pages(aid, bounds, relaxed, reviews):
+    """程序化目检的关键页（R13）：[{"first", "last", "reasons"}]，按页码排序。
+
+    首页、目录（00_目录.md 这一输入所在页）、各章首页、末页、带 page 的放宽项与
+    待复核项（原因写报告里的定位 relaxed_matches#n / reviews#n）、疑似空白页、
+    页脚异常页、渲染失败页；相邻且原因完全相同的页合并成区间。
+    """
+    total = len(aid.get("pages") or [])
+    reasons = {}
+
+    def add(page, reason):
+        if isinstance(page, int) and not isinstance(page, bool) and 1 <= page <= total:
+            found = reasons.setdefault(page, [])
+            if reason not in found:
+                found.append(reason)
+
+    if not total:
+        return []
+    add(1, "首页")
+    for chapter, start, end in bounds:
+        name = Path(str(chapter.path)).name
+        if name == exporter.TOC_FILE_NAME:
+            for page in range(start + 1, end + 1):
+                add(page, "目录")
+        else:
+            add(start + 1, "章首（%s）" % name)
+    add(total, "末页")
+    for index, item in enumerate(relaxed):
+        add(item.get("page"), "relaxed_matches#%d" % (index + 1))
+    for index, item in enumerate(reviews):
+        add(item.get("page"), "reviews#%d" % (index + 1))
+    for entry in aid["pages"]:
+        if entry.get("blank_suspect"):
+            add(entry["page"], "疑似空白页")
+        if not entry.get("footer_ok", True):
+            add(entry["page"], "页脚异常")
+        if not entry.get("render_ok"):
+            add(entry["page"], "渲染失败")
+    merged = []
+    for page in sorted(reasons):
+        if merged and merged[-1]["last"] == page - 1 and merged[-1]["reasons"] == reasons[page]:
+            merged[-1]["last"] = page
+        else:
+            merged.append({"first": page, "last": page, "reasons": reasons[page]})
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -971,13 +1039,28 @@ def check_svg_renders(chapters, pdf, report, failures) -> None:
             chapters, report.get("images_display_maps", []), diagnostics)
         enumerations = {chapter.path: exporter.enumerate_images(chapter, diagnostics)
                         for chapter in chapters}
+        try:
+            exporter.apply_image_adaptations(
+                chapters, enumerations, bindings,
+                exporter.report_image_adaptations(report), diagnostics)
+        except exporter.ExportError as exc:
+            failures.append({"code": "image-adaptations-mismatch", "message": str(exc)})
+            return
         bounds = chapter_bounds(chapters, pdf, {}, failures)
     else:
         bindings, enumerations, bounds = context
-    plans = exporter.plan_svg_renders(chapters, enumerations, bindings, diagnostics)
+    # 没有 svg_raster_scale 的旧报告按当时的 1 倍重建（R18）。
+    scale = report.get("svg_raster_scale", 1)
+    valid_scale = scale in (1, exporter.SVG_RASTER_SCALE)
+    plans = exporter.plan_svg_renders(chapters, enumerations, bindings, diagnostics,
+                                      scale=scale if valid_scale else 1)
     failures.extend(d for d in diagnostics if d["severity"] == "fail")
     expected_keys = [(plan["input"], plan["image_index"]) for plan in plans]
     pdf._svg_occurrences = set(expected_keys)
+    if not valid_scale:
+        failures.append({"code": "svg-render-evidence",
+                         "message": f"导出报告的 SVG 光栅倍数无效：{scale!r}"})
+        return
     rows = report.get("svg_renders", [])
     if (not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows)
             or [(row.get("input"), row.get("image_index")) for row in rows] != expected_keys):
@@ -1018,7 +1101,8 @@ def check_svg_renders(chapters, pdf, report, failures) -> None:
                 detail = {"input": key[0], "line": plan["record"]["line"]}
                 payload, evidence = exporter.render_svg_payload(
                     plan["record"]["path"], width_px=plan["width"], height_px=plan["height"],
-                    resource_registry=registry, browser=browser)
+                    resource_registry=registry, browser=browser,
+                    viewbox=plan.get("viewbox"))
                 if row.get("display") != plan["display"] or any(row.get(k) != v for k, v in evidence.items()):
                     failures.append({"code": "svg-render-drift", **detail,
                                      "message": f"SVG #{key[1]} 当前依赖、尺寸或渲染证据漂移：{evidence['source'][0]}"})
@@ -2316,6 +2400,26 @@ def _drawings_by_mark(pdf):
     return pdf._drawings_by_mark
 
 
+def _uri_equivalent(annotation_uri, href):
+    """外链注解与原文链接是否同一地址（R19）。
+
+    Chromium 给裸域名补尾斜杠（https://fmt.dev → https://fmt.dev/）；只把路径
+    "/" 与空路径视为相同，协议、主机、其余路径、查询与片段的差异仍判不等。
+    """
+    from urllib.parse import urlsplit
+
+    def canon(value):
+        try:
+            parts = urlsplit(value or "")
+        except ValueError:
+            return None
+        path = "" if parts.path == "/" else parts.path
+        return parts.scheme, parts.netloc, path, parts.query, parts.fragment
+
+    left, right = canon(annotation_uri), canon(href)
+    return left is not None and left == right
+
+
 def _link_instances(pdf):
     """完整保留结构树中的 Link 槽位，即使动作或实际页注解已损伤。"""
     text_by_mark, images_by_mark = _drawings_by_mark(pdf)
@@ -3104,6 +3208,7 @@ def check_blocks(chapters, pdf, bounds, failures, relaxed, kind):
                             "reason": "片段被数学字形或页缝分为两段，各段逐字齐全且"
                                       "顺序一致（第 %d→%d 页）" % (head_page + 1, tail_page + 1),
                             "input": str(chapter.path),
+                            "page": head_page + 1,
                         }
                     )
                     position = consumed
@@ -4538,6 +4643,25 @@ def build_line_buckets(drawn_events):
     return buckets
 
 
+_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+
+
+def _code_follows_heading(chapter, index):
+    """第 index 个代码块之前紧邻的元素是不是标题（R4）。
+
+    与 chapter.code_blocks 同序（导出器按 soup.find_all("pre") 收集）；
+    只含锚点的 .anchor-only 段落零高度，跳过。
+    """
+    blocks = chapter.soup.find_all("pre")
+    if index >= len(blocks):
+        return False
+    node = blocks[index].find_parent("div", class_="code-block") or blocks[index]
+    sibling = node.find_previous_sibling()
+    while sibling is not None and "anchor-only" in (sibling.get("class") or []):
+        sibling = sibling.find_previous_sibling()
+    return sibling is not None and sibling.name in _HEADING_TAGS
+
+
 def check_code_pagination(chapters, pdf, bounds, failures, reviews,
                           block_infos, relaxed=None):
     """长代码块整块移页检查（A21：code-page-gap）。
@@ -4550,8 +4674,9 @@ def check_code_pagination(chapters, pdf, bounds, failures, reviews,
     个有实际内容（文字/图片）的页，不用前一代码块末页代替。本页块上
     方的前导内容（标题、正文、图片随块移来）不构成豁免：前页放得下
     前导内容、块间必要间距与至少一完整代码行时仍判 code-page-gap——
-    增加一个 H2 不改变这一空间判断；确实放不下时该移页有依据，记录
-    实际前导区域、所需空间与前页占用的空间证据。行高取该块自身前两
+    块前紧邻标题时标题随块移页不孤行，改记 review 放宽项交视觉复核
+    （R4）；确实放不下时该移页有依据，记录实际前导区域、所需空间与
+    前页占用的空间证据。行高取该块自身前两
     个视觉行的物理基线差（由结构归属记录在逐块信息中），不按源码字
     符重新定位行。行高无法估计时记录待复核，不假判通过。短块整体移
     页的页尾空白明确放行。
@@ -4597,6 +4722,7 @@ def check_code_pagination(chapters, pdf, bounds, failures, reviews,
                         "message": "代码块 #%d 起于前一内容下一页，但行高无法"
                                    "从绘制坐标估计，需视觉复核是否有整块移页"
                                    % (bi + 1),
+                        "page": cur["first_page"] + 1,
                     }
                 )
                 continue
@@ -4637,7 +4763,23 @@ def check_code_pagination(chapters, pdf, bounds, failures, reviews,
             required_pt = (leading_height + line_height * 2.0
                            if leading else
                            line_height + block_start_overhead)
-            if remaining_pt >= required_pt:
+            if (remaining_pt >= required_pt and leading and relaxed is not None
+                    and _code_follows_heading(chapter, bi)):
+                # 标题 break-after: avoid 使 Chromium 把标题与长块一起移页：
+                # 前页尾隙是标题不孤行的代价，交视觉复核，不判失败（R4）。
+                relaxed.append(
+                    {
+                        "segment": "代码块 #%d 与紧邻的标题一起移到第 %d 页（标题不孤行）；"
+                                   "前页第 %d 页尾部仍剩约 %.0fpt"
+                                   % (bi + 1, cur["first_page"] + 1,
+                                      prev_page + 1, remaining_pt),
+                        "reason": "标题与长代码块同页移页，按 Chromium 实际分页登记待视觉复核",
+                        "input": str(chapter.path),
+                        "review": True,
+                        "page": cur["first_page"] + 1,
+                    }
+                )
+            elif remaining_pt >= required_pt:
                 block = chapter.code_blocks[bi]
                 lines = logical_lines_of(block)
                 failures.append(
@@ -5002,6 +5144,9 @@ def _destination_matches(pdf, annot, target, destinations, origins):
         first_page, (x0, _bottom, _right, y0) = images[0]
         # 图像的块级引导锚点可位于图片所在行盒的起点。
         upper = y0 + (10.5 * (1.65+0.45) if standalone else 0)
+        if standalone:
+            # 图片在版心内居中绘制，独立锚点段在版心边界（R17，同整表锚点）。
+            x0 = origin[0]
     else:
         boundary = 0
         first_page = event = None
@@ -5106,7 +5251,7 @@ def check_links(chapters, pdf, bounds, heading_pages, failures, reviews):
                 failures.append({"code": "internal-link-target",
                                  "message": f"{where} 期望对象 {target}，实际动作 {actions}", **detail})
             if not target and not link.get("range_out") and any(
-                    annot.get("uri") != link["href"] for annot in instance["annots"]):
+                    not _uri_equivalent(annot.get("uri"), link["href"]) for annot in instance["annots"]):
                 failures.append({"code": "external-link-missing",
                                  "message": where + " 的外链动作未保留", **detail})
         if len(actual) > len(expected):
@@ -5517,6 +5662,7 @@ def run_verification(args, *, run_context=None):
     failures = []
     relaxed = []
     reviews = []
+    bounds = []
     if not report_usable:
         failures.append({"code": "export-evidence-missing",
                          "message": "导出证据缺失或不可解析: %s；请在同一 --work-dir 先运行 "
@@ -5638,6 +5784,15 @@ def run_verification(args, *, run_context=None):
     enumerations = check_image_coverage(chapters, bindings, display_undetermined,
                          display_undetermined_raw, report,
                          bool(args.require_display_map), failures)
+    try:
+        adaptations = exporter.report_image_adaptations(report)
+    except exporter.ExportError as exc:
+        adaptations = None
+        failures.append({"code": "image-adaptations-mismatch", "message": str(exc)})
+    adaptation_diagnostics = []
+    exporter.apply_image_adaptations(chapters, enumerations, bindings, adaptations,
+                                     adaptation_diagnostics)
+    failures.extend(item for item in adaptation_diagnostics if item["severity"] == "fail")
 
     check_projection(chapters, report, pdf, failures, view_declaration)
     check_unlinked_links(chapters, pdf, args.unlink_target, report, failures)
@@ -5754,6 +5909,7 @@ def run_verification(args, *, run_context=None):
                     "message": aid["dependency_error"],
                 }
             )
+        aid["key_pages"] = visual_key_pages(aid, bounds, relaxed, reviews)
     return machine_pass, verify_report
 
 

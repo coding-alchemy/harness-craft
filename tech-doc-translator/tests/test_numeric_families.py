@@ -91,11 +91,9 @@ def test_paginated_ordered_sources_keep_occurrences():
         numeric_review=True)
     assert fail == 0
     hints = [m for m in msgs if m.startswith('数字提示 NUM')]
-    assert len(hints) == 4
-    assert any('[src_missing]#1' in h for h in hints)
-    assert any('[src_missing]#2' in h for h in hints)
-    assert any('[doc_added]#1' in h for h in hints)
-    assert any('[doc_added]#2' in h for h in hints)
+    assert len(hints) == 4 and len(set(hints)) == 4
+    assert sum('[src_missing] 104 billion @' in h for h in hints) == 2
+    assert sum('[doc_added] 1040 亿 @' in h for h in hints) == 2
 
 
 def test_paginated_unchecked_notice_by_default():

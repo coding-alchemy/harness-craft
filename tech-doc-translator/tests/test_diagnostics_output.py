@@ -24,6 +24,15 @@ class SummarizeTest(unittest.TestCase):
         self.assertIn('[6]', text)
         self.assertEqual(text.count('表格 table['), 3)   # 每类只列 3 条样例
 
+    def test_singleton_category_printed_once(self):
+        text = verification.summarize_messages(
+            ["强 token 增加 'HSTU': 源 116 处 vs 译 125 处",
+             "强 token 增加 'GEMM': 源 22 处 vs 译 31 处"])
+        self.assertEqual(text.split('\n'), [
+            '共 2 处，2 类：',
+            "  [1] 强 token 增加 'GEMM': 源 22 处 vs 译 31 处",
+            "  [1] 强 token 增加 'HSTU': 源 116 处 vs 译 125 处"])
+
     def test_reconcile_error_keeps_all_diffs(self):
         diffs = ['表格 table[%d] 不符' % i for i in range(9)]
         exc = latexml.ReconcileError('切片 #1', diffs)
@@ -63,6 +72,34 @@ class EvidenceMissingTest(unittest.TestCase):
             self.assertEqual(len(codes), 1, verify.stderr)
             self.assertIn('export-evidence-missing', codes[0])
             self.assertIn('同一 --work-dir', verify.stderr)
+
+
+class NumericSummaryTest(unittest.TestCase):
+    """第 2 批 R9 遗留：数字提示汇总为一行，逐项提示只在 --verbose 时打印。"""
+
+    def test_summary_warning_counts_categories(self):
+        import verify_reference_translation as reference
+        _fails, warns = reference.verify(
+            '# CUDA 指南\n\n模型有 1040 亿参数。\n',
+            '# CUDA 指南\n\nThe model has 104 billion parameters.\n',
+            [], doc_label='d.md', src_label='s.md', numeric_review=True)
+        self.assertIn('数字提示：共 2 处待复核（管理字段 0、标题或交叉引用 0、数量级或单位 2、'
+                      '其余 0），逐项见 verify_delivery --prepare-reviews 候选', warns)
+
+    def test_summarized_output_drops_item_hints(self):
+        with tempfile.TemporaryDirectory(prefix='numeric-summary-') as temp:
+            src, doc = Path(temp) / 's.md', Path(temp) / 'd.md'
+            src.write_text('# CUDA 指南\n\nvalues %s.\n'
+                           % ', '.join(str(n) for n in range(11, 23)), encoding='utf-8')
+            doc.write_text('# CUDA 指南\n\n一组数值。\n', encoding='utf-8')
+            command = [sys.executable, str(SCRIPTS / 'verify_reference_translation.py'),
+                       str(doc), str(src), '--numeric-review']
+            run = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertNotIn('数字提示 NUM[', run.stdout)
+            self.assertIn('数字提示：共 12 处待复核', run.stdout)
+            verbose = subprocess.run(command + ['--verbose'], capture_output=True, text=True)
+            self.assertEqual(verbose.stdout.count('数字提示 NUM['), 12)
 
 
 class SourceAdaptationArgTest(unittest.TestCase):

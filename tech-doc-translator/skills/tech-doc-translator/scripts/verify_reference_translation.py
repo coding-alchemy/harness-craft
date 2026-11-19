@@ -417,7 +417,9 @@ def verify(doc_text, src_text, strong_tokens, approved_extra_math=(),
             warns.append(numeric.format_policy_line(review['policy']))
             for diff in review['diffs']:
                 warns.append(numeric.format_diff_hint(diff))
-            if not review['diffs']:
+            if review['diffs']:
+                warns.append(numeric.format_diff_summary(review))
+            else:
                 warns.append('数字提示: 本次范围源/译逐字保留，无统计差异'
                              '（仍须独立语义复核，不授予完成）')
             warns.extend(numeric.unchecked_notes(review))
@@ -503,7 +505,9 @@ def main():
         for w in warns:
             print('   ⚠', w)
     elif warns:
-        print('   ⚠ ' + summarize_messages(warns).replace('\n', '\n     '))
+        # 逐项数字提示由上面的一行汇总代替；逐项 ID 见 --prepare-reviews 候选
+        shown = [w for w in warns if not w.startswith('数字提示 NUM[')]
+        print('   ⚠ ' + summarize_messages(shown).replace('\n', '\n     '))
         print('   （逐条告警加 --verbose）')
     sys.exit(0 if not fails else 1)
 
