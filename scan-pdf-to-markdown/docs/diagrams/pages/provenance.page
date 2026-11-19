@@ -1,0 +1,196 @@
+pageType: content
+background: {type: solid, color: "$paper"}
+notes: "按同一标识可查询两个派生文件。p0001-b0000 使用原始块索引。/pages/0/blocks/0 使用零起算的数组位置。图中的小页面是示意。"
+elements:
+  - elementId: source-map
+    elementType: shape
+    bounds: [330, 127, 284, 124]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$greenWash"}
+  - elementId: effective-blocks
+    elementType: shape
+    bounds: [330, 333, 284, 106]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$blueWash"}
+  - elementId: engine-record
+    elementType: shape
+    bounds: [725, 121, 237, 142]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$white"}
+    border: {"style": "solid", "width": 1, "color": "$lightLine"}
+  - elementId: source-pdf
+    elementType: shape
+    bounds: [725, 326, 237, 124]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$white"}
+    border: {"style": "solid", "width": 1, "color": "$lightLine"}
+  - elementId: printed-page
+    elementType: shape
+    bounds: [38, 152, 217, 260]
+    shapeName: "custom"
+    viewBox: [217, 260]
+    path: "M0,0 L176,0 L217,41 L217,260 L0,260 Z"
+    fill: {"type": "solid", "color": "$white"}
+    border: {"style": "solid", "width": 1, "color": "$lightLine"}
+  - elementId: fold
+    elementType: line
+    bounds: [214, 152, 41, 41]
+    viewBox: [41, 41]
+    points: "0,0 0,41 41,41"
+    curve: "sharp"
+    border: {"style": "solid", "width": 1, "color": "$greenLine"}
+    arrow: [null, null]
+  - elementId: sample-id
+    elementType: shape
+    bounds: [54, 259, 185, 50]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$ink"}
+  - elementId: sample-text-1
+    elementType: shape
+    bounds: [55, 330, 155, 4]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$lightLine"}
+  - elementId: sample-text-2
+    elementType: shape
+    bounds: [55, 351, 178, 4]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$lightLine"}
+  - elementId: sample-text-3
+    elementType: shape
+    bounds: [55, 372, 107, 4]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$lightLine"}
+  - elementId: page-to-map
+    elementType: line
+    bounds: [255, 186, 75, 98]
+    viewBox: [75, 98]
+    points: "0,98 36,98 36,0 75,0"
+    curve: "sharp"
+    border: {"style": "solid", "width": 2, "color": "$greenLine"}
+    arrow: [null, "stealth"]
+  - elementId: page-to-blocks
+    elementType: line
+    bounds: [291, 284, 39, 99]
+    viewBox: [39, 99]
+    points: "0,0 0,99 39,99"
+    curve: "sharp"
+    border: {"style": "dash", "width": 2, "color": "$blue"}
+    arrow: [null, "stealth"]
+  - elementId: map-to-zip
+    elementType: line
+    bounds: [614, 186, 111, 1]
+    viewBox: [111, 1]
+    points: "0,0 111,0"
+    curve: "sharp"
+    border: {"style": "solid", "width": 2, "color": "$greenLine"}
+    arrow: [null, "stealth"]
+  - elementId: map-to-pdf
+    elementType: line
+    bounds: [614, 222, 111, 158]
+    viewBox: [111, 158]
+    points: "0,0 54,0 54,158 111,158"
+    curve: "sharp"
+    border: {"style": "solid", "width": 2, "color": "$greenLine"}
+    arrow: [null, "stealth"]
+  - elementId: pdf-preview
+    elementType: shape
+    bounds: [882, 346, 55, 77]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$paper"}
+    border: {"style": "solid", "width": 1, "color": "$lightLine"}
+  - elementId: pdf-preview-line1
+    elementType: shape
+    bounds: [891, 359, 32, 3]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$lightLine"}
+  - elementId: pdf-preview-box
+    elementType: shape
+    bounds: [891, 369, 37, 24]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$greenWash"}
+    border: {"style": "solid", "width": 1, "color": "$greenLine"}
+  - elementId: pdf-preview-line2
+    elementType: shape
+    bounds: [891, 401, 34, 3]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$lightLine"}
+  - elementId: footnote-rule
+    elementType: line
+    bounds: [38, 486, 924, 1]
+    viewBox: [924, 1]
+    points: "0,0 924,0"
+    curve: "sharp"
+    border: {"style": "solid", "width": 1, "color": "$lightLine"}
+    arrow: [null, null]
+  - elementId: title
+    elementType: text
+    bounds: [38, 27, 900, 44]
+    content: {"text": "从正文块查回原始证据", "style": "$title", "align": ["left", "middle"], "wrap": false}
+  - elementId: subtitle
+    elementType: text
+    bounds: [40, 75, 900, 27]
+    content: {"text": "用同一个块 ID 查来源位置和有效内容", "style": "$body", "align": ["left", "middle"], "wrap": false}
+  - elementId: markdown
+    elementType: text
+    bounds: [55, 192, 151, 28]
+    content: {"text": "document.md", "style": "$code", "align": ["left", "middle"], "wrap": false}
+  - elementId: block-marker
+    elementType: text
+    bounds: [55, 227, 176, 26]
+    content: {"text": "正文注释中的块 ID", "style": "$body", "align": ["left", "middle"], "wrap": false}
+  - elementId: block-id
+    elementType: text
+    bounds: [68, 271, 159, 27]
+    content: {"text": "p0001-b0000", "style": "$code", "align": ["left", "middle"], "wrap": false, "color": "$white"}
+  - elementId: source-map-name
+    elementType: text
+    bounds: [351, 147, 242, 28]
+    content: {"text": "source-map.json", "style": "$code", "align": ["left", "middle"], "wrap": false}
+  - elementId: source-map-role
+    elementType: text
+    bounds: [351, 183, 246, 25]
+    content: {"text": "索引物理页、坐标与原始记录", "style": "$body", "align": ["left", "middle"], "wrap": false, "fontSize": 18}
+  - elementId: source-map-fields
+    elementType: text
+    bounds: [351, 213, 244, 23]
+    content: {"text": "raw_refs · page · bbox", "style": "$code", "align": ["left", "middle"], "wrap": false, "color": "$green", "fontSize": 16}
+  - elementId: blocks-name
+    elementType: text
+    bounds: [351, 349, 242, 28]
+    content: {"text": "blocks.jsonl", "style": "$code", "align": ["left", "middle"], "wrap": false}
+  - elementId: blocks-info
+    elementType: text
+    bounds: [351, 388, 246, 27]
+    content: {"text": "有效正文、行列、子块与配图", "style": "$body", "align": ["left", "middle"], "wrap": false, "fontSize": 18}
+  - elementId: zip-title
+    elementType: text
+    bounds: [743, 135, 203, 29]
+    content: {"text": "原始识别记录", "style": "$heading", "align": ["left", "middle"], "wrap": false, "fontSize": 22}
+  - elementId: zip
+    elementType: text
+    bounds: [743, 170, 204, 23]
+    content: {"text": "raw/engine.zip", "style": "$code", "align": ["left", "middle"], "wrap": false, "fontSize": 17}
+  - elementId: middle
+    elementType: text
+    bounds: [743, 196, 204, 23]
+    content: {"text": "middle_json.json", "style": "$code", "align": ["left", "middle"], "wrap": false, "fontSize": 17}
+  - elementId: pointer
+    elementType: text
+    bounds: [743, 224, 204, 23]
+    content: {"text": "/pages/0/blocks/0", "style": "$code", "align": ["left", "middle"], "wrap": false, "color": "$green", "fontSize": 17}
+  - elementId: pdf-title
+    elementType: text
+    bounds: [743, 342, 126, 30]
+    content: {"text": "源 PDF", "style": "$heading", "align": ["left", "middle"], "wrap": false, "fontSize": 22}
+  - elementId: pdf-page
+    elementType: text
+    bounds: [743, 376, 126, 25]
+    content: {"text": "物理页 1", "style": "$body", "align": ["left", "middle"], "wrap": false, "fontSize": 19}
+  - elementId: pdf-bbox
+    elementType: text
+    bounds: [743, 407, 131, 25]
+    content: {"text": "有框时定位区域", "style": "$body", "align": ["left", "middle"], "wrap": false, "fontSize": 17}
+  - elementId: example
+    elementType: text
+    bounds: [40, 504, 920, 29]
+    content: {"text": "图中块在物理页 1，原始 index 为 0，也位于块数组首位。缺框时仍可按物理页复核。", "style": "$body", "align": ["left", "middle"], "wrap": false}

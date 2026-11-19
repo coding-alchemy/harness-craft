@@ -1,0 +1,39 @@
+version: v2
+title: 扫描 PDF 阅读包架构
+size: [1000, 576]
+theme:
+  colors:
+    paper: "#F6F8F5"
+    white: "#FFFFFF"
+    ink: "#102E2B"
+    muted: "#3F5854"
+    green: "#176956"
+    greenLine: "#2B7966"
+    greenWash: "#E1F0EA"
+    blue: "#2E5A73"
+    blueWash: "#E8EFF4"
+    lightLine: "#C6D8D1"
+    lightText: "#D8F4E8"
+  textStyles:
+    title:
+      fontFamily: {latin: Arial, ea: PingFang SC}
+      color: "$ink"
+      fontSize: 36
+      bold: true
+    heading:
+      fontFamily: {latin: Arial, ea: PingFang SC}
+      color: "$ink"
+      fontSize: 24
+      bold: true
+    body:
+      fontFamily: {latin: Arial, ea: PingFang SC}
+      color: "$muted"
+      fontSize: 19
+    code:
+      fontFamily: {latin: Menlo, ea: PingFang SC}
+      color: "$ink"
+      fontSize: 20
+      bold: true
+pages:
+  - pages/pipeline.page
+  - pages/provenance.page
