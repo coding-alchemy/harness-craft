@@ -221,13 +221,13 @@ def test_diff_ids_deterministic_and_content_rich():
     assert len(ids_a) == 2 and len(set(ids_a)) == 2
     for diff in first['diffs']:
         assert '[full][src_missing]' in diff['id']
-        assert '1.0' in diff['id'] and '@s.md:L1' in diff['id']
-    # 位置变化 → ID 从本次扫描重新生成（不承担跨版本稳定状态）
+        assert '1.0' in diff['id'] and '@s.md ‹' in diff['id']
+    # 只改格式（拆段）→ ID 不变（第 2 批 R11）
     moved = numeric.compute_numeric_review('alpha 1.0\n\nbeta 1.0\n',
                                            'alpha\n\nbeta\n',
                                            's.md', 'd.md', 'full')
     ids_moved = [d['id'] for d in moved['diffs']]
-    assert ids_moved != ids_a
+    assert ids_moved == ids_a
 
 
 def test_policy_identity_default_and_file(tmp_path):
@@ -276,9 +276,9 @@ def test_reference_verify_reports_diffs_as_hints_not_fails():
                            '# CUDA 指南\n\nThe model has 104 billion '
                            'parameters.\n', numeric_review=True)
     assert not fails
-    hints = [w for w in warns if w.startswith('数字提示')]
+    hints = [w for w in warns if w.startswith('数字提示 NUM[')]
     assert len(hints) == 2
-    assert any('104 billion @s.md:L3' in w for w in hints)
+    assert any('104 billion @s.md ‹' in w and '（L3' in w for w in hints)
     assert any('无统计差异' not in w for w in hints)
 
 

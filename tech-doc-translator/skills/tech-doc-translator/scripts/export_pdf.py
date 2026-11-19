@@ -382,6 +382,40 @@ def wrap_code_block(rendered_html, code):
         code_block_class(code), rendered_html)
 
 
+_FIGURE_CAPTION = re.compile(r"图\s*[0-9A-Z]|(?:Figure|Fig\.)\s+[0-9A-Z]")
+_SUBFIGURE_CAPTION = re.compile(r"[（(][a-z0-9]{1,4}[)）]")
+
+
+def _image_paragraph(node):
+    """只含一张图片（或一个只包着图片的链接）的段落。"""
+    children = node.find_all(recursive=False)
+    return (node.name == "p" and not node.get_text(strip=True) and len(children) == 1
+            and (children[0].name == "img" or children[0].name == "a" and [
+                child.name for child in children[0].find_all(recursive=False)] == ["img"]))
+
+
+def mark_figure_captions(soup):
+    """紧跟图片段、以加粗图题或子图题开头的段落加 image-caption 类（R17 D4）。
+
+    段首的行内 <a id> 锚点不算；子图题之后接着看下一段，遇到独立锚点段或其他内容即停。
+    """
+    for image in [node for node in soup.find_all("p") if _image_paragraph(node)]:
+        node = image.find_next_sibling()
+        while node is not None and node.name == "p" and "anchor-only" not in node.get("class", ()):
+            lead = next((child for child in node.contents
+                         if not (child.name == "a" and child.has_attr("id")
+                                 and not child.has_attr("href"))
+                         and (child.name or child.strip())), None)
+            text = lead.get_text().lstrip() if getattr(lead, "name", None) == "strong" else ""
+            subfigure = _SUBFIGURE_CAPTION.match(text)
+            if not (subfigure or _FIGURE_CAPTION.match(text)):
+                break
+            node["class"] = node.get("class", []) + ["image-caption"]
+            if not subfigure:
+                break
+            node = node.find_next_sibling()
+
+
 def soup_images(chapter):
     return [img for img in chapter.soup.find_all("img") if img.get("src")]
 
@@ -2934,6 +2968,7 @@ def parse_chapter(chapter):
                 paragraph.decompose()
             else:
                 paragraph["class"] = paragraph.get("class", []) + ["anchor-only"]
+    mark_figure_captions(soup)
     for anchor in soup.find_all("a", id=True, href=False):
         chapter.targets.setdefault(anchor["id"], {"kind": "anchor"})
         chapter.source_anchors.append(anchor["id"])
@@ -3598,6 +3633,8 @@ def enumerate_images(chapter, diagnostics):
 # 11 张 >2600px 原图全部解码失败）。重采样只影响 data URI，交付文件的
 # 字节、身份核对（枚举阶段按原文件完成）与显示宽度注入均不受影响。
 EMBED_MAX_EDGE = 2600
+# SVG 派生位图至少是显示宽度的这一倍数像素（R18 D5）；写入导出报告，核验按报告重建。
+SVG_RASTER_SCALE = 2
 
 
 def _svg_resource_facts(svg_path):
@@ -3615,7 +3652,140 @@ def _svg_resource_facts(svg_path):
             "svg_dependencies": {path: sha256_file(path) for path in dependencies}}
 
 
-def svg_print_dimensions(record, binding):
+IMAGE_ADAPTATIONS_VERSION = 1
+
+
+def _svg_original_box(path):
+    """SVG 原始坐标框：有 viewBox 取 viewBox，否则取数值 width/height（R8）。"""
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError) as exc:
+        raise ExportError("图片适配：SVG 无法读取 %s（%s）" % (path, exc)) from exc
+    box = (root.get("viewBox") or "").replace(",", " ").split()
+    if len(box) == 4:
+        try:
+            return tuple(float(value) for value in box)
+        except ValueError:
+            pass
+    sizes = []
+    for name in ("width", "height"):
+        match = re.fullmatch(r"([0-9]*\.?[0-9]+)(?:px)?", (root.get(name) or "").strip())
+        sizes.append(float(match[1]) if match else None)
+    if None in sizes:
+        raise ExportError("图片适配：SVG 没有可确定的原始坐标框 %s" % path)
+    return (0.0, 0.0, sizes[0], sizes[1])
+
+
+def load_image_adaptations(path):
+    """读取并校验项目图片适配声明（R8）。声明只作导出输入，不修改任何图片。
+
+    返回 {"path", "sha256", "images"}；images 以图片规范化完整路径为键，
+    值为 {"sha256", "viewbox": (x, y, w, h) | None, "display_width_px", "basis"}。
+    """
+    if not path:
+        return None
+    path = Path(path).expanduser().resolve()
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ExportError("图片适配声明无法读取：%s（%s）" % (path, exc)) from exc
+    if (not isinstance(payload, dict)
+            or payload.get("version") != IMAGE_ADAPTATIONS_VERSION
+            or not isinstance(payload.get("images"), list)):
+        raise ExportError('图片适配声明须为 {"version": 1, "images": [...]}：%s' % path)
+    images = {}
+    for number, item in enumerate(payload["images"], start=1):
+        label = "图片适配 #%d" % number
+        if not isinstance(item, dict) or not isinstance(item.get("image"), str):
+            raise ExportError("%s 缺少 image" % label)
+        image = (path.parent / item["image"]).resolve()
+        if not image.is_file():
+            raise ExportError("%s 的图片不存在：%s" % (label, image))
+        if item.get("sha256") != sha256_file(image):
+            raise ExportError("%s 的 sha256 与当前文件不符：%s" % (label, image))
+        basis = item.get("basis")
+        if not isinstance(basis, str) or not basis.strip():
+            raise ExportError("%s 缺少批准依据 basis" % label)
+        width = item.get("display_width_px")
+        if width is not None and (isinstance(width, bool) or not isinstance(width, (int, float))
+                                  or not 0 < width <= CONTENT_WIDTH_PX):
+            raise ExportError("%s 的 display_width_px 须在 (0, %.0f] 内：%r"
+                              % (label, CONTENT_WIDTH_PX, width))
+        viewbox = item.get("viewbox")
+        if viewbox is not None:
+            if image.suffix.lower() != ".svg":
+                raise ExportError("%s：位图裁剪不支持，只能声明 display_width_px" % label)
+            try:
+                box = tuple(float(value) for value in str(viewbox).replace(",", " ").split())
+            except ValueError:
+                box = ()
+            if len(box) != 4 or box[2] <= 0 or box[3] <= 0:
+                raise ExportError("%s 的 viewbox 须为四个数且宽高为正：%r" % (label, viewbox))
+            ox, oy, ow, oh = _svg_original_box(image)
+            if (box[0] < ox or box[1] < oy or box[0] + box[2] > ox + ow
+                    or box[1] + box[3] > oy + oh):
+                raise ExportError("%s 的 viewbox 超出原图范围 %r" % (label, (ox, oy, ow, oh)))
+            viewbox = box
+        if viewbox is None and width is None:
+            raise ExportError("%s 至少声明 viewbox 或 display_width_px" % label)
+        if str(image) in images:
+            raise ExportError("%s 重复声明同一图片：%s" % (label, image))
+        images[str(image)] = {
+            "sha256": item["sha256"], "viewbox": viewbox,
+            "display_width_px": float(width) if width is not None else None,
+            "basis": basis.strip()}
+    return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "images": images}
+
+
+def apply_image_adaptations(chapters, enumerations, bindings, adaptations, diagnostics):
+    """把适配声明作用到逐出现的显示尺寸绑定上（R8）；不改任何文件。"""
+    if not adaptations:
+        return
+    used = set()
+    for chapter in chapters:
+        for index, record in enumerate(enumerations.get(chapter.path, []), start=1):
+            key = os.path.realpath(record["path"])
+            item = adaptations["images"].get(key)
+            if item is None:
+                continue
+            used.add(key)
+            binding = bindings.get(chapter.path, {}).get(index)
+            if binding is None:
+                diagnostics.append({
+                    "severity": "fail", "code": "image-adaptation-unbound",
+                    "input": str(chapter.path), "line": record.get("line"),
+                    "message": "图片 #%d 声明了适配，但没有显示尺寸绑定：%s" % (index, key)})
+                continue
+            if item["display_width_px"] is not None:
+                binding["px"] = item["display_width_px"]
+                binding["record"]["applied_px"] = item["display_width_px"]
+                binding["record"]["capped"] = False
+            binding["viewbox"] = item["viewbox"]
+            binding["adaptation"] = {
+                "image": key, "basis": item["basis"],
+                "viewbox": list(item["viewbox"]) if item["viewbox"] else None,
+                "display_width_px": item["display_width_px"]}
+    for key in sorted(set(adaptations["images"]) - used):
+        diagnostics.append({
+            "severity": "fail", "code": "image-adaptation-unused",
+            "message": "图片适配声明的图片不在本次输入中：%s" % key})
+
+
+def report_image_adaptations(report):
+    """核验侧取导出时生效的适配声明：按报告路径重读，摘要须与报告一致（R8）。"""
+    recorded = (report or {}).get("image_adaptations")
+    if not recorded:
+        return None
+    current = load_image_adaptations(recorded.get("path"))
+    if current["sha256"] != recorded.get("sha256"):
+        raise ExportError("图片适配声明在导出后被改动：%s" % recorded.get("path"))
+    return current
+
+
+def svg_print_dimensions(record, binding, scale=1):
     """已绑定显示宽度或含外部本地依赖的 SVG 需要可独立对账的负载。"""
     if record["kind"] != "SVG" or not (binding or record["svg_dependencies"]):
         return None
@@ -3626,7 +3796,11 @@ def svg_print_dimensions(record, binding):
     path = record["path"]
     if binding and binding.get("source_resource") not in (None, record["svg_identity"]):
         raise ExportError(f"SVG 递归身份与映射来源不一致：{path}（映射 {binding['map_path']}）")
-    ratio, basis = _svg_intrinsic_ratio(path)
+    crop = (binding or {}).get("viewbox")
+    if crop:
+        ratio, basis = crop[2] / crop[3], "adaptation-viewbox"
+    else:
+        ratio, basis = _svg_intrinsic_ratio(path)
     if not ratio or not isfinite(ratio) or ratio <= 0:
         raise ExportError(f"SVG 无可核验固有比例：{path}（{basis}）")
     try:
@@ -3636,7 +3810,10 @@ def svg_print_dimensions(record, binding):
     width = re.fullmatch(r"([0-9]*\.?[0-9]+)(?:px)?", (root.get("width") or "").strip())
     natural = float(width[1]) if width else 0
     viewbox = (root.get("viewBox") or "").replace(",", " ").split()
-    native = float(viewbox[2]) if basis == "svg-viewbox" else natural
+    if crop:
+        native = crop[2]
+    else:
+        native = float(viewbox[2]) if basis == "svg-viewbox" else natural
     display = binding["px"] if binding else natural
     if not display or not isfinite(display):
         raise ExportError(f"含本地依赖的 SVG 缺可确定显示宽度：{path}")
@@ -3644,15 +3821,18 @@ def svg_print_dimensions(record, binding):
     pixels = min(max(physical, native), EMBED_MAX_EDGE, EMBED_MAX_EDGE * ratio)
     if not isfinite(pixels) or pixels + 0.5 < physical:
         raise ExportError(f"SVG 在位图长边预算内无法保留显示分辨率：{path}")
-    return ceil(pixels), max(1, round(pixels / ratio)), display
+    width, height = ceil(pixels), max(1, round(pixels / ratio))
+    # 不足 scale 倍显示宽度时宽高同乘整数倍：宽高比不变，版面不动；不超过长边预算（R18）。
+    factor = max(1, min(ceil(scale * physical / width), EMBED_MAX_EDGE // max(width, height)))
+    return width * factor, height * factor, display
 
 
 def render_svg_payload(svg_path: str, *, width_px: int, height_px: int,
-                       resource_registry, browser) -> tuple[bytes, dict]:
+                       resource_registry, browser, viewbox=None) -> tuple[bytes, dict]:
     """只向离线浏览器提供已核对的源 SVG 与依赖，生成白底 PNG。"""
     svg_path = os.path.realpath(svg_path)
     facts = _svg_resource_facts(svg_path)
-    key = (facts["svg_identity"], width_px, height_px)
+    key = (facts["svg_identity"], width_px, height_px, tuple(viewbox) if viewbox else None)
     cached = resource_registry.setdefault(svg_path, {}).setdefault("svg_payloads", {})
     if key in cached:
         return cached[key]
@@ -3680,16 +3860,18 @@ def render_svg_payload(svg_path: str, *, width_px: int, height_px: int,
         page = context.new_page()
         page.on("requestfailed", lambda request: denied.append(request.url))
         page.goto("https://" + host + quote(svg_path), wait_until="load")
-        page.evaluate("""async ([width, height]) => {
+        crop = " ".join("%g" % value for value in viewbox) if viewbox else None
+        page.evaluate("""async ([width, height, crop]) => {
           const svg = document.documentElement;
           if (svg.localName !== 'svg') throw Error('SVG root missing');
           const box = svg.getBoundingClientRect();
-          if (!svg.hasAttribute('viewBox')) svg.setAttribute('viewBox', [0, 0, box.width, box.height].join(' '));
+          if (crop) svg.setAttribute('viewBox', crop);
+          else if (!svg.hasAttribute('viewBox')) svg.setAttribute('viewBox', [0, 0, box.width, box.height].join(' '));
           svg.style.setProperty('width', width + 'px', 'important');
           svg.style.setProperty('height', height + 'px', 'important');
           svg.style.setProperty('background-color', 'white', 'important');
           await document.fonts.ready;
-        }""", [width_px, height_px])
+        }""", [width_px, height_px, crop])
         payload = page.screenshot(animations="disabled")
     except Exception as exc:
         raise ExportError(f"SVG 离线派生失败：{svg_path}（{exc}）") from exc
@@ -3706,17 +3888,19 @@ def render_svg_payload(svg_path: str, *, width_px: int, height_px: int,
         "embedded": {"sha256": hashlib.sha256(payload).hexdigest(),
                      "width": width_px, "height": height_px},
     }
+    if viewbox:
+        evidence["render"]["viewbox"] = list(viewbox)
     cached[key] = payload, evidence
     return cached[key]
 
 
-def plan_svg_renders(chapters, enumerations, bindings, diagnostics):
+def plan_svg_renders(chapters, enumerations, bindings, diagnostics, scale=1):
     plans = []
     for chapter in chapters:
         for index, record in enumerate(enumerations[chapter.path], 1):
             binding = bindings.get(chapter.path, {}).get(index)
             try:
-                dimensions = svg_print_dimensions(record, binding)
+                dimensions = svg_print_dimensions(record, binding, scale)
             except (ExportError, OSError, ValueError) as exc:
                 diagnostics.append({
                     "severity": "fail", "code": "svg-print-size",
@@ -3729,7 +3913,8 @@ def plan_svg_renders(chapters, enumerations, bindings, diagnostics):
                 plans.append({"input": str(chapter.path), "image_index": index,
                               "record": record, "width": width, "height": height,
                               "display_px": display_px,
-                              "display": binding["record"]["width"] if binding else None})
+                              "display": binding["record"]["width"] if binding else None,
+                              "viewbox": binding.get("viewbox") if binding else None})
     return plans
 
 
@@ -4182,11 +4367,64 @@ def check_math_only(paths, katex_macros=None, source_adaptations=None):
     return 1 if checks["katex"] else 0
 
 
+STRICT_PDF_PARAMS = ("--require-display-map", "--toc-sections", "--images-display",
+                     "--provenance", "--view-declaration", "--unlink-target",
+                     "--navigation-record/--site-root")
+
+
+def record_pdf_param_mismatches(record_path, output, current):
+    """R12：与记录里 --pdf 指向本次输出的 verify_pdf 检查逐项比对严格参数。
+
+    current 的键与 verify_pdf 参数属性同名（require_display_map、toc_sections、
+    images_display、provenance、view_declaration、unlink_target、
+    navigation_record、site_root），路径按调用 cwd 解释；记录侧路径按交付根
+    解释。返回“参数：记录 X / 本次 Y”列表；没有对应的 verify_pdf 检查时返回 []。
+    """
+    from verify_delivery import _parse_tool_args, _rooted
+
+    with open(record_path, encoding="utf-8") as handle:
+        record = json.load(handle)
+    root = os.path.realpath(record["delivery_root"])
+    target = os.path.realpath(os.path.expanduser(str(output)))
+
+    def project(get, real):
+        pairs = zip(get("navigation_record") or [], get("site_root") or [])
+        return {
+            "--require-display-map": bool(get("require_display_map")),
+            "--toc-sections": bool(get("toc_sections")),
+            "--images-display": sorted(real(p) for p in get("images_display") or []),
+            "--provenance": [real(p) for p in [get("provenance")] if p],
+            "--view-declaration": [real(p) for p in [get("view_declaration")] if p],
+            "--unlink-target": sorted(real(p) for p in get("unlink_target") or []),
+            "--navigation-record/--site-root": sorted(
+                "%s @ %s" % (real(record_item), real(site)) for record_item, site in pairs),
+        }
+
+    def show(value):
+        if isinstance(value, bool):
+            return "启用" if value else "未启用"
+        return "、".join(value) or "无"
+
+    here = project(current.get, lambda p: os.path.realpath(os.path.expanduser(str(p))))
+    mismatches = []
+    for order, check in enumerate(record.get("checks") or [], start=1):
+        if check.get("tool") != "verify_pdf":
+            continue
+        parsed = _parse_tool_args("verify_pdf", list(check.get("args") or []), [], order, root)
+        if parsed is None or os.path.realpath(_rooted(root, parsed.pdf)) != target:
+            continue
+        recorded = project(lambda key: getattr(parsed, key, None),
+                           lambda p: os.path.realpath(_rooted(root, str(p))))
+        mismatches.extend("%s：记录 %s / 本次 %s" % (name, show(recorded[name]), show(here[name]))
+                          for name in STRICT_PDF_PARAMS if recorded[name] != here[name])
+    return mismatches
+
+
 def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
            toc_sections=False, require_display_map=False,
            provenance_map_path=None, translation_record_path=None,
            view_declaration_path=None, source_adaptation_path=None,
-           katex_macros_path=None, *,
+           katex_macros_path=None, image_adaptations_path=None, *,
            run_context=None, navigation_records=(), navigation_site_roots=()):
     from verify_delivery import (
         check_translation_readiness_cli, new_run_context, progress_stage,
@@ -4208,11 +4446,18 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     except PdfDependencyError as exc:
         raise ExportError(str(exc)) from exc
     diagnostics = []
+    image_adaptations = load_image_adaptations(image_adaptations_path)
     report = {
         "diagnostics": diagnostics,
         "katex_macros": ({"path": str(Path(katex_macros_path).expanduser().absolute()),
                           "sha256": hashlib.sha256(Path(katex_macros_path).expanduser().read_bytes()).hexdigest(),
                           "macros": katex_macros} if katex_macros_path else None),
+        "image_adaptations": ({
+            "path": image_adaptations["path"], "sha256": image_adaptations["sha256"],
+            "images": [dict(item, image=image,
+                            viewbox=list(item["viewbox"]) if item["viewbox"] else None)
+                       for image, item in sorted(image_adaptations["images"].items())],
+        } if image_adaptations else None),
     }
 
     # 翻译验收身份门禁（§4.7，只读）：翻译加导出必须传入验收记录；
@@ -4237,6 +4482,19 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
             return 1
         readiness_projection = readiness.get("identity") or {}
         readiness_record_sha256 = readiness["record_sha256"]
+        mismatches = record_pdf_param_mismatches(translation_record_path, output, {
+            "require_display_map": require_display_map, "toc_sections": toc_sections,
+            "images_display": images_display_paths, "provenance": provenance_map_path,
+            "view_declaration": view_declaration_path, "unlink_target": unlink_targets,
+            "navigation_record": navigation_records, "site_root": navigation_site_roots})
+        if mismatches:
+            report["status"] = STATUS_MACHINE_FAIL
+            report["error"] = ("导出参数与交付记录的 verify_pdf 检查不一致："
+                               + "；".join(mismatches))
+            (work_dir / REPORT_NAME).write_text(
+                json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            print("FAIL: %s（本次导出停止，旧成品不变）" % report["error"], file=sys.stderr)
+            return 1
 
     # 来源依据上下文（二期 02-6）：显式 --source-adaptation 优先（可重复，
     # 多快照 F7/§7.5）；翻译加导出从 --translation-record 的就绪投影取得
@@ -4478,7 +4736,9 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
     enumerations = {}
     for chapter in chapters:
         enumerations[chapter.path] = enumerate_images(chapter, diagnostics)
-    svg_plans = plan_svg_renders(chapters, enumerations, bindings, diagnostics)
+    apply_image_adaptations(chapters, enumerations, bindings, image_adaptations, diagnostics)
+    svg_plans = plan_svg_renders(chapters, enumerations, bindings, diagnostics,
+                                 scale=SVG_RASTER_SCALE)
     svg_pixels = {(plan["input"], plan["image_index"]): (plan["width"], plan["height"])
                   for plan in svg_plans}
     occurrences = [
@@ -4642,7 +4902,8 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                     source = plan["record"]
                     payload, evidence = render_svg_payload(
                         source["path"], width_px=plan["width"], height_px=plan["height"],
-                        resource_registry=resource_registry, browser=browser)
+                        resource_registry=resource_registry, browser=browser,
+                        viewbox=plan.get("viewbox"))
                     if evidence["source"][1] != source["svg_identity"]:
                         raise ExportError(f"SVG 在打印准备期间发生变化：{source['path']}")
                     image = source["img"]
@@ -4787,6 +5048,7 @@ def export(paths, output, work_dir, unlink_targets=(), images_display_paths=(),
                 "out_links": toc_out_links,
             },
             "browser_checks": browser_checks,
+            "svg_raster_scale": SVG_RASTER_SCALE,
             "svg_renders": svg_renders,
             "inputs": inputs,
             "resources": resources,
@@ -5055,6 +5317,9 @@ def main(argv=None):
     parser.add_argument("--katex-macros", metavar="JSON",
                         help='KaTeX 宏表：{"\\\\textsc": "\\\\text"}，只改交给渲染器的 TeX，'
                              '不改 data-tex 与核验基准；写入导出报告')
+    parser.add_argument("--image-adaptations", metavar="JSON",
+                        help="项目图片适配声明：SVG viewBox 裁剪与显示宽度，只在导出时生效，"
+                             "不改图片文件；写入导出报告")
     parser.add_argument("--check-math", action="store_true",
                         help="只渲染公式并列出全部失败，不排版、不出 PDF、不写导出报告")
     args = parser.parse_args(argv)
@@ -5083,6 +5348,7 @@ def main(argv=None):
                 view_declaration_path=args.view_declaration,
                 source_adaptation_path=args.source_adaptation,
                 katex_macros_path=args.katex_macros,
+                image_adaptations_path=args.image_adaptations,
                 run_context=run_context,
                 navigation_records=args.navigation_record,
                 navigation_site_roots=args.site_root,

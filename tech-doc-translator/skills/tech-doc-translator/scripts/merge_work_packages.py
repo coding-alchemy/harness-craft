@@ -361,7 +361,8 @@ def merge(out_path, inputs, source_path, strategy, wps_dir, evidence_path=None,
                              % (received[key]['path'], path))
         if key not in expected:
             raise ValueError('额外包（当前源预期中不存在）: %s' % path)
-        if meta['source_file'] != source_abs:
+        # 按真实路径比对：同一文件经符号链接或物理路径给出都算同源（R20）。
+        if os.path.realpath(meta['source_file']) != os.path.realpath(source_abs):
             raise ValueError('异源包: %s 的 source_file 为 %s，与当前源 %s 不符'
                              % (path, meta['source_file'], source_abs))
         if meta['source_order'] != expected[key]['order']:

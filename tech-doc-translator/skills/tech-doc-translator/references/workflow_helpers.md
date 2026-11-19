@@ -29,7 +29,7 @@ python3 "$SCRIPTS/verify_pdf.py" --pdf "$PDF" --work-dir "$CURRENT_REPORT" "$CHA
 
 按实际情况在两条命令传入同一交付级图像映射及适用的来源依据。复制和摘要核对成功后，把同一记录改为 `translation+pdf`，登记 PDF 角色和输出摘要，在原有翻译检查后追加 `verify_pdf` 的实际参数。首次准备 PDF 复核候选及登记视觉绑定时，记录中的 `--work-dir` 已指向 `CURRENT_REPORT`。目标报告已存在时停止复制，保持原记录和报告。按当前绑定登记实际视觉及适用链接复核，再用 `verify_delivery.py --record "$RECORD" --evidence-dir "$EVIDENCE"` 发布。仅增加 PDF 事实时，已核对的翻译范围和复核无需重录。来源、正文或核验口径变化后，按实际影响重核。
 
-就绪、打印、机器核验、复核门禁和发布的阶段进度写入 stderr，现有 stdout 结果可照常消费。同一次调用中仍使用同一身份的已完成翻译结果可复用；独立来源对账、人工复核和发布前的当前身份复查各自保留。
+就绪、打印、机器核验、复核门禁和发布的阶段进度写入 stderr，现有 stdout 结果可照常消费。阶段运行超过 60 秒时，每 60 秒输出一行 `running`，带已运行秒数。同一次调用中仍使用同一身份的已完成翻译结果可复用；独立来源对账、人工复核和发布前的当前身份复查各自保留。
 
 统一入口出现 `translation-readiness-invalid` 时，可把当前 `export_report.json` 原字节复制到新临时目录，使用记录实际调用的解释器、PDF、输入顺序和其余参数运行独立 `verify_pdf.py`，仅把 `--work-dir` 指向副本目录，从新 `verify_report.json` 读取具体失败原因。若指向检查器身份变化，对照实际加载的脚本及复核绑定摘要；历史版本的复验用于回查，当前交付仍按当前入口和真实复核闭合。
 
@@ -38,6 +38,17 @@ python3 "$SCRIPTS/verify_pdf.py" --pdf "$PDF" --work-dir "$CURRENT_REPORT" "$CHA
 用 `verify_delivery.py --record "$RECORD" --prepare-reviews "$CANDIDATE"` 在显式新路径生成复核候选。它按同一硬检查准备当前适用条目的绑定和逐项待办，原记录和索引保留。先实际回源、判读或目检，逐项登记依据并填写原有 `note/items/status`，再将闭合条目登记到当前记录，走正式 `--evidence-dir` 入口。候选中的 `pending` 和预填 `items` 表示待办。旧闭合条目仅在当前绑定、摘要和待处置覆盖一致时沿用。
 
 同路径重导出时，在覆盖前保留原实际视觉复核记录及旧成品、旧报告。当前视觉候选可按[显式视觉复用](pdf_export.md#显式视觉复用)人工登记 `reused`，由正式入口重验全页等价和原件。适用的链接复核另行核对并登记。
+
+## 检查器变化后的恢复
+
+组件脚本（检查器）变化后，记录里的复核绑定和导出报告里的依赖摘要同时失效，只重建一边不会通过。先把原记录另存一份，再按下列顺序恢复，每步到达检查点再做下一步：
+
+1. 记录临时改为 `translation` 模式（去掉 PDF 输出与 verify_pdf 检查）：`translation+pdf` 模式下准备候选会先卡在 PDF 旧证据的复验上。用 `verify_delivery.py --prepare-reviews` 取当前绑定，按当前检查实际重核，重新登记 source-reconcile 与 semantic 复核。检查点：带 `--translation-record` 的导出通过就绪检查。
+2. 导出到新的临时目录，按[单记录流程](#单记录翻译与-pdf-交付)把报告复制到持久目录，运行 `verify_pdf`。检查点：`verify_pdf` 没有失败项。
+3. 按另存的原记录把 PDF 输出与 verify_pdf 检查加回，模式改回 `translation+pdf`，再用 `--prepare-reviews` 取视觉与链接复核的当前绑定；成品像素不变时按[显式视觉复用](pdf_export.md#显式视觉复用)登记 `reused`。检查点：候选里没有缺绑定的条目。
+4. `verify_delivery.py --evidence-dir` 发布。检查点：输出“交付检查通过”。
+
+`--prepare-reviews` 或发布报“依赖身份在运行期间变化”时，报错列出变化的身份键和文件：找到运行期间写这些文件的步骤并消除写入，再重新运行。
 
 ## 数学逐字装配
 

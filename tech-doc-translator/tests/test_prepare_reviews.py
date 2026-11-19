@@ -91,3 +91,33 @@ def test_prepare_reviews_rejects_alias_and_stale_items(toc_project):
     chapter.write_text(chapter.read_text().replace("## Second", "### Second"))
     result = run_cli(original, "--prepare-reviews", output)
     assert result.returncode != 0 and not output.exists()
+
+
+def test_prepare_reviews_reports_same_and_added_items(toc_project):
+    root, chapter, original, record = make_numeric_record(toc_project)
+    closed = delivery.prepare_reviews(root, record)
+    for review in closed["reviews"]:
+        review.update(status="closed", note="测试人工处置记录")
+    closed_path = original.with_name("closed.json")
+    closed_path.write_text(json.dumps(closed, ensure_ascii=False))
+    chapter.write_text(chapter.read_text().replace("5s", "7s"))
+
+    candidate, _, changes = delivery._prepare_reviews(root, closed)
+    semantic = next(r for r in candidate["reviews"] if r["kind"] == "semantic")
+    assert len(semantic["items"]) == 2          # 候选仍列出全部当前项
+    change, = [c for c in changes if c["kind"] == "semantic"]
+    assert change["target"] == "01_正文.md" and change["same"] == 1
+    assert len(change["added"]) == 1 and "7s" in change["added"][0]
+
+    output = original.with_name("again.json")
+    result = run_cli(closed_path, "--prepare-reviews", output)
+    assert result.returncode == 0, result.stderr
+    assert "复核对照 semantic 01_正文.md：与上次闭合复核相同 1 项，新增 1 项" in result.stderr
+    added = [line for line in result.stderr.splitlines() if line.startswith("  新增 ")]
+    assert len(added) == 1 and "7s" in added[0]
+
+
+def test_prepare_reviews_without_closed_review_reports_no_change(toc_project):
+    root, _, _, record = make_numeric_record(toc_project)
+    _, _, changes = delivery._prepare_reviews(root, record)
+    assert changes == []

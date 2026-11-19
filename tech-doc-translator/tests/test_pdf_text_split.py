@@ -50,6 +50,7 @@ class SplitMatchTest(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(len(relaxed), 1)
         self.assertIn('第 1→2 页', relaxed[0]['reason'])
+        self.assertEqual(relaxed[0]['page'], 1)   # 第 2 批 R13：前段所在页进入关键页
 
     def test_same_page_long_interleave_is_relaxed(self):
         failures, relaxed = run(['由于注意力' + MATH + '复杂度按序列长度平方增长'])

@@ -104,6 +104,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -128,6 +129,11 @@ TRANSLATION_FAMILIES = ("single", "paginated", "reference", "api")
 # 不向 HTML 记录补填虚构页面字段。
 PDF_SOURCE_FAMILY = "pdf-source"
 USER_NOTE_NAMES = ("导出前准备说明.md", "PDF导出交付说明.md")
+# 渲染的交付文书与复核备注中需要人判断的位置（R12）；未替换不能闭合或交付
+PENDING_PLACEHOLDER = "〔待补"
+# 无读图能力时视觉复核备注的固定标注词（R13）与用户抽查结论行
+PROGRAMMATIC_VISUAL_TAG = "【程序化目检】"
+_USER_CHECK_LINE = re.compile(r"^用户抽查：(.*)$", re.M)
 TOC_NAME = "00_目录.md"
 GLOSSARY_NAME = "术语表.md"
 
@@ -188,13 +194,19 @@ def stderr_progress(event):
     print("[progress] " + label, file=sys.stderr, flush=True)
 
 
+# 阶段运行期间每隔这么多秒补一条 running 进度，长阶段不会长时间没有输出（R15）。
+PROGRESS_HEARTBEAT_SECONDS = 60
+_PROGRESS_LOCK = threading.Lock()
+
+
 @contextmanager
 def progress_stage(run_context, stage, target, order=None, *, problems=None):
-    """报告一个正在执行的职责，yield 的回调可标记返回式失败。"""
+    """报告一个正在执行的职责，yield 的回调可标记返回式失败；运行期间定时补 running。"""
     progress = run_context["progress"] if run_context else None
     initial_count = len(problems) if problems is not None else 0
     failed = False
     started = time.monotonic()
+    finished = threading.Event()
 
     def fail_stage():
         nonlocal failed
@@ -202,16 +214,27 @@ def progress_stage(run_context, stage, target, order=None, *, problems=None):
 
     def emit(event, elapsed):
         if progress is not None:
-            progress({"stage": stage, "event": event, "target": str(target),
-                      "order": order, "elapsed_seconds": elapsed})
+            with _PROGRESS_LOCK:
+                progress({"stage": stage, "event": event, "target": str(target),
+                          "order": order, "elapsed_seconds": elapsed})
+
+    def heartbeat():
+        while not finished.wait(PROGRESS_HEARTBEAT_SECONDS):
+            emit("running", time.monotonic() - started)
 
     emit("start", None)
+    beat = threading.Thread(target=heartbeat, daemon=True)
+    if progress is not None:
+        beat.start()
     try:
         yield fail_stage
     except BaseException:
         fail_stage()
         raise
     finally:
+        finished.set()
+        if beat.is_alive():
+            beat.join()
         if problems is not None and len(problems) != initial_count:
             fail_stage()
         emit("fail" if failed else "end", time.monotonic() - started)
@@ -2102,6 +2125,7 @@ def compute_delivery_identity(root, record, source_entries=None, *, purpose="ful
                 entry["parsed_markdown"]] = _snapshot_source_facts(
                 entry.get("family"), entry["snapshots"], rooted,
                 substitutions=_subs_list)
+    memo = {}
     for order, check in enumerate(record.get("checks") or [], start=1):
         tool = check.get("tool")
         if purpose == "translation" and tool == "verify_pdf":
@@ -2109,7 +2133,7 @@ def compute_delivery_identity(root, record, source_entries=None, *, purpose="ful
         facts = None
         if tool in KNOWN_TOOLS:
             facts, _parsed = _check_facts(
-                root_abs, tool, list(check.get("args") or []), order)
+                root_abs, tool, list(check.get("args") or []), order, memo=memo)
         identity["checks"].append({"order": order, "tool": tool,
                                    "facts": facts})
     # 交付入口自身参与结果判断，纳入有限依赖集合（§9.3）
@@ -2253,7 +2277,19 @@ def _parse_tool_args(tool, args, problems, order, root_abs=None):
     return parsed
 
 
-def _check_facts(root_abs, tool, args, order, problems=None):
+def _shared_navigation_facts(memo, record_path, site_root):
+    """一次身份计算或一次复跑内，同一来源记录与站点根只取一次导航事实（R15）。"""
+    from _api_navigation import navigation_facts
+
+    key = (os.path.realpath(record_path), os.path.realpath(site_root))
+    if memo is None:
+        return navigation_facts(*key)
+    if key not in memo:
+        memo[key] = navigation_facts(*key)
+    return memo[key]
+
+
+def _check_facts(root_abs, tool, args, order, problems=None, *, memo=None):
     """一条核验记录的规范化检查事实（§9.3 单一事实来源）。
 
     用真实 CLI parse_args 取得实际有序输入/输出、有效语义参数与文件
@@ -2306,6 +2342,9 @@ def _check_facts(root_abs, tool, args, order, problems=None):
                 report = json.load(handle)
         except (OSError, ValueError):
             report = None
+        if isinstance(report, dict) and isinstance(report.get("image_adaptations"), dict):
+            facts["files"]["image_adaptations"] = dep(
+                report["image_adaptations"].get("path") or "")
         try:
             adaptations = pdf_verifier.resolve_source_adaptations(
                 parsed, report if isinstance(report, dict) else {}, root=root_abs)
@@ -2319,13 +2358,16 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             "toc_sections": bool(parsed.toc_sections),
             "require_display_map": bool(parsed.require_display_map),
         }
+        if getattr(parsed, "visual_aid", False):
+            # R13：程序化目检要求绑定的核验带 --visual-aid；未启用的检查身份不变
+            facts["params"]["visual_aid"] = True
         try:
             pairs, binding = pdf_verifier.resolve_navigation_declarations(
                 parsed, report if isinstance(report, dict) else {}, root=root_abs)
             if pairs:
-                from _api_navigation import navigation_dependencies
                 facts["files"]["pdf_navigation_sources"] = [
-                    item for record_path, _site in pairs for item in navigation_dependencies(record_path)]
+                    item for record_path, site in pairs
+                    for item in _shared_navigation_facts(memo, record_path, site)["dependencies"]]
                 facts["params"]["api_navigation"] = [
                     {key: item[key] for key in ("record", "site_root", "inputs")} for item in binding]
         except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -2446,10 +2488,10 @@ def _check_facts(root_abs, tool, args, order, problems=None):
             else:
                 manifest = []
             if parsed.get('navigation_record'):
-                from _api_navigation import navigation_context
                 nav_path = _rooted(root_abs, parsed['navigation_record'])
                 try:
-                    context = navigation_context(nav_path, facts['params']['site_root'])
+                    context = _shared_navigation_facts(
+                        memo, nav_path, facts['params']['site_root'])
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     local_problems.append(f"核验记录 #{order} 导航来源拒绝：{exc}")
                     return None, None
@@ -2632,6 +2674,7 @@ def _rerun_checks(root, record, problems, *, purpose="full", run_context=None,
     candidates = []
     ordered_checks = sorted(enumerate(checks, start=1),
                             key=lambda item: item[1].get("tool") == "verify_pdf")
+    memo = {}
     for order, check in ordered_checks:
         tool = check.get("tool")
         if purpose == "translation" and tool == "verify_pdf":
@@ -2643,8 +2686,9 @@ def _rerun_checks(root, record, problems, *, purpose="full", run_context=None,
         tools_used.add(tool)
         script = os.path.join(SCRIPTS_DIR, KNOWN_TOOLS[tool])
         # 检查事实与完整身份同源：真实 CLI 解析 + 文件依赖摘要
-        facts, parsed = _check_facts(root_abs, tool, list(args), order,
-                                     problems)
+        with progress_stage(run_context, "check-facts", root_abs, order):
+            facts, parsed = _check_facts(root_abs, tool, list(args), order,
+                                         problems, memo=memo)
         if facts is None:
             continue
         entry = {"tool": tool, "args": args}
@@ -3205,6 +3249,12 @@ def check_reviews(record, problems, pending_reviews=None, root=None,
                             % (kind, "/".join(sorted(KNOWN_REVIEW_KINDS))))
         if not (review.get("note") or "").strip():
             problems.append("复核 %r 缺少实际记录内容（note 为空）" % review.get("target"))
+        elif PENDING_PLACEHOLDER in review["note"]:
+            problems.append("复核 %r 的备注仍有待补项（含“%s”）"
+                            % (review.get("target"), PENDING_PLACEHOLDER))
+        if (kind == REVIEW_VISUAL and isinstance(review.get("note"), str)
+                and review["note"].startswith(PROGRAMMATIC_VISUAL_TAG)):
+            problems.extend(_programmatic_visual_problems(review, root, pdf_checks))
         target = review.get("target")
         # 复核必须绑定本交付声明的产物：给不存在/未声明目标的复核
         # （如对 nonexistent.pdf 的 visual）不能闭合任何类别或待复核项。
@@ -3361,6 +3411,36 @@ def check_reviews(record, problems, pending_reviews=None, root=None,
                 problems.append(
                     "交付输入 %s 缺少必需复核类别（须绑定该产物）: %s"
                     % (target, "、".join(missing)))
+    # 交付根登记的用户说明不能留着待补占位（R12）；导出就绪只看翻译复核。
+    if not translation_only and root:
+        for name, role in sorted((record.get("files") or {}).items()):
+            if role != "user-note":
+                continue
+            try:
+                with open(os.path.join(root, name), encoding="utf-8") as handle:
+                    text = handle.read()
+            except (OSError, UnicodeDecodeError):
+                continue  # 缺失或不可读由 check_root_layout 报出
+            if PENDING_PLACEHOLDER in text:
+                problems.append("交付说明 %s 仍有待补项（含“%s”）"
+                                % (name, PENDING_PLACEHOLDER))
+
+
+def _programmatic_visual_problems(review, root, pdf_checks):
+    """R13：标为【程序化目检】的视觉复核须绑定启用 --visual-aid 的核验，并写明用户抽查结论。"""
+    target = review.get("target")
+    path = os.path.realpath(_rooted(root, target)) if root and target else None
+    contexts = (pdf_checks or {}).get(path) or []
+    problems = []
+    if not any(((context.get("facts") or {}).get("params") or {}).get("visual_aid")
+               for context in contexts):
+        problems.append("复核 %r 标为%s，但覆盖该成品的 verify_pdf 检查没有启用 --visual-aid"
+                        % (target, PROGRAMMATIC_VISUAL_TAG))
+    match = _USER_CHECK_LINE.search(review["note"])
+    if not match or not match.group(1).strip():
+        problems.append("复核 %r 标为%s，缺少写明用户抽查结论的“用户抽查：”行"
+                        % (target, PROGRAMMATIC_VISUAL_TAG))
+    return problems
 
 
 def ensure_persistent(evidence_dir):
@@ -3402,6 +3482,72 @@ def _batch_files(candidates, source_report=None):
             files.append(("%02d_export_report.json" % candidate["order"],
                           ("copy", candidate["export_report_path"])))
     return files
+
+
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _is_digest(value):
+    return value is None or (isinstance(value, str) and bool(_DIGEST_RE.fullmatch(value)))
+
+
+def _identity_changes(before, after, limit=5):
+    """R10：两次身份计算的差异 -> (变化的顶层键, 变化的文件（至多 limit 个）, 文件总数)。
+
+    文件按身份里的三种写法识别：[路径, 摘要] 对；带 path/snapshot/parsed_markdown
+    的对象里的 *sha256 字段；{名称: 摘要} 映射（输入、输出、共享脚本）。检查条目
+    以 tool 名标识（检查脚本本身变化时报工具名）。
+    """
+    keys = sorted(str(key) for key in set(before) | set(after)
+                  if before.get(key) != after.get(key))
+    files = []
+
+    def note(name):
+        if name and name not in files:
+            files.append(name)
+
+    def is_pair(value):
+        return (isinstance(value, list) and len(value) == 2
+                and isinstance(value[0], str) and _is_digest(value[1]))
+
+    def walk(old, new, context):
+        if old == new:
+            return
+        if is_pair(old) or is_pair(new):
+            note((new if is_pair(new) else old)[0])
+        elif isinstance(old, dict) or isinstance(new, dict):
+            old = old if isinstance(old, dict) else {}
+            new = new if isinstance(new, dict) else {}
+            here = next((side[name] for side in (new, old)
+                         for name in ("tool", "path", "snapshot", "parsed_markdown")
+                         if isinstance(side.get(name), str)), context)
+            for key in sorted(set(old) | set(new), key=str):
+                a, b = old.get(key), new.get(key)
+                if a == b:
+                    continue
+                if _is_digest(a) and _is_digest(b):
+                    note(here if str(key).endswith("sha256") and here else str(key))
+                else:
+                    walk(a, b, here or str(key))
+        elif isinstance(old, list) and isinstance(new, list):
+            if len(old) == len(new):
+                for a, b in zip(old, new):
+                    walk(a, b, context)
+            else:
+                for item in [x for x in old if x not in new] + [x for x in new if x not in old]:
+                    walk(item, None, context)
+
+    walk(before, after, None)
+    return keys, files[:limit], len(files)
+
+
+def _identity_change_text(before, after):
+    keys, files, total = _identity_changes(before, after)
+    text = "依赖身份在运行期间变化：%s；变化的文件：%s" % (
+        "、".join(keys) or "无", "、".join(files) or "未定位到文件")
+    if total > len(files):
+        text += " 等 %d 个" % total
+    return text
 
 
 def _identity_missing_digests(identity):
@@ -3557,11 +3703,8 @@ def publish_evidence(evidence_dir, record, root, candidates,
             "交付记录在运行期间被改写（输入/产物/口径身份变化），拒绝发布")
     current = compute_delivery_identity(root, record, source_entries)
     if current != baseline_identity:
-        changed = [key for key in set(current) | set(baseline_identity)
-                   if current.get(key) != baseline_identity.get(key)]
-        raise DeliveryError(
-            "发布前复查发现依赖身份在运行期间变化（%s），拒绝发布"
-            % "、".join(sorted(str(key) for key in changed)))
+        raise DeliveryError("发布前复查发现%s，拒绝发布"
+                            % _identity_change_text(baseline_identity, current))
     missing = _identity_missing_digests(current)
     if missing:
         raise DeliveryError(
@@ -3692,8 +3835,9 @@ def check_translation_readiness(root, record, target_inputs, *, run_context=None
             if not problems:
                 check_pdf_source_pending(root, record, problems)
         if not problems:
-            baseline = compute_delivery_identity(root, record, entries,
-                                                 purpose="translation")
+            with progress_stage(run_context, "identity", root_abs):
+                baseline = compute_delivery_identity(root, record, entries,
+                                                     purpose="translation")
             _reconcile_for_run(root, record, entries, problems, baseline, run_context)
         if not problems:
             _, pending, input_checks, pdf_checks = _rerun_checks(
@@ -3942,7 +4086,8 @@ def _delivery_checks(root, record, problems, run_context, *, record_path=None):
         entries = check_source_chains(root, record, problems)
     if problems:
         return None
-    identity = compute_delivery_identity(root, record, entries)
+    with progress_stage(run_context, "identity", root):
+        identity = compute_delivery_identity(root, record, entries)
     source_report = _reconcile_for_run(
         root, record, entries, problems, identity, run_context)
     candidates, pending, inputs, pdfs = _rerun_checks(
@@ -3958,8 +4103,7 @@ def _delivery_checks(root, record, problems, run_context, *, record_path=None):
 
 def prepare_reviews(root: str, record: dict, *, run_context=None) -> dict:
     """生成当前待办的记录副本；任何候选写入由 CLI 单独执行。"""
-    candidate, _ = _prepare_reviews(root, record, run_context=run_context)
-    return candidate
+    return _prepare_reviews(root, record, run_context=run_context)[0]
 
 
 def _prepare_reviews(root, record, *, run_context=None):
@@ -3992,6 +4136,7 @@ def _prepare_reviews(root, record, *, run_context=None):
         if checks_have_links or checked["pending"].get(path, {}).get(REVIEW_LINK):
             targets.append((REVIEW_LINK, target))
     reviews = []
+    changes = []
     for kind, target in targets:
         binding = expected_review_binding(
             kind, target, root, record, checked["entries"],
@@ -4010,11 +4155,37 @@ def _prepare_reviews(root, record, *, run_context=None):
             reviews.append({"kind": kind, "target": target, "status": "pending",
                             "sha256": digest, "binding": binding, "note": "",
                             "items": list(items.elements())})
-    if compute_delivery_identity(root, record, checked["entries"]) != identity:
-        raise DeliveryError("候选准备期间依赖身份变化，请重核当前输入")
+            change = _review_item_changes(record, kind, target, items)
+            if change is not None:
+                changes.append(change)
+    current = compute_delivery_identity(root, record, checked["entries"])
+    if current != identity:
+        raise DeliveryError("准备候选时%s" % _identity_change_text(identity, current))
     candidate = deepcopy(record)
     candidate["reviews"] = reviews
-    return candidate, checked["candidates"]
+    return candidate, checked["candidates"], changes
+
+
+def _review_item_changes(record, kind, target, items):
+    """当前 items 与同一 kind、target 最近一次闭合复核的对照（R11）。
+
+    最近一次 = 记录 reviews 中最后一条匹配的闭合复核。返回
+    {"kind", "target", "same": 相同项数, "added": [新增项…]}；没有闭合复核
+    或当前没有待审项时返回 None。
+    """
+    previous = None
+    for review in record.get("reviews", []):
+        if (isinstance(review, dict) and review.get("kind") == kind
+                and review.get("target") == target
+                and review.get("status") == "closed"
+                and isinstance(review.get("items"), list)):
+            previous = review
+    if previous is None or not items:
+        return None
+    old = Counter(item for item in previous["items"] if isinstance(item, str))
+    return {"kind": kind, "target": target,
+            "same": sum((items & old).values()),
+            "added": list((items - old).elements())}
 
 
 def _closed_review_covers(review, kind, target, digest, binding, items):
@@ -4028,6 +4199,92 @@ def _closed_review_covers(review, kind, target, digest, binding, items):
             and bool(note.strip()) and isinstance(old_items, list)
             and all(isinstance(item, str) for item in old_items)
             and not (items - Counter(old_items)))
+
+
+def _source_digest_files(root, identity):
+    """索引身份里登记了摘要的源侧文件（快照、解析产物、快照资源）的完整路径。"""
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for name, digest in (("snapshot", "snapshot_sha256"), ("path", "sha256"),
+                                 ("parsed_markdown", "parsed_sha256")):
+                if isinstance(node.get(name), str) and digest in node:
+                    found.append(os.path.realpath(_rooted(root, node[name])))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            if len(node) == 2 and isinstance(node[0], str) and _is_digest(node[1]):
+                found.append(os.path.realpath(_rooted(root, node[0])))
+            else:
+                for value in node:
+                    walk(value)
+
+    walk(identity.get("sources"))
+    walk((identity.get("resources") or {}).get("sources"))
+    return sorted(set(found))
+
+
+def check_after_cleanup(record, evidence_dir, published_roots=()):
+    """R14：清理后只读核对，不复跑检查、不发布。
+
+    返回 (problems, present, published, deleted)：交付根里摘要一致的文件、在
+    --published-root 同一相对路径找到的摘要一致副本、已不在场的源侧文件。
+    """
+    problems = []
+    index_path = os.path.join(evidence_dir, "delivery_index.json")
+    try:
+        with open(index_path, encoding="utf-8") as handle:
+            index = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise DeliveryError("证据索引不可读: %s（%s）" % (index_path, exc))
+    root = os.path.realpath(record["delivery_root"])
+    outputs = [{"path": o.get("path"), "sha256": o.get("sha256")}
+               for o in record.get("outputs", [])]
+    for key, value in (("inputs", record.get("inputs")), ("outputs", outputs),
+                       ("reviews", record.get("reviews", []))):
+        if index.get(key) != value:
+            problems.append("证据索引的 %s 与交付记录不一致" % key)
+    batch_files = [(index.get("sources_report"), None)] + [
+        (check.get(key), check.get("%s_sha256" % key))
+        for check in index.get("checks") or [] for key in ("report", "export_report")]
+    for rel, digest in batch_files:
+        if not rel:
+            continue
+        path = os.path.join(evidence_dir, rel)
+        if not os.path.isfile(path):
+            problems.append("证据批次文件缺失: %s" % rel)
+        elif digest and sha256_file(path) != digest:
+            problems.append("证据批次文件摘要与索引不符: %s" % rel)
+    identity = index.get("identity") or {}
+    expected = dict(identity.get("inputs") or {})
+    expected.update(identity.get("outputs") or {})
+    expected.update((identity.get("glossary") or {}).get("files") or {})
+    present, published = [], []
+    for rel, digest in sorted(expected.items()):
+        path = os.path.join(root, rel)
+        if os.path.isfile(path):
+            if sha256_file(path) == digest:
+                present.append(rel)
+            else:
+                problems.append("交付根文件与索引摘要不符: %s" % rel)
+            continue
+        copy = next((os.path.join(base, rel) for base in published_roots
+                     if os.path.isfile(os.path.join(base, rel))
+                     and sha256_file(os.path.join(base, rel)) == digest), None)
+        if copy:
+            published.append((rel, copy))
+        else:
+            problems.append("%s 不在交付根，也没有摘要一致的发布副本（--published-root: %s）"
+                            % (rel, "、".join(published_roots) or "未提供"))
+    deleted = [os.path.relpath(path, root) if path.startswith(root + os.sep) else path
+               for path in _source_digest_files(root, identity) if not os.path.isfile(path)]
+    return problems, present, published, deleted
+
+
+def _sample(items, limit=10):
+    text = "、".join(items[:limit]) or "无"
+    return text + (" 等 %d 个" % len(items) if len(items) > limit else "")
 
 
 def _write_new_review_candidate(path, record):
@@ -4061,7 +4318,15 @@ def main(argv=None):
                              help="持久证据目录（须在工作区外且不在系统临时根）")
     destination.add_argument("--prepare-reviews", metavar="PATH",
                              help="输出待复核候选到显式新路径")
+    parser.add_argument("--after-cleanup", action="store_true",
+                        help="清理后只读核对：证据索引、交付根文件与发布副本（需 --evidence-dir）")
+    parser.add_argument("--published-root", action="append", default=[], metavar="DIR",
+                        help="发布副本所在目录（按交付根相对路径查找，可重复）")
     args = parser.parse_args(argv)
+    if args.after_cleanup and not args.evidence_dir:
+        parser.error("--after-cleanup 需要 --evidence-dir")
+    if args.published_root and not args.after_cleanup:
+        parser.error("--published-root 只能和 --after-cleanup 一起用")
 
     problems = []
     record_digest = None
@@ -4073,10 +4338,23 @@ def main(argv=None):
         root = record["delivery_root"]
         if not os.path.isdir(root):
             raise DeliveryError("交付根不存在: %s" % root)
+        if args.after_cleanup:
+            problems, present, published, deleted = check_after_cleanup(
+                record, args.evidence_dir, args.published_root)
+            if problems:
+                _report_problems(problems)
+                return 1
+            print("清理后核对通过")
+            print("在场一致（%d）：%s" % (len(present), _sample(present)))
+            print("发布副本一致（%d）：%s" % (len(published), _sample(
+                ["%s → %s" % item for item in published])))
+            print("已删除、只存摘要（%d）：%s" % (len(deleted), _sample(deleted)))
+            return 0
         if args.prepare_reviews is not None:
             if os.path.lexists(args.prepare_reviews):
                 raise DeliveryError("复核候选须使用新路径，不覆盖已有文件或别名")
-            candidate, candidates = _prepare_reviews(root, record, run_context=run_context)
+            candidate, candidates, changes = _prepare_reviews(
+                root, record, run_context=run_context)
             if sha256_file(args.record) != record_digest:
                 raise DeliveryError("候选准备期间交付记录变化，请重核当前输入")
             _write_new_review_candidate(args.prepare_reviews, candidate)
@@ -4087,6 +4365,12 @@ def main(argv=None):
                                        for g in groups)
                     print("数字候选 #%d: %s；逐项 ID 见候选 items"
                           % (check["order"], summary), file=sys.stderr)
+            for change in changes:
+                print("复核对照 %s %s：与上次闭合复核相同 %d 项，新增 %d 项"
+                      % (change["kind"], change["target"], change["same"],
+                         len(change["added"])), file=sys.stderr)
+                for item in change["added"]:
+                    print("  新增 %s" % item, file=sys.stderr)
             print("已准备待复核候选：%s" % args.prepare_reviews)
             return 0
 

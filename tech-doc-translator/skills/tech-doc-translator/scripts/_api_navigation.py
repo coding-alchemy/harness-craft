@@ -1060,6 +1060,54 @@ def navigation_dependencies(record_path):
     return [[str(item), file_sha256(item)] for item in sorted(set(dependencies) | {path})]
 
 
+def navigation_facts(record_path, site_root):
+    """取检查事实用的导航事实：依赖摘要与各页归属，不做全站准入（R15）。
+
+    依赖清单与 navigation_dependencies 相同；页归属与 load_navigation 同一
+    口径（covers 唯一项为所属章，table_role_source 为表格角色来源）。全站
+    对账、锚点证明与表头读取留给实际检查（verify_api_translation、merge_api、
+    load_pdf_navigation）。
+    """
+    import verify_delivery as delivery
+    from _verification import file_sha256
+
+    path = Path(record_path).resolve()
+    record = json.loads(path.read_text(encoding='utf-8'))
+    root = Path(record['delivery_root']).resolve()
+    site = Path(site_root).resolve()
+    problems = []
+    entries = delivery.check_source_chains(str(root), record, problems, source_only=True)
+    if problems:
+        raise ValueError('导航来源准入失败: ' + '；'.join(problems))
+    dependency_paths = delivery.source_dependency_paths(
+        record['delivery_root'], record, problems, entries=entries,
+        include_parsed_resources=False)
+    if problems:
+        raise ValueError('导航依赖不可核对: ' + '；'.join(problems))
+    pages = {}
+    for entry in entries:
+        if entry['family'] != 'api':
+            continue
+        covers = entry['covers']
+        if len(covers) != 1:
+            raise ValueError('源页章节归属不唯一: ' + str(covers))
+        chapter = (root / covers[0]).resolve()
+        role_source = delivery.table_role_source(entry, str(root))
+        for snap in entry['snapshots']:
+            snapshot = (root / snap['snapshot']).resolve()
+            try:
+                key = snapshot.relative_to(site).as_posix()
+            except ValueError:
+                raise ValueError('导航快照不在 site_root: ' + str(snapshot))
+            if key in pages:
+                raise ValueError('源页章节归属重复: ' + key)
+            pages[key] = {'chapter': chapter, 'role_source': role_source}
+    dependencies = [[str(item), file_sha256(item)]
+                    for item in sorted(set(dependency_paths) | {path})]
+    return {'record': str(path), 'site_root': str(site), 'pages': pages,
+            'dependencies': dependencies}
+
+
 def navigation_context(record_path, site_root):
     record = str(Path(record_path).resolve())
     site = str(Path(site_root).resolve())

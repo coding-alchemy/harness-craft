@@ -265,6 +265,30 @@ class ExportReadinessTests(unittest.TestCase):
             pdf_verifier.parse_args(pdf_args))
         self.assertTrue(machine_ok, report['failures'])
 
+    def test_strict_param_mismatch_fails_before_render(self):
+        # 第 2 批 R12：记录登记了 --require-display-map，重导出漏传即在渲染前失败
+        record_path = self.root / 'source/acceptance_record.json'
+        first = run_export(self.root)
+        self.assertEqual(first.returncode, 0, first.stderr[-600:])
+        pdf = self.root / first.out_name
+        before = pdf.read_bytes()
+        record = json.loads(record_path.read_text())
+        record['mode'] = 'translation+pdf'
+        record['outputs'] = [{'path': pdf.name, 'sha256': delivery_verifier.sha256_file(pdf)}]
+        record['files'][pdf.name] = 'pdf'
+        record['checks'].append({'tool': 'verify_pdf', 'args': [
+            '--pdf', pdf.name, '--work-dir', str(first.work_dir),
+            '--images-display', 'export/images_display.json',
+            '--require-display-map', '01_章.md']})
+        self.addCleanup(self.build_record)
+        record_path.write_text(json.dumps(record))
+        again = run_export(self.root, out_name=pdf.name)
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn('导出参数与交付记录的 verify_pdf 检查不一致', again.stderr)
+        self.assertIn('--require-display-map：记录 启用 / 本次 未启用', again.stderr)
+        self.assertEqual(pdf.read_bytes(), before)
+        self.assertEqual(list(again.work_dir.rglob('*.pdf')), [])
+
     def test_pending_numeric_blocks_readiness(self):
         target = self.root / '01_章.md'
         original = target.read_text()

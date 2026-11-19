@@ -176,6 +176,69 @@ def test_aliases_and_cross_page_object_start_pass(printed_links):
     assert _damaged_copy(printed_links, 'equivalent-alias', use_alias) == []
 
 
+def test_standalone_images_are_centered_and_keep_their_anchor(printed_links):
+    import pymupdf
+
+    _, chapter, healthy = printed_links
+    assert check_link_failures(healthy, [chapter]) == []
+    with pymupdf.open(healthy) as doc:
+        offsets = [(info['bbox'][0] + info['bbox'][2]) / 2 - page.rect.width / 2
+                   for page in doc for info in page.get_image_info()]
+    assert len(offsets) == 2, offsets   # 带链接的图片与 #image 目标图片
+    assert all(abs(offset) <= 1.0 for offset in offsets), offsets
+
+
+def _line_extent(page, prefix):
+    """以 prefix 开头的那一行（含同一行上的链接等片段）的左右边界。"""
+    lines = [(line['bbox'], ''.join(span['text'] for span in line['spans']).strip())
+             for block in page.get_text('dict')['blocks'] for line in block.get('lines', [])]
+    top = next(box[1] for box, text in lines if text.startswith(prefix))
+    same = [box for box, text in lines if text and abs(box[1] - top) < 2]
+    return min(box[0] for box in same), max(box[2] for box in same)
+
+
+def test_single_line_captions_centered_multi_line_from_left_edge(tmp_path):
+    import pymupdf
+
+    (tmp_path/'pixel.png').write_bytes((Path(__file__).parent/'fixtures/valid_1x1.png').read_bytes())
+    long = '这是一段足够长、必须折成多行的图题文字，' * 6
+    chapter = tmp_path/'chapter.md'
+    chapter.write_text('# 图题版式\n\n> **来源**：https://example.org/caption\n\n正文段落。\n\n'
+                       '![一](pixel.png)\n\n**图 1. 单行图题**\n\n'
+                       f'![二](pixel.png)\n\n**图 2. {long}**\n\n'
+                       '![三](pixel.png)\n\n<a id="fig3"></a>\n**图 3. 段首有锚点的图题** [#](#fig3)\n')
+    pdf = tmp_path/'captions.pdf'
+    assert exporter.export([str(chapter)], pdf, tmp_path/'work') == 0
+    assert check_link_failures(pdf, [chapter]) == []
+    with pymupdf.open(pdf) as doc:
+        page = doc[0]
+        center = page.rect.width / 2
+        body_left, _ = _line_extent(page, '正文段落')
+        extents = {key: _line_extent(page, key) for key in ('图 1.', '图 2.', '图 3.')}
+    for key in ('图 1.', '图 3.'):
+        x0, x1 = extents[key]
+        assert abs((x0 + x1) / 2 - center) <= 1.0, (key, extents)
+    assert abs(extents['图 2.'][0] - body_left) <= 1.0, extents
+
+
+def test_bare_host_external_link_verifies(tmp_path):
+    import verify_pdf as verifier
+
+    chapter = tmp_path/'chapter.md'
+    chapter.write_text('# 外链\n\n> **来源**：https://example.org/bare\n\n'
+                       '[fmt 文档](https://fmt.dev) 与 [带路径](https://fmt.dev/latest/)。\n')
+    pdf = tmp_path/'bare.pdf'
+    assert exporter.export([str(chapter)], pdf, tmp_path/'work') == 0
+    assert check_link_failures(pdf, [chapter]) == []
+    assert verifier._uri_equivalent('https://fmt.dev/', 'https://fmt.dev')
+    for annotation, href in (('https://fmt.dev/a/', 'https://fmt.dev/a'),
+                             ('https://fmt.dev/', 'https://fmt.dev/?q=1'),
+                             ('https://fmt.dev/', 'http://fmt.dev'),
+                             ('https://fmt.dev/', 'https://fmt.org'),
+                             (None, 'https://fmt.dev')):
+        assert not verifier._uri_equivalent(annotation, href), (annotation, href)
+
+
 def test_destination_coordinates_match_actual_object_geometry(tmp_path):
     import pymupdf
     from playwright.sync_api import sync_playwright

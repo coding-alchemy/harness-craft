@@ -72,6 +72,45 @@ class AnchorWritingTest(unittest.TestCase):
         self.assertNotIn('<a id="fn:a">', md)
         self.assertIn('[^', md)
 
+    def test_table_cell_anchor_written_before_cell_text(self):
+        # R3 遗留闭合（用户 2026-11-18 评审修正）：第 1 批设计 §6.1 的契
+        # 约是“格内文字前”——锚点在格首、允许与格内文字之间有空白即满
+        # 足；删除锚点仍被核验拒绝。
+        from latexml_test_support import raw_document
+        raw = raw_document(
+            '<p class="ltx_p">See <a href="#S1.T1.c1">the cell</a>.</p>'
+            '<table class="ltx_simple" id="S1.T1">'
+            '<tr><td id="S1.T1.c1">Cell A</td><td>Cell B</td></tr></table>')
+        md, payload = current_candidate(self.base, raw)
+        self.assertRegex(md, r'<a id="S1\.T1\.c1"></a>\s*Cell A')
+        self.assertEqual(reconcile_latexml_to_markdown(raw, md, None, payload), [])
+        lost = md.replace('<a id="S1.T1.c1"></a>', '')
+        problems = compare_anchors(md, lost, inline=True)
+        self.assertTrue(problems)
+        self.assertIn('来源锚点', problems[0])
+
+    def test_anchor_inside_footnote_definition_written_at_definition_start(self):
+        # R3 遗留闭合（用户 2026-11-18 评审修正）：锚点写在脚注定义行首
+        # （第 1 批 §6.3 的判形口径：行首 [^ 即脚注形态，同一 定义行内的
+        # 位移不构成契约违背，不做断言）；删除锚点或把锚点移出定义行
+        # （独占一行）都被拒绝。
+        from latexml_test_support import raw_document
+        raw = raw_document(
+            '<p>Body <a href="#fn:a.x1">x</a> <a class="ltx_note_ref" '
+            'href="#fn:a">a</a>.</p>'
+            '<div class="ltx_note" id="fn:a"><div class="ltx_note_content">'
+            '<p class="ltx_p" id="fn:a.x1">Note target.</p></div></div>')
+        md, payload = current_candidate(self.base, raw)
+        self.assertRegex(md, r'(?m)^\[\^fn:a\]: <a id="fn:a\.x1"></a>Note target\.$')
+        self.assertEqual(reconcile_latexml_to_markdown(raw, md, None, payload), [])
+        for damaged in (md.replace('<a id="fn:a.x1"></a>', ''),
+                        md.replace('[^fn:a]: <a id="fn:a.x1"></a>Note target.',
+                                   '[^fn:a]: Note target.\n\n<a id="fn:a.x1"></a>')):
+            with self.subTest(damaged=damaged[:40]):
+                problems = compare_anchors(md, damaged, inline=True)
+                self.assertTrue(problems)
+                self.assertIn('来源锚点', problems[0])
+
 
 SOURCE = ('<a id="S1"></a>\n\n## 1 Intro\n\n<a id="S1.p1.1"></a>Text.\n\n'
           '$$x=1$$\n\n<a id="S1.E1"></a>(1)\n\n<a id="bib.bib1"></a>A (2020) Title.\n')

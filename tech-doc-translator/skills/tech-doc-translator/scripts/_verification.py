@@ -1914,6 +1914,9 @@ def summarize_messages(messages, samples=3):
         groups.setdefault(key, []).append(message)
     lines = ['共 %d 处，%d 类：' % (len(messages), len(groups))]
     for key, items in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        if len(items) == 1:
+            lines.append('  [1] ' + items[0][:200])   # 单条类别：类名就是这条，只印一行
+            continue
         lines.append('  [%d] %s' % (len(items), key))
         lines.extend('      - ' + item[:200] for item in items[:samples])
     return '\n'.join(lines)

@@ -51,14 +51,18 @@ th p, td p, .footnotes p, figcaption p { text-align: left; }
 
 /* 图/表与其紧邻的图题、表题或引导标签保持在同一页。 */
 p:has(+ table) { break-after: avoid-page; }
-p:has(> img) { break-after: avoid-page; }
-p:has(> img) + p { break-inside: avoid; }
-p:has(> img) + .anchor-only + p { break-inside: avoid; }
+p:has(> img), p:has(> a > img) { break-after: avoid-page; }
+p:has(> img) + p, p:has(> a > img) + p { break-inside: avoid; }
+p:has(> img) + .anchor-only + p, p:has(> a > img) + .anchor-only + p { break-inside: avoid; }
 .anchor-only { margin: 0; line-height: 0; break-after: avoid-page; }
 img { break-after: avoid-page; }
+/* 单独成段的图片（含带链接的图片）在版心内水平居中（R17）。 */
+p:has(> img), p:has(> a > img) { text-align: center; }
+/* 紧跟图片的图题：一行放得下时随图居中，多行时铺满版心（R17 D4）。 */
+p.image-caption { width: fit-content; margin-inline: auto; }
 caption { break-after: avoid-page; }
 
-a { color: #0b5394; text-decoration: none; word-break: break-all; }
+a { color: #0b5394; text-decoration: none; overflow-wrap: anywhere; }
 
 /* 跨章合订：每章从新页开始；单篇时仅一章，:first-child 不产生空白首页。 */
 .chapter { break-before: page; }
@@ -124,7 +128,7 @@ th, td {
 thead { display: table-header-group; }
 th { background: #efefef; font-family: "STHeiti", "Arial Unicode MS", sans-serif; }
 .table-number { white-space: nowrap; overflow-wrap: normal; }
-.table-number a { word-break: normal; }
+.table-number a { overflow-wrap: normal; }
 
 blockquote {
   margin: 0.7em 0;

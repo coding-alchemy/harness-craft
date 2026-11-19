@@ -176,6 +176,31 @@ class MergePackagesTest(unittest.TestCase):
         self.assertIn('阿尔法', text)
         self.assertIn('贝塔', text)
 
+    def test_source_reached_through_symlink_merges(self):
+        # 拆包与合并经不同路径（其一经过符号链接）指到同一个源文件时照常合并（R20）。
+        link = self.tmp + '-link'
+        os.symlink(self.tmp, link)
+        self.addCleanup(os.unlink, link)
+        received = merge.merge(
+            os.path.join(self.tmp, 'out.md'),
+            [self.targets[name] for name in sorted(TRANS)],
+            os.path.join(link, 'src.md'), 'h2',
+            self.wps, self.evidence, None, (), (), None, None)
+        self.assertEqual(len(received), 2)
+
+    def test_same_content_in_another_file_still_foreign(self):
+        # 另一个目录里内容相同的文件不是同一个源，仍报异源包（R20）。
+        other = tempfile.mkdtemp(prefix='merge_other_')
+        with open(os.path.join(other, 'src.md'), 'w', encoding='utf-8') as f:
+            f.write(SOURCE)
+        with self.assertRaises(ValueError) as ctx:
+            merge.merge(
+                os.path.join(self.tmp, 'out.md'),
+                [self.targets[name] for name in sorted(TRANS)],
+                os.path.join(other, 'src.md'), 'h2',
+                self.wps, self.evidence, None, (), (), None, None)
+        self.assertIn('异源包', str(ctx.exception))
+
     def test_swapped_existing_targets_rejected(self):
         # 评审 P2-1：交换两个现存目标路径必须失败
         copy_a = self._mutated_copy('wp_001.md', [

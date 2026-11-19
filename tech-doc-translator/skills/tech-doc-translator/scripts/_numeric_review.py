@@ -8,9 +8,10 @@
 
 输出保留完整位置清单和源/译差异多重集（源缺失/译新增，含数量级或
 单位相关上下文及位置）；不能可靠识别的写法列入 unclassified，明示
-未检查/待确认。每个本次差异生成定位 ID（角色、确认范围、原值/单位、
-出现序号、当前位置），供既有 semantic ``items`` 逐项对应；ID 从本次
-扫描生成，不承担跨版本稳定状态。
+未检查/待确认。每个本次差异生成定位 ID（确认范围、角色、原值/单位、去掉
+HTML 标签并归一空白后数字前后各 6 字、同前后文内的出现序号），供
+semantic ``items`` 逐项对应；只改格式时 ID 不变（第 2 批 R11），行号只
+出现在提示文字里。
 
 本模块是全部源家族共用的单一实现（Ticket 07 直接调用），消费者（各
 家族核验入口、包恢复/合并、最终交付）按当前输入重新计算，不从自由
@@ -20,6 +21,7 @@
 import hashlib
 import os
 import re
+from bisect import bisect_left
 from collections import Counter
 
 from _verification import (
@@ -70,6 +72,10 @@ _CAPTION_HINT = re.compile(
 
 # 报告/清单上限：完整位置清单不受限，诊断性未识别清单有界
 _UNCLASSIFIED_LIMIT = 20
+
+# 差异 ID 的前后文（R11）：去掉 HTML 标签、空白归一后，数字前后各取 6 字
+CONTEXT_CHARS = 6
+_HTML_TAG = re.compile(r'</?[A-Za-z][^<>\n]*>')
 
 
 def module_identity():
@@ -142,6 +148,30 @@ def _in_intervals(intervals, offset):
     return False
 
 
+def _flat_text(text):
+    """去掉 HTML 标签、连续空白（含换行）归一为一个空格后的全文（R11）。
+
+    返回 (平文, origin)：origin[i] 是平文第 i 个字符在原文中的偏移（递增），
+    用 bisect_left(origin, 原文偏移) 换算到平文。锚点、分页 div、换行与
+    拆段因此不改变数字的前后文。
+    """
+    chars, origin = [], []
+    cursor = 0
+    stops = [(m.start(), m.end()) for m in _HTML_TAG.finditer(text)]
+    stops.append((len(text), len(text)))
+    for tag_start, tag_end in stops:
+        for index in range(cursor, tag_start):
+            char = text[index]
+            if char.isspace():
+                if chars and chars[-1] == ' ':
+                    continue
+                char = ' '
+            chars.append(char)
+            origin.append(index)
+        cursor = tag_end
+    return ''.join(chars), origin
+
+
 def _host_facts(text, table_lines):
     """逐行已知宿主：所属章节、表格格位、题注、脚注。"""
     headings = [(line, title)
@@ -191,6 +221,7 @@ def extract_numeric_tokens(text, label='正文'):
     hosts = _host_facts(text, table_lines)
     lines = text.split('\n')
     offsets = _line_offsets(text)
+    flat, origin = _flat_text(text)
 
     tokens = []
     unclassified = []
@@ -258,6 +289,8 @@ def extract_numeric_tokens(text, label='正文'):
                     raw, unit, magnitude, end = _take_unit(line, start, end)
                 for i in range(match.end(), end):
                     consumed[base + i] = True
+            flat_start = bisect_left(origin, offset)
+            flat_end = bisect_left(origin, base + end)
             token = {
                 'raw': raw,
                 'value': value,
@@ -268,6 +301,9 @@ def extract_numeric_tokens(text, label='正文'):
                 'line': line_no,
                 'char': start,
                 'offset': offset,
+                'end': base + end,
+                'before': flat[max(0, flat_start - CONTEXT_CHARS):flat_start],
+                'after': flat[flat_end:flat_end + CONTEXT_CHARS],
                 'host': dict(hosts[line_no]),
             }
             if re.search(r'(?:\b(?:fig(?:ure)?\.?|table|eq(?:uation)?\.?|'
@@ -405,8 +441,8 @@ def diff_numeric_tokens(src_result, doc_result, scope):
     """源/译 body token 多重集差异；返回带定位 ID 的差异列表。
 
     源缺失/译新增按精确原值及明确词法形式（raw 含紧邻单位/数量级）
-    统计；同值不同单位的 token 给出 counterpart 提示。ID 从本次扫描
-    生成：角色、确认范围、原值/单位、出现序号与当前位置。
+    统计；同值不同单位的 token 给出 counterpart 提示。ID：确认范围、
+    角色、原值/单位、前后文与同前后文出现序号（R11），不含行号。
     """
     src_body = [t for t in src_result['tokens'] if t['context'] == 'body']
     doc_body = [t for t in doc_result['tokens'] if t['context'] == 'body']
@@ -436,16 +472,17 @@ def diff_numeric_tokens(src_result, doc_result, scope):
             if remaining.get(raw, 0) <= 0:
                 continue
             remaining[raw] -= 1
-            occurrence[raw] += 1
+            key = (raw, token['before'], token['after'])
+            occurrence[key] += 1
             note = ''
             for other in counterpart_values.get(value_key(raw), []):
                 if other['raw'] != raw:
                     note = ('同值异单位/数量级: 另一侧 %r（%s L%d）'
                             % (other['raw'], other['label'], other['line']))
                     break
-            diff_id = 'NUM[%s][%s]#%d %s @%s:L%d' % (
-                scope, role, occurrence[raw], raw,
-                token['label'], token['line'])
+            diff_id = 'NUM[%s][%s] %s @%s ‹%s|%s›#%d' % (
+                scope, role, raw, token['label'],
+                token['before'], token['after'], occurrence[key])
             diffs.append({
                 'id': diff_id,
                 'role': role,
@@ -453,10 +490,12 @@ def diff_numeric_tokens(src_result, doc_result, scope):
                 'value': token['value'],
                 'unit': token['unit'],
                 'magnitude': token['magnitude'],
-                'occurrence': occurrence[raw],
+                'occurrence': occurrence[key],
                 'label': token['label'],
                 'line': token['line'],
                 'char': token['char'],
+                'before': token['before'],
+                'after': token['after'],
                 'host': token['host'],
                 'note': note,
             })
@@ -532,6 +571,20 @@ def group_numeric_diffs(review: dict) -> list[dict]:
             for category, items in groups.items()]
 
 
+CATEGORY_LABELS = (('management', '管理字段'), ('cross_reference', '标题或交叉引用'),
+                   ('same_value_unit', '数量级或单位'), ('other', '其余'))
+
+
+def format_diff_summary(review):
+    """全部数字差异的一行汇总（R9：全绿复跑不逐项刷屏）。"""
+    counts = {group['category']: len(group['items'])
+              for group in group_numeric_diffs(review)}
+    parts = '、'.join('%s %d' % (label, counts.get(key, 0))
+                     for key, label in CATEGORY_LABELS)
+    return ('数字提示：共 %d 处待复核（%s），逐项见 verify_delivery --prepare-reviews 候选'
+            % (len(review['diffs']), parts))
+
+
 def numeric_binding(src_text, doc_text, scope, policy_path=None):
     """包证据/恢复核对的数字绑定投影：口径 + 实现身份 + 本次差异 ID。
 
@@ -571,7 +624,7 @@ def format_policy_line(policy):
 def format_diff_hint(diff):
     """单个数字差异提示行的共享文案（定位 ID + 宿主 + 同值异单位注记）。"""
     host = diff['host'] or {}
-    where = []
+    where = ['L%d' % diff['line']]
     if host.get('section'):
         where.append('章节 %r' % host['section'])
     if host.get('table'):
@@ -580,9 +633,7 @@ def format_diff_hint(diff):
         where.append('题注')
     if host.get('footnote'):
         where.append('脚注 [^%s]' % host['footnote'])
-    text = '数字提示 %s' % diff['id']
-    if where:
-        text += '（%s）' % '、'.join(where)
+    text = '数字提示 %s（%s）' % (diff['id'], '、'.join(where))
     if diff['note']:
         text += '：%s' % diff['note']
     return text

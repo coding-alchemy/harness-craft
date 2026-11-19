@@ -2287,6 +2287,7 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
                      % (digest[:12], actual[:12])], mapped_src, claimed_md,
                     cell_target_counts, cell_table_targets, note_targets)
     src_by_ordinal = {r['ordinal']: r for r in src.table_records}
+    md_records = {r['ordinal']: r for r in md.table_records()}
     declared_targets = {}  # (输出表序号, row, col) -> [(源表序号, row, col)]
     # 目标格位 -> 按源序登记的格内代码正文（源表序号、格位、正文）
     declared_codes = {}
@@ -2325,7 +2326,7 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
                             positions.append({'table': record['ordinal'], 'row': r, 'col': c})
                     expected_grid[row_no, col_no] = positions
                     cursor += cs
-            output = next((r for r in md.table_records() if r['ordinal'] == record['ordinal']), None)
+            output = md_records.get(record['ordinal'])
             width = max((c for r, c in occupied), default=0)
             if output is None or not output.get('gfm') or len(output['rows']) != len(record['rows']) \
                     or any(len(row) != width for row in output['rows']):
@@ -2382,7 +2383,7 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
                                  % (record['ordinal'], position))
                 if record.get('headers', {}).get(position):
                     for target in expected:
-                        out = next((r for r in md.table_records() if r['ordinal'] == target['table']), None)
+                        out = md_records.get(target['table'])
                         r, c = target['row'], target['col']
                         if out and r > 1 and r <= len(out['rows']) and c <= len(out['rows'][r-1]) \
                                 and out['rows'][r-1][c-1]:
@@ -2405,9 +2406,7 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
                         diffs.append('源表 #%d 格 %s 输出格位非法: %r'
                                      % (record['ordinal'], position, target))
                         continue
-                    out_record = next(
-                        (r for r in md.table_records()
-                         if r['ordinal'] == out_ordinal), None)
+                    out_record = md_records.get(out_ordinal)
                     if out_record is None:
                         diffs.append('源表 #%d 格 %s 指向的输出表 #%d 不存在'
                                      % (record['ordinal'], position,
@@ -2494,7 +2493,6 @@ def _conversion_map_diffs(raw_html, section_id, src, md, table_conversions,
                         (target['table'], target['row'], target['col']),
                         []).append((record['ordinal'], crow, ccol, body))
     # 逐输出格核验：声明指向它的源格文字（行优先序）与输出格文字一一相等
-    md_records = {r['ordinal']: r for r in md.table_records()}
     for out_position in sorted(declared_targets):
         sources = sorted(declared_targets[out_position])
         out_ordinal, out_row, out_col = out_position
@@ -2816,7 +2814,7 @@ def reconcile_html_to_markdown(raw_html, md_text, family,
 
 def _latexml_src_stream(raw_html, section_id, decisions,
                         decision_results=None, table_conversions=None,
-                        adaptation=None):
+                        adaptation=None, keep_itemize_markers=False):
     """从原始快照独立重建有序源 token 流与逐节点事实。
 
     返回 (tokens, facts, confirmed, problems, occ_stream, hosts)；tokens 供有序
@@ -2831,7 +2829,8 @@ def _latexml_src_stream(raw_html, section_id, decisions,
     不使用生成标记表，不按同文本反查。代码/TeX/内容性字符不随普通排版
     空白归一。
     """
-    from _latexml_source import (_LIST_BLOCK_RE, _MARK_RE, OccurrenceRegistry,
+    from _latexml_source import (_LIST_BLOCK_RE, _MARK_RE,
+                                 ITEMIZE_MARKERS, OccurrenceRegistry,
                                  _expand_markers_inline,
                                  aside_node_ids as _lx_aside_node_ids,
                                  classify_block, container_node_ids,
@@ -3290,7 +3289,8 @@ def _latexml_src_stream(raw_html, section_id, decisions,
         _register_paragraph(node_id, all_frags, section)
 
     def _enumerate_tokens(node, indent=0):
-        for item, marker, body, blocks in enumerate_items(node):
+        for item, marker, body, blocks in enumerate_items(
+                node, keep_itemize_markers):
             continuation = indent + len(marker)
             parts = _LIST_BLOCK_RE.split(_direct_read(body))
             first_token = len(tokens)
@@ -3493,8 +3493,14 @@ def _latexml_src_stream(raw_html, section_id, decisions,
                 for item in child.find_all('li', recursive=False):
                     # F4：条内公式出现按标记逐字重建（原 TeX 逐字），
                     # `- ` 前缀并入首个文字段；块级出现拆为独立块级
-                    # token（ticket 20）；文字直接 DOM 阅读（复评 S1）
-                    frags = marked_text_frags(_direct_read(item), registry)
+                    # token（ticket 20）；文字直接 DOM 阅读（复评 S1）；
+                    # 默认标记与写出侧一并剥除（R7），自定义标签保留
+                    body = copy.deepcopy(item)
+                    for label in body.find_all(class_='ltx_tag_item'):
+                        if (not keep_itemize_markers
+                                and label.get_text(strip=True) in ITEMIZE_MARKERS):
+                            label.extract()
+                    frags = marked_text_frags(_direct_read(body), registry)
                     if frags and frags[0][0] == 't':
                         frags = [('t', '- ' + frags[0][1])] + list(
                             frags[1:])
@@ -3882,7 +3888,8 @@ def _expected_table_block(label, entry, expected_map):
 def _reconcile_latexml_core(raw_html, md_text, section_id,
                             adaptation, html_label='原快照',
                             md_label='解析 Markdown',
-                            table_conversions=None):
+                            table_conversions=None,
+                            keep_itemize_markers=False):
     """LaTeXML 来源独立对账核心（无锚点口径）：身份/摘要核对 + 候选
     correspondences 与 unresolved 逐节点核对 + 两侧有序流比较。返回损伤
     诊断（空 = 通过）。
@@ -3918,7 +3925,8 @@ def _reconcile_latexml_core(raw_html, md_text, section_id,
     (src_tokens, facts, confirmed, src_problems,
      occ_stream, hosts) = _latexml_src_stream(
         raw_html, section_id, decisions, decision_results,
-        table_conversions=table_conversions, adaptation=adaptation)
+        table_conversions=table_conversions, adaptation=adaptation,
+        keep_itemize_markers=keep_itemize_markers)
     if isinstance(adaptation, dict) \
             and adaptation.get('resource_substitutions'):
         snap_path = (adaptation.get('snapshot') or {}).get('path')
@@ -4610,10 +4618,29 @@ def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
                                   adaptation, html_label='原快照',
                                   md_label='解析 Markdown',
                                   table_conversions=None):
-    """LaTeXML 来源独立对账入口：空锚点按零宽处理后交给 _reconcile_latexml_core。"""
+    """LaTeXML 来源独立对账入口。
+
+    先按现行读法（无序列表默认标记不进正文，R7）比对；不一致时按 R7 之前的
+    读法（保留默认标记）整篇重比，一致即为重新解析前写出的旧解析稿。两种
+    读法都不一致时报差异较少的一种。
+    """
+    args = (raw_html, md_text, section_id, adaptation, html_label, md_label,
+            table_conversions)
+    diffs = _reconcile_latexml_once(*args)
+    if not diffs:
+        return diffs
+    legacy = _reconcile_latexml_once(*args, keep_itemize_markers=True)
+    return legacy if len(legacy) < len(diffs) else diffs
+
+
+def _reconcile_latexml_once(raw_html, md_text, section_id,
+                            adaptation, html_label, md_label, table_conversions,
+                            keep_itemize_markers=False):
+    """按一种列表读法对账一次：空锚点按零宽处理后交给 _reconcile_latexml_core。"""
     if not adaptation or not _EMPTY_ANCHOR.search(md_text):
         return _reconcile_latexml_core(raw_html, md_text, section_id, adaptation,
-                                       html_label, md_label, table_conversions)
+                                       html_label, md_label, table_conversions,
+                                       keep_itemize_markers=keep_itemize_markers)
     # declared 由 _latexml_source.markdown_range_facts 写入（切片形式：
     # 去掉一个结尾换行），actual 按同一口径计算；只比较 sha256/lines 两键，
     # 依据若还有其他键则原样保留
@@ -4633,4 +4660,5 @@ def reconcile_latexml_to_markdown(raw_html, md_text, section_id,
         payload['markdown'] = dict(declared,
                                    **markdown_range_facts(clean))
     return _reconcile_latexml_core(raw_html, clean, section_id, payload,
-                                   html_label, md_label, table_conversions)
+                                   html_label, md_label, table_conversions,
+                                   keep_itemize_markers=keep_itemize_markers)
