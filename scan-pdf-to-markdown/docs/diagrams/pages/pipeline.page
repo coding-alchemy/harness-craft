@@ -1,0 +1,158 @@
+pageType: content
+background: {type: solid, color: "$paper"}
+notes: "整本无正文但候选资料完整时，失败诊断保留候选供 render。通过或降级的候选复查源件后使用排他重命名发布。公开 verify 只读。"
+elements:
+  - elementId: generated-lane
+    elementType: shape
+    bounds: [38, 109, 600, 211]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$greenWash"}
+  - elementId: verify-lane
+    elementType: shape
+    bounds: [664, 109, 298, 211]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$blueWash"}
+  - elementId: shared-check
+    elementType: shape
+    bounds: [38, 349, 924, 77]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$ink"}
+  - elementId: generated-report
+    elementType: shape
+    bounds: [38, 456, 600, 85]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$white"}
+    border: {"style": "solid", "width": 1, "color": "$lightLine"}
+  - elementId: verify-report
+    elementType: shape
+    bounds: [664, 456, 298, 85]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$white"}
+    border: {"style": "solid", "width": 1, "color": "$lightLine"}
+  - elementId: parse-render-divider
+    elementType: shape
+    bounds: [338, 128, 1, 72]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$lightLine"}
+  - elementId: parse-render-action
+    elementType: shape
+    bounds: [61, 243, 554, 59]
+    shapeName: "rect"
+    fill: {"type": "solid", "color": "$white"}
+    border: {"style": "solid", "width": 1, "color": "$lightLine"}
+  - elementId: parse-joins
+    elementType: line
+    bounds: [168, 203, 170, 19]
+    viewBox: [170, 19]
+    points: "0,0 0,19 170,19"
+    curve: "sharp"
+    border: {"style": "solid", "width": 2, "color": "$greenLine"}
+    arrow: [null, null]
+  - elementId: render-joins
+    elementType: line
+    bounds: [338, 203, 170, 19]
+    viewBox: [170, 19]
+    points: "170,0 170,19 0,19"
+    curve: "sharp"
+    border: {"style": "solid", "width": 2, "color": "$greenLine"}
+    arrow: [null, null]
+  - elementId: join-to-candidate
+    elementType: line
+    bounds: [338, 222, 1, 21]
+    viewBox: [1, 21]
+    points: "0,0 0,21"
+    curve: "sharp"
+    border: {"style": "solid", "width": 2, "color": "$greenLine"}
+    arrow: [null, "stealth"]
+  - elementId: candidate-to-check
+    elementType: line
+    bounds: [338, 302, 1, 47]
+    viewBox: [1, 47]
+    points: "0,0 0,47"
+    curve: "sharp"
+    border: {"style": "solid", "width": 2, "color": "$greenLine"}
+    arrow: [null, "stealth"]
+  - elementId: published-to-check
+    elementType: line
+    bounds: [814, 205, 1, 144]
+    viewBox: [1, 144]
+    points: "0,0 0,144"
+    curve: "sharp"
+    border: {"style": "solid", "width": 2, "color": "$blue"}
+    arrow: [null, "stealth"]
+  - elementId: check-to-write
+    elementType: line
+    bounds: [338, 426, 1, 30]
+    viewBox: [1, 30]
+    points: "0,0 0,30"
+    curve: "sharp"
+    border: {"style": "solid", "width": 2, "color": "$greenLine"}
+    arrow: [null, "stealth"]
+  - elementId: check-to-compare
+    elementType: line
+    bounds: [814, 426, 1, 30]
+    viewBox: [1, 30]
+    points: "0,0 0,30"
+    curve: "sharp"
+    border: {"style": "solid", "width": 2, "color": "$blue"}
+    arrow: [null, "stealth"]
+  - elementId: title
+    elementType: text
+    bounds: [38, 27, 900, 44]
+    content: {"text": "阅读包怎样生成与核验", "style": "$title", "align": ["left", "middle"], "wrap": false}
+  - elementId: entrance
+    elementType: text
+    bounds: [40, 75, 900, 27]
+    content: {"text": "Skill 和命令行调用同一个 scan_pdf.py", "style": "$body", "align": ["left", "middle"], "wrap": false}
+  - elementId: parse
+    elementType: text
+    bounds: [61, 131, 238, 30]
+    content: {"text": "parse", "style": "$code", "align": ["left", "middle"], "wrap": false, "color": "$green", "fontSize": 23}
+  - elementId: parse-detail
+    elementType: text
+    bounds: [61, 171, 258, 28]
+    content: {"text": "源 PDF → 本地 MinerU OCR", "style": "$body", "align": ["left", "middle"], "wrap": false}
+  - elementId: render
+    elementType: text
+    bounds: [363, 131, 245, 30]
+    content: {"text": "render", "style": "$code", "align": ["left", "middle"], "wrap": false, "color": "$green", "fontSize": 23}
+  - elementId: render-detail
+    elementType: text
+    bounds: [363, 171, 252, 28]
+    content: {"text": "同一 PDF、原包与复核记录", "style": "$body", "align": ["left", "middle"], "wrap": false}
+  - elementId: verify
+    elementType: text
+    bounds: [687, 131, 247, 30]
+    content: {"text": "verify", "style": "$code", "align": ["left", "middle"], "wrap": false, "color": "$blue", "fontSize": 23}
+  - elementId: verify-detail
+    elementType: text
+    bounds: [687, 171, 250, 28]
+    content: {"text": "同一 PDF、已落盘阅读包", "style": "$body", "align": ["left", "middle"], "wrap": false}
+  - elementId: generate
+    elementType: text
+    bounds: [77, 257, 520, 29]
+    content: {"text": "校验源件，按页组块，应用复核，写入候选目录", "style": "$heading", "align": ["left", "middle"], "wrap": false, "fontSize": 21}
+  - elementId: recompute
+    elementType: text
+    bounds: [64, 365, 162, 38]
+    content: {"text": "共用核验", "style": "$heading", "align": ["left", "middle"], "wrap": false, "color": "$white", "fontSize": 26}
+  - elementId: recompute-detail
+    elementType: text
+    bounds: [254, 370, 670, 32]
+    content: {"text": "从原包重算，核对落盘正文、来源映射与配图", "style": "$body", "align": ["left", "middle"], "wrap": false, "color": "$lightText", "fontSize": 21}
+  - elementId: write-report
+    elementType: text
+    bounds: [61, 468, 194, 28]
+    content: {"text": "写质量报告", "style": "$heading", "align": ["left", "middle"], "wrap": false, "fontSize": 22}
+  - elementId: publish
+    elementType: text
+    bounds: [61, 505, 554, 24]
+    content: {"text": "通过／降级后复查源件并排他发布。失败时返回诊断。", "style": "$body", "align": ["left", "middle"], "wrap": false}
+  - elementId: compare-report
+    elementType: text
+    bounds: [687, 468, 250, 28]
+    content: {"text": "核对落盘报告", "style": "$heading", "align": ["left", "middle"], "wrap": false, "fontSize": 22}
+  - elementId: verify-only
+    elementType: text
+    bounds: [687, 505, 250, 24]
+    content: {"text": "只读返回质量结论", "style": "$body", "align": ["left", "middle"], "wrap": false}

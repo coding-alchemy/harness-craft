@@ -1,0 +1,5 @@
+-r requirements.txt
+mineru==4.1.7
+docvortex==0.6.24
+onnxruntime==1.32.0
+# Basic ONNX 验收权重：OpenDataLab/MinerU-4_models_onnx@e916a9d96d645d005364abd7db8ffd4b7353cf4f
