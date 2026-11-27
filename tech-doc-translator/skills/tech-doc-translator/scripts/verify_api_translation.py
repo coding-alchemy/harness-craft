@@ -378,6 +378,9 @@ def main():
     with open(toc_path, encoding='utf-8') as f:
         official = [l.strip() for l in f if l.strip()]
     merged = open(merged_path, encoding='utf-8').read()
+    for src_path in src_paths:
+        if src_path.endswith('.rejected.md'):
+            sys.exit('这是源对账未通过的解析稿，已拒绝核验: %s' % src_path)
     src_texts = [open(p, encoding='utf-8').read() for p in src_paths]
 
     fails, warns = run_checks(

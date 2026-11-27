@@ -21,7 +21,8 @@ import sys
 import re
 from bs4 import Comment, Tag
 
-from _html_fidelity import HtmlFidelity, _is_admonition_div, warn_if_temp_output
+from _html_fidelity import (HtmlFidelity, _is_admonition_div,
+                            require_complete_html, warn_if_temp_output)
 from _source_reconcile import reconcile_html_to_markdown
 
 
@@ -49,6 +50,7 @@ def _has_protected_pre(tag):
 
 
 def render(node, out, fidelity):
+    fidelity.escape_table_pipes = True
     _render_children(node, out, fidelity)
 
 
@@ -173,6 +175,7 @@ def main():
 
     fidelity = HtmlFidelity(
         snapshot_dir=os.path.dirname(os.path.abspath(html_path)))
+    require_complete_html(html_path)
     raw = open(html_path, encoding='utf-8').read()
     soup = fidelity.parse(raw)
     if section_id:

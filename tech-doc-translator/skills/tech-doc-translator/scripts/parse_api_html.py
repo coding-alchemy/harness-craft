@@ -21,9 +21,9 @@ from html import escape
 
 from bs4 import Comment, Tag
 
-from _html_fidelity import HtmlFidelity, warn_if_temp_output
+from _html_fidelity import HtmlFidelity, require_complete_html, warn_if_temp_output
 from _source_reconcile import reconcile_html_to_markdown
-from _verification import file_sha256
+from _verification import file_sha256, summarize_messages
 from _api_navigation import source_anchor_ids, anchor_diffs
 
 
@@ -127,6 +127,8 @@ def _tabs_block(tag, out, fidelity):
 
 def render(node, out, fidelity):
     fidelity.inline_image = lambda img: _image_inline(img, fidelity)
+    fidelity.block_anchor_ids = source_anchor_ids
+    fidelity.escape_table_pipes = True
     _render_children(node, out, fidelity)
 
 
@@ -281,6 +283,7 @@ def main():
         unknown_footnote='[^?]',
         snapshot_dir=os.path.dirname(os.path.abspath(html_path)))
     fidelity.expand_tables = bool(args.expand_tables)
+    require_complete_html(html_path)
     raw = open(html_path, encoding='utf-8', newline='').read()
     soup = fidelity.parse(raw)
     root = soup.find('article') or soup.find('main') or soup.find('body')
@@ -297,9 +300,16 @@ def main():
                                        md_label=out_path, table_conversions=conversions)
     diffs += anchor_diffs(raw, md_text)
     if diffs:
-        sys.exit('源对账失败: %s 与 %s 不一致，已阻断分派\n%s' % (
-            html_path, out_path,
-            '\n'.join('  - ' + d for d in diffs)))
+        side = tempfile.mkdtemp(prefix='parse_api_rejected_')
+        stem = os.path.splitext(os.path.basename(out_path))[0]
+        with open(os.path.join(side, stem + '.rejected.md'), 'w',
+                  encoding='utf-8', newline='') as handle:
+            handle.write(md_text)          # 与参与对账的文本逐字节相同
+        with open(os.path.join(side, 'reconcile_diffs.txt'), 'w', encoding='utf-8') as handle:
+            handle.write(''.join(d + '\n' for d in diffs))
+        kind = lambda m: re.sub(r'\d+', 'N', m.split(': ', 1)[0])  # 冒号前是差异类型
+        sys.exit('源对账失败: %s 与 %s 不一致，已阻断分派\n%s\n全部差异与被拒解析稿：%s'
+                 % (html_path, out_path, summarize_messages(diffs, samples=1, key=kind), side))
     if args.expand_tables:
         map_path = args.table_conversions_output
         display_map = os.path.splitext(out_path)[0] + '.images_display.json' if fidelity.image_display else None

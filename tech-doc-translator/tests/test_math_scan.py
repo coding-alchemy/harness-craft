@@ -1,4 +1,5 @@
 """共享公式扫描与逐项比较的固定语义验收（任务 02：公式内容与顺序）。"""
+import re
 import shutil
 import subprocess
 import sys
@@ -10,9 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills/tech-doc-tr
 from _verification import (
     compare_math_spans,
     extract_approved_extra_math,
+    is_literal_dollar,
     markdown_table_row_lines,
     scan_math,
     scan_math_spans,
+    summarize_messages,
 )
 
 
@@ -221,6 +224,20 @@ class ScanMathDigitLeadingUnclosedTest(unittest.TestCase):
         self.assertEqual(kinds(scan.spans),
                          [('inline', '5 + x'), ('inline', '5')])
         self.assertEqual(scan.issues, ())
+
+
+class LiteralDollarBoundaryTest(unittest.TestCase):
+    """R6/D3：HTML 字面美元判别——只有紧贴标识符的不配对 `$` 算字面文字。"""
+
+    def test_literal_dollar_identifier_boundary(self):
+        for text in ('$pointerType', 'cuda_tile.preview$call', '$value_2'):
+            issue = scan_math(text).issues[0]
+            self.assertTrue(is_literal_dollar(issue, text), text)
+        issue = scan_math('$x').issues[0]
+        self.assertFalse(is_literal_dollar(issue, '$x'))
+        self.assertEqual(scan_math('价格 $100').issues, ())
+        self.assertEqual(scan_math('$ 5').issues, ())
+        self.assertEqual([s.expr for s in scan_math('$x$').spans], ['x'])
 
 
 class VerifyTranslationUnclosedDigitCliTest(unittest.TestCase):
@@ -510,6 +527,35 @@ class TablePipeNormalizationTest(unittest.TestCase):
         diffs, _ = compare_math_spans(src, doc_same, 'src.md', 'doc.md',
                                       doc_text='A | B value $|x|$\n')
         self.assertEqual(diffs, [])
+
+
+class SummarizeMessagesCategoryKeyTest(unittest.TestCase):
+    """R8：summarize_messages 可选 key 按差异类别归类；缺省模板逐字不变。"""
+
+    def test_summarize_messages_accepts_category_key(self):
+        messages = [
+            '定义列表第 41 项不一致: a.md (41,) vs b.md (42,)',
+            '定义列表第 57 项不一致: a.md (57,) vs b.md (58,)',
+            '表格第 5 张第 17 行格数不一致: a.md 5 格 vs b.md 6 格',
+        ]
+        kind = lambda m: re.sub(r'\d+', 'N', m.split(': ', 1)[0])
+        summary = summarize_messages(messages, samples=1, key=kind)
+        # 同一“定义列表”类两条并入一类，另一类单列；每类只印一条样本
+        self.assertEqual(summary.splitlines()[0], '共 3 处，2 类：')
+        self.assertIn('  [2] 定义列表第 N 项不一致', summary)
+        self.assertIn('  [1] 表格第 5 张第 17 行格数不一致: a.md 5 格 vs b.md 6 格',
+                      summary)
+        self.assertEqual([line for line in summary.splitlines()
+                          if line.startswith('      - ')],
+                         ['      - ' + messages[0]])
+        # 省略 key 的既有调用逐字沿用旧模板（LaTeXML 归类输出不变）
+        self.assertEqual(summarize_messages(messages), '''共 3 处，2 类：
+  [2] 定义列表第 N 项不一致: a.md (N,) vs b.md (N,)
+      - 定义列表第 41 项不一致: a.md (41,) vs b.md (42,)
+      - 定义列表第 57 项不一致: a.md (57,) vs b.md (58,)
+  [1] 表格第 5 张第 17 行格数不一致: a.md 5 格 vs b.md 6 格''')
+        self.assertEqual(summarize_messages(messages, key=None),
+                         summarize_messages(messages))
 
 
 class ExtractApprovedExtraMathTest(unittest.TestCase):
