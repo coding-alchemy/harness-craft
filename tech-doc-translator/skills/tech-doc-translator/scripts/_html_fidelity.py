@@ -6,12 +6,13 @@ import copy
 import json
 import os
 import re
+from html import escape
 
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 from markdown_it import MarkdownIt
 
 from _verification import _ESCAPABLE_PUNCT, _protected_inline_spans, \
-    file_sha256, resource_identity_digest, scan_math
+    file_sha256, is_literal_dollar, resource_identity_digest, scan_math
 
 
 # 内联 CSS width 属性（仅取 width 声明；max-width 等不作为显示宽度依据）。
@@ -686,6 +687,17 @@ def table_grid_cells(tag, ordinal):
     return len(rows), width, layout
 
 
+def require_complete_html(path):
+    """以 <!DOCTYPE 或 <html 开头的整页快照必须以 </html> 结束；片段不检查。
+
+    按字节判断，截在多字节字符中间的快照同样报截断，而不是报解码错误。"""
+    data = open(path, 'rb').read()
+    if data.lstrip(b'\xef\xbb\xbf \t\r\n')[:9].lower().startswith((b'<!doctype', b'<html')) \
+            and not data.rstrip().lower().endswith(b'</html>'):
+        raise SystemExit('HTML 快照截断：%s（%d 字节）缺少 </html>，已阻断解析'
+                         % (path, len(data)))
+
+
 class HtmlFidelity:
     """保护代码并渲染各源家族一致的 Markdown 结构。"""
 
@@ -694,7 +706,9 @@ class HtmlFidelity:
         self._unknown_footnote = unknown_footnote
         self.image_display = []  # 按输出顺序登记的图片显示尺寸条目
         self.inline_image = None  # 家族显式提供图片选择；缺省保持原行内合同
+        self.block_anchor_ids = None  # API 家族提供：富容器内块对象的源 ID（缺省不写锚点）
         self.expand_tables = False
+        self.escape_table_pipes = False  # HTML 家族解析入口开启：[TABLE] 格内 | 写成 \|
         self.table_conversions = []
         self._soup = None
         self.snapshot_dir = snapshot_dir  # 快照 HTML 所在目录（高度推导与 resource_base 用）
@@ -881,8 +895,15 @@ class HtmlFidelity:
             raw = re.sub(r'\s*\n\s*', ' ', str(node))
             # 字面转义括号不是数学定界；掩蔽保留原偏移与内部字符。
             masked = raw.replace(r'\[', 'xx').replace(r'\]', 'xx')
-            spans = scan_math(masked).spans
-            for span in reversed(spans):
+            scan = scan_math(masked)
+            # 不配对、紧贴标识符的 $ 是字面文字：写成 \$，不再被读作公式定界
+            literal = [(issue.start, None) for issue in scan.issues
+                       if is_literal_dollar(issue, masked)]
+            for start, span in sorted([(s.start, s) for s in scan.spans] + literal,
+                                      key=lambda item: item[0], reverse=True):
+                if span is None:
+                    raw = raw[:start] + '\\' + raw[start:]
+                    continue
                 code_spans.append(raw[span.start:span.end])
                 raw = (raw[:span.start] + _CODE_TOKEN_FMT % (len(code_spans) - 1)
                        + raw[span.end:])
@@ -1031,6 +1052,12 @@ class HtmlFidelity:
             skipped = set(skip)
             skip = lambda child: child in skipped  # noqa: E731
         first_text_done = False
+
+        def emit_anchors(item):
+            for name in (self.block_anchor_ids(item)
+                         if self.block_anchor_ids is not None else ()):
+                out.append('\n<a id="%s"></a>\n' % escape(name, quote=True))
+
         for kind, item in self._block_sequence(node, skip=skip):
             if kind == 'fence':
                 if bullet and not first_text_done:
@@ -1090,6 +1117,7 @@ class HtmlFidelity:
                     out.append(bullet.rstrip())
                     first_text_done = True
                 before = len(out)
+                emit_anchors(item)
                 out.extend(self.table_block(item))
                 for idx in range(before, len(out)):
                     out[idx] = self._indented_block(out[idx], indent)
@@ -1106,6 +1134,7 @@ class HtmlFidelity:
                 if bullet and not first_text_done:
                     out.append(bullet.rstrip())
                     first_text_done = True
+                emit_anchors(item)
                 out.append('\n' + self.heading_line(
                     int(name[1]), self.clean_heading(
                         self.heading_text(item, escape_backslashes=True))))
@@ -1119,6 +1148,7 @@ class HtmlFidelity:
                     # render_block 会进入其子节点循环而丢失提示框结构
                     title = item.find(['p', 'div'], class_='admonition-title')
                     label = title.get_text(strip=True) if title else 'Note'
+                    emit_anchors(item)
                     out.append('\n> **ADMONITION [%s]**' % label)
                     self.admonition_content_lines(
                         item, out, render_block, emit_image)
@@ -1298,7 +1328,12 @@ class HtmlFidelity:
                 # 格位是 GFM 行内语境：\+ASCII 标点的实际阅读丢反斜线，
                 # 在源文本节点层按阅读语义加写（\\ 阅读为一个反斜线），
                 # 生成的链接语法不再被二次加写，逐格可读可验（F1/R2）
-                cells.append(self.render_inline(cell, escape_backslashes=True))
+                cell_text = self.render_inline(cell, escape_backslashes=True)
+                if self.escape_table_pipes:
+                    # 格内 | 写成 \|，不破坏 ' | ' 列界；对账端按 GFM
+                    # 表格语义读回 |（R3）
+                    cell_text = cell_text.replace('|', r'\|')
+                cells.append(cell_text)
                 for order, fenced in enumerate(self.cell_fences(cell),
                                                start=1):
                     code_entries.append((row_no, col_no, order, fenced))

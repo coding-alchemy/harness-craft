@@ -33,6 +33,7 @@ from _verification import (
     heading_entries,
     image_marker_spans,
     image_reference_spans,
+    is_literal_dollar,
     line_code_spans,
     parse_inline_code_spans,
     resolve_backslash_escapes,
@@ -359,6 +360,8 @@ def _norm_text(text, unwrap_links=True, mark_code=False,
         text = re.sub(
             r'^(\\+)(#{1,8})(?=\s|$)',
             lambda m: '\\' * (len(m.group(1)) // 2) + m.group(2), text)
+    # 解析稿的字面美元写作 \$（阅读为 $）：文字事实按阅读语义比较
+    text = text.replace('\\$', '$')
     if not resolve_escapes:
         text = _MD_IMAGE_RE.sub(' ', text)
         text = _MD_IMG_MARKER_RE.sub(' ', text)
@@ -521,11 +524,37 @@ def _literal_math_exprs(text):
     return result
 
 
-def _literal_math_issues(text):
-    """文本节点字面公式扫描的未解决定界（原偏移在序列化后的文字上）。"""
+def _math_scan_text(text):
     serialized = re.sub(r'\s*\n\s*', ' ', text)
-    stripped = serialized.replace('\\[', 'xx').replace('\\]', 'xx')
-    return list(scan_math(stripped).issues)
+    return serialized.replace('\\[', 'xx').replace('\\]', 'xx')
+
+
+def _literal_math_issues(node):
+    """文本节点字面公式扫描的未解决定界（原偏移在序列化后的文字上）。
+
+    不配对、紧贴标识符的 $ 是源中字面文字（解析稿写成转义的 $），不算
+    残缺公式；它在所在块的拼接文字里与别的文本节点的 $ 配成公式时（公式
+    被 <em>、<sup> 等标签切开），照旧算未解决定界。"""
+    stripped = _math_scan_text(str(node))
+    issues = scan_math(stripped).issues
+    literal = [issue for issue in issues if is_literal_dollar(issue, stripped)]
+    if not literal:
+        return list(issues)
+    block = (node.find_parent(['p', 'li', 'dt', 'dd', 'td', 'th',
+                               'caption', 'figcaption'])
+             or node.parent)
+    whole, offset = '', 0
+    for other in block.find_all(string=True):   # 与 _math 公式流同一排除范围
+        if (_in_pre(other) or _in_heading(other)
+                or other.find_parent(class_='math') is not None
+                or other.find_parent('code') is not None):
+            continue
+        if other is node:
+            offset = len(whole)
+        whole += _math_scan_text(str(other))
+    spans = scan_math(whole).spans
+    return [issue for issue in issues if issue not in literal
+            or any(s.start <= offset + issue.start < s.end for s in spans)]
 
 
 def _in_pre(node):
@@ -737,7 +766,7 @@ class _SourceFacts:
                     continue
                 order = self._index[id(node)]
                 sub = sub_by_index.get(order, 0)
-                self.math_issues.extend(_literal_math_issues(str(node)))
+                self.math_issues.extend(_literal_math_issues(node))
                 for kind, expr in _literal_math_exprs(str(node)):
                     spans.append((self._section_of(node), order, sub, kind,
                                   expr))
@@ -1309,6 +1338,13 @@ class _MarkdownFacts:
         self._heading_ordinals = {entry[0]: ordinal + 1
                                   for ordinal, entry in
                                   enumerate(self._heading_entries)}
+        # 表格行集合（table_records 的全部表格行）：HTML 家族（无来源依据）
+        # 的格内文字、行内代码、公式与图片地址同一读回口径（表格行内的
+        # \| 读作 |）；带来源依据（LaTeXML）的写出端不转义格内 |，为空集、
+        # 照旧按字面读
+        self._table_row_lines = (
+            set().union(*(r['row_lines'] for r in self.table_records()))
+            if self._source_context is None else set())
         self.code = self._tagged_code()
         # math 流剥离转义括号后再扫描（家族合同：字面 \[ \] 不是公式
         # 定界），类型与表达式从同一次共享 scan_math 结果投影，issues
@@ -1340,21 +1376,32 @@ class _MarkdownFacts:
             offset += len(line) + 1
         scan = scan_math(stripped)
         self.math_issues = scan.issues
-        return [(self._md_section(span.start_line), span.start_line,
-                 max(0, span.start - line_starts.get(span.start_line, 0)),
-                 span.kind,
-                 (_strip_math_wrappers(self.text[span.start + 2:span.end - 2].strip())
-                  if span.kind == 'block'
-                  else self.text[span.start + 1:span.end - 1]))
-                for span in scan.spans
-                if span.start_line not in self._heading_lines]
+        tagged = []
+        for span in scan.spans:
+            if span.start_line in self._heading_lines:
+                continue
+            expression = (_strip_math_wrappers(self.text[span.start + 2:span.end - 2].strip())
+                          if span.kind == 'block'
+                          else self.text[span.start + 1:span.end - 1])
+            if span.start_line in self._table_row_lines:
+                # 表格行内公式与格内文字、行内代码、图片地址同一读回口径：
+                # 表格行内公式的 \| 是 |
+                expression = expression.replace('\\|', '|')
+            tagged.append((self._md_section(span.start_line), span.start_line,
+                           max(0, span.start - line_starts.get(span.start_line, 0)),
+                           span.kind, expression))
+        return tagged
 
     def _tagged_inline_code(self):
+        # HTML 家族（无来源依据）的 [TABLE] 行按 GFM 表格语义读回：
+        # 表格行内代码的 \| 是 |
         tagged = []
         for line_no, line in enumerate(self.lines, start=1):
             if line_no in self.fenced or line_no in self._heading_lines:
                 continue
             for content, (start, _end) in line_code_spans(line):
+                if line_no in self._table_row_lines:
+                    content = content.replace('\\|', '|')
                 tagged.append((self._md_section(line_no), line_no, start,
                                'inline-code', _norm_code_text(content)))
         return tagged
@@ -1369,7 +1416,11 @@ class _MarkdownFacts:
                        for line_no, start, end, path
                        in image_marker_spans(self.text))
         entries.sort(key=lambda item: (item[0], item[1]))
-        return [(self._md_section(line_no), line_no, start, 'image', src)
+        # 表格行内图片地址与格内文字、行内代码、公式同一读回口径：表格行内
+        # 图片地址的 \| 是 |；起点偏移取自原行，不随读回改变
+        return [(self._md_section(line_no), line_no, start, 'image',
+                 src.replace('\\|', '|') if line_no in self._table_row_lines
+                 else src)
                 for line_no, _kind, start, _end, src in entries]
 
     def footnote_streams(self, rich=False):
@@ -1500,6 +1551,7 @@ class _MarkdownFacts:
         context_alive = False
         last_ordinal = {}
         def_region = None   # [DEF-LIST]/[FOOTNOTE-LIST] 缩进内容区的列深
+        def_list_indent = None  # 定义区内嵌列表最外层标记的列深
         near_table = False  # 位于 [TABLE] 之后的表格区域
         pending_table_code = False  # 表格区域的 [TABLE-CODE] 待 consume 围栏
 
@@ -1553,9 +1605,10 @@ class _MarkdownFacts:
                 continue
             # [DEF-LIST]/[FOOTNOTE-LIST] 开启缩进内容区：列 0 属顶层内容，
             # 结束列表上下文；项内形态已按层缩进，只跳过不结束。其后的
-            # 更深缩进的非标记行属定义条目，不计入项内顺序（dd 内嵌套
-            # 列表的标记行照常处理）
+            # 缩进非标记行属定义条目（dd 内嵌套列表的标记行与项内续段
+            # 照常处理）
             if stripped in ('[DEF-LIST]', '[FOOTNOTE-LIST]'):
+                def_list_indent = None
                 if line.startswith((' ', '\t')):
                     def_region = len(line) - len(line.lstrip(' '))
                     continue
@@ -1567,13 +1620,25 @@ class _MarkdownFacts:
             if def_region is not None and line_no in marker_lines \
                     and len(line)-len(line.lstrip(' ')) <= def_region+2:
                 def_region=None
+                def_list_indent = None
+            if def_region is not None and line_no in marker_lines:
+                # 定义区内嵌列表的标记行照常入栈，并记最外层标记列深，
+                # 作为项内续段与 dd 自身段落的分界
+                marker_indent = len(line) - len(line.lstrip(' '))
+                def_list_indent = (marker_indent if def_list_indent is None
+                                   else min(def_list_indent, marker_indent))
             if def_region is not None and line_no not in marker_lines:
                 if not stripped:
                     continue
                 indent = len(line) - len(line.lstrip(' '))
-                if indent > def_region:
+                if def_list_indent is not None and indent >= def_list_indent:
+                    pass  # dd 内嵌列表项的续段：按列表续行归属
+                elif indent > def_region:
+                    def_list_indent = None  # dd 自身段落：内嵌列表到此结束
                     continue
-                def_region = None  # 缩进回到标记层：内容区结束
+                else:
+                    def_region = None  # 缩进回到标记层：内容区结束
+                    def_list_indent = None
             indented_line = line.startswith((' ', '\t'))
             if near_table:
                 # 表格区域：行/分隔行/格内代码标记都属表格作用域，
@@ -1609,9 +1674,12 @@ class _MarkdownFacts:
                 level = max(1, len(match.group(1)) // 2)
                 near_table = False  # 列表标记之后的 ' | ' 是正文续行
                 if stack and level > stack[-1]['level'] \
-                        and def_region is None:
+                        and (def_region is None
+                             or (def_list_indent is not None
+                                 and len(match.group(1)) > def_list_indent)):
                     # 更深层首个标记 = 栈顶项的子列表边界（可多次记录）；
-                    # 定义区内的列表属 dt/dd 内容，边界不记入宿主页
+                    # 定义区内只有比 dd 内嵌列表最外层更深的标记才是其项
+                    # 的子列表，dd 自己的列表边界不记入宿主页
                     stack[-1]['seq'].append(('list', None))
                 finalize_to(level)
                 ordinal = (last_ordinal.get(level, 0) + 1
@@ -1709,6 +1777,7 @@ class _MarkdownFacts:
                 continue
             if not stripped and line:
                 # 单列全空单元格行（渲染端以单个空格输出，与零长空行区分）
+                current['single_column'] = True
                 current['raw_rows'].append([''])
                 current['rows'].append([_norm_text('',
                                                    decode_heading_escape=True)])
@@ -1729,6 +1798,11 @@ class _MarkdownFacts:
                 # 形态识别；单列行内容以 | 结尾时不受影响）
                 line = line + ' '
             cells = line.split(' | ')
+            if self._source_context is None:
+                # HTML 家族的 [TABLE] 格内 \| 按 GFM 表格语义读作 |（含
+                # 行内代码）；LaTeXML 写出器不转义格内 |，带来源依据时
+                # 照旧按字面读
+                cells = [cell.replace('\\|', '|') for cell in cells]
             if all(cell.strip() and _MD_TABLE_SEP_CELL_RE.match(cell.strip())
                    for cell in cells):
                 current['row_lines'].add(line_no)  # 分隔行属于表格，与 GFM 记录一致
@@ -1745,6 +1819,8 @@ class _MarkdownFacts:
                     current.get('single_column') or not current['rows']):
                 # 单列表格行（无列界记号）：自首行起进入单列模式，空行结束
                 current['single_column'] = True
+                if self._source_context is None:
+                    line = line.replace('\\|', '|')
                 current['raw_rows'].append([line])
                 current['rows'].append([cell_reading(line)])
                 current['row_lines'].add(line_no)
@@ -1820,7 +1896,9 @@ class _MarkdownFacts:
     def terms(self):
         pairs = []
         in_def = False
+        previous_blank = False
         for line_no, line in enumerate(self.lines, start=1):
+            after_blank, previous_blank = previous_blank, not line.strip()
             if line_no in self.fenced:
                 continue
             if line.strip() == '[DEF-LIST]':
@@ -1828,6 +1906,8 @@ class _MarkdownFacts:
                 continue
             if not in_def:
                 continue
+            if not line.strip():
+                continue  # dd 多段之间的空行属定义内容，不结束定义区
             if not line.startswith(' '):
                 in_def = False
                 continue
@@ -1836,7 +1916,8 @@ class _MarkdownFacts:
                 in_def = False
                 continue
             m = re.match(r'^\*\*(.+?)\*\*\s*(.*)$', s)
-            if m:
+            # 术语行紧接上一行写出；dd 里空行之后的 **…** 行是块内容（如选项卡标签）
+            if m and not after_blank:
                 pairs.append((_norm_text(m.group(1),
                                          decode_heading_escape=True),
                               _norm_text(m.group(2),

@@ -39,7 +39,7 @@ from pathlib import Path
 from bs4 import Tag
 
 from _html_fidelity import (HtmlFidelity, contains_block_content,
-                            warn_if_temp_output)
+                            require_complete_html, warn_if_temp_output)
 from _source_reconcile import reconcile_html_to_markdown
 
 
@@ -89,6 +89,7 @@ def _figure_block(tag, out, fidelity):
 
 
 def render(node, out, fidelity):
+    fidelity.escape_table_pipes = True
     _render_children(node, out, fidelity)
 
 
@@ -339,6 +340,7 @@ def _adapted_main(html_path, section_id, out_path, args):
     except ValueError as exc:
         sys.exit(str(exc))
 
+    require_complete_html(html_path)
     raw = open(html_path, encoding='utf-8').read()
     problems = latexml.validate_adaptation(
         payload, raw_html=raw, snapshot_path=html_path)
@@ -413,6 +415,7 @@ def inspect_reference(html_path: str, section_id: str | None = None, *,
     from _verification import resource_identity_digest, scan_math
 
     snapshot = Path(html_path).absolute()
+    require_complete_html(html_path)
     raw = snapshot.read_bytes().decode('utf-8')
     digest = latexml.sha256_text(raw)
     payload = {}
@@ -555,6 +558,7 @@ def main():
     fidelity = HtmlFidelity(
         unknown_footnote='[^?]',
         snapshot_dir=os.path.dirname(os.path.abspath(html_path)))
+    require_complete_html(html_path)
     raw = open(html_path, encoding='utf-8').read()
     soup = fidelity.parse(raw)
     root = _select_root(soup, section_id)

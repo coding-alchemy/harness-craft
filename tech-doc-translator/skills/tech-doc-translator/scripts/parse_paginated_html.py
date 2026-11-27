@@ -22,7 +22,7 @@ import os
 from bs4 import Tag
 
 from _html_fidelity import (HtmlFidelity, contains_block_content,
-                            warn_if_temp_output)
+                            require_complete_html, warn_if_temp_output)
 from _source_reconcile import reconcile_html_to_markdown
 
 
@@ -50,6 +50,7 @@ def _math_block(tag, out):
 
 
 def render(node, out, fidelity):
+    fidelity.escape_table_pipes = True
     _render_children(node, out, fidelity)
 
 
@@ -144,6 +145,7 @@ def _render_children(node, out, fidelity):
 def extract_one(html_path):
     fidelity = HtmlFidelity(
         snapshot_dir=os.path.dirname(os.path.abspath(html_path)))
+    require_complete_html(html_path)
     raw = open(html_path, encoding='utf-8').read()
     soup = fidelity.parse(raw)
     root = soup.find('article') or soup.find('main') or soup.find('body')

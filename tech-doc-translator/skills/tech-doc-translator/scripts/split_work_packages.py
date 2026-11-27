@@ -544,6 +544,8 @@ def split(source_path, out_dir, trans_dir, strategy,
           source_adaptation=None, project_context=None):
     if not os.path.isfile(source_path):
         sys.exit('源文件不存在: %s' % source_path)
+    if source_path.endswith('.rejected.md'):
+        sys.exit('这是源对账未通过的解析稿，已拒绝拆包: %s' % source_path)
     if strategy != 'h2' and not strategy.startswith('chars:'):
         sys.exit('未知拆分策略: %s（支持 h2 或 chars:N）' % strategy)
     if strategy.startswith('chars:'):

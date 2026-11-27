@@ -45,6 +45,19 @@ def _protected_inline_spans(text):
     return sorted(spans)
 
 
+def is_literal_dollar(issue, text):
+    """HTML 文本里不配对、紧贴标识符的单个 `$`（如 `$pointerType`、
+    `preview$call`）：源中字面文字。
+
+    `$` 之后至少两个标识符字符，或 `$` 之前紧贴标识符字符时成立；`$x`
+    这类仍算残缺公式。`$ 5` 在现行扫描中不产生 issue，不进入本判定，
+    继续保持原样。"""
+    if issue.raw != '$' or not issue.reason.startswith('未闭合的行内公式定界'):
+        return False
+    return (re.match(r'[A-Za-z0-9_]{2}', text[issue.end:]) is not None
+            or re.search(r'[A-Za-z0-9_]$', text[:issue.start]) is not None)
+
+
 def resolve_backslash_escapes(text):
     r"""按 Markdown 行内阅读语义解析反斜线：普通文字段 \+ASCII 标点阅读
     为标点（反斜线消解）、\\ 阅读为一个反斜线；代码跨度与公式跨度内容
@@ -1906,17 +1919,21 @@ def residual_markers(text, markers):
     return residuals
 
 
-def summarize_messages(messages, samples=3):
-    """按模板归类：数字与 name[n] 节点编号替换为占位后取前 60 字为类。"""
+def summarize_messages(messages, samples=3, key=None):
+    """按模板归类：数字与 name[n] 节点编号替换为占位后取前 60 字为类。
+
+    提供时改为 key(message) 取类别；排序、计数与样本截断不变。"""
+    if key is None:
+        key = lambda message: re.sub(
+            r'\d+', 'N', re.sub(r'[A-Za-z_]+\[\d+\]', 'node[N]', message))[:60]
     groups = {}
     for message in messages:
-        key = re.sub(r'\d+', 'N', re.sub(r'[A-Za-z_]+\[\d+\]', 'node[N]', message))[:60]
-        groups.setdefault(key, []).append(message)
+        groups.setdefault(key(message), []).append(message)
     lines = ['共 %d 处，%d 类：' % (len(messages), len(groups))]
-    for key, items in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+    for category, items in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
         if len(items) == 1:
             lines.append('  [1] ' + items[0][:200])   # 单条类别：类名就是这条，只印一行
             continue
-        lines.append('  [%d] %s' % (len(items), key))
+        lines.append('  [%d] %s' % (len(items), category))
         lines.extend('      - ' + item[:200] for item in items[:samples])
     return '\n'.join(lines)
